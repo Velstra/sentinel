@@ -344,10 +344,10 @@ fn tunnel_netdev_body(iface: &Interface) -> String {
     if let Some(remote) = &iface.remote {
         body.push_str(&format!("Remote={remote}\n"));
     }
-    if iface.tunnel_supports_key() {
-        if let Some(key) = iface.tunnel_key {
-            body.push_str(&format!("Key={key}\n"));
-        }
+    if iface.tunnel_supports_key()
+        && let Some(key) = iface.tunnel_key
+    {
+        body.push_str(&format!("Key={key}\n"));
     }
     if let Some(ttl) = iface.ttl {
         body.push_str(&format!("TTL={ttl}\n"));
@@ -548,10 +548,10 @@ fn network_unit_body(
     body.push_str(&format!("[Match]\nName={iface}\n\n[Network]\n"));
     // Static addresses (v4 then v6). "dhcp" is handled by the combined DHCP=
     // directive below; "auto" (v6) accepts RAs (SLAAC).
-    if let Some(addr) = address {
-        if addr != "dhcp" {
-            body.push_str(&format!("Address={addr}\n"));
-        }
+    if let Some(addr) = address
+        && addr != "dhcp"
+    {
+        body.push_str(&format!("Address={addr}\n"));
     }
     match address6 {
         Some("auto") => body.push_str("IPv6AcceptRA=yes\n"),
@@ -1998,6 +1998,162 @@ const SSH_DROPIN: &str = "/run/sentinel-ssh/10-sentinel.conf";
 // would incorrectly reject a live enable that has not been saved yet.
 const SSH_ENABLED: &str = "/run/sentinel-ssh/enabled";
 const SSH_UNIT: &str = "sshd.service";
+const LOGIN_REGISTRY: &str = "/var/lib/sentinel/login-accounts.json";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedLogin {
+    // None is a durable creation intent, written BEFORE useradd. If creation
+    // crashes, the next apply still owns/reconciles that explicitly named user.
+    uid: Option<u32>,
+    active: bool,
+    administrator: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRegistry {
+    version: u8,
+    accounts: BTreeMap<String, ManagedLogin>,
+}
+
+fn managed_login_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 32
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        && !matches!(name, "root" | "nobody" | "sshd")
+        && !name.starts_with("systemd-")
+}
+
+fn validate_managed_login_identity(recorded: Option<u32>, actual: Option<u32>) -> Result<()> {
+    if let (Some(expected), Some(actual)) = (recorded, actual) {
+        anyhow::ensure!(
+            expected == actual,
+            "managed login changed UID; reconcile ownership before applying"
+        );
+    }
+    Ok(())
+}
+
+impl LoginRegistry {
+    fn verify_observer(&self, name: &str, uid: u32, actual: Option<u32>) -> Result<()> {
+        let record = self
+            .accounts
+            .get(name)
+            .context("local observation requires a reconciled managed login")?;
+        anyhow::ensure!(
+            system::managed_login_uid(uid)
+                && record.active
+                && record.uid == Some(uid)
+                && actual == Some(uid),
+            "local observation identity is retired, pending or has changed UID"
+        );
+        Ok(())
+    }
+
+    fn read(path: &Path) -> Result<Self> {
+        let registry = match system::read_owned_regular(path, 1024 * 1024)? {
+            Some(body) => Self::decode(&body)?,
+            None => Self {
+                version: 1,
+                accounts: BTreeMap::new(),
+            },
+        };
+        Ok(registry)
+    }
+
+    fn decode(body: &str) -> Result<Self> {
+        let registry: Self =
+            serde_json::from_str(body).context("invalid managed-login registry")?;
+        anyhow::ensure!(
+            registry.version == 1,
+            "unsupported managed-login registry version"
+        );
+        let mut used = HashSet::new();
+        for (name, account) in &registry.accounts {
+            anyhow::ensure!(
+                managed_login_name(name),
+                "unsafe managed-login registry name"
+            );
+            anyhow::ensure!(
+                account.uid.is_none_or(system::managed_login_uid),
+                "unsafe managed-login registry UID"
+            );
+            if let Some(uid) = account.uid {
+                anyhow::ensure!(used.insert(uid), "duplicate managed-login registry UID");
+            }
+        }
+        Ok(registry)
+    }
+
+    fn persist(&self) -> Result<()> {
+        system::install_ha_secret(Path::new(LOGIN_REGISTRY), &serde_json::to_string(self)?)
+            .context("persisting managed-login ownership")
+    }
+}
+
+/// The capability never infers ownership from a reusable username, wheel or an
+/// environment claim. Account retirement/UID changes revoke reads immediately.
+pub(crate) fn verify_observer_login(name: &str, uid: u32) -> Result<()> {
+    LoginRegistry::read(Path::new(LOGIN_REGISTRY))?.verify_observer(
+        name,
+        uid,
+        system::local_login_uid(name)?,
+    )
+}
+
+fn preflight_login_lifecycle(appliance: &Appliance, registry: &LoginRegistry) -> Result<()> {
+    let caller_uid = unsafe { libc::geteuid() };
+    for (name, record) in &registry.accounts {
+        let actual = system::local_login_uid(name)?;
+        validate_managed_login_identity(record.uid, actual)
+            .with_context(|| format!("managed login {name:?}"))?;
+        let desired = appliance.system.logins.iter().find(|l| l.username == *name);
+        anyhow::ensure!(
+            record.uid.is_some() || actual.is_none() || desired.is_some(),
+            "pending managed login {name:?} has an unconfirmed UID; reconcile ownership before removing it"
+        );
+        let demoted = desired
+            .is_some_and(|login| record.administrator && !login_administrator(appliance, login));
+        anyhow::ensure!(
+            actual != Some(caller_uid) || (desired.is_some() && !demoted),
+            "cannot remove or demote the account running this commit; use another administrator or the root recovery console"
+        );
+    }
+    for login in &appliance.system.logins {
+        if let Some(uid) = system::local_login_uid(&login.username)? {
+            anyhow::ensure!(
+                system::managed_login_uid(uid),
+                "refusing to adopt operating-system account {:?}",
+                login.username
+            );
+            anyhow::ensure!(
+                !registry
+                    .accounts
+                    .iter()
+                    .any(|(name, record)| name != &login.username && record.uid == Some(uid)),
+                "login UID is reserved by another managed identity or retirement tombstone"
+            );
+            if !login_administrator(appliance, login) && system::login_in_wheel(&login.username)? {
+                anyhow::ensure!(
+                    uid != caller_uid,
+                    "cannot demote the account running this commit; use another administrator or the root recovery console"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run before the first apply mutation, not merely before account operations:
+/// a CLI must not partially apply a configuration that would revoke its own
+/// ability to finish/recover the transaction.
+pub(crate) fn preflight_login_accounts(appliance: &Appliance) -> Result<()> {
+    preflight_login_lifecycle(appliance, &LoginRegistry::read(Path::new(LOGIN_REGISTRY))?)
+}
 
 /// Render BOTH password transports explicitly, even at defaults. An omitted
 /// PasswordAuthentication setting must not inherit a permissive daemon policy,
@@ -2052,10 +2208,8 @@ fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             if let Err(e) = system::service_start(SSH_UNIT) {
                 eprintln!("warning: starting {SSH_UNIT} failed: {e}");
             }
-            if dropin_changed {
-                if let Err(e) = system::service_restart(SSH_UNIT) {
-                    eprintln!("warning: restarting {SSH_UNIT} failed: {e}");
-                }
+            if dropin_changed && let Err(e) = system::service_restart(SSH_UNIT) {
+                eprintln!("warning: restarting {SSH_UNIT} failed: {e}");
             }
         } else if let Err(e) = system::service_stop(SSH_UNIT) {
             eprintln!("warning: stopping {SSH_UNIT}: {e}");
@@ -2065,16 +2219,57 @@ fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 }
 
 /// Reconcile the local login accounts (`[[system.login]]`, VyOS-style). Each named
-/// account is created if missing (mutableUsers: `useradd -m -G wheel`), its pre-
-/// hashed password is set (`chpasswd -e`) when given, and its SSH keys are rendered
+/// account is created if missing and wheel membership follows its permission
+/// group. Its pre-hashed password is set when given, and its SSH keys are rendered
 /// to `/run/sentinel-ssh/authorized_keys.<user>`. Key files for users no longer in
-/// the config are removed so revoking a login revokes its key access (the account
-/// itself is left in place — we never `userdel`, so the built-in admin is safe).
-/// Live only creates users / sets passwords; at boot the accounts already exist and
-/// only the (tmpfs) key files are re-rendered.
+/// the config are removed and managed accounts are locked/expired, stripped of
+/// wheel, and their sessions ended. UID/home data are retained. Retired ownership
+/// records survive reboot, including removal of a configured bootstrap admin.
+/// Accounts and tmpfs key files are reconciled at both boot and live apply.
+fn login_administrator(appliance: &Appliance, login: &crate::config::Login) -> bool {
+    match login.group.as_deref() {
+        Some(name) => appliance
+            .system
+            .groups
+            .iter()
+            .find(|group| group.name == name)
+            .is_some_and(|group| group.permission.may_write()),
+        // Keep the factory recovery identity usable before provisioning.
+        // An explicitly read-only group still demotes that account.
+        None => login.username == "admin",
+    }
+}
+
+pub(crate) fn validate_present_interfaces(appliance: &Appliance, present: &[String]) -> Result<()> {
+    let missing: Vec<&str> = appliance
+        .interfaces
+        .iter()
+        .filter(|interface| {
+            !interface.disabled
+                && interface.if_type.is_none()
+                && interface.parent.is_none()
+                && interface.vlan.is_none()
+        })
+        .filter(|interface| {
+            interface.zone.is_some() || interface.address.is_some() || interface.address6.is_some()
+        })
+        .filter(|interface| !present.contains(&interface.name))
+        .map(|interface| interface.name.as_str())
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "configured physical interfaces are missing: {}",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
 fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     use std::collections::BTreeSet;
+    let _transaction = system::apply_lock()?;
     let logins = &appliance.system.logins;
+    let mut registry = LoginRegistry::read(Path::new(LOGIN_REGISTRY))?;
+    preflight_login_lifecycle(appliance, &registry)?;
 
     // An interface the box does not have. The installer names links as the
     // *live medium* saw them, and a config written there can arrive on hardware
@@ -2123,6 +2318,52 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let mut wanted: BTreeSet<String> = BTreeSet::new();
     for login in logins {
         wanted.insert(login.username.clone());
+        let administrator = login_administrator(appliance, login);
+        let current_uid = system::local_login_uid(&login.username)?;
+        let was_administrator = registry
+            .accounts
+            .get(&login.username)
+            .is_some_and(|record| record.administrator)
+            || (current_uid.is_some() && system::login_in_wheel(&login.username)?);
+        let planned_uid = match current_uid.or_else(|| {
+            registry
+                .accounts
+                .get(&login.username)
+                .and_then(|record| record.uid)
+        }) {
+            Some(uid) => uid,
+            None => system::allocate_login_uid(
+                &registry
+                    .accounts
+                    .values()
+                    .filter_map(|record| record.uid)
+                    .collect::<Vec<_>>(),
+            )?,
+        };
+        // Adopt ONLY explicitly configured normal local identities. Historical
+        // accounts absent from the configuration cannot safely be guessed from
+        // /etc/passwd and are not automatically revoked on migration.
+        registry
+            .accounts
+            .entry(login.username.clone())
+            .or_insert(ManagedLogin {
+                uid: Some(planned_uid),
+                active: false,
+                administrator: was_administrator,
+            });
+        registry.accounts.get_mut(&login.username).unwrap().uid = Some(planned_uid);
+        registry.persist()?;
+        let uid = system::ensure_login_created(&login.username, Some(planned_uid))?;
+        let record = registry.accounts.get_mut(&login.username).unwrap();
+        record.uid = Some(uid);
+        registry.persist()?;
+        // Only a UID whose durable ownership is recorded may acquire wheel,
+        // a usable password or rendered SSH credentials.
+        system::ensure_login_account(&login.username, administrator)?;
+        system::activate_login_password(&login.username, login.hashed_password.as_deref())?;
+        if mode == ApplyMode::Live && was_administrator && !administrator {
+            system::end_login_sessions(&login.username, uid)?;
+        }
         let path = format!("{SSH_DIR}/authorized_keys.{}", login.username);
         if login.ssh_keys.is_empty() {
             system::remove_file(Path::new(&path))?;
@@ -2138,35 +2379,54 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             system::install_file(Path::new(&path), &body)?;
         }
 
-        // Account + password are live-only side effects on the OS user database.
-        // Created at boot as well, not only on a commit. "At boot the accounts
-        // already exist" holds for a box that has been configured at least once
-        // — and is exactly wrong for a freshly installed one, whose first boot
-        // is its first apply. The account the operator created in the installer
-        // did not exist, so the password they set could not be used.
-        // `ensure_login_account` checks before it creates, and setting the same
-        // hash twice is a no-op, so this is safe to run every boot.
-        {
-            system::ensure_login_account(&login.username)?;
-            if let Some(hash) = &login.hashed_password {
-                system::set_login_password(&login.username, hash)?;
-            }
-        }
+        let record = registry.accounts.get_mut(&login.username).unwrap();
+        record.active = true;
+        record.administrator = administrator;
+        registry.persist()?;
     }
 
-    // Revoke key files for users dropped from the config (the account lingers, but
-    // key access is gone; at boot only wanted files are re-created on the tmpfs).
-    if let Ok(entries) = std::fs::read_dir(SSH_DIR) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if let Some(user) = name.strip_prefix("authorized_keys.") {
-                if !wanted.contains(user) {
-                    let _ = system::remove_file(&entry.path());
+    // A retirement failure is an apply failure, never a success with a still-
+    // privileged login. Keep tombstones and re-enforce them on every boot.
+    let retired: Vec<String> = registry
+        .accounts
+        .keys()
+        .filter(|name| !wanted.contains(*name))
+        .cloned()
+        .collect();
+    for name in retired {
+        system::remove_file(&Path::new(SSH_DIR).join(format!("authorized_keys.{name}")))?;
+        if let Some(uid) = registry.accounts[&name].uid {
+            // Before networkd/basic.target, logind must not be activated by an
+            // early boot renderer. Credentials/fencing apply now; only a LIVE
+            // change has user sessions to terminate through logind and pkill.
+            system::retire_login_account(&name, uid, mode == ApplyMode::Live)?;
+        }
+        let record = registry.accounts.get_mut(&name).unwrap();
+        record.active = false;
+        record.administrator = false;
+        registry.persist()?;
+    }
+    // Strictly revoke legacy rendered keys too, without assuming ownership of
+    // the associated Unix account or swallowing a permission/I/O error.
+    match std::fs::read_dir(SSH_DIR) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.context("reading rendered login key entry")?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if let Some(user) = name.strip_prefix("authorized_keys.")
+                    && !wanted.contains(user)
+                {
+                    system::remove_file(&entry.path())?;
                 }
             }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("reading rendered login keys"),
     }
+    // An empty first registry still marks the migration boundary explicitly;
+    // no unknown historical Unix identity is silently claimed or removed.
+    registry.persist()?;
     Ok(())
 }
 
@@ -2189,8 +2449,8 @@ const API_UNIT: &str = "sentinel-api.service";
 const API_LISTENER: &str = "/run/sentinel/api-listener.json";
 
 /// Reconcile the receiving side of HA config sync to `[system.config-sync]`: a
-/// configured `secret` becomes the API's bearer token and the API is widened +
-/// started so a peer may push here; removing config sync stops it again. Live only
+/// configured `secret` becomes the API's bearer token and starts the API at its
+/// configured management bind; it never widens an address. Live only
 /// touches the unit; at boot the API starts on its own with the files in place.
 fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let cs = &appliance.system.config_sync;
@@ -2207,27 +2467,16 @@ fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 /// and one listen address — two writers of `api.env` would take turns undoing
 /// each other, and which of them ran last would decide whether the console was
 /// reachable.
+fn api_listen_address(appliance: &Appliance) -> Option<String> {
+    let web = &appliance.services.web;
+    // Config sync is not permission to expose every management endpoint on
+    // every address. Remote peers require a deliberate reachable bind.
+    (web.enable || appliance.system.config_sync.secret.is_some()).then(|| web.bind())
+}
+
 fn apply_api(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let web = &appliance.services.web;
-    let sync = appliance.system.config_sync.secret.is_some();
-
-    let listen = match (web.enable, sync) {
-        (false, false) => None,
-        // Config sync alone: off-box on the port peers push to.
-        (false, true) => Some("0.0.0.0:8080".to_string()),
-        (true, false) => Some(web.bind()),
-        // Both: the operator's port, but reachable — a console bound to
-        // localhost would silently stop peers from pushing here.
-        (true, true) => {
-            let port = web.port.unwrap_or(8080);
-            match web.listen_address.as_deref() {
-                Some(a) if a != "127.0.0.1" && a != "::1" => Some(web.bind()),
-                _ => Some(format!("0.0.0.0:{port}")),
-            }
-        }
-    };
-
-    match listen {
+    match api_listen_address(appliance) {
         Some(addr) => {
             // SECURITY (H3): the management server is HTTPS by default, so an
             // off-box console is encrypted. Only warn when the operator has opted
@@ -2554,12 +2803,8 @@ fn apply_nat64(appliance: &Appliance) -> Result<()> {
             system::ensure_dir(Path::new(NAT64_DIR))?;
             system::install_file(conf_path, &conf)?;
             system::install_file(setup_path, &setup)?;
-            if changed {
-                if let Err(e) = system::service_restart(NAT64_UNIT) {
-                    eprintln!(
-                        "warning: (re)starting {NAT64_UNIT} failed (applies on next start): {e}"
-                    );
-                }
+            if changed && let Err(e) = system::service_restart(NAT64_UNIT) {
+                eprintln!("warning: (re)starting {NAT64_UNIT} failed (applies on next start): {e}");
             }
         }
         _ => {
@@ -2676,7 +2921,7 @@ fn pppoe_peer_body(iface: &Interface) -> String {
 fn ppp_secrets_body(ifaces: &[Interface], bng: &PppoeServer) -> Option<String> {
     let ppp: Vec<&Interface> = ifaces.iter().filter(|i| is_active_pppoe(i)).collect();
     let serving = bng.runnable();
-    if ppp.is_empty() && !(serving && !bng.users.is_empty()) {
+    if ppp.is_empty() && (!serving || bng.users.is_empty()) {
         return None;
     }
     let mut body =
@@ -3135,12 +3380,16 @@ const MULTIWAN_SCRIPT: &str = "/run/sentinel/multiwan/health.sh";
 /// reconcile so a removed uplink's table can be flushed.
 const MULTIWAN_TABLES: &str = "/run/sentinel/multiwan/tables";
 
-/// A shell-quoted single-token value: only the charset our validators already
-/// allow (IPv4 / interface names) reaches here, so plain double-quotes suffice
-/// and there is nothing to escape — but quote anyway so an empty gateway can't
-/// splice the array.
+/// Quote one literal shell token, including metacharacters in operator labels.
+/// Validation is not an escaping mechanism; keep this safe independently.
 fn shq(s: &str) -> String {
-    format!("\"{s}\"")
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`")
+    )
 }
 
 /// Render the Multi-WAN health-check + failover daemon for `mw`. The script sets
@@ -3471,28 +3720,26 @@ fn apply_multiwan(appliance: &Appliance) -> Result<()> {
                 .map(|(idx, u)| mw.table_for(idx, u).to_string())
                 .collect();
             system::install_file(tables_path, &format!("{}\n", tables.join("\n")))?;
-            if changed {
-                if let Err(e) = system::multiwan_restart() {
-                    eprintln!(
-                        "warning: (re)starting the multiwan daemon failed (applies on next start): {e}"
-                    );
-                }
+            if changed && let Err(e) = system::multiwan_restart() {
+                eprintln!(
+                    "warning: (re)starting the multiwan daemon failed (applies on next start): {e}"
+                );
             }
         }
         None => {
             // No uplink configured: stop the daemon and flush the tables it owned
             // (recorded on the last apply), then drop the runtime artifacts.
-            if script_path.exists() {
-                if let Err(e) = system::multiwan_stop() {
-                    eprintln!("warning: stopping the multiwan daemon: {e}");
-                }
+            if script_path.exists()
+                && let Err(e) = system::multiwan_stop()
+            {
+                eprintln!("warning: stopping the multiwan daemon: {e}");
             }
             if let Ok(list) = std::fs::read_to_string(tables_path) {
                 for t in list.split_whitespace() {
-                    if let Ok(table) = t.parse::<u32>() {
-                        if let Err(e) = system::ip_route_flush_table(table) {
-                            eprintln!("warning: flushing multiwan table {table}: {e}");
-                        }
+                    if let Ok(table) = t.parse::<u32>()
+                        && let Err(e) = system::ip_route_flush_table(table)
+                    {
+                        eprintln!("warning: flushing multiwan table {table}: {e}");
                     }
                 }
             }
@@ -3585,6 +3832,7 @@ fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 }
 
 pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    preflight_login_accounts(appliance)?;
     crate::ipsec_guards::prepare(appliance)?;
     let ifaces = &appliance.interfaces;
 
@@ -3612,13 +3860,13 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // `parent` names its host NIC, whose `.network` gains a `MACVLAN=` per child.
     let mut macvlan_children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for i in ifaces {
-        if i.is_macvlan() {
-            if let Some(parent) = &i.parent {
-                macvlan_children
-                    .entry(parent.as_str())
-                    .or_default()
-                    .push(i.name.clone());
-            }
+        if i.is_macvlan()
+            && let Some(parent) = &i.parent
+        {
+            macvlan_children
+                .entry(parent.as_str())
+                .or_default()
+                .push(i.name.clone());
         }
     }
 
@@ -3626,13 +3874,13 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // parent's `.network` gains a `MACsec=` per encrypted link (roadmap C14).
     let mut macsec_children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for i in ifaces {
-        if i.is_macsec() {
-            if let Some(parent) = &i.parent {
-                macsec_children
-                    .entry(parent.as_str())
-                    .or_default()
-                    .push(i.name.clone());
-            }
+        if i.is_macsec()
+            && let Some(parent) = &i.parent
+        {
+            macsec_children
+                .entry(parent.as_str())
+                .or_default()
+                .push(i.name.clone());
         }
     }
 
@@ -3857,10 +4105,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(PREFIX)
             && (name.ends_with(".network") || name.ends_with(".netdev") || name.ends_with(".link"))
+            && let Some(body) = system::read_owned_file(&entry.path())?
         {
-            if let Some(body) = system::read_owned_file(&entry.path())? {
-                previous.insert(name, body);
-            }
+            previous.insert(name, body);
         }
     }
     let desired: BTreeMap<String, String> = writes.iter().cloned().collect();
@@ -4365,24 +4612,24 @@ fn apply_offload(appliance: &Appliance) -> Result<()> {
             }
         }
         let e = &i.ethernet;
-        if let (Some(speed), Some(duplex)) = (e.speed, e.duplex.as_deref()) {
-            if let Err(err) = system::ethtool_link(&i.name, speed, duplex) {
-                eprintln!(
-                    "warning: forcing {speed}/{duplex} on {} failed: {err}",
-                    i.name
-                );
-            }
+        if let (Some(speed), Some(duplex)) = (e.speed, e.duplex.as_deref())
+            && let Err(err) = system::ethtool_link(&i.name, speed, duplex)
+        {
+            eprintln!(
+                "warning: forcing {speed}/{duplex} on {} failed: {err}",
+                i.name
+            );
         }
-        if e.rx_ring.is_some() || e.tx_ring.is_some() {
-            if let Err(err) = system::ethtool_ring(&i.name, e.rx_ring, e.tx_ring) {
-                eprintln!("warning: resizing rings on {} failed: {err}", i.name);
-            }
+        if (e.rx_ring.is_some() || e.tx_ring.is_some())
+            && let Err(err) = system::ethtool_ring(&i.name, e.rx_ring, e.tx_ring)
+        {
+            eprintln!("warning: resizing rings on {} failed: {err}", i.name);
         }
         let coalesce = coalesce_params(e);
-        if !coalesce.is_empty() {
-            if let Err(err) = system::ethtool_coalesce(&i.name, &coalesce) {
-                eprintln!("warning: setting coalescing on {} failed: {err}", i.name);
-            }
+        if !coalesce.is_empty()
+            && let Err(err) = system::ethtool_coalesce(&i.name, &coalesce)
+        {
+            eprintln!("warning: setting coalescing on {} failed: {err}", i.name);
         }
     }
     Ok(())
@@ -4713,10 +4960,10 @@ fn apply_locale(appliance: &Appliance) -> Result<()> {
     // write — the call is the whole of it. Same reasoning as the keymap: on an
     // image-based appliance /etc does not survive, so it has to be set every
     // boot, not only when an operator commits.
-    if let Some(tz) = &sys.timezone {
-        if let Err(e) = system::set_timezone(tz) {
-            eprintln!("warning: setting timezone {tz} failed: {e}");
-        }
+    if let Some(tz) = &sys.timezone
+        && let Err(e) = system::set_timezone(tz)
+    {
+        eprintln!("warning: setting timezone {tz} failed: {e}");
     }
     Ok(())
 }
@@ -4753,6 +5000,127 @@ fn apply_console(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_login_registry_refuses_unowned_system_and_malformed_identities() {
+        use super::{LoginRegistry, validate_managed_login_identity};
+        let good = r#"{"version":1,"accounts":{"ops":{"uid":1002,"active":true,"administrator":true},"admin":{"uid":1000,"active":false,"administrator":false}}}"#;
+        let registry = LoginRegistry::decode(good).unwrap();
+        assert_eq!(registry.accounts.len(), 2);
+        assert!(!registry.accounts["admin"].active);
+        for bad in [
+            "{",
+            r#"{"version":2,"accounts":{}}"#,
+            r#"{"version":1,"accounts":{"root":{"uid":0,"active":false,"administrator":false}}}"#,
+            r#"{"version":1,"accounts":{"ops":{"uid":999,"active":true,"administrator":true}}}"#,
+            r#"{"version":1,"accounts":{"ops":{"uid":65534,"active":true,"administrator":true}}}"#,
+            r#"{"version":1,"accounts":{"../ops":{"uid":1002,"active":true,"administrator":true}}}"#,
+            r#"{"version":1,"accounts":{"ops":{"uid":1002,"active":true,"administrator":true,"unknown":true}}}"#,
+        ] {
+            assert!(LoginRegistry::decode(bad).is_err(), "{bad}");
+        }
+        assert!(validate_managed_login_identity(Some(1002), Some(1003)).is_err());
+        assert!(validate_managed_login_identity(Some(1002), Some(1002)).is_ok());
+        assert!(validate_managed_login_identity(Some(1002), None).is_ok());
+        assert!(validate_managed_login_identity(None, Some(1002)).is_ok());
+    }
+
+    #[test]
+    fn generated_shell_arrays_do_not_evaluate_operator_text() {
+        for value in [
+            "",
+            "ordinary-label",
+            "$(printf injected)",
+            "`printf injected`",
+            "\"; printf injected; #",
+            "back\\slash$HOME",
+            "line\nsecond'line",
+        ] {
+            let output = std::process::Command::new("bash")
+                .args([
+                    "-c",
+                    &format!("value={}; printf '%s' \"$value\"", super::shq(value)),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn live_config_validation_checks_real_physical_not_future_virtual_devices() {
+        let appliance = Appliance::from_toml(
+            r#"
+            [system]
+            hostname = "hardware-preflight"
+            [[interface]]
+            name = "wan0"
+            zone = "wan"
+            address = "dhcp"
+            [[interface]]
+            name = "spare0"
+            disabled = true
+            [[interface]]
+            name = "dummy0"
+            type = "dummy"
+            address = "192.0.2.1/24"
+        "#,
+        )
+        .unwrap();
+        assert!(validate_present_interfaces(&appliance, &["wan0".into()]).is_ok());
+        let error = validate_present_interfaces(&appliance, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wan0"), "{error}");
+        assert!(
+            !error.contains("dummy0") && !error.contains("spare0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn local_read_only_and_ungrouped_accounts_do_not_receive_sudo() {
+        let mut appliance = Appliance::from_toml(
+            r#"
+            [system]
+            hostname = "account-policy"
+            [[system.group]]
+            name = "viewers"
+            permission = "read-only"
+            [[system.group]]
+            name = "operators"
+            permission = "read-write"
+            [[system.login]]
+            username = "viewer"
+            group = "viewers"
+            [[system.login]]
+            username = "operator"
+            group = "operators"
+            [[system.login]]
+            username = "shellonly"
+            [[system.login]]
+            username = "admin"
+        "#,
+        )
+        .unwrap();
+        let grants: Vec<bool> = appliance
+            .system
+            .logins
+            .iter()
+            .map(|login| login_administrator(&appliance, login))
+            .collect();
+        assert_eq!(grants, [false, true, false, true]);
+        appliance.system.logins[3].group = Some("viewers".into());
+        assert!(!login_administrator(
+            &appliance,
+            &appliance.system.logins[3]
+        ));
+        appliance.system.logins[1].group = Some("missing".into());
+        assert!(!login_administrator(
+            &appliance,
+            &appliance.system.logins[1]
+        ));
+    }
 
     /// A NIC that cannot take XDP is dark under the old configuration and the
     /// new one alike. A commit that leaves it dark fails and says how to get
@@ -7727,5 +8095,85 @@ mod dhcp_vip_tests {
         let view = dhcp_server_view(&a, &a.interfaces[0]).unwrap();
         assert!(view.default_router.is_none());
         assert!(view.dns.is_empty());
+    }
+}
+#[test]
+fn observation_identity_requires_active_matching_managed_uid() {
+    let active = LoginRegistry::decode(
+        r#"{"version":1,"accounts":{"viewer":{"uid":1234,"active":true,"administrator":false}}}"#,
+    )
+    .unwrap();
+    assert!(active.verify_observer("viewer", 1234, Some(1234)).is_ok());
+    assert!(active.verify_observer("other", 1234, Some(1234)).is_err());
+    assert!(active.verify_observer("viewer", 2345, Some(2345)).is_err());
+    assert!(active.verify_observer("viewer", 1234, Some(2345)).is_err());
+    assert!(active.verify_observer("viewer", 1234, None).is_err());
+    for (uid, flag) in [("1234", false), ("null", true)] {
+        let body = format!(
+            "{{\"version\":1,\"accounts\":{{\"viewer\":{{\"uid\":{uid},\"active\":{flag},\"administrator\":false}}}}}}"
+        );
+        let registry = LoginRegistry::decode(&body).unwrap();
+        assert!(
+            registry
+                .verify_observer("viewer", 1234, Some(1234))
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod management_bind_tests {
+    use super::*;
+
+    #[test]
+    fn config_sync_never_widens_default_or_explicit_management_binds() {
+        for web in [false, true] {
+            for (address, expected) in [
+                (None, "127.0.0.1:8080"),
+                (Some("127.0.0.1"), "127.0.0.1:8080"),
+                (Some("::1"), "[::1]:8080"),
+                (Some("10.72.1.1"), "10.72.1.1:8080"),
+                (Some("2001:db8:72::1"), "[2001:db8:72::1]:8080"),
+                (Some("0.0.0.0"), "0.0.0.0:8080"),
+                (Some("::"), "[::]:8080"),
+            ] {
+                let mut appliance =
+                    Appliance::from_toml("[system]\nhostname='bind-test'\n").unwrap();
+                appliance.services.web.enable = web;
+                appliance.services.web.listen_address = address.map(str::to_string);
+                appliance.system.config_sync.secret =
+                    Some("disposable-api-bind-test-secret".into());
+                assert_eq!(
+                    api_listen_address(&appliance).as_deref(),
+                    Some(expected),
+                    "web={web}, address={address:?}"
+                );
+                assert!(
+                    appliance.services.web.tls,
+                    "listener selection must not downgrade TLS"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn listener_activation_and_custom_port_use_one_shared_web_configuration() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='bind-test'\n").unwrap();
+        appliance.services.web.listen_address = Some("10.72.1.1".into());
+        appliance.services.web.port = Some(9443);
+        assert_eq!(api_listen_address(&appliance), None);
+        appliance.services.web.enable = true;
+        assert_eq!(
+            api_listen_address(&appliance).as_deref(),
+            Some("10.72.1.1:9443")
+        );
+        appliance.services.web.enable = false;
+        appliance.system.config_sync.secret = Some("disposable-api-bind-test-secret".into());
+        assert_eq!(
+            api_listen_address(&appliance).as_deref(),
+            Some("10.72.1.1:9443")
+        );
+        appliance.system.config_sync.secret = None;
+        assert_eq!(api_listen_address(&appliance), None);
     }
 }

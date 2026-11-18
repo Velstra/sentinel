@@ -146,10 +146,10 @@ pub fn apply(appliance: &crate::config::Appliance) -> Result<()> {
             }
         }
         None => {
-            if crate::system::unit_active(RELAY_UNIT) {
-                if let Err(e) = crate::system::service_stop(RELAY_UNIT) {
-                    eprintln!("warning: stopping {RELAY_UNIT}: {e}");
-                }
+            if crate::system::unit_active(RELAY_UNIT)
+                && let Err(e) = crate::system::service_stop(RELAY_UNIT)
+            {
+                eprintln!("warning: stopping {RELAY_UNIT}: {e}");
             }
             if path.exists() {
                 crate::system::remove_file(path)?;

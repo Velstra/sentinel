@@ -276,6 +276,9 @@ struct Collector {
     /// plane, re-derived only when the text changes: a held link that is down
     /// is shown as waiting for the datapath, not as merely "down".
     held: Option<(String, std::collections::BTreeSet<String>)>,
+    /// Busy and total CPU jiffies at the previous sample: utilisation is the
+    /// share of the time *between* two samples, never a figure since boot.
+    cpu: Option<(u64, u64)>,
 }
 impl Collector {
     fn collect(&mut self, include_events: bool) -> Value {
@@ -382,12 +385,55 @@ impl Collector {
                 .as_array()
                 .map(|a| a.iter().take(200).cloned().collect::<Vec<_>>())
         });
+        let system = self.system();
         self.sequence += 1;
-        json!({"sequence":self.sequence,"sampled_at":crate::aaa::unix_now(),"interfaces":interfaces,
+        json!({"sequence":self.sequence,"sampled_at":crate::aaa::unix_now(),"interfaces":interfaces,"system":system,
             "events":self.events,"oldest_event_id":self.events.front().and_then(|v|v["id"].as_u64()),"next_event_id":self.cursor+1,
             "events_lost":self.lost,
             "conntrack":{"total":total,"states":states,"sample_limit":200,"nat_flows":nat},"top_talkers":top,"top_talkers_scope":"NAT flows; node-local counters",
             "rule_counters":rules,"ha":ha,"routing":routing,"wireguard":vpn,"errors":errors})
+    }
+    /// The appliance's own vitals: uptime, load, processor and memory use, and
+    /// how full the persistent and runtime filesystems are. Read from `/proc`
+    /// and `statvfs` — no child process — and every figure that could not be
+    /// read is null (or its filesystem row omitted) rather than zero, so a dashboard cannot show an
+    /// unreadable disk as an empty one.
+    fn system(&mut self) -> Value {
+        let read = |path: &str| std::fs::read_to_string(path).ok();
+        let now = read("/proc/stat").as_deref().and_then(parse_cpu);
+        let cpu_percent = match (self.cpu, now) {
+            (Some(old), Some(new)) => cpu_percent(old, new),
+            _ => None,
+        };
+        self.cpu = now;
+        let memory = read("/proc/meminfo").as_deref().and_then(parse_meminfo);
+        let cpus = std::thread::available_parallelism().ok().map(|n| n.get());
+        let mut seen = Vec::new();
+        let filesystems: Vec<Value> = [
+            ("data", STATE_DIR),
+            ("root", "/"),
+            ("runtime", "/run"),
+        ]
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let (id, total, available) = filesystem(path)?;
+            // A path that is not a mount of its own reports its parent's
+            // filesystem; one filesystem is one row.
+            if total == 0 || seen.contains(&id) {
+                return None;
+            }
+            seen.push(id);
+            Some(json!({"name":name,"path":path,"total_bytes":total,"available_bytes":available}))
+        })
+        .collect();
+        json!({
+            "uptime_seconds": read("/proc/uptime").as_deref().and_then(parse_uptime),
+            "load": read("/proc/loadavg").as_deref().and_then(parse_load),
+            "cpus": cpus,
+            "cpu_percent": cpu_percent,
+            "memory": memory.map(|(total, available)| json!({"total_bytes":total,"available_bytes":available})),
+            "filesystems": filesystems,
+        })
     }
     /// Take one `packet-events-since` page: advance the cursor and count what
     /// this view lost. A new agent run restarts the cursor rather than waiting
@@ -471,6 +517,76 @@ impl Collector {
         self.previous = Some((now, counters));
         rows
     }
+}
+/// The one persistent, writable partition (LABEL=data) of an appliance image.
+const STATE_DIR: &str = "/var/lib/sentinel";
+/// Busy and total jiffies from the aggregate `cpu` line of `/proc/stat`. Idle
+/// and iowait are the time nothing ran; everything else is work.
+fn parse_cpu(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().find(|line| line.starts_with("cpu "))?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|v| v.parse().ok())
+        .collect::<Option<_>>()?;
+    if fields.len() < 4 {
+        return None;
+    }
+    // Guest time is already counted inside user and nice; adding the two
+    // trailing guest columns again would double it.
+    let total: u64 = fields.iter().take(8).sum();
+    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    Some((total.checked_sub(idle)?, total))
+}
+/// Utilisation between two samples, in percent. Counter resets, no total
+/// movement or a busy delta exceeding the total are not measurements.
+fn cpu_percent(old: (u64, u64), new: (u64, u64)) -> Option<f64> {
+    if old.0 > old.1 || new.0 > new.1 {
+        return None;
+    }
+    let total = new.1.checked_sub(old.1).filter(|&d| d > 0)?;
+    let busy = new.0.checked_sub(old.0).filter(|&d| d <= total)?;
+    Some(((busy as f64 / total as f64) * 1000.0).round() / 10.0)
+}
+/// Total and available memory in bytes. `MemAvailable` is the kernel's own
+/// estimate of what a new workload could have; "free" would count the page
+/// cache as used and report a healthy box as nearly full.
+fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+    };
+    let (total, available) = (field("MemTotal")?, field("MemAvailable")?);
+    (available <= total).then_some((total, available))
+}
+fn parse_uptime(text: &str) -> Option<u64> {
+    let seconds: f64 = text.split_whitespace().next()?.parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds as u64)
+}
+fn parse_load(text: &str) -> Option<[f64; 3]> {
+    let mut values = text.split_whitespace().map(|v| v.parse::<f64>().ok());
+    let load = [values.next()??, values.next()??, values.next()??];
+    load.iter()
+        .all(|v| v.is_finite() && *v >= 0.0)
+        .then_some(load)
+}
+/// Filesystem identity, size and space an unprivileged writer could still use.
+fn filesystem(path: &str) -> Option<(u64, u64, u64)> {
+    let name = std::ffi::CString::new(path).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `name` is a valid NUL-terminated path and `stat` is a writable
+    // statvfs the call fills in completely when it returns 0.
+    let stat = unsafe {
+        (libc::statvfs(name.as_ptr(), stat.as_mut_ptr()) == 0).then(|| stat.assume_init())
+    }?;
+    let block = stat.f_frsize as u64;
+    Some((
+        stat.f_fsid as u64,
+        (stat.f_blocks as u64).saturating_mul(block),
+        (stat.f_bavail as u64).saturating_mul(block),
+    ))
 }
 /// The `packet-events-since` request for a cursor. The run the cursor belongs
 /// to goes along, so the agent can tell an old run's cursor from one of its own
@@ -562,6 +678,134 @@ fn command(binary: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn emitted_system_vitals_match_the_shared_openapi_field_contract() {
+        let frame_schema = crate::openapi::document();
+        let schema = &frame_schema["components"]["schemas"]["SystemVitals"];
+        let observed = Collector::default().system();
+        let actual = observed.as_object().unwrap();
+        let documented = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            documented.keys().collect::<Vec<_>>()
+        );
+        for required in schema["required"].as_array().unwrap() {
+            assert!(actual.contains_key(required.as_str().unwrap()));
+        }
+        assert!(
+            observed["cpu_percent"].is_null(),
+            "the first sample is unknown, not zero"
+        );
+        for row in observed["filesystems"].as_array().unwrap() {
+            let documented = &documented["filesystems"]["items"];
+            assert!(
+                documented["properties"]["name"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&row["name"])
+            );
+            for required in documented["required"].as_array().unwrap() {
+                assert!(row.get(required.as_str().unwrap()).is_some());
+            }
+        }
+    }
+    #[test]
+    fn vitals_are_measured_between_samples_and_unreadable_ones_stay_absent() {
+        let first = parse_cpu("cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 1 2 3 4\n").unwrap();
+        let second = parse_cpu("cpu  160 0 90 1500 50 0 0 0 0 0\n").unwrap();
+        // 150 busy of 1000 total; idle and iowait both count as not working.
+        assert_eq!(first, (150, 1000));
+        assert_eq!(cpu_percent(first, second), Some(12.5));
+        // A counter that did not move, or went backwards, is not zero load.
+        assert_eq!(cpu_percent(second, second), None);
+        assert_eq!(cpu_percent(second, first), None);
+        assert_eq!(parse_cpu("intr 1 2 3\n"), None);
+        assert_eq!(parse_cpu("cpu  1 x 3 4\n"), None);
+        // Guest columns are already inside user/nice and must not be re-added.
+        assert_eq!(parse_cpu("cpu  10 0 0 90 0 0 0 0 10 0\n"), Some((10, 100)));
+
+        let meminfo = "MemTotal:        4000000 kB\nMemFree:          100000 kB\nMemAvailable:    3000000 kB\n";
+        assert_eq!(
+            parse_meminfo(meminfo),
+            Some((4_000_000 * 1024, 3_000_000 * 1024))
+        );
+        assert_eq!(parse_meminfo("MemTotal: 10 kB\n"), None);
+        assert_eq!(
+            parse_meminfo("MemTotal: 10 kB\nMemAvailable: 20 kB\n"),
+            None
+        );
+
+        assert_eq!(parse_uptime("12345.67 99999.00\n"), Some(12345));
+        assert_eq!(parse_uptime("soon\n"), None);
+        assert_eq!(
+            parse_load("0.52 0.31 0.10 1/234 5678\n"),
+            Some([0.52, 0.31, 0.10])
+        );
+        assert_eq!(parse_load("0.52 0.31\n"), None);
+
+        assert!(filesystem("/").is_some_and(|(_, total, available)| available <= total));
+        assert_eq!(filesystem("/nonexistent/sentinel/vitals"), None);
+
+        // The first sample has no interval to measure across; later ones do.
+        let mut collector = Collector::default();
+        let first = collector.system();
+        assert!(first["cpu_percent"].is_null());
+        assert!(first["uptime_seconds"].as_u64().is_some());
+        assert!(first["memory"]["total_bytes"].as_u64().unwrap() > 0);
+        let rows = first["filesystems"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row["name"] == "root" || row["name"] == "data")
+        );
+        let mut ids: Vec<&str> = rows.iter().filter_map(|row| row["path"].as_str()).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), rows.len());
+    }
+
+    #[test]
+    fn cpu_percent_distinguishes_measured_idle_full_and_fractional_load() {
+        assert_eq!(cpu_percent((100, 400), (125, 600)), Some(12.5));
+        assert_eq!(cpu_percent((150, 1000), (150, 1100)), Some(0.0));
+        assert_eq!(cpu_percent((150, 1000), (250, 1100)), Some(100.0));
+        assert_eq!(cpu_percent((150, 1000), (151, 1003)), Some(33.3));
+        assert_eq!(cpu_percent((0, 0), (1, 1)), Some(100.0));
+    }
+
+    #[test]
+    fn cpu_percent_refuses_inconsistent_partial_resets_without_clamping() {
+        // Both aggregate totals increase and each sample is individually valid,
+        // but idle decreased. The resulting 200% is not a real measurement.
+        let before = parse_cpu("cpu 100 0 0 100 0 0 0 0\n").unwrap();
+        let partial_reset = parse_cpu("cpu 120 0 0 90 0 0 0 0\n").unwrap();
+        assert_eq!(cpu_percent(before, partial_reset), None);
+        // The next consistent interval can be measured without inventing a
+        // value for the invalid interval or requiring lifetime-monotonic idle.
+        assert_eq!(cpu_percent(partial_reset, (125, 220)), Some(50.0));
+        for (old, new) in [
+            ((100, 200), (100, 200)), // no aggregate movement
+            ((100, 200), (50, 100)),  // complete reset
+            ((100, 200), (90, 210)),  // busy counter reset
+            ((100, 200), (101, 200)), // busy changed with zero total delta
+            ((101, 100), (102, 200)), // invalid earlier sample
+            ((50, 100), (201, 200)),  // invalid current sample
+        ] {
+            assert_eq!(cpu_percent(old, new), None, "{old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
+    fn cpu_percent_accepts_only_physically_possible_counter_deltas() {
+        for total in 1..=64 {
+            for busy in 0..=65 {
+                let observed = cpu_percent((100, 1000), (100 + busy, 1000 + total));
+                if busy > total {
+                    assert_eq!(observed, None, "busy={busy}, total={total}");
+                } else {
+                    assert!(observed.is_some_and(|value| (0.0..=100.0).contains(&value)));
+                }
+            }
+        }
+    }
     #[test]
     fn stalled_commands_and_inherited_stdout_are_bounded_without_orphans() {
         let start = Instant::now();

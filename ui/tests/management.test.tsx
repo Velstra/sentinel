@@ -8,12 +8,8 @@ import {
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Management } from "../src/controller";
-import {
-  Dashboard,
-  Flows,
-  ConfigEditor,
-  Confirmation,
-} from "../src/components";
+import { Flows, ConfigEditor, Confirmation } from "../src/components";
+import { Dashboard } from "../src/dashboard";
 import { sseFrames, selectEvents } from "../src/model";
 import type { Host, Telemetry, Pending } from "../src/model";
 
@@ -103,8 +99,8 @@ describe("React dashboard and packet inspector", () => {
     const { manager } = fixture();
     manager.acceptFrame(frame());
     render(<Dashboard manager={manager} />);
-    expect(screen.getByText("wan0")).toBeVisible();
-    expect(screen.getAllByText("2 KiB/s")).toHaveLength(2);
+    expect(screen.getAllByText("wan0")[0]).toBeVisible();
+    expect(screen.getAllByText("16.4 kbit/s")).toHaveLength(2);
     expect(screen.getAllByText("Backup")).toHaveLength(2);
     expect(screen.getByText(/replica update 125 ms/)).toBeVisible();
     expect(screen.getByText(/192.0.2.2 Established/)).toBeVisible();
@@ -176,19 +172,19 @@ describe("React dashboard and packet inspector", () => {
     const { manager, host } = fixture();
     manager.acceptFrame(frame());
     render(<Dashboard manager={manager} />);
-    expect(screen.getByText("3 KiB/s")).toBeVisible();
+    expect(screen.getByText("24.6 kbit/s")).toBeVisible();
     expect(screen.queryByRole("img")).toBeNull();
     act(() => manager.acceptFrame(frame({ sequence: 2 })));
     expect(
       screen.getByRole("img", { name: /throughput samples/ }),
     ).toBeVisible();
-    expect(screen.getByText("Peak 3 KiB/s")).toBeVisible();
+    expect(screen.getByText("Peak 24.6 kbit/s")).toBeVisible();
     host.remote = () => true;
     act(() => manager.contextChanged());
     expect(screen.queryByRole("img")).toBeNull();
-    expect(screen.queryByText("Peak 3 KiB/s")).toBeNull();
+    expect(screen.queryByText("Peak 24.6 kbit/s")).toBeNull();
     act(() => manager.acceptFrame(frame()));
-    expect(screen.getByText("3 KiB/s")).toBeVisible();
+    expect(screen.getByText("24.6 kbit/s")).toBeVisible();
     expect(screen.queryByRole("img")).toBeNull();
     act(() => manager.acceptFrame(frame({ sequence: 2 })));
     expect(
@@ -237,6 +233,342 @@ describe("React dashboard and packet inspector", () => {
     expect(screen.getByText("held: waiting for datapath")).toHaveClass(
       "health-down",
     );
+  });
+  it("shows the member's own vitals and never a zero for one it could not read", () => {
+    const { manager } = fixture();
+    manager.acceptFrame(
+      frame({
+        system: {
+          uptime_seconds: 93784,
+          load: [0.52, 0.31, 0.1],
+          cpus: 2,
+          cpu_percent: 12.5,
+          memory: {
+            total_bytes: 4 * 1024 ** 3,
+            available_bytes: 3 * 1024 ** 3,
+          },
+          filesystems: [
+            {
+              name: "data",
+              path: "/var/lib/sentinel",
+              total_bytes: 10 * 1024 ** 3,
+              available_bytes: 1024 ** 3,
+            },
+          ],
+        },
+      }),
+    );
+    const { unmount } = render(<Dashboard manager={manager} />);
+    expect(screen.getByText("1 d 2 h")).toBeVisible();
+    expect(screen.getAllByText("13 %").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("25 %").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("1 GiB of 4 GiB").length).toBeGreaterThan(0);
+    const disk = screen.getByRole("meter", { name: "data filesystem use" });
+    expect(disk).toHaveAttribute("aria-valuenow", "90");
+    expect(disk).toHaveClass("high");
+    expect(screen.getByText("9 GiB of 10 GiB")).toBeVisible();
+    unmount();
+    // An older member, or a first sample: unknown, not idle.
+    manager.acceptFrame(
+      frame({
+        sequence: 2,
+        system: {
+          uptime_seconds: null,
+          load: null,
+          cpus: null,
+          cpu_percent: null,
+          memory: null,
+          filesystems: [],
+        },
+      }),
+    );
+    const second = render(<Dashboard manager={manager} />);
+    expect(
+      screen.getAllByRole("meter", { name: "Processor use" })[0],
+    ).toHaveAttribute("aria-valuetext", "unknown");
+    expect(screen.queryByText("0 %")).toBeNull();
+    second.unmount();
+    manager.acceptFrame(frame({ sequence: 3 }));
+    render(<Dashboard manager={manager} />);
+    expect(
+      screen.getByText("This member does not report system vitals."),
+    ).toBeVisible();
+  });
+  it("counts refused packets from the rule counters between samples, never from the first one", () => {
+    const { manager } = fixture();
+    const counters = (dropped: number, accepted: number) => ({
+      rules: [
+        {
+          rule: "no-telnet",
+          policy: 1,
+          accepted: 0,
+          dropped,
+          packets: dropped,
+          bytes: dropped * 60,
+        },
+        {
+          rule: null,
+          policy: 1,
+          accepted,
+          dropped: 0,
+          packets: accepted,
+          bytes: accepted * 900,
+        },
+      ],
+    });
+    const event = (id: number) => ({
+      id,
+      src: id % 2 ? "198.51.100.7" : "198.51.100.9",
+      dst: "10.0.0.5",
+      src_port: 40000 + id,
+      dst_port: 23,
+      protocol: 6,
+      interface: 2,
+      rule: "no-telnet",
+      rule_id: 3,
+      action: "reject",
+    });
+    manager.acceptFrame(
+      frame({ rule_counters: counters(100, 5000), events: [event(1)] }),
+    );
+    render(<Dashboard manager={manager} />);
+    const tile = () => screen.getByRole("button", { name: "Open flows" });
+    // One sample is a total since the data plane started, not a rate.
+    expect(tile()).toHaveTextContent("—");
+    act(() =>
+      manager.acceptFrame(
+        frame({
+          sequence: 2,
+          sampled_at: 1700000005,
+          rule_counters: counters(107, 5400),
+          events: [event(1), event(2), event(3)],
+        }),
+      ),
+    );
+    expect(tile()).toHaveTextContent("7");
+    expect(tile()).toHaveTextContent("400 allowed");
+    // The busiest rules, by name, with the default action told apart.
+    const rules = document.querySelector("#live-rules")!;
+    expect(rules).toHaveTextContent("default actions and established traffic");
+    expect(rules.querySelector("tbody tr")).toHaveTextContent("no-telnet");
+    expect(rules.querySelector(".refused")).toHaveTextContent("107");
+    // Sources are ranked over the retained events, most refused first.
+    const ranked = screen
+      .getAllByRole("meter", { name: /share of refused packets/ })
+      .map((meter) => meter.getAttribute("aria-label"));
+    expect(ranked[0]).toBe("198.51.100.7 share of refused packets");
+    // A restarted data plane starts counting again instead of going negative.
+    act(() =>
+      manager.acceptFrame(
+        frame({
+          sequence: 3,
+          sampled_at: 1700000010,
+          rule_counters: counters(2, 10),
+        }),
+      ),
+    );
+    expect(tile()).toHaveTextContent("—");
+    // A member without counters is unknown, not quiet.
+    act(() =>
+      manager.acceptFrame(frame({ sequence: 4, sampled_at: 1700000015 })),
+    );
+    expect(tile()).toHaveTextContent("—");
+    expect(tile()).not.toHaveTextContent("0");
+  });
+  it("draws receive and transmit separately, leaves loopback out and folds a long route table", () => {
+    const { manager } = fixture();
+    const sample = frame();
+    const routes = Array.from(
+      { length: 12 },
+      (_, i) => `10.${i}.0.0/16 via 192.0.2.2 proto bgp metric 1`,
+    );
+    const withLo = (sequence: number) =>
+      frame({
+        sequence,
+        interfaces: [
+          ...sample.interfaces,
+          { ...sample.interfaces[0], name: "lo" },
+        ],
+        routing: { routes: routes.join("\n") },
+      });
+    manager.acceptFrame(withLo(1));
+    const { container } = render(<Dashboard manager={manager} />);
+    act(() => manager.acceptFrame(withLo(2)));
+    const chart = screen.getByRole("img", { name: /throughput samples/ });
+    expect(chart.querySelectorAll("polyline")).toHaveLength(2);
+    expect(screen.queryByText("lo")).toBeNull();
+    expect(
+      container.querySelector("#live-interfaces svg.spark"),
+    ).not.toBeNull();
+    expect(screen.getByText(/12 learned \(12 bgp\)/)).toBeVisible();
+    expect(screen.getAllByText(/10\.0\.0\.0\/16/)[0]).toBeVisible();
+    const all = container.querySelector(".dash-routes")!;
+    expect(all.querySelector("summary")).toHaveTextContent("All 12 lines");
+    expect(all).not.toHaveAttribute("open");
+  });
+  it("follows one chosen link in the chart instead of the double-counted sum", async () => {
+    const { manager } = fixture();
+    const sample = frame();
+    const two = (sequence: number) =>
+      frame({
+        sequence,
+        interfaces: [
+          sample.interfaces[0],
+          {
+            ...sample.interfaces[0],
+            name: "lan0",
+            rates: {
+              rx_bytes_per_second: 125000,
+              tx_bytes_per_second: 250000,
+              rx_pps: 1,
+              tx_pps: 1,
+            },
+          },
+        ],
+      });
+    manager.acceptFrame(two(1));
+    render(<Dashboard manager={manager} />);
+    act(() => manager.acceptFrame(two(2)));
+    // The sum of both links, in the tile and in the chart's caption.
+    expect(
+      screen.getByRole("button", { name: "Open interfaces" }),
+    ).toHaveTextContent("3 Mbit/s");
+    expect(screen.getByText("Peak 3 Mbit/s")).toBeVisible();
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Interface shown in the chart" }),
+      "lan0",
+    );
+    // A different link is a different measurement: its history starts again.
+    expect(screen.queryByRole("img")).toBeNull();
+    act(() => manager.acceptFrame(two(3)));
+    act(() => manager.acceptFrame(two(4)));
+    expect(screen.getByText("Peak 3 Mbit/s")).toBeVisible();
+    expect(screen.getAllByText("1 Mbit/s").length).toBeGreaterThan(1);
+    // The link goes away: the chart returns to the sum rather than to nothing.
+    act(() => manager.acceptFrame(frame({ sequence: 5 })));
+    expect(
+      screen.getByRole("combobox", { name: "Interface shown in the chart" }),
+    ).toHaveValue("");
+  });
+  it("names links as the configuration does and lists only what an operator can act on", async () => {
+    const { manager, host } = fixture();
+    host.links = () => ({
+      wan0: { zone: "wan", description: "uplink" },
+      lan0: { zone: "lan" },
+    });
+    const sample = frame();
+    const quiet = frame({
+      routing: { bgp: '192.0.2.2 AS 65010 Established hold 180 "isp"\n' },
+      ha: { role: "standalone" },
+    });
+    manager.acceptFrame(quiet);
+    const { unmount } = render(<Dashboard manager={manager} />);
+    expect(screen.getAllByText("uplink · wan")[0]).toBeVisible();
+    expect(
+      screen.queryByRole("region", { name: "Needs attention" }),
+    ).toBeNull();
+    expect(screen.getByText("Established")).toHaveClass("health-up");
+    // Standalone is said once, by the tile.
+    expect(
+      screen.queryByRole("region", { name: "High availability" }),
+    ).toBeNull();
+    unmount();
+    manager.acceptFrame(
+      frame({
+        sequence: 2,
+        interfaces: [
+          ...sample.interfaces,
+          { ...sample.interfaces[0], name: "lan0", state: "down", rates: null },
+          {
+            ...sample.interfaces[0],
+            name: "spare3",
+            state: "down",
+            rates: null,
+          },
+        ],
+        routing: { bgp: '192.0.2.2 AS 65010 Idle hold 180 "isp"\n' },
+        ha: { role: "Backup", not_ready: "policy differs" },
+        system: {
+          uptime_seconds: 10,
+          load: null,
+          cpus: null,
+          cpu_percent: null,
+          memory: { total_bytes: 1000, available_bytes: 50 },
+          filesystems: [
+            {
+              name: "data",
+              path: "/var/lib/sentinel",
+              total_bytes: 100,
+              available_bytes: 4,
+            },
+          ],
+        },
+      }),
+    );
+    render(<Dashboard manager={manager} />);
+    const list = screen.getByRole("region", { name: "Needs attention" });
+    const items = [...list.querySelectorAll("li")].map(
+      (li) => li.firstElementChild!.textContent,
+    );
+    expect(items).toEqual([
+      "lan (lan0) is down.",
+      "BGP neighbour isp is Idle.",
+      "The standby could not take over: policy differs.",
+      "Memory is 95 % used.",
+      "Data disk is 96 % full.",
+    ]);
+    // A port nobody configured is a spare port, not a fault.
+    expect(list).not.toHaveTextContent("spare3");
+    expect(screen.getByText("Idle")).toHaveClass("health-down");
+    await userEvent.click(list.querySelectorAll("button")[1]);
+    expect(host.navigate).toHaveBeenLastCalledWith("routing:bgp");
+  });
+  it("charts the appliance's recorded history on request and never a peer's", async () => {
+    const { manager, host } = fixture();
+    const series = (values: number[]) => ({
+      points: values.map((value, i) => ({ at: 1700000000 + i * 60, value })),
+    });
+    vi.mocked(host.api).mockImplementation(async (path: string) => {
+      if (path === "/api/v1/metrics")
+        return new Response(
+          JSON.stringify({
+            series: [
+              "iface.wan0.rx",
+              "iface.wan0.tx",
+              "iface.lo.rx",
+              "gauge.x",
+            ],
+          }),
+        );
+      return new Response(
+        JSON.stringify(
+          path.endsWith(".rx")
+            ? series([1000, 3000, 2000])
+            : series([100, 200, 125000]),
+        ),
+      );
+    });
+    manager.acceptFrame(frame());
+    render(<Dashboard manager={manager} />);
+    expect(host.api).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "1 h" }));
+    const chart = await screen.findByRole("img", {
+      name: /Recorded throughput, 3 one-minute averages/,
+    });
+    expect(chart.querySelectorAll("polyline")).toHaveLength(2);
+    expect(screen.getByText("Peak 1 Mbit/s")).toBeVisible();
+    const asked = vi.mocked(host.api).mock.calls.map((call) => call[0]);
+    expect(asked).toContain("/api/v1/metrics/minute/iface.wan0.rx");
+    expect(asked.some((path) => String(path).includes("iface.lo"))).toBe(false);
+    // Looking at a peer: its history is on the peer, so the chart is live.
+    host.remote = () => true;
+    act(() => manager.contextChanged());
+    expect(screen.getByRole("button", { name: "1 h" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Live" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.queryByRole("img")).toBeNull();
   });
   it("opens real management destinations from the overview without mutating configuration", async () => {
     const { manager, host } = fixture();
@@ -334,6 +666,227 @@ describe("React dashboard and packet inspector", () => {
 });
 
 describe("React document editor and safe apply", () => {
+  it("shows configuration advisories after review and provisional admission without treating them as errors", async () => {
+    const { manager, host } = fixture();
+    render(<ConfigEditor manager={manager} />);
+    await act(() => manager.loadEditor());
+    act(() => manager.changeCandidate(toml.replace("sentinel", "proposed")));
+    const warning =
+      'rule "telnet": `to wan` matches only connected destination prefixes, not routed traffic. <img src=x onerror=alert(1)>';
+    vi.mocked(host.api).mockImplementationOnce(() =>
+      reply({ valid: true, diff: "-old\n+new", warnings: [warning] }),
+    );
+    await act(() => manager.submitEditor(true));
+    expect(
+      screen.getByRole("status", { name: "Configuration advisories" }),
+    ).toHaveTextContent(warning);
+    expect(document.querySelector("#toml-warnings img")).toBeNull();
+    expect(
+      screen.getByText("Valid configuration. Nothing applied."),
+    ).toBeVisible();
+    expect(screen.getByText("Apply with confirmation")).toBeEnabled();
+    expect(
+      screen.getByLabelText("Proposed appliance.toml"),
+    ).not.toHaveAttribute("aria-invalid", "true");
+    const accepted = { ...pending, ready: false };
+    vi.mocked(host.api).mockImplementationOnce(() =>
+      reply({ accepted: true, pending: accepted, warnings: [warning] }),
+    );
+    await act(() => manager.submitEditor(false));
+    expect(
+      screen.getByRole("status", { name: "Configuration advisories" }),
+    ).toHaveTextContent(warning);
+    expect(manager.getSnapshot().pending).toEqual(accepted);
+    expect(screen.getByText(/Application accepted/)).toBeVisible();
+    expect(screen.getByText("Apply with confirmation")).toBeDisabled();
+    expect(host.api).toHaveBeenCalledTimes(3);
+  });
+
+  it("clears configuration advisories when the draft, baseline or validation result changes", async () => {
+    const { manager, host } = fixture();
+    render(<ConfigEditor manager={manager} />);
+    await act(() => manager.loadEditor());
+    const validate = async () => {
+      vi.mocked(host.api).mockImplementationOnce(() =>
+        reply({
+          valid: true,
+          diff: "reviewed",
+          warnings: ["Review this route."],
+        }),
+      );
+      await act(() => manager.submitEditor(true));
+      expect(screen.getByText("Review this route.")).toBeVisible();
+    };
+    await validate();
+    act(() => manager.changeCandidate(toml.replace("sentinel", "edited")));
+    expect(screen.queryByText("Review this route.")).toBeNull();
+    await validate();
+    await act(() => manager.loadEditor(true));
+    expect(screen.queryByText("Review this route.")).toBeNull();
+    expect(manager.getSnapshot().editor.candidate).toContain("edited");
+    await validate();
+    vi.mocked(host.api)
+      .mockRejectedValueOnce(failure("Invalid route", 400))
+      .mockImplementationOnce(() => reply({ pending: null }));
+    await act(() => manager.submitEditor(true));
+    expect(screen.queryByText("Review this route.")).toBeNull();
+    expect(screen.getByText("Invalid route")).toBeVisible();
+    expect(manager.getSnapshot().editor.candidate).toContain("edited");
+    await validate();
+    act(() => manager.stop());
+    expect(manager.getSnapshot().editor.warnings).toEqual([]);
+    expect(screen.queryByText("Review this route.")).toBeNull();
+  });
+
+  it("validates configuration advisory types without hiding valid advice or blocking apply", async () => {
+    const { manager, host } = fixture();
+    render(<ConfigEditor manager={manager} />);
+    await act(() => manager.loadEditor());
+    for (const warnings of [
+      undefined,
+      [],
+      null,
+      "not-an-array",
+      { warning: "not-a-list" },
+      ["A valid advisory", null, false, {}, 1, "", "   ", "A valid advisory"],
+    ]) {
+      vi.mocked(host.api).mockImplementationOnce(() =>
+        reply({ valid: true, diff: "reviewed", warnings }),
+      );
+      await act(() => manager.submitEditor(true));
+      if (
+        warnings === undefined ||
+        (Array.isArray(warnings) && !warnings.length)
+      ) {
+        expect(
+          screen.queryByRole("status", { name: "Configuration advisories" }),
+        ).toBeNull();
+      } else {
+        expect(
+          screen.getByText(
+            /Some configuration advisories could not be displayed/,
+          ),
+        ).toBeVisible();
+      }
+      if (Array.isArray(warnings) && warnings.length) {
+        expect(screen.getAllByText("A valid advisory")).toHaveLength(1);
+      }
+      expect(screen.getByText("Apply with confirmation")).toBeEnabled();
+      expect(manager.getSnapshot().editor.invalid).toBe(false);
+    }
+  });
+
+  it("does not restore a stale document response or advisories after identity or member changes", async () => {
+    for (const context of ["member", "credential", "permission"] as const) {
+      const { manager, host } = fixture();
+      await manager.loadEditor();
+      let resolve!: (response: Response) => void;
+      vi.mocked(host.api).mockImplementationOnce(
+        () => new Promise((done) => (resolve = done)),
+      );
+      const validating = manager.submitEditor(true);
+      if (context === "member") host.remote = () => true;
+      if (context === "credential")
+        host.credential = () => "replacement-session";
+      if (context === "permission") host.canWrite = () => false;
+      manager.contextChanged();
+      resolve(
+        new Response(
+          JSON.stringify({
+            valid: true,
+            diff: "PRIVATE OLD DIFF",
+            warnings: ["OLD PRIVATE ADVISORY"],
+          }),
+        ),
+      );
+      await validating;
+      expect(manager.getSnapshot().editor.diff, context).toBe("");
+      expect(manager.getSnapshot().editor.warnings, context).toEqual([]);
+      expect(manager.getSnapshot().editor.feedback, context).not.toBe(
+        "Valid configuration. Nothing applied.",
+      );
+      manager.stop();
+    }
+  });
+
+  it("does not restore stale document errors and recovers pending admission through transaction polling", async () => {
+    const { manager, host } = fixture();
+    await manager.loadEditor();
+    let reject!: (error: Error) => void;
+    vi.mocked(host.api).mockImplementationOnce(
+      () => new Promise((_done, fail) => (reject = fail)),
+    );
+    const applying = manager.submitEditor(false);
+    host.remote = () => true;
+    manager.contextChanged();
+    reject(failure("PRIVATE OLD ERROR", 400));
+    await applying;
+    expect(manager.getSnapshot().editor.feedback).not.toContain(
+      "PRIVATE OLD ERROR",
+    );
+    expect(manager.getSnapshot().editor.invalid).toBe(false);
+    expect(manager.getSnapshot().editor.warnings).toEqual([]);
+    host.remote = () => false;
+    manager.contextChanged();
+    vi.mocked(host.api).mockImplementationOnce(() => reply({ pending }));
+    await manager.refreshTransaction();
+    expect(manager.getSnapshot().pending).toEqual(pending);
+    expect(host.api).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(host.api).mock.calls.at(-1)?.[0]).toBe(
+      "/api/v1/config/transaction",
+    );
+  });
+
+  it("does not reveal a delayed document after leaving and returning to the local member", async () => {
+    const { manager, host } = fixture();
+    let resolve!: (response: Response) => void;
+    vi.mocked(host.api).mockImplementationOnce(
+      () => new Promise((done) => (resolve = done)),
+    );
+    const loading = manager.loadEditor();
+    host.remote = () => true;
+    manager.contextChanged();
+    host.remote = () => false;
+    manager.contextChanged();
+    resolve(
+      new Response(
+        JSON.stringify({ toml: "STALE PRIVATE DOCUMENT", revision: "old" }),
+      ),
+    );
+    await loading;
+    expect(manager.getSnapshot().editor.visible).toBe(false);
+    expect(manager.getSnapshot().editor.baseline).toBe("");
+    expect(manager.getSnapshot().editor.busy).toBe(false);
+  });
+
+  it("does not let a stale document finalizer clear the next request's busy state", async () => {
+    const { manager, host } = fixture();
+    let old!: (response: Response) => void;
+    let current!: (response: Response) => void;
+    vi.mocked(host.api).mockImplementationOnce(
+      () => new Promise((done) => (old = done)),
+    );
+    const first = manager.loadEditor();
+    host.canWrite = () => false;
+    manager.contextChanged();
+    manager.clearEditor();
+    host.canWrite = () => true;
+    manager.contextChanged();
+    vi.mocked(host.api).mockImplementationOnce(
+      () => new Promise((done) => (current = done)),
+    );
+    const second = manager.loadEditor();
+    old(new Response(JSON.stringify({ toml: "OLD PRIVATE", revision: "old" })));
+    await first;
+    expect(manager.getSnapshot().editor.busy).toBe(true);
+    expect(manager.getSnapshot().editor.baseline).toBe("");
+    current(new Response(JSON.stringify({ toml, revision: "current" })));
+    await second;
+    expect(manager.getSnapshot().editor.busy).toBe(false);
+    expect(manager.getSnapshot().editor.baseline).toBe(toml);
+    expect(manager.getSnapshot().editor.revision).toBe("current");
+  });
+
   it("reveals secrets only on request and provides a real side-by-side visual diff", async () => {
     const { manager, host } = fixture(),
       user = userEvent.setup();
@@ -744,9 +1297,9 @@ describe("authenticated SSE transport", () => {
       routing: { routes_unchanged: true },
     });
     await act(async () => release(new Response(JSON.stringify(peerFrame))));
-    expect(screen.getByText("peer-b-nic")).toBeVisible();
+    expect(screen.getAllByText("peer-b-nic")[0]).toBeVisible();
     expect(screen.queryByText("old-peer-route")).toBeNull();
-    expect(screen.getByText("3 KiB/s")).toBeVisible();
+    expect(screen.getByText("24.6 kbit/s")).toBeVisible();
     expect(
       screen.queryByRole("img", { name: /throughput samples/ }),
     ).toBeNull();

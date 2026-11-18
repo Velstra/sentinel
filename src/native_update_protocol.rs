@@ -25,6 +25,8 @@ struct WireManifest {
     image: String,
     sha256: String,
     product: String,
+    #[serde(default)]
+    freshness: Option<update::Freshness>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +41,7 @@ impl WireOffer {
             && self.manifest.image == expected.manifest.image
             && self.manifest.sha256 == expected.manifest.sha256
             && Some(self.manifest.product.as_str()) == expected.manifest.product.as_deref()
+            && self.manifest.freshness == expected.manifest.freshness
             && self.manifest_sha256 == expected.manifest_sha256
             && self.public_key_sha256 == expected.public_key_sha256
     }
@@ -282,7 +285,7 @@ fn run_with_deadlines(
     );
     let mut request = serde_json::to_vec(&serde_json::json!({
         "schema": 1,
-        "channel": {"url": channel.url, "public-key": channel.public_key,
+        "channel": {"name": channel.label(), "url": channel.url, "public-key": channel.public_key,
                     "subscription-key": channel.subscription_key},
         "expected": expected,
     }))?;

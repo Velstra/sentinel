@@ -227,38 +227,32 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "confirm" => crate::confirm::confirm(act, rest.first().copied()),
         "rollback" => return rollback_line(session, act, rest),
         "save" => (|| -> Result<()> {
-            // Keep the saved baseline and cancellation of its CLI rollback in
-            // one mutation interval. Releasing persist's inner lock before
-            // disarming the timer would expose a falsely-idle OTA checkpoint.
+            // A save never confirms a trial implicitly, including --no-apply
+            // or exports from an appliance. Keep admission and persistence in
+            // one mutation interval so a timer cannot appear between them.
             let _lock = system::apply_lock()?;
+            crate::confirm::ensure_idle_for_write(act.enabled)?;
+            if act.enabled {
+                session.ensure_current()?;
+            }
             let to = rest.first().map(Path::new);
-            // A default `save` overwrites the very baseline a pending
-            // commit-confirm would revert to. Left armed, the timer would then
-            // "revert" to the just-saved config — a no-op that still reports
-            // success, silently defeating the safety net. So a save that
-            // overwrites the baseline cancels the pending auto-revert and says
-            // so; a `save <other-path>` leaves the baseline (and the timer) alone.
-            let overwrites_baseline = to.is_none() || to == Some(session.config_path());
             session.save(to).map(|p| {
                 eprintln!(
                     "{} saved {} (persists across reboot)",
                     ui::green("✔"),
                     p.display()
                 );
-                if overwrites_baseline && crate::system::confirm_pending() {
-                    crate::system::disarm_confirm();
-                    eprintln!(
-                        "{}",
-                        ui::yellow(
-                            "note: a commit-confirm auto-revert was pending; this save makes \
-                             the current config the new baseline, so the auto-revert has been \
-                             cancelled (there is no earlier config left to revert to)"
-                        )
-                    );
-                }
             })
         })(),
-        "discard" => session.discard().map(|()| eprintln!("discarded edits")),
+        "discard" => (|| {
+            if act.enabled {
+                *session = Session::load_live(session.config_path())?;
+            } else {
+                session.discard()?;
+            }
+            eprintln!("discarded edits; candidate reloaded");
+            Ok(())
+        })(),
         "exit" | "quit" => {
             // VyOS: inside an edit context, `exit` returns to the top of the
             // tree; only at the top does it leave configuration mode.
@@ -278,10 +272,10 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             // configuration of a firewall behind it. Best-effort and only
             // inside a real login session: run from a script or a pipe, there
             // is no session to end and this is a no-op.
-            if std::io::stdin().is_terminal() {
-                if let Err(e) = crate::system::terminate_own_session() {
-                    eprintln!("{}", ui::dim(&format!("(not logging out: {e})")));
-                }
+            if std::io::stdin().is_terminal()
+                && let Err(e) = crate::system::terminate_own_session()
+            {
+                eprintln!("{}", ui::dim(&format!("(not logging out: {e})")));
             }
             return true;
         }
@@ -468,7 +462,7 @@ fn unknown_command(cmd: &str, rest: &[&str], ctx: &[String]) -> anyhow::Error {
     }
 }
 
-/// `commit`: validate the candidate, persist it, then — if enabled — apply it to
+/// `commit`: validate the candidate, then — if enabled — apply it to
 /// the **running** system: recompile the firewall and reload the velstra data
 /// plane, and set the hostname live. No rebuild, no reboot. Never exits the
 /// shell. Returns `false`.
@@ -481,19 +475,19 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             return false;
         }
     };
-    // Somebody else got here first. Not refused — an operator may well mean to
-    // replace what the other session did — but never silent: this commit
-    // replaces the running configuration wholesale, including the parts they
-    // changed and this session never saw.
-    if session.committed_elsewhere().is_some() {
-        eprintln!(
-            "{}",
-            ui::yellow(
-                "warning: another session has committed since you started. This commit \
-                 replaces what they applied, including changes you have not seen — \
-                 `compare running` first if that is not what you mean."
-            )
-        );
+    // A candidate cannot erase a concurrent write or bypass a protected trial
+    // with --no-apply on the appliance. Off-box validation remains portable.
+    let admission = crate::confirm::ensure_idle_for_write(act.enabled).and_then(|()| {
+        if act.enabled {
+            session.ensure_current()
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = admission {
+        eprintln!("error: {error:#}");
+        note_refusal();
+        return false;
     }
     // Both baselines the lockout warning compares against, read before anything
     // moves: the saved file is what the next boot loads, and the running
@@ -564,7 +558,17 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // rolls a partial failure back to last-good instead of leaving a mix.
     let last_good = running_before.as_ref().or(saved_before.as_ref());
     if let Err(e) = apply_live(&appliance, act, last_good) {
-        eprintln!("{} applying config: {e}", ui::red("error:"));
+        let message = apply_error_message(
+            &anyhow!(e.to_string()),
+            [
+                Some(&appliance),
+                running_before.as_ref(),
+                saved_before.as_ref(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        eprintln!("{} applying config: {message}", ui::red("error:"));
         note_refusal();
         return false;
     }
@@ -671,7 +675,18 @@ fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
         note_refusal();
         return false;
     };
-    match crate::archive::rollback(session, act, n) {
+    let restored = (|| {
+        // An archived revision is a new configuration replacement, not the
+        // explicit cancellation/recovery of an existing protected trial.
+        let _lock = system::apply_lock()?;
+        crate::confirm::ensure_idle_for_write(act.enabled)?;
+        crate::safe_apply::ensure_writable(session.config_path())?;
+        if act.enabled {
+            session.ensure_current()?;
+        }
+        crate::archive::rollback(session, act, n)
+    })();
+    match restored {
         Ok(()) => eprintln!("rolled back to revision {n} (applied live + saved)."),
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -731,57 +746,733 @@ fn atomic_install(path: &Path, bytes: &[u8]) -> Result<()> {
 fn restore_file(path: &Path, prev: Option<&[u8]>) -> Result<()> {
     match prev {
         Some(bytes) => atomic_install(path, bytes),
-        None => {
-            let _ = std::fs::remove_file(path);
-            Ok(())
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+        },
+    }
+}
+
+/// A missing baseline is distinct from one we could not read. Refuse the latter
+/// before publishing any candidate or advancing the mutation generation.
+fn read_previous_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Compiled runtime files are regular files, never symlinks/devices/FIFOs.
+    // 64MiB deliberately accommodates large generated route/rule inventories
+    // while bounding allocation and rejecting a growing/untrusted baseline.
+    const MAX_COMPILED_BYTES: u64 = 64 * 1024 * 1024;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening previous {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .context("inspecting previous compiled file")?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "previous compiled configuration is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_COMPILED_BYTES,
+        "previous compiled configuration exceeds 64MiB limit"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_COMPILED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading previous {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_COMPILED_BYTES,
+        "previous compiled configuration exceeds 64MiB limit"
+    );
+    Ok(Some(bytes))
+}
+
+#[derive(Debug)]
+enum ServiceRecovery {
+    Restored,
+    Incomplete(anyhow::Error),
+}
+
+/// Keep recovery separate from the original failure until the common error
+/// boundary decides whether a clean rollback can truthfully be reported.
+#[derive(Debug)]
+struct ServiceApplyFailure {
+    cause: anyhow::Error,
+    recovery: ServiceRecovery,
+}
+
+impl std::fmt::Display for ServiceApplyFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("compiled service apply failed")
+    }
+}
+
+impl std::error::Error for ServiceApplyFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+/// Private dependency injection: production always uses the fixed system
+/// adapter; tests supply replies without replacing binaries or environment.
+trait ServiceControl: Clone + 'static {
+    fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()>;
+    fn restore(&self, unit: &str, installed: &[u8], previous: &[u8]) -> Result<()> {
+        self.reload(unit, Some(installed), previous)
+    }
+    fn ready(&self, unit: &str) -> Result<()>;
+    fn wait_ready(&self, unit: &str) -> Result<()> {
+        self.ready(unit)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SystemServiceControl;
+
+impl ServiceControl for SystemServiceControl {
+    fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+        system::reload_compiled(unit, previous, next)
+    }
+
+    fn restore(&self, unit: &str, installed: &[u8], previous: &[u8]) -> Result<()> {
+        restore_compiled_service(
+            unit,
+            installed,
+            previous,
+            system::reload_compiled,
+            system::service_restart,
+        )
+    }
+
+    fn ready(&self, unit: &str) -> Result<()> {
+        service_ready(unit)
+    }
+
+    fn wait_ready(&self, unit: &str) -> Result<()> {
+        // Read-only startup observation, never a retry of candidate mutation.
+        // A final probe can add at most 3s (root) / 4s (sudo monitor) to this
+        // 15s observation window, apart from OS scheduling/teardown delays.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match self.ready(unit) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if !readiness_socket_starting(&error)
+                        || std::time::Instant::now() >= deadline =>
+                {
+                    return Err(error);
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
         }
     }
 }
 
-/// Install a compiled config file and reload its unit as one unit of work. On
-/// failure it restores the previous file (best-effort) and returns the error,
-/// having made no lasting change. On success it returns an undo that restores
-/// the previous file + reloads, so a *later* stage's failure can roll this back
-/// too. Returns the undo boxed for the rollback stack.
+fn restore_compiled_service(
+    unit: &str,
+    installed: &[u8],
+    previous: &[u8],
+    reload: impl FnOnce(&str, Option<&[u8]>, &[u8]) -> Result<()>,
+    restart: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    match ReadinessService::from_unit(unit)? {
+        // A static-only Wren reload sends SIGHUP asynchronously. A generic
+        // routing query can be answered before that pending config is applied,
+        // so recovery must restart from the restored file instead.
+        ReadinessService::Routing => restart(unit),
+        ReadinessService::Dataplane => reload(unit, Some(installed), previous),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadinessService {
+    Dataplane,
+    Routing,
+}
+
+#[derive(Debug)]
+struct ReadinessSocketStarting(std::io::Error);
+
+impl std::fmt::Display for ReadinessSocketStarting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("readiness socket is not listening yet")
+    }
+}
+
+impl std::error::Error for ReadinessSocketStarting {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn readiness_connect_error(error: std::io::Error) -> anyhow::Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) {
+        ReadinessSocketStarting(error).into()
+    } else {
+        error.into()
+    }
+}
+
+impl ReadinessService {
+    fn from_unit(unit: &str) -> Result<Self> {
+        match unit {
+            "velstra.service" => Ok(Self::Dataplane),
+            "wren.service" => Ok(Self::Routing),
+            _ => anyhow::bail!("no readiness probe is defined for {unit}"),
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            Self::Dataplane => "velstra.service",
+            Self::Routing => "wren.service",
+        }
+    }
+}
+
+fn service_ready(unit: &str) -> Result<()> {
+    let service = ReadinessService::from_unit(unit)?;
+    if system::is_root() {
+        return service_ready_root(service);
+    }
+    // The privileged helper enforces its own three-second probe deadline.
+    // Killing an unprivileged sudo monitor cannot itself guarantee killing a
+    // root-owned/detached child; the inner deadline must not depend on that.
+    let mut command = std::process::Command::new("sudo");
+    command.args([
+        "-n",
+        &system::bin("sentinel-self"),
+        "service-readiness",
+        service.unit(),
+    ]);
+    let output = readiness_process(
+        &mut command,
+        std::time::Instant::now() + std::time::Duration::from_secs(4),
+    )?;
+    match output.as_slice() {
+        b"ready\n" => Ok(()),
+        b"starting\n" => {
+            Err(ReadinessSocketStarting(std::io::Error::from(std::io::ErrorKind::NotFound)).into())
+        }
+        b"failed\n" => anyhow::bail!("{} readiness probe failed", service.unit()),
+        _ => anyhow::bail!("invalid privileged readiness response"),
+    }
+}
+
+/// Fixed read-only privilege boundary, with no caller-supplied socket or verb.
+/// Only a small status token crosses stdout, never daemon/config diagnostics.
+pub(crate) fn service_readiness(unit: &str) -> Result<()> {
+    let service = ReadinessService::from_unit(unit)?;
+    anyhow::ensure!(system::is_root(), "service readiness helper requires root");
+    println!(
+        "{}",
+        match service_ready_root(service) {
+            Ok(()) => "ready",
+            Err(error) if readiness_socket_starting(&error) => "starting",
+            Err(_) => "failed",
+        }
+    );
+    Ok(())
+}
+
+fn service_ready_root(service: ReadinessService) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut command = std::process::Command::new(system::bin("systemctl"));
+    command.args(["is-active", "--quiet", service.unit()]);
+    readiness_process(&mut command, deadline).context("checking service active state")?;
+    match service {
+        ReadinessService::Dataplane => {
+            let reply = readiness_query(Path::new("/run/velstra/query.sock"), "status", deadline)?;
+            anyhow::ensure!(
+                reply.trim() == "Ready",
+                "dataplane configuration is not Ready"
+            );
+        }
+        ReadinessService::Routing => {
+            let reply = readiness_query(Path::new("/run/wren/wren.sock"), "show vrf", deadline)?;
+            anyhow::ensure!(
+                routing_ready_reply(&reply),
+                "routing control response is not ready"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Private runner used only for the two fixed readiness commands above. The
+/// leader is observed without reaping, so killpg cannot target a reused PID.
+/// OS-uninterruptible processes remain an OS limitation, not a successful probe.
+fn readiness_process(
+    command: &mut std::process::Command,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn().context("starting readiness probe")?;
+    let pid = child.id() as libc::pid_t;
+    let result = (|| {
+        let mut stdout = child.stdout.take().context("readiness stdout missing")?;
+        let fd = stdout.as_raw_fd();
+        // SAFETY: fd is owned by stdout for the duration of this probe.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        anyhow::ensure!(
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+            "setting readiness pipe nonblocking failed"
+        );
+        let mut output = Vec::new();
+        let mut eof = false;
+        loop {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "readiness probe timed out"
+            );
+            let mut bytes = [0u8; 4096];
+            match stdout.read(&mut bytes) {
+                Ok(0) => eof = true,
+                Ok(size) => {
+                    anyhow::ensure!(
+                        output.len() + size <= 65_536,
+                        "readiness output limit exceeded"
+                    );
+                    output.extend_from_slice(&bytes[..size]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error).context("reading readiness response"),
+            }
+            // SAFETY: waitid only observes our child and WNOWAIT keeps it owned.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if status != 0 {
+                return Err(std::io::Error::last_os_error()).context("observing readiness helper");
+            }
+            if eof && unsafe { info.si_pid() } == pid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok(output)
+    })();
+    // SAFETY: process_group(0) created this group, and its leader has not been
+    // reaped. Never signal a caller-supplied process/group identifier.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let status = child.wait().context("reaping readiness helper")?;
+    let output = result?;
+    anyhow::ensure!(status.success(), "readiness command failed");
+    Ok(output)
+}
+
+fn readiness_wait_fd(
+    fd: std::os::fd::RawFd,
+    events: libc::c_short,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "readiness probe timed out");
+        let mut poll = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: poll points at one valid pollfd, whose fd remains owned.
+        let result = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+            )
+        };
+        if result > 0 {
+            return Ok(());
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+fn readiness_query(path: &Path, request: &str, deadline: std::time::Instant) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixStream;
+
+    // SAFETY: no pointer arguments; the returned descriptor is immediately owned.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    anyhow::ensure!(
+        bytes.len() < address.sun_path.len() && !bytes.contains(&0),
+        "invalid readiness socket path"
+    );
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    // SAFETY: address is initialized and contains a terminated pathname.
+    if unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(readiness_connect_error(error));
+        }
+        readiness_wait_fd(fd.as_raw_fd(), libc::POLLOUT, deadline)?;
+        let mut error = 0i32;
+        let mut len = std::mem::size_of_val(&error) as libc::socklen_t;
+        // SAFETY: both output pointers have the correct sizes and live storage.
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut error as *mut i32).cast(),
+                &mut len,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if error != 0 {
+            return Err(readiness_connect_error(std::io::Error::from_raw_os_error(
+                error,
+            )));
+        }
+    }
+    let mut stream = UnixStream::from(fd);
+    let message = format!("{request}\n");
+    let mut pending = message.as_bytes();
+    while !pending.is_empty() {
+        readiness_wait_fd(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+        match stream.write(pending) {
+            Ok(0) => anyhow::bail!("readiness socket closed before request"),
+            Ok(size) => pending = &pending[size..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut output = Vec::new();
+    loop {
+        readiness_wait_fd(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+        let mut bytes = [0u8; 4096];
+        match stream.read(&mut bytes) {
+            Ok(0) => {
+                return String::from_utf8(output).context("invalid readiness response encoding");
+            }
+            Ok(size) => {
+                anyhow::ensure!(
+                    output.len() + size <= 65_536,
+                    "readiness output limit exceeded"
+                );
+                output.extend_from_slice(&bytes[..size]);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn readiness_socket_starting(error: &anyhow::Error) -> bool {
+    // Only an absent/not-yet-listening startup socket is pending. An actual
+    // Failed reply, a stalled query, an inactive unit or a malformed response
+    // is a failure, never polled until it happens to look healthy.
+    error.downcast_ref::<ReadinessSocketStarting>().is_some()
+}
+
+/// Match the boot-readiness gate's central routing-task response, not merely
+/// the existence of a listener or an active systemd process.
+fn routing_ready_reply(reply: &str) -> bool {
+    let reply = reply.trim();
+    reply == "no vrfs configured"
+        || reply
+            .lines()
+            .next()
+            .is_some_and(|line| line.split_whitespace().eq(["vrf", "table", "rd", "routes"]))
+}
+
+fn restore_service<C: ServiceControl>(
+    out: &Path,
+    unit: &str,
+    installed: &[u8],
+    previous: Option<&[u8]>,
+    control: &C,
+) -> Result<()> {
+    restore_file(out, previous).context("restoring previous compiled file")?;
+    let previous = previous.context(
+        "candidate file removed, but no previous compiled configuration exists; daemon state is unknown",
+    )?;
+    control
+        .restore(unit, installed, previous)
+        .with_context(|| format!("reloading previous configuration for {unit}"))?;
+    control
+        .wait_ready(unit)
+        .with_context(|| format!("verifying recovered {unit}"))?;
+    anyhow::ensure!(
+        read_previous_file(out)?.as_deref() == Some(previous),
+        "recovered compiled file no longer matches the previous configuration"
+    );
+    Ok(())
+}
+
+/// A failed candidate always remains an error, even when recovery succeeds.
+/// A successful undo requires both the prior file and a verified daemon reload;
+/// neither restoring bytes alone nor systemd's active state proves recovery.
 fn apply_service(
     out: &Path,
     unit: &str,
     new: &[u8],
     prev: Option<&[u8]>,
 ) -> Result<Box<dyn FnOnce() -> Result<()>>> {
-    if prev == Some(new) && system::unit_active(unit) {
-        return Ok(Box::new(|| Ok(())));
+    apply_service_with(out, unit, new, prev, SystemServiceControl)
+}
+
+fn apply_service_with<C: ServiceControl>(
+    out: &Path,
+    unit: &str,
+    new: &[u8],
+    prev: Option<&[u8]>,
+    control: C,
+) -> Result<Box<dyn FnOnce() -> Result<()>>> {
+    ReadinessService::from_unit(unit)?;
+    // This is a readiness snapshot, not a promise of ongoing cluster authority.
+    if prev == Some(new) && control.ready(unit).is_ok() {
+        let out = out.to_path_buf();
+        let unit = unit.to_owned();
+        let previous = new.to_vec();
+        return Ok(Box::new(move || {
+            anyhow::ensure!(
+                read_previous_file(&out)?.as_deref() == Some(previous.as_slice()),
+                "unchanged compiled file no longer matches the previous configuration"
+            );
+            control
+                .ready(&unit)
+                .context("verifying unchanged service during rollback")
+        }));
     }
-    atomic_install(out, new).with_context(|| format!("installing {}", out.display()))?;
-    if let Err(e) = system::reload_compiled(unit, prev, new) {
-        // Reload failed: put the previous file back so we don't leave a new
-        // config staged under a daemon still running the old one.
-        let _ = restore_file(out, prev);
-        return Err(e).with_context(|| format!("reloading {unit}"));
+    if let Err(cause) = atomic_install(out, new) {
+        // No reload was issued. Do not gratuitously bounce a daemon on an
+        // install failure, but verify the old bytes and readiness before saying
+        // that the earlier state was retained.
+        let retained = (|| {
+            anyhow::ensure!(
+                prev.is_some(),
+                "no previous compiled configuration; daemon state is unknown"
+            );
+            anyhow::ensure!(
+                read_previous_file(out)?.as_deref() == prev,
+                "previous compiled file was not retained"
+            );
+            control.ready(unit)
+        })();
+        return Err(ServiceApplyFailure {
+            cause: cause.context(format!("installing {}", out.display())),
+            recovery: match retained {
+                Ok(()) => ServiceRecovery::Restored,
+                Err(error) => ServiceRecovery::Incomplete(error),
+            },
+        }
+        .into());
+    }
+    let applied = control
+        .reload(unit, prev, new)
+        .and_then(|()| control.wait_ready(unit));
+    if let Err(cause) = applied {
+        let recovery = match restore_service(out, unit, new, prev, &control) {
+            Ok(()) => ServiceRecovery::Restored,
+            Err(error) => ServiceRecovery::Incomplete(error),
+        };
+        return Err(ServiceApplyFailure {
+            cause: cause.context(format!("reloading {unit}")),
+            recovery,
+        }
+        .into());
     }
     let out = out.to_path_buf();
     let unit = unit.to_string();
     let prev = prev.map(<[u8]>::to_vec);
     let installed = new.to_vec();
     Ok(Box::new(move || {
-        restore_file(&out, prev.as_deref())?;
-        system::reload_compiled(&unit, Some(&installed), prev.as_deref().unwrap_or_default())
+        restore_service(&out, &unit, &installed, prev.as_deref(), &control)
     }))
 }
 
 /// Combine the original stage error with the rollback outcome into one report.
 /// Only for stages the rollback stack actually covers (firewall, routing,
 /// hostname) — where "rolled back to the previous running config" is the truth.
-fn unwind_err(rb: Rollback, cause: anyhow::Error, stage: &str) -> anyhow::Error {
-    let failures = rb.unwind();
-    if failures.is_empty() {
+fn unwind_err<'a>(
+    rb: Rollback,
+    cause: anyhow::Error,
+    stage: &str,
+    configurations: impl IntoIterator<Item = &'a crate::config::Appliance>,
+) -> anyhow::Error {
+    let configurations: Vec<_> = configurations.into_iter().collect();
+    let mut failures: Vec<_> = rb
+        .unwind()
+        .into_iter()
+        .map(|failure| diagnostic_chain(&anyhow!(failure), &configurations))
+        .collect();
+    if let Some(ServiceApplyFailure {
+        recovery: ServiceRecovery::Incomplete(error),
+        ..
+    }) = cause.downcast_ref::<ServiceApplyFailure>()
+    {
+        failures.push(format!(
+            "failed {stage} recovery ({})",
+            diagnostic_chain(error, &configurations)
+        ));
+    }
+    let cause = diagnostic_chain(&cause, &configurations);
+    let error = if failures.is_empty() {
         anyhow!("applying {stage} failed: {cause}\n  rolled back to the previous running config")
     } else {
         anyhow!(
             "applying {stage} failed: {cause}\n  ROLLBACK INCOMPLETE — still inconsistent: {}",
             failures.join("; ")
         )
+    };
+    // This error also crosses the API boundary: sanitize here, not only when
+    // the interactive CLI prints it. Never retain the unsanitized source chain.
+    anyhow!(apply_error_message(&error, configurations))
+}
+
+/// Keep nested operational causes, but never append parser source excerpts or
+/// raw multi-line configuration documents to a reload diagnostic.
+fn diagnostic_chain(error: &anyhow::Error, configurations: &[&crate::config::Appliance]) -> String {
+    error
+        .chain()
+        .map(|cause| {
+            // Redact before truncation: a multi-line credential must not leave
+            // an unmatched secret prefix behind when source lines are omitted.
+            let text =
+                apply_error_message(&anyhow!(cause.to_string()), configurations.iter().copied());
+            let mut lines = text.lines();
+            let first = lines.next().unwrap_or("unspecified error");
+            let mut summary = first.to_string();
+            if lines.next().is_some() {
+                summary.push_str(" [additional diagnostic lines omitted]");
+            }
+            summary
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+/// Diagnostics are not a credential export. Reuse the configuration secret
+/// inventory for both new and old credentials, including quoted spellings.
+fn apply_error_message<'a>(
+    error: &anyhow::Error,
+    configurations: impl IntoIterator<Item = &'a crate::config::Appliance>,
+) -> String {
+    let mut secrets: Vec<_> = configurations
+        .into_iter()
+        .flat_map(crate::redact::every_secret_value)
+        .collect();
+    for secret in secrets.clone() {
+        let quoted = format!("{secret:?}");
+        secrets.push(quoted[1..quoted.len() - 1].to_string());
+        if let Ok(quoted) = serde_json::to_string(&secret) {
+            secrets.push(quoted[1..quoted.len() - 1].to_string());
+        }
     }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    let scrubbed = scrub_diagnostic_secrets(&format!("{error:#}"), &secrets);
+    let mut message = String::new();
+    for character in scrubbed.chars() {
+        if character.is_control() && character != '\n' {
+            message.extend(character.escape_debug());
+        } else {
+            message.push(character);
+        }
+    }
+    message
+}
+
+/// Match once against the original text. Short configured secrets are still
+/// protected, but must not recursively expand the replacement marker (including
+/// a marker emitted by an earlier shared/API diagnostic boundary).
+fn scrub_diagnostic_secrets(text: &str, secrets: &[String]) -> String {
+    let mut scrubbed = String::with_capacity(text.len());
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let starts_marker = remaining.starts_with(crate::redact::REDACTED);
+        // A real credential can itself start with the marker. Match that whole
+        // longer credential before treating an existing marker as atomic.
+        let secret = secrets.iter().find(|secret| {
+            !secret.is_empty()
+                && (!starts_marker || secret.len() > crate::redact::REDACTED.len())
+                && remaining.starts_with(secret.as_str())
+        });
+        if let Some(secret) = secret {
+            scrubbed.push_str(crate::redact::REDACTED);
+            remaining = &remaining[secret.len()..];
+        } else if let Some(rest) = remaining.strip_prefix(crate::redact::REDACTED) {
+            scrubbed.push_str(crate::redact::REDACTED);
+            remaining = rest;
+        } else {
+            let character = remaining.chars().next().expect("nonempty diagnostic");
+            scrubbed.push(character);
+            remaining = &remaining[character.len_utf8()..];
+        }
+    }
+    scrubbed
 }
 
 /// Report a failure of the final, broad `net::apply` stage honestly.
@@ -927,6 +1618,11 @@ pub(crate) fn apply_live(
     act: &Apply,
     rollback_to: Option<&crate::config::Appliance>,
 ) -> Result<()> {
+    // Low-level activation: callers must admit the candidate against their
+    // authoritative saved/running baseline while holding apply.lock BEFORE
+    // entering this function (and before journaling or arming recovery).
+    // `rollback_to` is an undo target, never an admission authority. Reading
+    // DEFAULT_CONFIG here would incorrectly reject callers with another path.
     apply_live_as(appliance, act, rollback_to, crate::net::Verify::Forward)
 }
 
@@ -969,12 +1665,13 @@ fn apply_live_as(
         .context("compiling routing config")?;
     // Snapshot the currently-installed configs so a later failure can restore
     // them (None ⇒ there was no file, so rollback removes ours).
-    let velstra_prev = std::fs::read(&act.velstra_out).ok();
-    let wren_prev = std::fs::read(&act.wren_out).ok();
+    let velstra_prev = read_previous_file(&act.velstra_out)?;
+    let wren_prev = read_previous_file(&act.wren_out)?;
     let old_host = system::current_hostname();
 
     // ---- Phase 2: apply, each stage undoable on a later failure ----
     if act.enabled {
+        crate::net::preflight_login_accounts(appliance)?;
         crate::mutation::advance()?;
     }
     let mut rb = Rollback::new();
@@ -991,7 +1688,12 @@ fn apply_live_as(
             crate::ha::prepare_guard(&previous)
         });
         if let Err(error) = crate::ha::prepare_guard(&rendered) {
-            return Err(unwind_err(rb, error, "HA fence"));
+            return Err(unwind_err(
+                rb,
+                error,
+                "HA fence",
+                [Some(appliance), rollback_to].into_iter().flatten(),
+            ));
         }
     }
     // Firewall install/reload may now have an earlier guard to unwind.
@@ -1002,7 +1704,14 @@ fn apply_live_as(
         velstra_prev.as_deref(),
     ) {
         Ok(undo) => undo,
-        Err(error) => return Err(unwind_err(rb, error, "firewall")),
+        Err(error) => {
+            return Err(unwind_err(
+                rb,
+                error,
+                "firewall",
+                [Some(appliance), rollback_to].into_iter().flatten(),
+            ));
+        }
     };
     rb.push("firewall", undo);
 
@@ -1014,12 +1723,24 @@ fn apply_live_as(
         wren_prev.as_deref(),
     ) {
         Ok(undo) => rb.push("routing", undo),
-        Err(e) => return Err(unwind_err(rb, e, "routing")),
+        Err(e) => {
+            return Err(unwind_err(
+                rb,
+                e,
+                "routing",
+                [Some(appliance), rollback_to].into_iter().flatten(),
+            ));
+        }
     }
 
     // Hostname: set it live.
     if let Err(e) = system::set_hostname(&appliance.system.hostname) {
-        return Err(unwind_err(rb, e, "hostname"));
+        return Err(unwind_err(
+            rb,
+            e,
+            "hostname",
+            [Some(appliance), rollback_to].into_iter().flatten(),
+        ));
     }
     rb.push("hostname", move || system::set_hostname(&old_host));
 
@@ -1403,7 +2124,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ),
     (
         "firewall",
-        "firewall summary / statistics / counters / events [since <id>] / states / hits / log",
+        "firewall summary / statistics / capacity / counters / events / states / hits / log",
     ),
     ("nat", "NAT configuration summary"),
     ("ids", "intrusion detection: what is watched, what fired"),
@@ -1426,6 +2147,25 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("system", "hostname, services, interfaces"),
     ("log", "recent service log (velstra | wren)"),
     ("version", "software versions"),
+];
+const OP_SHOW_FIREWALL: &[Cand] = &[
+    ("zones", "interface membership and zone posture"),
+    ("statistics", "data-plane packet statistics"),
+    (
+        "capacity",
+        "observed kernel map occupancy and sampling status (JSON)",
+    ),
+    ("counters", "rule packet and byte counters (JSON)"),
+    ("events", "recent packet events; optionally since <id>"),
+    ("states", "active connection states (JSON)"),
+    ("hits", "rule traffic attribution"),
+    ("flows", "tracked flows (JSON)"),
+    ("flowspec", "FlowSpec enforcement state"),
+    ("top-talkers", "top traffic sources"),
+    (
+        "log",
+        "firewall journal; optionally <count> or since <window>",
+    ),
 ];
 const OP_IP: &[Cand] = &[
     ("route", "the routing table (via the wren RIB)"),
@@ -2858,7 +3598,7 @@ const SYSTEM_FIELDS: &[Cand] = &[
     ),
     (
         "conntrack-sync",
-        "mirror the conntrack table to peers so NAT flows survive failover (HA, C9)",
+        "authenticated state replication; requires an explicitly configured 32..1024-byte config-sync secret",
     ),
 ];
 const HA_FIELDS: &[Cand] = &[
@@ -2937,7 +3677,10 @@ const CONNTRACKSYNC_FIELDS: &[Cand] = &[
         "peer",
         "a peer firewall to push conntrack state to — host or host:port (repeatable)",
     ),
-    ("interval", "seconds between pushes (default 1)"),
+    (
+        "interval",
+        "optional polling seconds (default authenticated polling: 50ms)",
+    ),
 ];
 const CONNTRACK_FIELDS: &[Cand] = &[
     ("tcp-syn", "idle timeout in seconds"),
@@ -4410,6 +5153,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // `run` — operational commands from config mode (vtysh-style).
         ["run"] => RUN_TOP,
         ["run", "show"] => OP_SHOW_TOP,
+        ["run", "show", "firewall"] => OP_SHOW_FIREWALL,
         ["run", "show", "ip"] => OP_IP,
         ["run", "show", "ipv6"] => OP_IPV6,
         ["run", "show", "vpn"] => OP_VPN,
@@ -5481,9 +6225,764 @@ impl Completer for ConfigCompleter {
 mod tests {
     use super::*;
 
+    type ReloadHook = Box<dyn FnMut(&str, Option<&[u8]>, &[u8]) -> Result<()>>;
+    type ReadyHook = Box<dyn FnMut(&str) -> Result<()>>;
+
+    #[derive(Clone)]
+    struct TestServiceControl {
+        reload: std::rc::Rc<std::cell::RefCell<ReloadHook>>,
+        ready: std::rc::Rc<std::cell::RefCell<ReadyHook>>,
+    }
+
+    impl TestServiceControl {
+        fn new(
+            reload: impl FnMut(&str, Option<&[u8]>, &[u8]) -> Result<()> + 'static,
+            ready: impl FnMut(&str) -> Result<()> + 'static,
+        ) -> Self {
+            Self {
+                reload: std::rc::Rc::new(std::cell::RefCell::new(Box::new(reload))),
+                ready: std::rc::Rc::new(std::cell::RefCell::new(Box::new(ready))),
+            }
+        }
+    }
+
+    impl ServiceControl for TestServiceControl {
+        fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+            self.reload.borrow_mut()(unit, previous, next)
+        }
+
+        fn ready(&self, unit: &str) -> Result<()> {
+            self.ready.borrow_mut()(unit)
+        }
+    }
+
+    struct ServiceTestDir(PathBuf);
+
+    impl ServiceTestDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "sentinel-service-recovery-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn config(&self) -> PathBuf {
+            self.0.join("compiled.toml")
+        }
+    }
+
+    impl Drop for ServiceTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn service_recovery_restore_and_snapshot_refuse_real_filesystem_errors() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        assert_eq!(read_previous_file(&path).unwrap(), None);
+        restore_file(&path, None).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("owned-proof"), b"unchanged").unwrap();
+        assert!(restore_file(&path, None).is_err());
+        assert!(read_previous_file(&path).is_err());
+        assert_eq!(
+            std::fs::read(path.join("owned-proof")).unwrap(),
+            b"unchanged"
+        );
+    }
+
+    #[test]
+    fn service_recovery_baseline_rejects_fifo_symlink_and_oversized_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = ServiceTestDir::new();
+        let fifo = dir.0.join("previous.fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid terminated pathname in this owned fixture dir.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(
+            read_previous_file(&fifo)
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            fifo.exists(),
+            "read refusal must not remove the original object"
+        );
+
+        let real = dir.0.join("real.toml");
+        std::fs::write(&real, b"original").unwrap();
+        let link = dir.0.join("linked.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_previous_file(&link).is_err());
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"original");
+
+        let oversized = dir.0.join("oversized.toml");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            read_previous_file(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("64MiB limit")
+        );
+        assert_eq!(
+            std::fs::metadata(&oversized).unwrap().len(),
+            64 * 1024 * 1024 + 1
+        );
+        assert!(
+            !dir.config().exists(),
+            "baseline failure occurs without candidate publication"
+        );
+    }
+
+    #[test]
+    fn service_recovery_failed_candidate_restores_file_and_reloads_old_daemon() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"old").unwrap();
+        let observed = path.clone();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = calls.clone();
+        let control = TestServiceControl::new(
+            move |_, previous, next| {
+                count.set(count.get() + 1);
+                assert_eq!(std::fs::read(&observed).unwrap(), next);
+                match count.get() {
+                    1 => {
+                        assert_eq!(previous, Some(b"old".as_slice()));
+                        assert_eq!(next, b"new");
+                        Err(anyhow!("candidate rejected"))
+                    }
+                    2 => {
+                        assert_eq!(previous, Some(b"new".as_slice()));
+                        assert_eq!(next, b"old");
+                        Ok(())
+                    }
+                    _ => panic!("candidate must never be retried"),
+                }
+            },
+            |_| Ok(()),
+        );
+        let failure = apply_service_with(&path, "velstra.service", b"new", Some(b"old"), control)
+            .err()
+            .expect("recovered rejection remains an error");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+        let message = unwind_err(Rollback::new(), failure, "firewall", []).to_string();
+        assert!(message.contains("candidate rejected"), "{message}");
+        assert!(
+            message.contains("rolled back to the previous running config"),
+            "{message}"
+        );
+        assert!(!message.contains("ROLLBACK INCOMPLETE"), "{message}");
+    }
+
+    #[test]
+    fn service_recovery_restore_write_fault_is_incomplete_and_earlier_stages_unwind() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"old").unwrap();
+        let blocked_temp = path.with_extension("toml.tmp");
+        let control = TestServiceControl::new(
+            move |_, _, _| {
+                // Real filesystem obstruction, independent of effective UID.
+                std::fs::create_dir(&blocked_temp).unwrap();
+                Err(anyhow!("candidate refused"))
+            },
+            |_| panic!("failed restore must not claim daemon readiness"),
+        );
+        let failure = apply_service_with(&path, "velstra.service", b"new", Some(b"old"), control)
+            .err()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let earlier = std::rc::Rc::new(std::cell::Cell::new(false));
+        let marker = earlier.clone();
+        let mut rb = Rollback::new();
+        rb.push("earlier stage", move || {
+            marker.set(true);
+            Ok(())
+        });
+        let message = unwind_err(rb, failure, "firewall", []).to_string();
+        assert!(earlier.get());
+        assert!(message.contains("ROLLBACK INCOMPLETE"), "{message}");
+        assert!(
+            message.contains("restoring previous compiled file"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("rolled back to the previous running config"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn service_recovery_reload_or_readiness_failure_never_claims_clean_rollback() {
+        for reload_fails in [true, false] {
+            let dir = ServiceTestDir::new();
+            let path = dir.config();
+            std::fs::write(&path, b"old").unwrap();
+            let mut count = 0;
+            let control = TestServiceControl::new(
+                move |_, _, _| {
+                    count += 1;
+                    if count == 1 {
+                        Err(anyhow!("candidate rejected"))
+                    } else if reload_fails {
+                        Err(anyhow!("old daemon refused reload"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Err(anyhow!("dataplane configuration is not Ready")),
+            );
+            let failure =
+                apply_service_with(&path, "velstra.service", b"new", Some(b"old"), control)
+                    .err()
+                    .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), b"old");
+            let message = unwind_err(Rollback::new(), failure, "firewall", []).to_string();
+            assert!(message.contains("ROLLBACK INCOMPLETE"), "{message}");
+            assert!(
+                message.contains(if reload_fails {
+                    "old daemon refused reload"
+                } else {
+                    "not Ready"
+                }),
+                "{message}"
+            );
+            assert!(
+                !message.contains("rolled back to the previous running config"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_recovery_without_baseline_removes_file_but_reports_unknown_daemon() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        let mut count = 0;
+        let control = TestServiceControl::new(
+            move |_, _, _| {
+                count += 1;
+                assert_eq!(count, 1);
+                Err(anyhow!("candidate rejected"))
+            },
+            |_| panic!("no old configuration exists to verify"),
+        );
+        let failure = apply_service_with(&path, "velstra.service", b"new", None, control)
+            .err()
+            .unwrap();
+        assert!(!path.exists());
+        let message = unwind_err(Rollback::new(), failure, "firewall", []).to_string();
+        assert!(message.contains("ROLLBACK INCOMPLETE"), "{message}");
+        assert!(message.contains("daemon state is unknown"), "{message}");
+    }
+
+    #[test]
+    fn service_recovery_same_bytes_failed_daemon_is_reloaded_not_skipped() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"same").unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = calls.clone();
+        let mut probes = 0;
+        let control = TestServiceControl::new(
+            move |_, previous, next| {
+                count.set(count.get() + 1);
+                assert_eq!(previous, Some(b"same".as_slice()));
+                assert_eq!(next, b"same");
+                Ok(())
+            },
+            move |_| {
+                probes += 1;
+                if probes == 1 {
+                    Err(anyhow!("active but Failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let _undo =
+            apply_service_with(&path, "velstra.service", b"same", Some(b"same"), control).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn service_recovery_successful_stage_undo_propagates_reload_failure() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"old").unwrap();
+        let mut count = 0;
+        let control = TestServiceControl::new(
+            move |_, _, _| {
+                count += 1;
+                if count == 1 {
+                    Ok(())
+                } else {
+                    Err(anyhow!("undo refused"))
+                }
+            },
+            |_| Ok(()),
+        );
+        let undo =
+            apply_service_with(&path, "velstra.service", b"new", Some(b"old"), control).unwrap();
+        let mut rb = Rollback::new();
+        rb.push("firewall", undo);
+        let message = unwind_err(rb, anyhow!("later stage refused"), "routing", []).to_string();
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+        assert!(message.contains("ROLLBACK INCOMPLETE"), "{message}");
+        assert!(
+            message.contains("reloading previous configuration for velstra.service"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn service_recovery_install_fault_retains_healthy_baseline_without_reload() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::create_dir(path.with_extension("toml.tmp")).unwrap();
+        let control =
+            TestServiceControl::new(|_, _, _| panic!("install failed before reload"), |_| Ok(()));
+        let failure = apply_service_with(&path, "velstra.service", b"new", Some(b"old"), control)
+            .err()
+            .unwrap();
+        let message = unwind_err(Rollback::new(), failure, "firewall", []).to_string();
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+        assert!(
+            message.contains("rolled back to the previous running config"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn service_recovery_readiness_matches_boot_gate_and_only_retries_startup_socket() {
+        for reply in [
+            "no vrfs configured\n",
+            "vrf table rd routes\nblue 100 - 2\n",
+        ] {
+            assert!(routing_ready_reply(reply));
+        }
+        for reply in [
+            "",
+            "ok",
+            "error: unavailable",
+            "vrf table rd routes unexpected",
+        ] {
+            assert!(!routing_ready_reply(reply));
+        }
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(readiness_socket_starting(&readiness_connect_error(
+                std::io::Error::from(kind)
+            )));
+            assert!(
+                !readiness_socket_starting(&anyhow::Error::new(std::io::Error::from(kind))),
+                "missing systemctl/sudo must not be treated as a starting socket"
+            );
+        }
+        assert!(!readiness_socket_starting(&anyhow!(
+            "dataplane configuration is not Ready"
+        )));
+        assert!(!readiness_socket_starting(&anyhow::Error::new(
+            std::io::Error::from(std::io::ErrorKind::TimedOut)
+        )));
+    }
+
+    #[test]
+    fn service_recovery_unknown_unit_is_refused_before_file_or_service_mutation() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"old").unwrap();
+        let control = TestServiceControl::new(
+            |_, _, _| panic!("unknown service must not be reloaded"),
+            |_| panic!("unknown service must not borrow another service's probe"),
+        );
+        assert!(apply_service_with(&path, "other.service", b"new", Some(b"old"), control).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn service_recovery_typed_incomplete_error_is_sanitized_at_api_boundary() {
+        let mut candidate =
+            crate::config::Appliance::from_toml("[system]\nhostname = \"test\"\n").unwrap();
+        candidate.system.config_sync.secret = Some("candidate-private".into());
+        let mut previous = candidate.clone();
+        previous.system.config_sync.secret = Some("previous-private".into());
+        let failure = ServiceApplyFailure {
+            cause: anyhow!("candidate-private rejected\nsecret = unknown-candidate-source"),
+            recovery: ServiceRecovery::Incomplete(anyhow!(
+                "previous-private failed\nsecret = unknown-previous-source"
+            )),
+        };
+        let error = unwind_err(
+            Rollback::new(),
+            failure.into(),
+            "firewall",
+            [&candidate, &previous],
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("ROLLBACK INCOMPLETE"), "{message}");
+        for secret in [
+            "candidate-private",
+            "previous-private",
+            "unknown-candidate-source",
+            "unknown-previous-source",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+        assert!(message.contains(crate::redact::REDACTED), "{message}");
+    }
+
+    #[test]
+    fn service_recovery_noop_undo_rechecks_readiness_without_a_reload() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"same").unwrap();
+        let mut probes = 0;
+        let control = TestServiceControl::new(
+            |_, _, _| panic!("unchanged healthy service needs no reload"),
+            move |_| {
+                probes += 1;
+                if probes == 1 {
+                    Ok(())
+                } else {
+                    Err(anyhow!("later daemon failure"))
+                }
+            },
+        );
+        let undo =
+            apply_service_with(&path, "velstra.service", b"same", Some(b"same"), control).unwrap();
+        assert!(undo().is_err(), "initial Ready is not permanent health");
+    }
+
+    #[test]
+    fn service_recovery_wren_restarts_instead_of_accepting_an_async_static_reload() {
+        restore_compiled_service(
+            "wren.service",
+            b"candidate-static",
+            b"previous-static",
+            |_, _, _| panic!("Wren recovery must not use asynchronous SIGHUP"),
+            |unit| {
+                assert_eq!(unit, "wren.service");
+                Ok(())
+            },
+        )
+        .unwrap();
+        let error = restore_compiled_service(
+            "wren.service",
+            b"new",
+            b"old",
+            |_, _, _| panic!("a failed recovery restart must not fall back to reload"),
+            |_| Err(anyhow!("recovery restart failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "recovery restart failed");
+        restore_compiled_service(
+            "velstra.service",
+            b"new",
+            b"old",
+            |unit, installed, previous| {
+                assert_eq!(unit, "velstra.service");
+                assert_eq!(installed, Some(b"new".as_slice()));
+                assert_eq!(previous, b"old");
+                Ok(())
+            },
+            |_| panic!("dataplane retains its acknowledged reload protocol"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn service_recovery_readiness_process_deadline_and_output_limit_are_real() {
+        let start = std::time::Instant::now();
+        let mut stalled = std::process::Command::new("sh");
+        stalled.args(["-c", "sleep 30 & wait"]);
+        let error = readiness_process(&mut stalled, start + std::time::Duration::from_millis(100))
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        let mut oversized = std::process::Command::new("sh");
+        oversized.args(["-c", "yes readiness"]);
+        let error = readiness_process(
+            &mut oversized,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("output limit"), "{error:#}");
+        let mut good = std::process::Command::new("sh");
+        good.args(["-c", "printf ready"]);
+        assert_eq!(
+            readiness_process(
+                &mut good,
+                std::time::Instant::now() + std::time::Duration::from_secs(3)
+            )
+            .unwrap(),
+            b"ready"
+        );
+    }
+
+    #[test]
+    fn service_recovery_readiness_socket_is_deadline_and_output_bounded() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        for mode in ["ready", "stall", "oversized"] {
+            let dir = ServiceTestDir::new();
+            let path = dir.0.join("probe.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 7];
+                stream.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"status\n");
+                match mode {
+                    "ready" => stream.write_all(b"Ready\n").unwrap(),
+                    "stall" => std::thread::sleep(std::time::Duration::from_millis(200)),
+                    _ => {
+                        let _ = stream.write_all(&vec![b'x'; 70_000]);
+                    }
+                }
+            });
+            let timeout = if mode == "stall" { 50 } else { 1000 };
+            let result = readiness_query(
+                &path,
+                "status",
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout),
+            );
+            match mode {
+                "ready" => assert_eq!(result.unwrap(), "Ready\n"),
+                "stall" => assert!(result.unwrap_err().to_string().contains("timed out")),
+                _ => assert!(result.unwrap_err().to_string().contains("output limit")),
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn reload_diagnostic_preserves_root_cause_and_clean_rollback() {
+        let cause = anyhow!("interface IPv4 inventory no longer matches the prepared policy")
+            .context("error: applying configuration")
+            .context("reloading velstra.service");
+        let error = unwind_err(Rollback::new(), cause, "firewall", []);
+        let message = apply_error_message(&error, []);
+        assert!(message.contains("reloading velstra.service"), "{message}");
+        assert!(
+            message.contains("error: applying configuration"),
+            "{message}"
+        );
+        assert!(
+            message.contains("interface IPv4 inventory no longer matches the prepared policy"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("rolled back to the previous running config"),
+            "{message}"
+        );
+        assert!(!message.contains("ROLLBACK INCOMPLETE"), "{message}");
+    }
+
+    #[test]
+    fn reload_diagnostic_preserves_failure_and_incomplete_rollback() {
+        let mut rb = Rollback::new();
+        rb.push("routing", || {
+            Err(anyhow!("connection refused").context("reloading wren.service"))
+        });
+        let error = unwind_err(
+            rb,
+            anyhow!("candidate map insertion failed").context("reloading velstra.service"),
+            "firewall",
+            [],
+        );
+        let message = apply_error_message(&error, []);
+        assert!(
+            message.contains("candidate map insertion failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("routing (reloading wren.service)"),
+            "{message}"
+        );
+        assert!(message.contains("ROLLBACK INCOMPLETE"), "{message}");
+        assert!(
+            !message.contains("rolled back to the previous running config"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reload_diagnostic_omits_parser_source_and_scrubs_old_and_new_credentials() {
+        let mut candidate =
+            crate::config::Appliance::from_toml("[system]\nhostname = \"test\"\n").unwrap();
+        candidate.system.config_sync.secret = Some("new-credential\\with\"quotes".into());
+        let mut previous = candidate.clone();
+        previous.system.config_sync.secret = Some("old-credential".into());
+        let new = candidate.system.config_sync.secret.as_ref().unwrap();
+        let cause = anyhow!("TOML parse error at line 2, column 1\n2 | secret = \"unrecognised-source-credential\"\n  | invalid value")
+            .context(format!("peer refused {new:?} and old-credential"))
+            .context("reloading velstra.service");
+        let error = unwind_err(Rollback::new(), cause, "firewall", [&candidate, &previous]);
+        // The API renders the returned error directly, without the CLI helper.
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("TOML parse error at line 2, column 1"),
+            "{message}"
+        );
+        assert!(
+            message.contains("additional diagnostic lines omitted"),
+            "{message}"
+        );
+        for forbidden in [
+            new.as_str(),
+            "old-credential",
+            "unrecognised-source-credential",
+            "secret =",
+        ] {
+            assert!(!message.contains(forbidden), "{message}");
+        }
+        assert!(!message.contains(&format!("{new:?}")), "{message}");
+        assert!(message.contains(crate::redact::REDACTED), "{message}");
+        assert!(
+            message.ends_with("rolled back to the previous running config"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reload_diagnostic_escapes_terminal_controls_before_api_return() {
+        let error = unwind_err(
+            Rollback::new(),
+            anyhow!("reload refused: \u{1b}[2Jpolicy\tinvalid\u{7}")
+                .context("reloading velstra.service"),
+            "firewall",
+            [],
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("reloading velstra.service"), "{message}");
+        assert!(
+            message.contains("\\u{1b}[2Jpolicy\\tinvalid\\u{7}"),
+            "{message}"
+        );
+        assert!(
+            message.chars().all(|c| !c.is_control() || c == '\n'),
+            "{message:?}"
+        );
+    }
+
+    #[test]
+    fn reload_diagnostic_scrubs_multiline_credential_before_omitting_lines() {
+        let mut candidate =
+            crate::config::Appliance::from_toml("[system]\nhostname = \"test\"\n").unwrap();
+        candidate.system.config_sync.secret = Some("secret-first-line\nsecret-second-line".into());
+        let error = unwind_err(
+            Rollback::new(),
+            anyhow!("peer rejected secret-first-line\nsecret-second-line\nsource excerpt")
+                .context("reloading velstra.service"),
+            "firewall",
+            [&candidate],
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains(crate::redact::REDACTED), "{message}");
+        assert!(!message.contains("secret-first-line"), "{message}");
+        assert!(!message.contains("secret-second-line"), "{message}");
+        assert!(!message.contains("source excerpt"), "{message}");
+        assert!(
+            message.contains("additional diagnostic lines omitted"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reload_diagnostic_omits_incomplete_rollback_source_excerpts() {
+        let mut previous =
+            crate::config::Appliance::from_toml("[system]\nhostname = \"test\"\n").unwrap();
+        previous.system.config_sync.secret = Some("old-secret-first\nold-secret-second".into());
+        let mut rb = Rollback::new();
+        rb.push("routing", || {
+            Err(anyhow!(
+                "reload refused old-secret-first\nold-secret-second\nsecret = unknown-source-credential"
+            ))
+        });
+        let error = unwind_err(rb, anyhow!("candidate refused"), "hostname", [&previous]);
+        let message = format!("{error:#}");
+        assert!(message.contains("ROLLBACK INCOMPLETE"), "{message}");
+        assert!(message.contains("routing (reload refused"), "{message}");
+        assert!(message.contains(crate::redact::REDACTED), "{message}");
+        for forbidden in [
+            "old-secret-first",
+            "old-secret-second",
+            "unknown-source-credential",
+            "secret =",
+        ] {
+            assert!(!message.contains(forbidden), "{message}");
+        }
+    }
+
+    #[test]
+    fn reload_diagnostic_short_secret_redaction_is_bounded_and_idempotent() {
+        let secrets: Vec<_> = ["_", "a", "c", "d", "e", "r", "t", "é"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let text = "error: update refused é __redacted__";
+        let once = scrub_diagnostic_secrets(text, &secrets);
+        assert!(once.len() <= text.len() * crate::redact::REDACTED.len());
+        assert_eq!(scrub_diagnostic_secrets(&once, &secrets), once);
+        let unmasked = once.replace(crate::redact::REDACTED, "");
+        for secret in secrets {
+            assert!(!unmasked.contains(&secret), "{once}");
+        }
+    }
+
+    #[test]
+    fn reload_diagnostic_scrubs_complete_overlapping_and_marker_prefixed_secrets() {
+        let secrets = ["__redacted__private-suffix", "abcdef", "abc", "_", ""].map(str::to_string);
+        let once = scrub_diagnostic_secrets(
+            "rejected __redacted__private-suffix and abcdef; existing __redacted__",
+            &secrets,
+        );
+        assert_eq!(
+            once,
+            "rejected __redacted__ and __redacted__; existing __redacted__"
+        );
+        assert_eq!(scrub_diagnostic_secrets(&once, &secrets), once);
+    }
+
     /// The keywords offered for a context (drops the descriptions).
     fn kw(tokens: &[&str]) -> Vec<&'static str> {
         candidates(tokens).iter().map(|(k, _)| *k).collect()
+    }
+
+    #[test]
+    fn operational_firewall_completion_exposes_capacity_and_existing_views() {
+        let offered = kw(&["run", "show", "firewall"]);
+        for command in [
+            "capacity",
+            "states",
+            "counters",
+            "events",
+            "statistics",
+            "zones",
+        ] {
+            assert!(offered.contains(&command), "missing {command}: {offered:?}");
+        }
+        assert!(kw(&["run", "show", "firewall", "capacity"]).is_empty());
     }
 
     /// A successful reconcile with every covered stage restored is a TRUE

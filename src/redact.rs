@@ -640,10 +640,10 @@ mod tests {
         let mut names = std::collections::BTreeSet::new();
         for line in source.lines() {
             let line = line.trim();
-            if let Some(rest) = line.split("rename = \"").nth(1) {
-                if let Some(name) = rest.split('"').next() {
-                    names.insert(name.to_string());
-                }
+            if let Some(rest) = line.split("rename = \"").nth(1)
+                && let Some(name) = rest.split('"').next()
+            {
+                names.insert(name.to_string());
             }
             if let Some(field) = line
                 .strip_prefix("pub ")

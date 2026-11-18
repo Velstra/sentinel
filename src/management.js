@@ -9,6 +9,7 @@ const management = window.SentinelReact.mount({
   remote: () => !!target,
   member: () => target,
   updatesVisible: () => view === "system",
+  links: () => linkMeta(),
   refresh: () => refresh(),
   navigate: destination => goto(destination),
   signOut: message => signOut(message),

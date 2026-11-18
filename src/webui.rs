@@ -152,6 +152,79 @@ pub const GRAPHS: &[(&str, &str)] = &[
     ("synproxy_challenged", "SYNs challenged"),
 ];
 
+/// What each console field is for, in the CLI's own words.
+///
+/// Every keyword the grammar offers carries the one-line description the CLI
+/// prints at `?`. The console's fields are those same keywords, so the help a
+/// field shows is looked up here rather than written a second time: a console
+/// that explained a setting differently from the CLI would be two manuals to
+/// keep in step, and a field added to both gets its explanation for nothing.
+///
+/// Keyed by the setting's path with every freeform word (an interface's name, a
+/// neighbour's address, a rule's sequence) replaced by `*`, which is how the
+/// page finds the entry for whatever object it happens to be editing.
+fn field_help() -> std::collections::BTreeMap<String, String> {
+    let entries: Vec<[String; 3]> =
+        serde_json::from_str(include_str!("settings-index.json")).unwrap_or_default();
+    let mut help = std::collections::BTreeMap::new();
+    for [_label, _place, path] in &entries {
+        let words: Vec<&str> = path.split_whitespace().collect();
+        let mut tokens: Vec<&str> = vec!["set"];
+        let mut shape: Vec<&str> = Vec::new();
+        for (i, word) in words.iter().enumerate() {
+            let offered = crate::repl::candidates(&tokens);
+            match offered.iter().find(|(keyword, _)| keyword == word) {
+                Some((_, described)) => {
+                    shape.push(word);
+                    tokens.push(word);
+                    if i + 1 == words.len() {
+                        let text = tidy_help(described);
+                        if !text.is_empty() {
+                            help.insert(shape.join(" "), text);
+                        }
+                    }
+                }
+                // Not a keyword here: an object's own name.
+                None => {
+                    shape.push("*");
+                    tokens.push(if word.starts_with('<') { "x" } else { word });
+                }
+            }
+        }
+    }
+    help
+}
+
+/// A completion description, as the line under a field. Left in the CLI's own
+/// lower-case voice — the hints beside it are written the same way, and a
+/// capital would turn `tcp / udp` or `cake (shaper+AQM)` into words they are
+/// not — but without the `(true|false)` a switch already says by being one.
+fn tidy_help(described: &str) -> String {
+    let mut text = described.trim();
+    for tail in ["(true|false)", "(true/false)", "(bool)"] {
+        if let Some(rest) = text.strip_suffix(tail) {
+            text = rest.trim_end();
+        }
+    }
+    // "(true|false; default true)" keeps the half that is news.
+    text.replace("(true|false; ", "(")
+        .replace("(true|false, ", "(")
+}
+
+/// A JSON value as a literal inside the page's script. The script is scanned
+/// by guards that read `name(` as a call and `=>` as a function, and the page
+/// may not mention an outside URL, so the characters those look for are
+/// written as escapes — the string the browser sees is unchanged.
+fn script_literal(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "{}".into())
+        .replace('(', "\\u0028")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('$', "\\u0024")
+        .replace("//", "\\u002f\\u002f")
+}
+
 /// The console, as one document.
 pub fn page() -> String {
     let nav: String = PANELS
@@ -208,6 +281,12 @@ pub fn page() -> String {
     let management_css = include_str!("../ui/dist/management.css");
     let react_js = include_str!("../ui/dist/management.js");
     let max_port_range = crate::config::MAX_PORT_RANGE;
+    // Every setting a console mask offers, with the page that holds it: what
+    // lets "mtu" or "hostname" be found by name. Generated from the masks the
+    // console really builds (`tests/console/settings-index.mjs`), never typed —
+    // a hand-kept list beside the forms is a list that drifts from them.
+    let settings_index = include_str!("settings-index.json").trim();
+    let field_help = script_literal(&field_help());
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -1231,15 +1310,8 @@ pub fn page() -> String {
   }}
 
   /* --- staged changes ---------------------------------------------------- */
-  .staged {{
-    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4);
-    border-radius: var(--radius-sm); border-color: color-mix(in oklab, var(--product) 40%, var(--border));
-  }}
-  .staged .tile {{
-    display: grid; place-items: center; width: 34px; height: 34px; flex: none;
-    border-radius: var(--radius-sm); background: var(--product-subtle); color: var(--product);
-  }}
-  .staged .tile svg {{ width: 17px; height: 17px; }}
+  /* The dock's composition (position, wrapping, the room the page leaves for
+     it) lives in ui/src/shell.css with the rest of the shell. */
   .stagedtext {{ display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 220px; }}
   .stagedtext .t {{ font: var(--fw-semibold) var(--text-base) var(--font-sans); color: var(--text-strong); }}
   .stagedtext .b {{ font-size: var(--text-sm); color: var(--text-muted); }}
@@ -1330,7 +1402,12 @@ pub fn page() -> String {
     padding: var(--space-2) 0; border-bottom: 1px solid var(--border-subtle);
   }}
   .change:last-child {{ border-bottom: 0; }}
-  .change .what {{ flex: 1 1 auto; font-size: var(--text-sm); color: var(--text-body); }}
+  .change .what {{ flex: 1 1 auto; min-width: 0; font-size: var(--text-sm); color: var(--text-body); }}
+  /* An answer can run to several lines; its dot belongs to the first. */
+  #resultout .change {{ align-items: flex-start; }}
+  #resultout .change .dot {{ flex: none; margin-top: .5em; }}
+  #resultout .what {{ overflow-wrap: anywhere; line-height: 1.5; }}
+  #resultout .advice .lbl {{ display: block; color: var(--text-strong); font-weight: var(--fw-medium); }}
   #stagedlist {{ background: none; border: 0; border-left: 0; padding: 0; white-space: normal; }}
 
   /* --- dashboard tiles ---------------------------------------------------- */
@@ -1699,8 +1776,6 @@ pub fn page() -> String {
         <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/></svg>
       </button>
       <button class="iconbtn" id="theme" title="Appearance" aria-label="Appearance"></button>
-      <button class="btn" id="discard">Discard</button>
-      <button class="btn primary" id="applystaged">Apply</button>
       <!-- Who is driving. The identity sits where every console in the family
            puts it — top right — so the answer to "am I the right account for
            this?" never needs a trip to the sidebar. -->
@@ -1711,23 +1786,33 @@ pub fn page() -> String {
       <span class="pill warn hidden" id="permpill">read-only</span>
     </header>
 
-    <div class="card staged hidden" id="stagedcard">
-      <span class="tile"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></span>
-      <span class="stagedtext">
-        <span class="t" id="stagedtitle">Staged changes</span>
-        <span class="b">Your appliance is unchanged until you apply. Validate this batch,
-          then apply it when ready.</span>
-      </span>
-      <span class="row" style="flex:none">
-        <button class="btn" id="validate">Validate</button>
-        <button class="btn primary" id="applystaged2">Apply and save</button>
-      </span>
-      <div class="script" id="stagedlist" style="flex:1 1 100%"></div>
-    </div>
+    <!-- The change dock. Staging is the console's central promise — nothing
+         reaches the appliance until Apply — so the batch travels with the
+         operator at the foot of the window instead of pushing every page down
+         from the top. One row at rest: how much is waiting, what was staged
+         last, and the only Apply there is. Review opens the batch itself, each
+         change with the exact commands it will send. -->
+    <section class="staged hidden" id="stagedcard" aria-label="Staged changes">
+      <div class="stagedhead">
+        <span class="dot warn" aria-hidden="true"></span>
+        <span class="stagedtext">
+          <span class="t" id="stagedtitle">Staged changes</span>
+          <span class="b" id="stagedlatest" role="status" aria-live="polite">Nothing reaches the appliance until you apply.</span>
+        </span>
+        <span class="row stagedactions">
+          <button class="btn" id="stagedreview" type="button" aria-expanded="false" aria-controls="stagedlist">Review</button>
+          <button class="btn" id="discard" type="button">Discard</button>
+          <button class="btn" id="validate" type="button">Validate</button>
+          <button class="btn primary" id="applystaged" type="button">Apply and save</button>
+        </span>
+      </div>
+      <div class="script hidden" id="stagedlist"></div>
+    </section>
 
     <div id="react-confirmation"></div>
     <div class="secstrip" id="sectionstrip"></div>
     <div class="page" id="pagehead"></div>
+    <nav class="pageindex hidden" id="pageindex" aria-label="On this page"></nav>
     <p class="note hidden" id="write-boundary" role="status"></p>
 
     <div id="view-dashboard">
@@ -1736,6 +1821,17 @@ pub fn page() -> String {
            at -- how many links, how many routes, how many rules -- and a page
            that opens with a time series answers a question they have not asked
            yet. -->
+      <!-- First steps, read off the configuration: what a new appliance still
+           needs before it is a firewall somebody can hand over. It answers
+           "what do I do first?" on the page an operator lands on, and it goes
+           away by itself once the answers are in the configuration. -->
+      <details class="setup hidden" id="setupcard">
+        <summary>
+          <span class="st" id="setuptitle">Finish setting up</span>
+          <span class="sb" id="setupsummary"></span>
+        </summary>
+        <ol id="setuplist"></ol>
+      </details>
       <div id="react-dashboard"></div>
       <details class="dashboard-details"><summary>System details and diagnostics<span>Addresses, routes, logs and counters</span></summary>
       <div class="stats" id="stats"></div>
@@ -1780,8 +1876,8 @@ pub fn page() -> String {
     <div id="view-rules" class="hidden">
       <div class="toolbar">
         <label class="inline">
-          <span>Default policy</span>
-          <select id="defaultpolicy">
+          <span>When no rule matches</span>
+          <select id="defaultpolicy" title="The global default action for traffic no rule and no zone posture decides">
             <option value="">(unchanged)</option>
             <option value="drop">drop</option>
             <option value="reject">reject</option>
@@ -1805,10 +1901,8 @@ pub fn page() -> String {
     <div id="view-zones" class="hidden">
       <div class="card">
         <h3>Global posture</h3>
-        <p class="lede" style="margin:0 0 var(--space-3)">
-          What every zone inherits. A zone leaving a field unset takes the value
-          from here — the same thing as leaving it out of the config.
-        </p>
+        <p class="lede" style="margin:0 0 var(--space-3)">What every zone inherits.</p>
+      <details class="ledemore"><summary>Details</summary><p>A zone leaving a field unset takes the value from here — the same thing as leaving it out of the config.</p></details>
         <div class="addpanel" id="globalform"></div>
       </div>
 
@@ -1849,10 +1943,8 @@ pub fn page() -> String {
 
       <div class="card">
         <h3>NAT64</h3>
-        <p class="lede" style="margin:0 0 var(--space-4)">
-          Translate IPv6 clients to IPv4 using this prefix. Clients also need
-          DNS64 to resolve IPv4-only names into the translation prefix.
-        </p>
+        <p class="lede" style="margin:0 0 var(--space-4)">Translate IPv6 clients to IPv4 using this prefix.</p>
+      <details class="ledemore"><summary>Details</summary><p>Clients also need DNS64 to resolve IPv4-only names into the translation prefix.</p></details>
         <div class="grid" id="nat64form"></div>
       </div>
 
@@ -1945,11 +2037,8 @@ pub fn page() -> String {
         <label class="inline"><span>on</span><select id="mapiface"></select></label>
         <button class="btn" id="togglemap" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
-      <p class="lede inset" style="margin:0 0 var(--space-4)">
-        The same address every time, for a machine that has to be findable. The
-        address must be in the server's subnet but outside its pool, or the
-        server will hand it to somebody else as well.
-      </p>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">The same address every time, for a machine that has to be findable.</p>
+      <details class="ledemore"><summary>Details</summary><p>The address must be in the server's subnet but outside its pool, or the server will hand it to somebody else as well.</p></details>
       <div class="card addpanel hidden" id="addmappanel"></div>
       <div id="maplist"></div>
 
@@ -1959,11 +2048,8 @@ pub fn page() -> String {
         <label class="inline"><span>on</span><select id="raiface"></select></label>
         <button class="btn" id="enablera">Enable</button>
       </div>
-      <p class="lede inset" style="margin:0 0 var(--space-4)">
-        How IPv6 hosts learn there is a router and what prefix to use. Managed
-        sends them to DHCPv6 for an address as well; other-config sends them
-        there for everything but the address.
-      </p>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">How IPv6 hosts learn there is a router and what prefix to use.</p>
+      <details class="ledemore"><summary>Details</summary><p>Managed sends them to DHCPv6 for an address as well; other-config sends them there for everything but the address.</p></details>
       <div id="ralist"></div>
 
       <div class="card"><h3>Leases</h3><pre class="out" id="dhcpshow">…</pre></div>
@@ -2030,11 +2116,8 @@ pub fn page() -> String {
       <div id="calist"></div>
       <div class="card">
         <h3>Automatic issuance</h3>
-        <p class="lede" style="margin:0 0 var(--space-4)">
-          A certificate with <code>ca = "acme"</code> is obtained from this
-          directory instead of signed here. The appliance has to be reachable
-          for the challenge it agrees to answer.
-        </p>
+        <p class="lede" style="margin:0 0 var(--space-4)">A certificate with <code>ca = "acme"</code> is obtained from this directory instead of signed here.</p>
+      <details class="ledemore"><summary>Details</summary><p>The appliance has to be reachable for the challenge it agrees to answer.</p></details>
         <div class="grid" id="acmeform"></div>
       </div>
     </div>
@@ -2075,10 +2158,8 @@ pub fn page() -> String {
 
       <div class="card">
         <h3>Where a password is checked</h3>
-        <p class="lede" style="margin:0 0 var(--space-4)">
-          Use an authentication server for central accounts. Local passwords are
-          tried first, retaining access when the directory is unreachable.
-        </p>
+        <p class="lede" style="margin:0 0 var(--space-4)">Use an authentication server for central accounts.</p>
+      <details class="ledemore"><summary>Details</summary><p>Local passwords are tried first, retaining access when the directory is unreachable.</p></details>
         <div class="grid" id="aaa-form"></div>
       </div>
       <div class="section">
@@ -2094,10 +2175,8 @@ pub fn page() -> String {
         <span class="spacer"></span>
         <button class="btn" id="toggleldap" disabled data-config-loading aria-busy="true" title="Loading configuration…">New directory</button>
       </div>
-      <p class="lede inset" style="margin:0 0 var(--space-4)">
-        Authenticate with a direct user bind. Set the account base and username
-        attribute; no directory-search service account is required.
-      </p>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">Authenticate with a direct user bind.</p>
+      <details class="ledemore"><summary>Details</summary><p>Set the account base and username attribute; no directory-search service account is required.</p></details>
       <div class="card addpanel hidden" id="addldappanel"></div>
       <div id="ldaplist"></div>
 
@@ -2113,10 +2192,8 @@ pub fn page() -> String {
         <h3>Accounts as the appliance sees them</h3>
         <pre class="out" id="usersshow">…</pre>
       </div>
-      <p class="lede" style="margin:var(--space-3) 0 0">
-        Read-only inspects permitted data. Read-write can stage and apply
-        configuration through the same validated workflow as the CLI.
-      </p>
+      <p class="lede" style="margin:var(--space-3) 0 0">Read-only inspects permitted data.</p>
+      <details class="ledemore"><summary>Details</summary><p>Read-write can stage and apply configuration through the same validated workflow as the CLI.</p></details>
     </div>
 
     <div id="view-synproxy" class="hidden">
@@ -2171,11 +2248,8 @@ pub fn page() -> String {
         <span class="spacer"></span>
         <button class="btn" id="toggleevi" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
-      <p class="lede">
-        A layer-2 segment and the local ports on it. The VNI is the segment's id
-        on the wire and the data plane's id for it, so two segments cannot share
-        one.
-      </p>
+      <p class="lede">A layer-2 segment and the local ports on it.</p>
+      <details class="ledemore"><summary>Details</summary><p>The VNI is the segment's id on the wire and the data plane's id for it, so two segments cannot share one.</p></details>
       <div class="card addpanel hidden" id="addevipanel"></div>
       <div id="evilist"></div>
       <div class="section">
@@ -2212,10 +2286,8 @@ pub fn page() -> String {
       </div>
       <div class="card">
         <h3>Independent witness</h3>
-        <p class="lede" style="margin:0 0 var(--space-4)">
-          Configure this only on the independent witness appliance. Its
-          enrollment credential must match the pair's configuration sync secret.
-        </p>
+        <p class="lede" style="margin:0 0 var(--space-4)">Configure this only on the independent witness appliance.</p>
+      <details class="ledemore"><summary>Details</summary><p>Its enrollment credential must match the pair's configuration sync secret.</p></details>
         <div class="grid" id="hawitnessform"></div>
       </div>
       <div class="section">
@@ -2223,11 +2295,10 @@ pub fn page() -> String {
         <span class="spacer"></span>
         <button class="btn" id="togglevrrp" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
-      <p class="lede">
-        A tracked interface is what makes failover mean something: when it goes
-        down this box lowers its own priority by the decrement, and the peer —
-        which did not lose that link — takes the address.
-      </p>
+      <p class="lede">A tracked interface makes failover follow a lost link.</p>
+      <details class="ledemore"><summary>Details</summary><p>When a tracked interface goes
+        down this box lowers its own priority by the decrement, and the peer — which did not
+        lose that link — takes the address.</p></details>
       <div class="card addpanel hidden" id="addvrrppanel"></div>
       <div id="vrrplist"></div>
 
@@ -2266,11 +2337,8 @@ pub fn page() -> String {
     <div id="view-wan" class="hidden">
       <div class="card">
         <h3>Mode</h3>
-        <p class="lede" style="margin:0 0 var(--space-4)">
-          Failover uses the highest-priority uplink that is up; load-balance
-          spreads new connections across them by weight. An uplink with no health
-          check is assumed up, which is what makes a check worth configuring.
-        </p>
+        <p class="lede" style="margin:0 0 var(--space-4)">Failover uses the highest-priority uplink that is up; load-balance spreads new connections across them by weight.</p>
+      <details class="ledemore"><summary>Details</summary><p>An uplink with no health check is assumed up, which is what makes a check worth configuring.</p></details>
         <div class="grid" id="wan-mode"></div>
       </div>
       <div class="section">
@@ -2286,10 +2354,8 @@ pub fn page() -> String {
         <span class="spacer"></span>
         <button class="btn" id="togglewanpolicy" disabled data-config-loading aria-busy="true" title="Loading configuration…">New policy</button>
       </div>
-      <p class="lede inset" style="margin:0 0 var(--space-4)">
-        Assign traffic to preferred uplinks and define when it should move to a
-        fallback. Uplink health targets and limits govern availability.
-      </p>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">Assign traffic to preferred uplinks and define when it should move to a fallback.</p>
+      <details class="ledemore"><summary>Details</summary><p>Uplink health targets and limits govern availability.</p></details>
       <div class="card addpanel hidden" id="addwanpolicypanel"></div>
       <div id="wanpolicylist"></div>
 
@@ -2365,13 +2431,12 @@ pub fn page() -> String {
       </div>
       <div class="card addpanel hidden" id="addsysctlpanel"></div>
       <div id="sysctllist"></div>
-      <p class="lede" style="margin:var(--space-3) 0 var(--space-6)">
-        Only <code>net.*</code> and <code>vm.*</code> parameters are allowed.
-        For example, <code>net.ipv4.ip_nonlocal_bind</code> permits binding an address not held locally.
-      </p>
+      <p class="lede" style="margin:var(--space-3) 0 var(--space-6)">Only <code>net.*</code> and <code>vm.*</code> parameters are allowed.</p>
+      <details class="ledemore"><summary>Details</summary><p>For example, <code>net.ipv4.ip_nonlocal_bind</code> permits binding an address not held locally.</p></details>
       <div class="card">
         <h3>Fleet enrollment</h3>
-        <p class="lede">Optional outbound management with a provisioned client identity and a pinned command-signing key. Leave unconfigured for standalone operation. Remove the complete fleet section in the configuration editor to disconnect.</p>
+        <p class="lede">Optional outbound management with a provisioned client identity and a pinned command-signing key.</p>
+      <details class="ledemore"><summary>Details</summary><p>Leave unconfigured for standalone operation. Remove the complete fleet section in the configuration editor to disconnect.</p></details>
         <div class="grid" id="sys-fleet"></div>
         <button class="btn" id="disconnect-fleet">Disconnect fleet</button>
       </div>
@@ -2387,10 +2452,8 @@ pub fn page() -> String {
         <span class="spacer"></span>
         <button class="btn" id="toggleupchan" disabled data-config-loading aria-busy="true" title="Loading configuration…">New channel</button>
       </div>
-      <p class="lede inset" style="margin:0 0 var(--space-4)">
-        Each channel has its own signing key. Subscriptions gate updates, not features;
-        expiry stops new downloads without changing the running appliance.
-      </p>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">Each channel has its own signing key.</p>
+      <details class="ledemore"><summary>Details</summary><p>Subscriptions gate updates, not features; expiry stops new downloads without changing the running appliance.</p></details>
       <div class="card addpanel hidden" id="addupchanpanel"></div>
       <div id="upchanlist"></div>
       <div class="card"><h3>Subscription</h3><pre class="out" id="subshow">…</pre></div>
@@ -2420,11 +2483,8 @@ pub fn page() -> String {
           <span class="spacer"></span>
           <button class="btn" id="toggleagg" disabled data-config-loading aria-busy="true" title="Loading configuration…">New aggregate</button>
         </div>
-        <p class="lede inset" style="margin:0 0 var(--space-4)">
-          One prefix announced in place of the more specific ones inside it.
-          Summary-only suppresses those; without it both go out, which is a
-          bigger table for the same reachability.
-        </p>
+        <p class="lede inset" style="margin:0 0 var(--space-4)">One prefix announced in place of the more specific ones inside it.</p>
+      <details class="ledemore"><summary>Details</summary><p>Summary-only suppresses those; without it both go out, which is a bigger table for the same reachability.</p></details>
         <div class="card addpanel hidden" id="addaggpanel"></div>
         <div id="agglist"></div>
         <div class="section">
@@ -2432,10 +2492,8 @@ pub fn page() -> String {
           <span class="spacer"></span>
           <button class="btn" id="toggleroa" disabled data-config-loading aria-busy="true" title="Loading configuration…">New authorisation</button>
         </div>
-        <p class="lede inset" style="margin:0 0 var(--space-4)">
-          Which AS may originate a prefix, stated locally rather than fetched
-          from a validator. Useful where there is no RTR server to ask.
-        </p>
+        <p class="lede inset" style="margin:0 0 var(--space-4)">Which AS may originate a prefix, stated locally rather than fetched from a validator.</p>
+      <details class="ledemore"><summary>Details</summary><p>Useful where there is no RTR server to ask.</p></details>
         <div class="card addpanel hidden" id="addroapanel"></div>
         <div id="roalist"></div>
         <div class="section">
@@ -2486,10 +2544,8 @@ pub fn page() -> String {
 
       <div class="tabpane hidden" data-tab="multicast">
         <div class="card"><div class="grid" id="mcastform"></div></div>
-        <p class="lede inset" style="margin:0 0 var(--space-4)">
-          Configure a querier within each segment and PIM between segments.
-          Sparse mode needs a rendezvous point; add every PIM link as a multicast interface below.
-        </p>
+        <p class="lede inset" style="margin:0 0 var(--space-4)">Configure a querier within each segment and PIM between segments.</p>
+      <details class="ledemore"><summary>Details</summary><p>Sparse mode needs a rendezvous point; add every PIM link as a multicast interface below.</p></details>
         <div class="section">
           <h3>Interfaces</h3>
           <span class="spacer"></span>
@@ -2535,7 +2591,8 @@ pub fn page() -> String {
       <div class="tabpane hidden" data-tab="resolution">
         <div class="card"><h3>DNS resolver</h3><div class="grid" id="svc-dns"></div></div>
         <div class="card"><h3>NTP · appliance clock and optional LAN service</h3>
-          <p class="lede">Upstreams synchronise this appliance; leave empty for image defaults. LAN serving (<code>serve-on</code>) is optional and not required for clock synchronisation.</p>
+          <p class="lede">Upstreams synchronise this appliance; leave empty for image defaults.</p>
+      <details class="ledemore"><summary>Details</summary><p>LAN serving (<code>serve-on</code>) is optional and not required for clock synchronisation.</p></details>
           <p class="lede">Restrict <code>allow-from</code> to trusted LANs. Never expose NTP to <code>0.0.0.0/0</code> or <code>::/0</code>.</p>
           <div class="grid" id="svc-ntp"></div></div>
       </div>
@@ -2595,11 +2652,8 @@ pub fn page() -> String {
         <div class="card"><h3>Alert mail</h3><div class="grid" id="svc-alertmail"></div></div>
         <div class="card">
           <h3>Flow export (IPFIX)</h3>
-          <p class="lede" style="margin:0 0 var(--space-4)">
-            Every connection this box tracks, shipped to a collector as RFC 7011
-            records. What is sent is the change since the last export, not a
-            running total — a collector sums what it receives.
-          </p>
+          <p class="lede" style="margin:0 0 var(--space-4)">Every connection this box tracks, shipped to a collector as RFC 7011 records.</p>
+      <details class="ledemore"><summary>Details</summary><p>What is sent is the change since the last export, not a running total — a collector sums what it receives.</p></details>
           <div class="grid" id="svc-flow"></div>
         </div>
 
@@ -2677,11 +2731,8 @@ pub fn page() -> String {
       </div>
       <div class="card">
         <h3 id="logheading">Refused packets</h3>
-        <p class="lede" style="margin:0 0 var(--space-3)">
-          The data plane writes a line for every packet it turns away. This reads
-          them back out of the journal, so traffic that is disappearing can be
-          found without a shell on the appliance.
-        </p>
+        <p class="lede" style="margin:0 0 var(--space-3)">The data plane writes a line for every packet it turns away.</p>
+      <details class="ledemore"><summary>Details</summary><p>This reads them back out of the journal, so traffic that is disappearing can be found without a shell on the appliance.</p></details>
         <div id="loglist"><p class="empty">Not read yet.</p></div>
       </div>
     </div>
@@ -2729,11 +2780,8 @@ pub fn page() -> String {
         <h3>Members</h3>
         <p id="stack-sync-note" class="note hidden" role="status"></p>
         <div class="tblwrap"><table id="stacktable"></table></div>
-        <p class="lede" style="margin:var(--space-3) 0 0">
-          A member is a <code>system config-sync peer</code> — the boxes this one
-          already pushes its running config to. Selecting one points the read-only
-          views at it; configuration is always applied here and synced on commit.
-        </p>
+        <p class="lede" style="margin:var(--space-3) 0 0">A member is a <code>system config-sync peer</code> — the boxes this one already pushes its running config to.</p>
+      <details class="ledemore"><summary>Details</summary><p>Selecting one points the read-only views at it; configuration is always applied here and synced on commit.</p></details>
       </div>
     </div>
 
@@ -2782,10 +2830,10 @@ pub fn page() -> String {
      opened with Cmd/Ctrl-K, driven by the arrows and Enter, closed with Esc.
      It reuses the rail's own activation — `goto` for a view, the panel swap for
      a look — so there is one code path to a page however you reach it. -->
-<dialog id="palette" aria-label="Jump to a page">
-  <input id="paletteq" placeholder="Jump to a page…" autocomplete="off"
+<dialog id="palette" aria-label="Jump to a page or setting">
+  <input id="paletteq" placeholder="Jump to a page or setting…" autocomplete="off"
          role="combobox" aria-controls="palettelist" aria-expanded="true">
-  <div id="palettelist" role="listbox" aria-label="Pages"></div>
+  <div id="palettelist" role="listbox" aria-label="Pages and settings"></div>
 </dialog>
 
 <script data-sentinel-react>
@@ -3415,18 +3463,35 @@ async function refreshRules() {{
   const list = $("rulelist");
   list.textContent = "";
   if (!rules.length) {{
-    list.append(el("p", {{ class: "empty", text: "No rules configured." }}));
+    list.append(emptyState({{
+      text: "No rules configured.",
+      hint: "Until a rule says otherwise, traffic follows each zone's default action.",
+      action: "Add a firewall rule", toggleId: "togglerule",
+    }}));
   }} else {{
     const body = el("tbody", {{}});
     rules.forEach((r, i) => body.append(ruleRow(r, i, zones, hitsAnswered ? hits : null)));
-    list.append(el("div", {{ class: "tblwrap" }}, [
-      el("table", {{ class: "otbl" }}, [
-        el("thead", {{}}, [el("tr", {{}},
-          ["order", "action", "rule", "match", "open", "carrying", "note", ""]
-          .map((h) => el("th", {{ text: h }})))]),
-        body,
-      ]),
-    ]));
+    // Column heads in the words an operator would use for them. "In use" is the
+    // live column: what each accept rule is carrying right now.
+    const heads = [
+      ["#", "Order of evaluation"], ["Action", ""], ["Name", ""],
+      ["Traffic", "From zone → to zone, protocol and port; addresses and groups when the rule names them"],
+      ["Schedule", "When the rule is open"],
+      ["In use", "Connections each accept rule is carrying right now"],
+      ["Notes", "Description and rate limit"], ["", ""],
+    ];
+    const table = el("table", {{ class: "otbl" }}, [
+      el("thead", {{}}, [el("tr", {{}}, heads.map(([h, title]) => {{
+        const th = el("th", {{ text: h }});
+        th.setAttribute("scope", "col");
+        if (title) th.title = title;
+        return th;
+      }}))]),
+      body,
+    ]);
+    // A filter earns its place once the list no longer fits in one glance.
+    if (rules.length > 6) list.append(tableFilter(body, "rule", rules.length));
+    list.append(el("div", {{ class: "tblwrap" }}, [table]));
   }}
   // The rules are a list until you can see which of them the box is using.
   await showInto("rulesshow", "/api/v1/show/firewall/statistics");
@@ -3450,6 +3515,11 @@ function ruleRow(r, i, zones, hits) {{
   const dest = r["destination-group"] ? "group " + r["destination-group"]
                                       : (r.destination || "any");
   const ports = r["port-group"] ? "group " + r["port-group"] : (r.port || "any");
+  // A port number an operator has to look up is a rule they cannot audit at a
+  // glance: 443 reads as https for the same table the port field suggests from.
+  const service = (!r["port-group"] && WELL_KNOWN_PORTS[Number(r.port)]) || "";
+  const matchLine = (r.from || "any") + " → " + (r.to || "any") +
+    (r.proto ? " · " + r.proto + "/" + ports : "");
 
   // The schedule is three settings; on a board it is one column — nobody reads
   // "days", "start" and "end" as three separate facts about a rule.
@@ -3480,13 +3550,12 @@ function ruleRow(r, i, zones, hits) {{
     // the default earns no place at all, let alone the lead.
     el("td", {{}}, (source === "any" && dest === "any")
       ? [
-          el("span", {{ class: "val", text: (r.from || "any") + " → " + (r.to || "any") +
-            (r.proto ? " · " + r.proto + "/" + ports : "") }}),
+          el("span", {{ class: "val", text: matchLine }}),
+          ...(service ? [el("span", {{ class: "sub", text: service }})] : []),
         ]
       : [
           el("span", {{ class: "val", text: source + " → " + dest }}),
-          el("span", {{ class: "sub", text: (r.from || "any") + " → " + (r.to || "any") +
-            (r.proto ? " · " + r.proto + "/" + ports : "") }}),
+          el("span", {{ class: "sub", text: matchLine + (service ? " (" + service + ")" : "") }}),
         ]),
     el("td", {{}}, [el("span", {{ class: "val dim", text: open }})]),
     el("td", {{}}, carrying(r, action, hits)),
@@ -3716,25 +3785,71 @@ function renderStaged() {{
     $("stagedbadge").className = "pill" + (n ? " warn" : " rest");
   }}
   $("stagedbadge").title = n ? "Review the staged changes" : "";
-  // Apply and Discard only exist while there is something to apply or discard —
-  // a resting header must not offer actions that would do nothing.
-  $("discard").classList.toggle("hidden", n === 0);
-  $("applystaged").classList.toggle("hidden", n === 0);
+  // The dock only exists while there is something to apply or discard — a
+  // resting console must not offer actions that would do nothing. The page
+  // makes room for it, so the last control of a long form can still be
+  // scrolled clear of it.
   $("stagedcard").classList.toggle("hidden", n === 0);
+  $("app").toggleAttribute("data-staged", n > 0);
   $("stagedtitle").textContent = n + " staged change" + (n === 1 ? "" : "s");
+  // What was staged last, in the operator's own words: the answer to "did
+  // that button do anything?" without opening the review.
+  $("stagedlatest").textContent = n
+    ? "Last: " + staged[n - 1].label + " — nothing reaches the appliance until you apply."
+    : "Nothing reaches the appliance until you apply.";
+  if (!n) {{
+    stagedOpen = false;
+    // The masks are keyed by the protected lines themselves; an empty batch
+    // has no use for them, and sign-out empties the batch.
+    reviewMasks.clear();
+  }}
+  $("stagedreview").setAttribute("aria-expanded", String(stagedOpen));
+  $("stagedreview").textContent = stagedOpen ? "Hide review" : "Review";
 
   const list = $("stagedlist");
+  list.classList.toggle("hidden", !stagedOpen || n === 0);
   list.textContent = "";
   staged.forEach((entry, i) => {{
+    // A change is its label and the commands behind it. The commands are what
+    // the appliance will be sent, so the review shows them — except a secret,
+    // which is masked here exactly as its own field masks it.
+    const cmds = el("pre", {{ class: "cmds", text: entry.cmds.map(reviewLine).join("\n") }});
     list.append(el("div", {{ class: "change" }}, [
       el("span", {{ class: "dot warn" }}),
-      el("span", {{ class: "what", text: entry.label }}),
+      el("div", {{ class: "what" }}, [
+        el("span", {{ class: "lbl", text: entry.label }}),
+        cmds,
+      ]),
       el("button", {{
         class: "btn", text: "Remove",
+        "aria-label": "Remove staged change: " + entry.label,
         onclick: () => {{ staged.splice(i, 1); renderStaged(); }},
       }}),
     ]));
   }});
+}}
+
+// Whether the review is open. Kept out of the batch: opening it changes nothing.
+let stagedOpen = false;
+
+// One staged command as the review prints it. The batch can carry credentials
+// — a pre-shared key, a peer identity, a password hash — and a review that
+// printed them would put a secret on a shared screen that its own field keeps
+// masked. The setting's name stays, so the operator still sees *that* it
+// changes; the value does not.
+//
+// Two owners, on purpose. `fieldLines` knows a field is protected from the same
+// classification that masks its input, and records the line it wrote. The word
+// check behind it covers a bespoke control that stages a credential without
+// going through a field table.
+const reviewMasks = new Map();
+function reviewLine(cmd) {{
+  const masked = reviewMasks.get(cmd);
+  if (masked) return masked;
+  const words = String(cmd).split(" ");
+  if (words[0] !== "set" || words.length < 3) return cmd;
+  const at = words.findIndex((w, i) => i > 0 && i < words.length - 1 && SECRETS.includes(w));
+  return at < 0 ? cmd : words.slice(0, at + 1).join(" ") + " ••••••";
 }}
 
 // `tail` is what turns a script into an intention: nothing commits, `commit`
@@ -3763,7 +3878,7 @@ async function applyStaged(tail) {{
   // Say that it is happening. An apply takes a second or two on the box and
   // longer on a slow link, and a button that goes quiet for that long reads
   // as a button that did nothing — which is when somebody presses it again.
-  const working = busy(["applystaged", "applystaged2", "validate"], "Applying…");
+  const working = busy(["applystaged", "validate"], "Applying…");
   try {{
     await applyStagedNow(tail);
   }} finally {{
@@ -3798,34 +3913,16 @@ function busy(ids, label) {{
 }}
 
 async function applyStagedNow(tail) {{
-  // The batch runs once, and the appliance's own report is the answer.
-  //
-  // Applying used to run every command twice: once with no `commit` to see
-  // whether the batch "would be refused", and then again for real. The check
-  // could not know anything the real run would not — it ran the same lines
-  // against the same configuration — so all it bought was a second execution
-  // of the whole batch on every single apply. What it cost was worse: any
-  // reply with an `error:` line in it stopped the apply outright, so one
-  // refused command meant the changes staged *beside* it were never applied
-  // either, and since the refusal names the setting but not which staged
-  // change contained it, an operator with several waiting could be left unable
-  // to save any of them. The appliance runs a batch line by line, commits what
-  // survived and says what it refused; that report is what to show.
-  //
-  // Checking first is still here — it is what Validate is, and an operator who
-  // wants to know before touching the box presses it. What is gone is the
-  // hidden second run that every apply paid for and that could refuse a change
-  // the appliance was willing to take.
-  //
-  // Validating runs the same commands with no `commit`, so nothing is applied
-  // — and the staged list must survive it. Clearing on a *validate* was the
-  // worst possible bug in this panel: the check said "fine", the panel emptied
-  // itself, and the change an operator had just been told was good could no
-  // longer be applied.
+  // Submit once. The management endpoint validates the complete candidate
+  // before any write; HTTP 400 preserves the entire batch. Validate has no
+  // commit and must also leave the staged list intact.
   const committed = tail.includes("commit");
+  // Attribute a numbered refusal to what was submitted, not a later draft.
+  const batch = staged.map((entry) => ({{ label: entry.label, cmds: entry.cmds.slice() }}));
+  const sent = batch.flatMap((entry) => entry.cmds);
   let r;
   try {{
-    r = await configure(stagedCommands().concat(tail));
+    r = await configure(sent.concat(tail));
   }} catch (e) {{
     // An apply that never reached the appliance has to say so. Left to throw,
     // the page swallowed it: no dialog, no banner, the changes still staged —
@@ -3833,11 +3930,11 @@ async function applyStagedNow(tail) {{
     if (committed) await refreshTransaction();
     showResult({{ ok: false, uncertain: committed && !e.status,
       output: "error: " + (e.message || e) + (committed && !e.status
-        ? " The request may have started. Check the pending revision after reconnecting; recovery runs independently." : "") }}, committed);
+        ? " The request may have started. Check the pending revision after reconnecting; recovery runs independently." : "") }}, committed, refusedChange(e, batch), sent);
     return;
   }}
   const refused = !r.ok || summarise(r.output).some((n) => n.kind === "bad");
-  showResult(r, committed, refused ? await culprit() : null);
+  showResult(r, committed, refused ? await culprit() : null, sent);
   // Only clear once they have actually run. A refused commit leaves the
   // commands staged, so the operator can fix one and try again rather than
   // reconstructing what they had clicked.
@@ -3848,6 +3945,23 @@ async function applyStagedNow(tail) {{
   }}
   await buildSearchIndex();
   await refresh();
+}}
+
+// The API numbers physical request lines. Never infer blame from an unnumbered
+// candidate-level error, a permission/transport failure, or an out-of-range
+// line (including a trailing commit/save). This requires no replay request.
+function refusedChange(error, batch) {{
+  if (error.status !== 400) return null;
+  const match = /^line ([1-9][0-9]*) refused:/.exec(error.message || "");
+  if (!match) return null;
+  let line = Number(match[1]);
+  if (!Number.isSafeInteger(line)) return null;
+  for (const entry of batch) {{
+    const count = entry.cmds.reduce((sum, command) => sum + command.split("\n").length, 0);
+    if (line <= count) return entry.label;
+    line -= count;
+  }}
+  return null;
 }}
 
 // Which staged change the appliance refused.
@@ -3922,9 +4036,59 @@ function summarise(output) {{
   return notes;
 }}
 
-function showResult(r, committed, blamed) {{
+// The appliance's advisories, each said once.
+//
+// A commit warns about the whole configuration, one line per object, and most
+// of those lines say the same thing about a different object: a policy written
+// as zone pairs draws one paragraph per rule, at every apply, including the
+// apply that only renamed the box. A wall like that is read once and never
+// again, and the line about the rule just written is somewhere inside it. So
+// lines that differ only in the object they name become one line naming them
+// all, and a line that names something in this batch comes first. Nothing is
+// dropped and nothing is reworded — the sentence is the appliance's, and the
+// name it opened with becomes the row's heading.
+//
+// "In this batch" is read from the commands, not guessed from the words: an
+// advisory about `rule "ssh"` belongs to a batch that says `… rule ssh …`,
+// and not to one that merely sets `services ssh port`.
+const ADVICE = /^([a-z][a-z0-9 -]*?) "([^"]+)": ([\s\S]+)$/;
+function advisories(notes, sent) {{
+  // Every adjacent pair of words the batch sent: "rule ssh", "ssh port", …
+  const pairs = new Set((sent || []).flatMap((c) => {{
+    const w = String(c).split(" ");
+    return w.slice(1).map((word, i) => w[i] + " " + word);
+  }}));
+  const sentFor = (g, name) => pairs.has(g.kind.split(" ").pop() + " " + name);
+  const groups = new Map();
+  for (const n of notes) {{
+    const m = ADVICE.exec(n.text);
+    const kind = m ? m[1] : "";
+    const text = m ? m[3] : n.text;
+    const key = JSON.stringify([kind, text]);
+    if (!groups.has(key)) groups.set(key, {{ kind, text, names: [] }});
+    if (m && !groups.get(key).names.includes(m[2])) groups.get(key).names.push(m[2]);
+  }}
+  return [...groups.values()].map((g) => {{
+    const mine = (name) => (sentFor(g, name) ? 0 : 1);
+    const names = g.names.slice().sort((x, y) => mine(x) - mine(y));
+    // "rule" for one and "rules" for several, where adding an s is English; a
+    // kind that is already a path ("services dns") stays as it was written.
+    const kind = names.length > 1 && /^[a-z]*[a-rt-xz]$/.test(g.kind) ? g.kind + "s" : g.kind;
+    return {{
+      subject: names.length ? kind.charAt(0).toUpperCase() + kind.slice(1) + " " + names.join(", ") : "",
+      text: g.text,
+      mine: names.some((name) => sentFor(g, name)),
+    }};
+  }}).sort((x, y) => (x.mine ? 0 : 1) - (y.mine ? 0 : 1));
+}}
+
+function showResult(r, committed, blamed, sent) {{
   $("result").dataset.transaction = r.pending?.id || "";
-  const notes = summarise(r.output);
+  const said = summarise(r.output);
+  // An advisory is about the configuration, not about whether this went
+  // through. The answer comes first and the advice follows it.
+  const advice = advisories(said.filter((n) => n.kind === "warn"), sent);
+  const notes = said.filter((n) => n.kind !== "warn");
   const failed = notes.some((n) => n.kind === "bad");
   // The appliance runs the commands it can and reports what it could not: a
   // batch that is refused *and* committed leaves the box changed, and calling
@@ -3946,7 +4110,7 @@ function showResult(r, committed, blamed) {{
     }});
   }}
   if (!committed && !failed) {{
-    notes.push({{ kind: "ok", text: "Press Apply when you are ready." }});
+    notes.push({{ kind: "ok", text: "Press Apply and save in the bar below when you are ready." }});
   }}
   if (partly) {{
     notes.unshift({{ kind: "warn", text:
@@ -3963,6 +4127,15 @@ function showResult(r, committed, blamed) {{
     box.append(el("div", {{ class: "change" }}, [
       el("span", {{ class: "dot " + (n.kind === "bad" ? "down" : n.kind === "warn" ? "warn" : "up") }}),
       el("span", {{ class: "what", text: n.text }}),
+    ]));
+  }}
+  for (const a of advice) {{
+    box.append(el("div", {{ class: "change advice" }}, [
+      el("span", {{ class: "dot warn" }}),
+      el("div", {{ class: "what" }}, [
+        ...(a.subject ? [el("span", {{ class: "lbl", text: a.subject }})] : []),
+        el("span", {{ text: a.text }}),
+      ]),
     ]));
   }}
   $("result").showModal();
@@ -4220,7 +4393,7 @@ const HINTS = {{
 
 // One hint per field, recomputed as it is typed into. Debounced because the
 // asynchronous ones cross the network, and a keystroke is not a question.
-function wireHint(field, widget, box, values) {{
+function wireHint(field, widget, box, values, quiet) {{
   if (isUpdateSigningKey(field[0])) {{
     box.textContent = "Paste an Ed25519 PUBLIC KEY PEM or use file:/etc/sentinel/release.pem; never paste a private key.";
     return () => {{}};
@@ -4233,16 +4406,31 @@ function wireHint(field, widget, box, values) {{
   // is no longer what happens. Not under a dropdown: its unset entry says the
   // same thing already, and twice is once too often.
   const gloss = widget.tagName === "SELECT" ? "" : defaultGloss(field[0]);
-  if (!compute && !gloss) return () => {{}};
+  // What the field is for, when nothing more specific can be said about its
+  // value: a box with a label and no other word is a box an operator has to
+  // look up. Captured now — `fieldPath` belongs to whichever mask is being
+  // built, and another one is built before this field is ever typed into. A
+  // cell of a matrix stays quiet: its row and column are its explanation, and
+  // sixteen sentences in a table is the questionnaire the table replaced.
+  const help = quiet || echoesLabel(fieldHelp(field[0]), field[1]) ? "" : fieldHelp(field[0]);
+  if (!compute && !gloss && !help) return () => {{}};
   let timer = null;
   const run = () => {{
     const value = widget.value || "";
-    const idle = value ? "" : gloss;
+    // Empty: what happens if it is left empty, else what it is. Filled: what it
+    // is, unless there is something to say about the value itself.
+    const idle = value ? help : (gloss || help);
     // Hints can wrap just like errors. Native change/async completion during
     // pointer-down must not move the pressed Add/Stage before pointer-up.
     // Reuse the shared validation feedback queue, including its cancel path.
     const paint = (text) => {{
-      const update = () => {{ if ((widget.value || "") === value) box.textContent = text; }};
+      const update = () => {{
+        if ((widget.value || "") !== value) return;
+        box.textContent = text;
+        // Prose reads as prose; a computed range or a default keeps the
+        // technical face it has always had.
+        box.classList.toggle("help", !!help && text === help);
+      }};
       if (validationPointers.size) deferredBlurChecks.add(() => {{ if (widget.isConnected) update(); }});
       else update();
     }};
@@ -4250,7 +4438,10 @@ function wireHint(field, widget, box, values) {{
     let answer;
     try {{ answer = compute(value, values ? values() : {{}}); }} catch (e) {{ answer = ""; }}
     if (answer && typeof answer.then === "function") {{
-      paint(idle);
+      // While the appliance is being asked about a value the slot is empty, as
+      // it always was: the answer is what belongs there, and a line that is
+      // about to be replaced reads as the answer to whoever is waiting for it.
+      paint(value ? "" : idle);
       answer.then((text) => paint(text || idle));
       return;
     }}
@@ -5692,7 +5883,7 @@ function fieldGrid(fields, row, required, form) {{
           const cellBox = el("label", {{ class: "field w-m" }}, [widgets[i], hint]);
           boxes[i] = cellBox;
           cell.append(cellBox);
-          wireHint(fields[i], widgets[i], hint, values);
+          wireHint(fields[i], widgets[i], hint, values, true);
           checks.push(bindField(fields[i], widgets[i], hint, rowLabel + " " + col[1]));
         }}
         tr.append(cell);
@@ -5900,6 +6091,9 @@ function fieldLines(fields, widgets, path, before) {{
       // command boundary. The field-specific setter restores canonical PEM.
       const argument = isUpdateSigningKey(f[0], path) ? JSON.stringify(v.replace(/[\r\n]+/g, " "))
         : f[0] === "peer-identity" || isSecretField(f) || spacedPorts ? JSON.stringify(v) : v;
+      if (isSecretField(f) && !updateKey) {{
+        reviewMasks.set(`set ${{path}} ${{f[0]}} ${{argument}}`, `set ${{path}} ${{f[0]}} ••••••`);
+      }}
       push(`set ${{path}} ${{f[0]}} ${{argument}}`);
     }}
   }});
@@ -5920,7 +6114,7 @@ function settingsPanel(boxId, fields, current, path, label, form) {{
   // A mask with headings shows its first group and folds the rest away, unless
   // the caller says otherwise — the first group is what somebody came to set,
   // and the rest is why the page looked like a questionnaire.
-  const shape = form || (fields.some((f) => f[0] === "#") ? {{ essential: firstGroup(fields) }} : null);
+  const shape = defaultShape(fields, form, null, false);
   const {{ grid, widgets, more, validate }} = fieldGrid(fields, current, null, shape);
   maskHost(box);
   box.append(grid);
@@ -6006,6 +6200,35 @@ function maskHost(box) {{
 // are its first group. Skipping to the first *heading* put exactly the settings
 // somebody opened the page for behind "More settings" and left the rare ones on
 // screen, which is the fold upside down.
+// How a mask folds when its caller did not say. With groups, the first group
+// is what somebody came to set. A long run with no groups at all is the same
+// questionnaire without the headings, so it leads with its first few fields —
+// the tables are written most-used first — and keeps the rest one click away.
+// Nothing that is set is ever folded: `fieldGrid` shows a value however it got
+// there.
+const FLAT_FOLD = 6;
+function defaultShape(fields, form, required, creating) {{
+  if (form) return form;
+  const keep = (lead) => (required && !lead.includes(required) ? [...lead, required] : lead);
+  if (fields.some((f) => f[0] === "#")) {{
+    let lead = firstGroup(fields);
+    // A new object needs enough to be one: where the lead is a single choice,
+    // the first group under a heading — what it matches, where it goes — is
+    // part of the question, not an extra.
+    if (creating && lead.length <= 2) {{
+      let seen = 0;
+      for (const f of fields) {{
+        if (f[0] === "#") {{ if (++seen > 1) break; continue; }}
+        if (seen && !lead.includes(f[0])) lead = [...lead, f[0]];
+      }}
+    }}
+    return {{ essential: keep(lead) }};
+  }}
+  const keys = fields.map((f) => f[0]);
+  if (keys.length <= FLAT_FOLD) return null;
+  return {{ essential: keep(keys.slice(0, 4)) }};
+}}
+
 function firstGroup(fields) {{
   const lead = [];
   for (const f of fields) {{
@@ -6082,6 +6305,7 @@ function objectCard(o, row, cols, span) {{
   }}
   tr.append(el("td", {{ class: o.badge ? "" : "mark" }},
     [el("span", {{ class: "val", text: row.name }})]));
+  if (o.live) tr.append(el("td", {{}}, [o.live.cell(row)]));
   for (const f of cols) {{
     const v = shown(f[0], row[f[0]]);
     tr.append(el("td", {{}}, [el("span", {{ class: "val dim", text: v || "—" }})]));
@@ -6100,7 +6324,8 @@ function objectCard(o, row, cols, span) {{
       cell.textContent = "";
       fieldSubject = row.name;
       fieldPath = path;
-      const {{ grid, widgets, more, validate }} = fieldGrid(o.fields, row, null, o.form);
+      const {{ grid, widgets, more, validate }} = fieldGrid(
+        o.fields, row, null, defaultShape(o.fields, o.form, o.required, true));
       const stageit = el("button", {{
         class: "btn primary", text: "Stage",
         onclick: () => {{
@@ -6241,6 +6466,57 @@ function unavailableCreation(o, reason) {{
 
 // `o` carries listId, addId?, toggleId?, unavailable?, parentFocusId?, refreshDraft?, noun,
 // fields, path(name), rows, badge?, nameHint and empty.
+// An empty list says what is missing, why that matters, and offers the way to
+// fix it where the operator is already looking. The action is the page's own
+// creation control pressed on their behalf — one creation path, two doors — so
+// it is offered only while that control is, and it inherits the same write
+// gate by starting with the same verb.
+function emptyState(o) {{
+  const box = el("div", {{ class: "emptystate" }}, [el("p", {{ class: "empty", text: o.text }})]);
+  if (o.hint) box.append(el("p", {{ class: "emptyhint", text: o.hint }}));
+  const trigger = o.toggleId && $(o.toggleId);
+  if (trigger && o.action) {{
+    box.append(el("button", {{
+      class: "btn", type: "button", text: o.action,
+      onclick: () => {{
+        const t = $(o.toggleId);
+        if (!t || t.disabled) return;
+        const panelId = t.getAttribute("aria-controls");
+        if (t.getAttribute("aria-expanded") !== "true") t.click();
+        const panel = panelId && $(panelId);
+        if (panel) {{
+          panel.scrollIntoView({{ block: "nearest" }});
+          panel.querySelector("input,select,textarea,button")?.focus();
+        }}
+      }},
+    }}));
+  }}
+  return box;
+}}
+
+// Filter a long board by what is written on it. Local, immediate and never
+// stored: the rows are already on the page, so this hides the ones that do not
+// mention the text and says how many are left.
+function tableFilter(tbody, noun, total) {{
+  const input = el("input", {{
+    type: "search", placeholder: "Filter " + noun + "s", autocomplete: "off",
+    "aria-label": "Filter " + noun + "s",
+  }});
+  const tally = el("span", {{ class: "hint", text: total + " " + noun + "s" }});
+  tally.setAttribute("role", "status");
+  input.oninput = () => {{
+    const q = input.value.trim().toLowerCase();
+    let shown = 0;
+    for (const tr of tbody.children) {{
+      const hit = !q || tr.textContent.toLowerCase().includes(q);
+      tr.classList.toggle("hidden", !hit);
+      if (hit) shown++;
+    }}
+    tally.textContent = q ? shown + " of " + total + " " + noun + "s" : total + " " + noun + "s";
+  }};
+  return el("div", {{ class: "tblfilter" }}, [input, tally]);
+}}
+
 function renderObjects(o) {{
   if (!configReadable && !o.rows.length) {{
     unavailableCreation(o, "Read the configuration successfully before creating an object.");
@@ -6249,14 +6525,24 @@ function renderObjects(o) {{
   const list = $(o.listId);
   list.textContent = "";
   if (!o.rows.length) {{
-    list.append(el("p", {{ class: "empty",
-      text: o.empty || ("No " + o.noun.toLowerCase() + " configured.") }}));
+    list.append(emptyState({{
+      text: o.empty || ("No " + o.noun.toLowerCase() + " configured."),
+      hint: o.emptyHint,
+      // Only where creation is on offer: a list whose parent is missing
+      // explains that on its disabled control instead.
+      action: o.addId && !o.unavailable ? (o.emptyAction || ("Add " + o.noun.toLowerCase())) : "",
+      toggleId: o.toggleId,
+    }}));
   }} else {{
     const cols = objectColumns(o);
-    const span = (o.badge ? 1 : 0) + 1 + cols.length + 1;
+    const span = (o.badge ? 1 : 0) + 1 + (o.live ? 1 : 0) + cols.length + 1;
     const head = el("tr", {{}});
     if (o.badge) head.append(el("th", {{}}));
     head.append(el("th", {{ text: o.noun }}));
+    // What the appliance observes about this object right now, beside what it
+    // is configured to be: a board that only lists settings cannot say whether
+    // the thing they describe is there.
+    if (o.live) head.append(el("th", {{ text: o.live.head, title: o.live.title || "" }}));
     for (const f of cols) head.append(el("th", {{ text: f[1] }}));
     head.append(el("th", {{}}));
     const tbody = el("tbody", {{}});
@@ -6362,7 +6648,8 @@ function renderAddPanel(o) {{
     name.min = String(o.nameBounds[0]); name.max = String(o.nameBounds[1]);
     name.inputMode = "numeric";
   }}
-  const {{ grid, widgets, more, validate }} = fieldGrid(o.fields, null, o.required, o.form);
+  const {{ grid, widgets, more, validate }} = fieldGrid(
+    o.fields, null, o.required, defaultShape(o.fields, o.form, o.required, true));
   // The name leads the mask rather than standing above it: it is the first
   // thing asked for, not a separate step before the form starts.
   const nameHint = el("span", {{ class: "hint", text: o.nameHelp || "" }});
@@ -6688,7 +6975,8 @@ const CONNTRACK_TIMEOUTS = [
 async function refreshZones() {{
   const ls = await leaves();
   const globals = fieldsOf(ls, "firewall global");
-  settingsPanel("globalform", GLOBAL_POSTURE, globals, "firewall global", "Global firewall posture");
+  settingsPanel("globalform", GLOBAL_POSTURE, globals, "firewall global", "Global firewall posture",
+                FORMS.posture);
   settingsPanel("conntrackform", CONNTRACK_TIMEOUTS, fieldsOf(ls, "firewall global conntrack"),
     "firewall global conntrack", "Connection timeouts");
 
@@ -6766,6 +7054,8 @@ async function refreshNat() {{
     rows: entriesUnder(ls, ["nat", "source"]),
     badge: (r) => ({{ text: r["cgnat-block-size"] ? "cgnat" : "masquerade" }}),
     empty: "No source NAT configured.",
+    emptyHint: "Private addresses reach the internet only through a source NAT rule on the outside zone.",
+    emptyAction: "Add a source rule",
   }});
   renderObjects({{
     listId: "dnatlist", form: FORMS.natDest, required: "to", toggleId: "toggleddnat", toggleLabel: "New port forward", addId: "adddnatpanel", noun: "Port forward",
@@ -6775,6 +7065,8 @@ async function refreshNat() {{
     badge: (r) => r.port ? {{ text: (r.proto || "tcp") + "/" + r.port }}
                          : {{ text: "incomplete", cls: "warn" }},
     empty: "No port forwards configured.",
+    emptyHint: "Publishes one inside service on the outside address; it also needs a firewall rule that admits it.",
+    emptyAction: "Add a port forward",
   }});
 }}
 
@@ -6904,6 +7196,7 @@ async function refreshIpsec() {{
     badge: (r) => (r.local && r.remote) ? {{ text: "ike" + (r["ike-version"] || "2") }}
                                         : {{ text: "incomplete", cls: "warn" }},
     empty: "No IPsec tunnels configured.",
+    emptyHint: "Needs the remote gateway, a secret or certificate, and the networks on both sides.",
   }});
   // showInto owns read pending/error/generation state. Its diagnostic is not
   // part of the form transaction, so it must not keep Validate/Apply busy.
@@ -6938,6 +7231,7 @@ async function refreshWireguard() {{
     badge: (r) => r["listen-port"] ? {{ text: ":" + r["listen-port"] }}
                                    : {{ text: "no port", cls: "warn" }},
     empty: "No WireGuard interfaces configured.",
+    emptyHint: "One end of a tunnel: this appliance's key and port. Peers are added to it afterwards.",
   }});
 
   // Peers belong to an interface, so the interface is picked once in the
@@ -7025,6 +7319,7 @@ async function refreshDhcp() {{
     rows: [...servers.values()],
     badge: (r) => ({{ text: r["pool-size"] ? r["pool-size"] + " leases" : "default pool" }}),
     empty: "No DHCP servers configured.",
+    emptyHint: "Hands the clients on a segment their address, gateway and name servers.",
   }});
 
   // Reservations belong to one server, so the interface is chosen first and the
@@ -7081,6 +7376,24 @@ async function refreshDhcp() {{
 // asks for thirty things asks for nothing in particular, and the rest of these
 // masks had the same problem the interface one did.
 const FORMS = {{
+  // The pair. Which fields exist depends on how the two members elect: a
+  // witness address means nothing to a two-node pair, and heartbeat paths mean
+  // nothing with a witness. Showing all sixteen at once made an operator read
+  // both designs to configure one.
+  ha: {{
+    essential: ["mode", "enabled", "node", "sync-interface", "witness", "priority",
+                "heartbeat-listen", "heartbeat-peer"],
+    only: {{ key: "mode", map: {{
+      witness: ["", "witness"],
+      "heartbeat-listen": ["two-node"], "heartbeat-peer": ["two-node"],
+      "peer-timeout-ms": ["two-node"], "startup-delay-ms": ["two-node"],
+    }} }},
+  }},
+  haWitness: {{ essential: ["listen", "key", "member"] }},
+  identity: {{ essential: ["hostname", "timezone"] }},
+  fleet: {{ essential: ["controller-url", "node-id", "enrollment-token"] }},
+  posture: {{ essential: ["default-action", "stateful", "log", "block-icmp"] }},
+  webConsole: {{ essential: ["enable", "port", "listen-address", "tls"] }},
   bgpNeighbour: {{ essential: ["remote-as", "description", "update-source"] }},
   ipsec: {{ essential: ["remote", "local", "local-subnet", "remote-subnet", "psk"] }},
   wireguard: {{ essential: ["private-key", "listen-port"] }},
@@ -7384,7 +7697,25 @@ const IFACE_FORM = {{
 
 async function refreshInterfaces() {{
   await showInto("ifaceshow", "/api/v1/show/interfaces");
+  // The live pane below was already asked for; the same answer says, per
+  // configured interface, whether the kernel has it and whether it is up — no
+  // second request. A configured name the appliance does not have is the
+  // commonest reason an interface "does nothing", and the list is where an
+  // operator looks first.
+  const observed = new Map(parseLinks($("ifaceshow").textContent).map((l) => [l.name, l.state]));
+  const linkState = (row) => {{
+    if (!observed.size) return el("span", {{ class: "val dim", text: "—", title: "No live reading" }});
+    const state = observed.get(row.name);
+    if (state === "UP") return el("span", {{ class: "pill up", text: "up" }});
+    if (state === "DOWN") return el("span", {{ class: "pill down", text: "down" }});
+    if (state) return el("span", {{ class: "pill rest", text: "unknown" }});
+    return el("span", {{
+      class: "pill warn", text: "not present",
+      title: "The appliance has no interface with this name right now",
+    }});
+  }};
   renderObjects({{
+    live: {{ head: "Link", title: "Live link state as the appliance reports it", cell: linkState }},
     listId: "ifacelist", allowBare: true, toggleId: "toggleiface", toggleLabel: "New",
     addId: "addifacepanel", noun: "Interface", form: IFACE_FORM,
     fields: IFACE, nameHint: "eth0",
@@ -7573,6 +7904,8 @@ async function refreshUsers() {{
     badge: (r) => r.group ? {{ text: r.group }}
                           : {{ text: "no management access", cls: "warn" }},
     empty: "No administrators configured.",
+    emptyHint: "Until an account exists, the management token is the only way in.",
+    emptyAction: "Add an administrator",
   }});
   renderObjects({{
     listId: "admingrouplist", form: FORMS.group, required: "permission", toggleId: "toggleadmingroup", toggleLabel: "New group", addId: "addadmingrouppanel", noun: "Group",
@@ -8259,6 +8592,7 @@ async function refreshWan() {{
     // failover does not happen when it should, so it is said on the card.
     badge: (r) => r.check ? {{ text: "checked" }} : {{ text: "assumed up", cls: "warn" }},
     empty: "No uplinks configured.",
+    emptyHint: "Two or more uplinks allow failover or load sharing; each needs a target to probe.",
   }});
   // There is no `show multiwan`; what an operator actually needs to see is
   // which uplink the routing table is using right now, which is the same
@@ -8389,7 +8723,7 @@ async function refreshSystem() {{
   void management.updates.refresh();
   const ls = await leaves();
   const under = (node) => fieldsOf(ls, node);
-  settingsPanel("sys-ident", SYS_IDENT, under("system"), "system", "Identity");
+  settingsPanel("sys-ident", SYS_IDENT, under("system"), "system", "Identity", FORMS.identity);
   renderObjects({{
     listId: "sysctllist", addId: "addsysctlpanel",
     toggleId: "togglesysctl", toggleLabel: "New",
@@ -8399,7 +8733,7 @@ async function refreshSystem() {{
     rows: entriesUnder(ls, ["system", "sysctl"]),
     empty: "No kernel parameters set.",
   }});
-  settingsPanel("sys-fleet", SYS_FLEET, under("fleet"), "fleet", "Fleet enrollment");
+  settingsPanel("sys-fleet", SYS_FLEET, under("fleet"), "fleet", "Fleet enrollment", FORMS.fleet);
   $("disconnect-fleet").disabled = !mayWrite() || !under("fleet")["controller-url"];
   $("disconnect-fleet").onclick = () => stage("Disconnect fleet", ["delete fleet"]);
   settingsPanel("sys-update", SYS_UPDATE, under("update"), "update", "Update channel");
@@ -8458,6 +8792,8 @@ async function refreshRouting() {{
     rows: entriesUnder(ls, ["protocols", "static"]),
     badge: (r) => r.via ? {{ text: "via " + r.via }} : {{ text: "no next hop", cls: "warn" }},
     empty: "No static routes configured.",
+    emptyHint: "Only for a network behind another router, or a default route the uplink does not announce.",
+    emptyAction: "Add a static route",
   }});
   renderObjects({{
     listId: "bgplist", form: FORMS.bgpNeighbour, required: "remote-as",
@@ -8540,7 +8876,7 @@ async function refreshServices() {{
     ["svc-dns", SVC_DNS, "services dns", "DNS resolver"],
     ["svc-ntp", SVC_NTP, "services ntp", "NTP"],
     ["svc-ssh", SVC_SSH, "services ssh", "SSH access"],
-    ["svc-web", SVC_WEB, "services web", "Web console"],
+    ["svc-web", SVC_WEB, "services web", "Web console", FORMS.webConsole],
     ["svc-snmp", SVC_SNMP, "services snmp", "SNMP"],
     ["svc-lldp", SVC_LLDP, "services lldp", "LLDP"],
     ["svc-mdns", SVC_MDNS, "services mdns", "mDNS reflector"],
@@ -8553,8 +8889,8 @@ async function refreshServices() {{
     ["svc-alertmail", SVC_ALERTMAIL, "services alerts mail", "Alert mail"],
     ["svc-flow", SVC_FLOW, "services flow-export", "Flow export"],
   ];
-  for (const [box, fields, path, label] of flat) {{
-    settingsPanel(box, fields, under(path), path, label);
+  for (const [box, fields, path, label, shape] of flat) {{
+    settingsPanel(box, fields, under(path), path, label, shape);
   }}
 
   renderObjects({{
@@ -8676,9 +9012,9 @@ async function refreshHa() {{
   // the same way BGP's router settings are rather than as objects with names.
   const ls = await leaves();
   const under = (node) => fieldsOf(ls, node);
-  settingsPanel("haform", HA, under("system ha"), "system ha", "HA");
+  settingsPanel("haform", HA, under("system ha"), "system ha", "HA", FORMS.ha);
   settingsPanel("hawitnessform", HA_WITNESS, under("system ha-witness"),
-                "system ha-witness", "Independent witness");
+                "system ha-witness", "Independent witness", FORMS.haWitness);
   settingsPanel(
     "configsyncform", CONFIG_SYNC, under("system config-sync"),
     "system config-sync", "Configuration sync",
@@ -9380,22 +9716,155 @@ function renderPalette() {{
   // Substring over the page's own name and its category — enough to find a page
   // you can name, and nothing an operator has to learn the ranking of.
   palItems = q ? all.filter((e) => (e.t + " " + e.g).toLowerCase().includes(q)) : all;
+  // Pages first: a page an operator can name is what they asked for. Then the
+  // settings whose label or CLI name mentions the text, each carrying the page
+  // it is set on — the answer to "where do I change the MTU?".
+  const pages = palItems.length;
+  for (const hit of settingHits(q, 24)) {{
+    palItems.push({{ t: hit[0], g: settingPlace(hit[1]), path: hit[2], run: () => gotoSetting(hit) }});
+  }}
   if (palSel >= palItems.length) palSel = Math.max(0, palItems.length - 1);
   const list = $("palettelist");
   list.textContent = "";
   if (!palItems.length) {{
-    list.append(el("div", {{ class: "palempty", text: "No page matches" }}));
+    list.append(el("div", {{ class: "palempty", text: "No page or setting matches" }}));
     return;
   }}
   palItems.forEach((e, idx) => {{
-    const b = el("button", {{ class: "palitem" + (idx === palSel ? " on" : ""),
+    if (idx === pages) list.append(el("div", {{ class: "palhead", text: "Settings" }}));
+    const b = el("button", {{ class: "palitem" + (e.path ? " setting" : "") + (idx === palSel ? " on" : ""),
                              onclick: () => runPalette(idx) }});
     b.setAttribute("role", "option");
     b.setAttribute("aria-selected", String(idx === palSel));
-    b.append(el("span", {{ class: "palt", text: e.t }}),
-             el("span", {{ class: "palg", text: e.g }}));
+    b.append(el("span", {{ class: "palt", text: e.t }}));
+    if (e.path) b.append(el("span", {{ class: "palp", text: e.path }}));
+    b.append(el("span", {{ class: "palg", text: e.g }}));
     list.append(b);
   }});
+}}
+
+// ---- finding a setting by name ---------------------------------------------
+//
+// The catalogue is `[label, page, CLI path]` for every field a mask offers:
+// data the build embeds from `settings-index.json`, written out here as a
+// literal. It is part of this script on purpose — the page's policy admits
+// exactly two script blocks, and a third element to carry data would be one
+// more thing that policy has to count.
+const SETTINGS = {settings_index};
+
+// What a field is for, in the CLI's own words: the description the grammar
+// prints at `?`, keyed by the setting's path with every freeform word replaced
+// by `*`. Generated at build time from the completion tables, never typed here.
+const FIELD_HELP = {field_help};
+
+// A description that only says the label again — "dedicated control
+// interface" under a box labelled Dedicated control interface — is a second
+// line of the same words. It is left out; the label already said it.
+function echoesLabel(help, label) {{
+  if (!help) return true;
+  const words = (text) => String(text).toLowerCase()
+    .replace(/[()]/g, " ").split(/[^a-z0-9:.+-]+/)
+    .filter((w) => w && !["the", "a", "an", "this", "of", "for", "secret", "s", "ms"].includes(w));
+  const said = new Set(words(label));
+  return words(help).every((w) => said.has(w));
+}}
+
+// The entry for a field of whatever is being edited. The path carries real
+// names — an interface, a neighbour's address, a sequence number — so up to two
+// of its words are tried as the wildcard they are in the table.
+function fieldHelp(key, path = fieldPath) {{
+  const words = (String(path || "").trim() + " " + key).split(" ").filter(Boolean);
+  if (FIELD_HELP[words.join(" ")]) return FIELD_HELP[words.join(" ")];
+  const last = words.length - 1;
+  for (let i = 1; i < last; i++) {{
+    const one = words.slice();
+    one[i] = "*";
+    if (FIELD_HELP[one.join(" ")]) return FIELD_HELP[one.join(" ")];
+    for (let j = i + 1; j < last; j++) {{
+      const two = one.slice();
+      two[j] = "*";
+      if (FIELD_HELP[two.join(" ")]) return FIELD_HELP[two.join(" ")];
+    }}
+  }}
+  return "";
+}}
+
+// Best first: a label that starts with the text, then one that contains it,
+// then one whose CLI name does. Bounded, because a search that answers with
+// two hundred rows has not answered.
+function settingHits(q, limit) {{
+  const text = String(q || "").trim().toLowerCase();
+  if (text.length < 2) return [];
+  const ranked = [[], [], []];
+  for (const entry of SETTINGS) {{
+    const label = entry[0].toLowerCase();
+    if (label.startsWith(text)) ranked[0].push(entry);
+    else if (label.includes(text)) ranked[1].push(entry);
+    else if (entry[2].toLowerCase().includes(text)) ranked[2].push(entry);
+  }}
+  return ranked.flat().slice(0, limit);
+}}
+
+// "Network / Interfaces" for a destination key, from the same table the rail
+// and the breadcrumb are built from.
+function settingPlace(key) {{
+  for (const group of SECTIONS) {{
+    for (const item of group.items) {{
+      if ((item.tab ? item.v + ":" + item.tab : item.v) === key) return group.g + " / " + item.t;
+    }}
+  }}
+  return key;
+}}
+
+// Go to the page a setting lives on and put the operator's eyes on it. A
+// setting that belongs to an object — a rule's port, a neighbour's AS — only
+// exists inside that object's own form, so there the page says where to look
+// instead of pretending to have found a field that is not on screen.
+async function gotoSetting(hit) {{
+  focusDestination = false;
+  const [v, tab] = String(hit[1]).split(":");
+  view = v;
+  if (tab) tabs[v] = tab;
+  panel = null;
+  buildNav();
+  await refresh();
+  const visible = (n) => n.getClientRects().length > 0;
+  // A field is known by its caption — the words before any "required" mark,
+  // and without the unit its box carries — not by everything under it: the
+  // line of help below a field is not part of its name.
+  const captionOf = (f) => {{
+    const first = f.firstElementChild;
+    return ((first && first.firstChild && first.firstChild.textContent) || "").trim();
+  }};
+  const named = (f) => {{
+    const caption = captionOf(f);
+    return caption && (caption === hit[0] || hit[0].startsWith(caption + " ("));
+  }};
+  // Only the page's own masks: a field inside a creation drawer or an edit row
+  // belongs to an object, and is reached through that object.
+  const own = [...document.querySelectorAll("#view-" + v + " .field")]
+    .filter((f) => named(f) && !f.closest(".addpanel") && !f.closest(".editrow"));
+  let field = own.find(visible);
+  if (!field && own.length) {{
+    // Folded behind "More settings": unfold that mask rather than report a
+    // setting the operator is one click away from.
+    const host = own[0].closest(".mask") && own[0].closest(".mask").parentElement;
+    const more = host && [...host.querySelectorAll(".maskfoot button")]
+      .find((b) => b.textContent === "More settings");
+    if (more) more.click();
+    field = own.find(visible);
+  }}
+  if (!field) {{
+    window.scrollTo(0, 0);
+    banner("“" + hit[0] + "” is set per object on this page — open New, or Edit on " +
+           "an existing entry, to find it.", "note");
+    return;
+  }}
+  field.scrollIntoView({{ block: "center" }});
+  field.classList.add("found");
+  setTimeout(() => field.classList.remove("found"), 2600);
+  const control = field.querySelector("input,select,textarea,button");
+  if (control) control.focus({{ preventScroll: true }});
 }}
 
 function scrollPaletteSel() {{
@@ -9461,6 +9930,123 @@ async function buildSearchIndex() {{
     seen.add(key);
     searchIndex.push({{ key, view, label, hay: haystack }});
   }}
+  // The same reading feeds the first-steps list — it is taken at sign-in and
+  // after every apply, which is exactly when that list can have changed, and
+  // costs the appliance no request of its own.
+  setupSteps = configReadable && !member ? setupFrom(ls) : [];
+  renderSetup();
+}}
+
+// What the configuration calls each link — its zone and its description — for
+// the dashboard, which otherwise knows a link only by its kernel name. Read
+// off the last configuration reading; it asks the appliance nothing.
+function linkMeta() {{
+  const out = {{}};
+  for (const l of lastLeaves) {{
+    if (l.path[0] !== "interface" || !l.path[1]) continue;
+    if (l.path[2] !== "zone" && l.path[2] !== "description") continue;
+    (out[l.path[1]] = out[l.path[1]] || {{}})[l.path[2]] = l.value;
+  }}
+  return out;
+}}
+
+// ---- first steps ------------------------------------------------------------
+//
+// Each step is a fact about the configuration, never a flag somebody ticks: a
+// step is done because the appliance has the setting, and undone again if it is
+// removed. Required steps are the ones without which the box is not safely in
+// service; the rest are recommended, said as such, and never nag — once the
+// required ones are done the list folds to one quiet line.
+let setupSteps = [];
+
+function setupFrom(ls) {{
+  const has = (...prefix) => ls.some((l) => prefix.every((p, i) => l.path[i] === p));
+  // An interface enslaved to a bridge or a bond is placed by its master, not by
+  // a zone of its own; counting it as unfinished would be a step nobody can
+  // finish.
+  const links = new Map();
+  const members = new Set();
+  for (const l of ls) {{
+    if (l.path[0] !== "interface" || !l.path[1]) continue;
+    if (!links.has(l.path[1])) links.set(l.path[1], false);
+    if (l.path[2] === "zone" && l.value) links.set(l.path[1], true);
+    if (/^members?$/.test(l.path[l.path.length - 1])) {{
+      for (const name of String(l.value).split(",")) members.add(name.trim());
+    }}
+  }}
+  const zoned = [...links.values()].filter(Boolean).length;
+  const unzoned = [...links].filter(([name, zone]) => !zone && !members.has(name)).length;
+  return [
+    {{
+      title: "Create an administrator account", required: true,
+      done: has("system", "login"),
+      why: "Until then the management token is the only way in.",
+      to: "users", open: "Open Administrators",
+    }},
+    {{
+      title: "Give every interface a zone", required: true,
+      done: zoned > 0 && unzoned === 0,
+      why: unzoned
+        ? unzoned + (unzoned === 1 ? " interface has" : " interfaces have") + " no zone, so no rule covers " + (unzoned === 1 ? "it." : "them.")
+        : "Rules are written between zones.",
+      to: "interfaces", open: "Open Interfaces",
+    }},
+    {{
+      title: "Translate outbound traffic", required: false,
+      done: has("nat", "source"),
+      why: "Needed for private addresses to reach the internet; not for a purely routed firewall.",
+      to: "nat", open: "Open NAT",
+    }},
+    {{
+      title: "Set name resolution and time", required: false,
+      done: has("services", "dns") || has("services", "ntp"),
+      why: "Certificates, logs and update checks depend on both.",
+      to: "services:resolution", open: "Open DNS and time",
+    }},
+    {{
+      title: "Choose where signed updates come from", required: false,
+      done: has("update"),
+      why: "Otherwise the appliance never learns that a fixed image exists.",
+      to: "system", open: "Open System",
+    }},
+  ];
+}}
+
+function renderSetup() {{
+  const card = $("setupcard");
+  const open = setupSteps.filter((s) => !s.done);
+  const required = open.filter((s) => s.required);
+  // Nothing left, another member's configuration on screen, or no reading at
+  // all: there is nothing true this list could say.
+  card.classList.toggle("hidden", !open.length || !!target);
+  if (!open.length) return;
+  const done = setupSteps.length - open.length;
+  $("setuptitle").textContent = required.length ? "Finish setting up" : "Recommended next steps";
+  $("setupsummary").textContent = done + " of " + setupSteps.length + " done" +
+    (required.length ? " · " + required.length + " needed before this appliance is ready"
+                     : " · " + open.length + " recommended");
+  // Open while something is needed; one line once only recommendations remain.
+  if (card.dataset.required !== String(required.length > 0)) {{
+    card.open = required.length > 0;
+    card.dataset.required = String(required.length > 0);
+  }}
+  const list = $("setuplist");
+  list.textContent = "";
+  for (const step of setupSteps) {{
+    const state = step.done ? "done" : step.required ? "needed" : "recommended";
+    const row = el("li", {{ class: "step " + state }}, [
+      el("span", {{ class: "mark", "aria-hidden": "true", text: step.done ? "✓" : "" }}),
+      el("div", {{ class: "body" }}, [
+        el("span", {{ class: "t", text: step.title }}),
+        el("span", {{ class: "w", text: step.done ? "Done." : step.why }}),
+      ]),
+      el("span", {{ class: "pill" + (state === "needed" ? " warn" : " rest"), text: state }}),
+    ]);
+    if (!step.done) {{
+      row.append(el("button", {{ class: "btn", type: "button", text: step.open, onclick: () => goto(step.to) }}));
+    }}
+    list.append(row);
+  }}
 }}
 
 function renderMatches() {{
@@ -9469,14 +10055,27 @@ function renderMatches() {{
   const q = $("navsearch").value.trim().toLowerCase();
   if (q.length < 2) return;
   const hits = searchIndex.filter((e) => e.hay.includes(q)).slice(0, 12);
-  if (!hits.length) return;
-  box.append(el("span", {{ class: "grp", text: "Matches" }}));
-  for (const h of hits) {{
-    box.append(el("button", {{
-      class: "navitem",
-      text: h.label,
-      onclick: () => goto(h.view),
-    }}));
+  if (hits.length) {{
+    box.append(el("span", {{ class: "grp", text: "Matches" }}));
+    for (const h of hits) {{
+      box.append(el("button", {{
+        class: "navitem",
+        text: h.label,
+        onclick: () => goto(h.view),
+      }}));
+    }}
+  }}
+  // Settings by name, whether or not this appliance has set them: the place a
+  // value would go is as findable as a value that is already there.
+  const settings = settingHits(q, 8);
+  if (!settings.length) return;
+  box.append(el("span", {{ class: "grp", text: "Settings" }}));
+  for (const s of settings) {{
+    const b = el("button", {{ class: "navitem setting", onclick: () => gotoSetting(s) }}, [
+      el("span", {{ class: "st", text: s[0] }}),
+      el("span", {{ class: "sp", text: settingPlace(s[1]) }}),
+    ]);
+    box.append(b);
   }}
 }}
 
@@ -9613,7 +10212,7 @@ function buildNav() {{
       }}
       nav.append(box);
     }}
-    if (!nav.children.length) {{
+    if (!nav.children.length && !settingHits(filter, 1).length) {{
       nav.append(el("div", {{ class: "group" }}, [
         el("span", {{ class: "grp", text: "No section matches" }}),
         el("button", {{
@@ -9840,6 +10439,55 @@ async function refresh() {{
   gateWrites();
   renderLive();
 
+  renderSetup();
+  // The page's own contents list: once for the markup that is already there,
+  // and again when the view has finished building what it reads from the box.
+  renderPageIndex();
+  const shownView = view, shownPanel = panel;
+  try {{
+    return await refreshView();
+  }} finally {{
+    if (view === shownView && panel === shownPanel) renderPageIndex();
+  }}
+}}
+
+// A long page is a list of sections, and an operator looking for "Update
+// channel" on the System page should not have to scroll four screens to learn
+// whether it is there. The index is read off the headings the page really
+// shows — never a list kept beside them — and only appears when there are
+// enough of them to be worth a jump.
+function renderPageIndex() {{
+  const host = $("pageindex");
+  host.textContent = "";
+  const box = $("view-" + view);
+  // Really on screen: a heading inside a closed disclosure still has a box in
+  // some engines, and a link that scrolls to nothing is worse than no link.
+  const onScreen = (h) => {{
+    const fold = h.closest("details");
+    if (fold && !fold.open) return false;
+    return typeof h.checkVisibility === "function" ? h.checkVisibility() : h.getClientRects().length > 0;
+  }};
+  // The dashboard is a summary read top to bottom, not a form to jump around in.
+  const heads = box && !panel && view !== "dashboard"
+    ? [...box.querySelectorAll("h3")].filter((h) => onScreen(h) && h.textContent.trim())
+    : [];
+  host.classList.toggle("hidden", heads.length < 4);
+  if (heads.length < 4) return;
+  host.append(el("span", {{ class: "pilabel", text: "On this page" }}));
+  for (const h of heads) {{
+    host.append(el("a", {{
+      href: "#pageindex", text: h.textContent.trim(),
+      onclick: (ev) => {{
+        ev.preventDefault();
+        h.setAttribute("tabindex", "-1");
+        h.scrollIntoView({{ block: "start" }});
+        h.focus({{ preventScroll: true }});
+      }},
+    }}));
+  }}
+}}
+
+async function refreshView() {{
   if (view === "dashboard") return refreshDashboard();
   if (view === "rules") return refreshRules();
   if (view === "zones") return refreshZones();
@@ -9890,7 +10538,7 @@ function renderWho() {{
   const readOnly = !mayWrite();
   // Everything that changes the appliance is a POST, and a read-only token is
   // refused every one of them. Saying so here beats saying it afterwards.
-  for (const id of ["applystaged", "applystaged2", "validate", "discard"]) {{
+  for (const id of ["applystaged", "validate", "discard"]) {{
     const b = $(id);
     if (!b) continue;
     b.disabled = readOnly;
@@ -9922,6 +10570,10 @@ function signOut(message) {{
   // operator would apply as their own, a peer they did not select, and a
   // configuration they were never shown.
   staged = [];
+  reviewMasks.clear();
+  stagedOpen = false;
+  setupSteps = [];
+  renderSetup();
   dirty.clear();
   target = "";
   view = "dashboard";
@@ -10095,14 +10747,17 @@ $("defaultpolicy").onchange = (e) => {{
   e.target.value = "";
 }};
 $("discard").onclick = () => {{ staged = []; renderStaged(); }};
-// The badge is the review's doorway: it brings the staged card into view, so
-// the exact commands are read before anything is applied.
-$("stagedbadge").onclick = () => {{
+// The badge and the dock's own Review are the same doorway: they open the
+// batch, so the exact commands are read before anything is applied.
+const toggleStagedReview = (open) => {{
   if (!staged.length) return;
-  $("stagedcard").scrollIntoView({{ behavior: "smooth", block: "start" }});
+  stagedOpen = open === undefined ? !stagedOpen : open;
+  renderStaged();
+  if (stagedOpen) $("stagedreview").focus();
 }};
+$("stagedbadge").onclick = () => toggleStagedReview(true);
+$("stagedreview").onclick = () => toggleStagedReview();
 $("applystaged").onclick = () => applyStaged(["commit", "save"]);
-$("applystaged2").onclick = () => applyStaged(["commit", "save"]);
 // Validating sends the staged commands with no commit: the appliance checks
 // every one of them and writes nothing, which is how you find out that a change
 // would be refused before it touches the box.
@@ -10980,12 +11635,12 @@ mod tests {
         // resolver). Checking only const/let/function gives false positives.
         for (at, _) in script.match_indices("=>") {
             let before = script[..at].trim_end();
-            if let Some(before) = before.strip_suffix(')') {
-                if let Some(start) = before.rfind('(') {
-                    for parameter in before[start + 1..].split(',').map(str::trim) {
-                        if ident(parameter) == Some(parameter) {
-                            defined.insert(parameter);
-                        }
+            if let Some(before) = before.strip_suffix(')')
+                && let Some(start) = before.rfind('(')
+            {
+                for parameter in before[start + 1..].split(',').map(str::trim) {
+                    if ident(parameter) == Some(parameter) {
+                        defined.insert(parameter);
                     }
                 }
             }
@@ -11266,5 +11921,201 @@ mod tests {
             );
             assert!(page().contains(counter), "{counter} never reaches the page");
         }
+    }
+    /// One batch, one Apply. Two buttons that did the same thing under two
+    /// names — "Apply" in the bar, "Apply and save" on a card — left an operator
+    /// to wonder which of them persisted the change. The dock is the only place
+    /// a batch is applied from, and it carries the review beside it.
+    #[test]
+    fn a_staged_batch_has_one_apply_and_a_review() {
+        let html = page();
+        assert_eq!(html.matches("id=\"applystaged\"").count(), 1);
+        assert!(
+            !html.contains("applystaged2"),
+            "a second Apply came back beside the dock's"
+        );
+        for id in ["stagedcard", "stagedreview", "stagedlatest", "stagedlist"] {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "the dock lost #{id}"
+            );
+        }
+        assert!(
+            html.contains("$(\"app\").toggleAttribute(\"data-staged\", n > 0);"),
+            "the page no longer makes room for the dock"
+        );
+    }
+
+    /// The review prints the commands a batch will send. A credential must not
+    /// appear there in clear: the classification that masks its input field is
+    /// the one that masks its line.
+    #[test]
+    fn the_staged_review_masks_protected_values() {
+        let html = page();
+        assert!(html.contains("function reviewLine(cmd) {"));
+        assert!(
+            html.contains("if (isSecretField(f) && !updateKey) {"),
+            "fieldLines no longer records the protected lines it writes"
+        );
+        assert!(
+            html.contains("text: entry.cmds.map(reviewLine).join("),
+            "the review prints staged commands without masking them"
+        );
+        assert!(
+            html.contains("reviewMasks.clear();"),
+            "protected lines outlive the batch they belonged to"
+        );
+    }
+
+    /// A commit's advisories reach the answer merged — one line per sentence,
+    /// naming every object it is about — and after the answer itself. Printed
+    /// raw they are one paragraph per rule on every apply.
+    #[test]
+    fn the_answer_says_each_advisory_once_after_the_verdict() {
+        let html = page();
+        assert!(html.contains("function advisories(notes, sent) {"));
+        assert!(
+            html.contains(r#"advisories(said.filter((n) => n.kind === "warn"), sent)"#),
+            "the answer prints the appliance's advisories one line per object again"
+        );
+        assert!(
+            html.contains(r#"const notes = said.filter((n) => n.kind !== "warn");"#),
+            "advisories are back among the lines that say whether it went through"
+        );
+        assert!(
+            html.contains("showResult(r, committed, refused ? await culprit() : null, sent);"),
+            "the answer no longer knows which lines this batch sent"
+        );
+    }
+
+    /// The settings catalogue is generated from the console's own masks and
+    /// embedded as data. It has to parse, stay inside its script element, and
+    /// send an operator only to pages the rail really has.
+    #[test]
+    fn the_settings_catalogue_points_at_real_pages() {
+        let raw = include_str!("settings-index.json");
+        let entries: Vec<[String; 3]> =
+            serde_json::from_str(raw).expect("settings-index.json is [label, page, path] rows");
+        assert!(
+            entries.len() >= 300,
+            "the catalogue shrank to {} entries — regenerate it",
+            entries.len()
+        );
+        let lower = raw.to_ascii_lowercase();
+        for forbidden in ["</script", "<!--", "http://", "https://"] {
+            assert!(
+                !lower.contains(forbidden),
+                "the catalogue contains {forbidden:?}"
+            );
+        }
+        // It is written into the page's script as a literal, so it must not
+        // read as code to the guards that scan that script: no call-shaped
+        // text, no arrow, no element lookup.
+        let bytes = raw.as_bytes();
+        for (i, _) in raw.match_indices('(') {
+            assert!(
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'),
+                "a catalogue label reads as a function call near byte {i}"
+            );
+        }
+        for forbidden in ["=>", "$(\""] {
+            assert!(
+                !raw.contains(forbidden),
+                "the catalogue contains {forbidden:?}"
+            );
+        }
+        let html = page();
+        assert!(html.contains("const SETTINGS = [\n[\""));
+        for [label, place, path] in &entries {
+            assert!(!label.trim().is_empty() && !path.trim().is_empty());
+            let (view, tab) = place.split_once(':').unwrap_or((place.as_str(), ""));
+            assert!(
+                html.contains(&format!("{{ v: \"{view}\"")),
+                "{label}: no rail entry opens the view {view:?}"
+            );
+            if !tab.is_empty() {
+                assert!(
+                    html.contains(&format!("tab: \"{tab}\"")),
+                    "{label}: no rail entry opens the tab {tab:?}"
+                );
+            }
+        }
+    }
+
+    /// An empty list offers the page's own creation control, pressed on the
+    /// operator's behalf — never a second creation path — and its label starts
+    /// with the verb the write gate recognises, so a read-only account is not
+    /// offered an action it cannot take.
+    #[test]
+    fn an_empty_list_offers_its_own_creation_control() {
+        let html = page();
+        assert!(html.contains("function emptyState(o) {"));
+        assert!(
+            html.contains("action: o.addId && !o.unavailable ? (o.emptyAction || (\"Add \" + o.noun.toLowerCase())) : \"\","),
+            "the shared list no longer derives its empty-state action"
+        );
+        let gate = html
+            .split_once("function gateWrites() {")
+            .map(|(_, rest)| rest)
+            .expect("gateWrites");
+        assert!(
+            gate.contains("/^(edit|delete|new|add|"),
+            "the write gate no longer covers Add…"
+        );
+        for (i, _) in html.match_indices("emptyAction: \"") {
+            let label = &html[i + 14..];
+            assert!(
+                label.starts_with("Add "),
+                "an empty-state action escapes the write gate: {}",
+                &label[..label.find('"').unwrap_or(20)]
+            );
+        }
+    }
+    /// Field help is the CLI's own description of each keyword. Most fields
+    /// must find one, and the page must carry them as data the script guards
+    /// cannot mistake for code.
+    #[test]
+    fn field_help_comes_from_the_cli_grammar() {
+        let help = field_help();
+        let entries: Vec<[String; 3]> =
+            serde_json::from_str(include_str!("settings-index.json")).unwrap();
+        if std::env::var("SENTINEL_PRINT_FIELD_HELP").is_ok() {
+            for (path, text) in &help {
+                println!("{path} => {text}");
+            }
+            println!("{} of {} catalogue entries", help.len(), entries.len());
+        }
+        assert!(
+            help.len() * 100 >= entries.len() * 60,
+            "only {} of {} console fields found a CLI description",
+            help.len(),
+            entries.len()
+        );
+        assert_eq!(
+            help.get("system ha priority").map(String::as_str),
+            Some("election priority 1..255")
+        );
+        assert!(
+            help.contains_key("interface * mtu"),
+            "a named object's field lost its wildcard"
+        );
+        assert!(
+            help.values()
+                .all(|text| !text.ends_with("(true|false)") && !text.contains("(true|false;")),
+            "a switch still spells out its two states"
+        );
+        let literal = script_literal(&help);
+        for forbidden in ["(", "<", ">", "$", "//"] {
+            assert!(
+                !literal.contains(forbidden),
+                "the help literal carries {forbidden:?}"
+            );
+        }
+        let html = page();
+        assert!(html.contains("const FIELD_HELP = {\""));
+        assert!(
+            html.contains("const help = quiet || echoesLabel(fieldHelp(field[0]), field[1])"),
+            "fields no longer show the CLI description, or matrix cells stopped being quiet"
+        );
     }
 }

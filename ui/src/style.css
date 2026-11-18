@@ -470,8 +470,8 @@
 /* Appliance overview: compact operational summary with direct destinations. */
 .overview-summary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--space-4);
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--space-3);
   margin-bottom: var(--space-4);
 }
 .overview-metric {
@@ -481,9 +481,12 @@
   border-radius: var(--radius-lg);
   background: var(--surface);
   color: var(--text-body);
-  padding: var(--space-5);
+  padding: var(--space-4);
   cursor: pointer;
   box-shadow: var(--edge-top);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
   transition:
     border-color var(--dur-fast) ease,
     background var(--dur-fast) ease;
@@ -515,7 +518,8 @@
 .overview-metric > strong {
   display: block;
   color: var(--text-strong);
-  margin: var(--space-4) 0;
+  margin: var(--space-1) 0 0;
+  overflow-wrap: anywhere;
   font: var(--fw-semibold) var(--text-xl)/var(--leading-tight)
     var(--font-display);
   letter-spacing: var(--tracking-tight);
@@ -736,7 +740,12 @@
     gap: var(--space-4);
   }
 }
-@media (max-width: 1100px) {
+@media (max-width: 1300px) {
+  .overview-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 700px) {
   .overview-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -783,4 +792,390 @@
   margin-bottom: var(--space-4);
   color: var(--amber-300);
   font-size: var(--text-sm);
+}
+
+/* The dashboard proper. One status line, six figures, then panels on a
+   twelve-column grid: traffic takes the width, everything else is a half. */
+.dash-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-5);
+  margin-bottom: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.dash-status .telemetry-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  gap: var(--space-1) var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+.health-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  flex: 1 1 24rem;
+  min-width: 0;
+}
+.health-bar .system-health-state {
+  min-height: 0;
+  flex: 0 1 auto;
+  justify-content: flex-start;
+  align-items: center;
+}
+.health-bar .system-health-state p {
+  flex: 0 1 auto;
+}
+.health-bar .system-health-state p:empty {
+  display: none;
+}
+.health-bar .system-health-issues {
+  flex: 1 1 100%;
+  order: 3;
+  margin: 0;
+}
+.health-bar .system-health-issues li + li {
+  margin-top: var(--space-1);
+}
+.health-bar .system-health-actions {
+  margin: 0 0 0 auto;
+  gap: var(--space-2);
+}
+.health-bar .system-health-actions .btn {
+  min-height: 32px;
+  padding-block: var(--space-1);
+  font-size: var(--text-xs);
+}
+.health-bar > .lede {
+  flex: 1 1 100%;
+  margin: 0;
+}
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--space-4);
+  align-items: start;
+  margin-bottom: var(--space-4);
+}
+.dash-grid > * {
+  grid-column: span 4;
+  min-width: 0;
+}
+.dash-grid > .dash-wide {
+  grid-column: span 8;
+}
+.dash-grid > .dash-half {
+  grid-column: span 6;
+}
+.dash-grid .management-panel {
+  margin: 0;
+  height: 100%;
+}
+.dash-grid h4 {
+  margin: var(--space-4) 0 var(--space-2);
+  color: var(--text-muted);
+  font: var(--fw-medium) var(--text-xs)/var(--leading-normal) var(--font-sans);
+  letter-spacing: var(--tracking-small);
+}
+.dash-grid h4:first-child {
+  margin-top: 0;
+}
+@media (max-width: 1280px) {
+  .dash-grid > *,
+  .dash-grid > .dash-wide,
+  .dash-grid > .dash-half {
+    grid-column: 1 / -1;
+  }
+}
+/* A level, 0–100. Neutral until it is worth a look; the figure beside it is
+   the value, the bar is only its shape. */
+.meter {
+  display: block;
+  height: 6px;
+  min-width: 3rem;
+  border-radius: 3px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+}
+.meter > span {
+  display: block;
+  height: 100%;
+  background: var(--link);
+  transition: width var(--dur-base) var(--ease-out);
+}
+.meter.raised > span {
+  background: var(--status-warn);
+}
+.meter.high > span {
+  background: var(--status-down);
+}
+.overview-metric .meter {
+  margin-top: auto;
+}
+.overview-metric .metric-bottom {
+  margin-top: auto;
+}
+.overview-metric .meter + .metric-bottom {
+  margin-top: 0;
+}
+.traffic-directions strong {
+  display: block;
+  font: var(--fw-semibold) var(--text-lg)/var(--leading-tight) var(--font-mono);
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+.traffic-readout {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.swatch {
+  display: inline-block;
+  width: 10px;
+  height: 3px;
+  margin-right: var(--space-1);
+  vertical-align: middle;
+  border-radius: 2px;
+}
+.swatch.rx,
+.chart-rx {
+  color: var(--link);
+  background: var(--link);
+}
+.swatch.tx,
+.chart-tx {
+  color: var(--product);
+  background: var(--product);
+}
+.traffic-chart svg {
+  height: 6.5rem;
+}
+.traffic-chart polygon.chart-rx {
+  background: none;
+  fill: var(--link);
+  opacity: 0.1;
+}
+.traffic-chart polyline.chart-rx {
+  background: none;
+  stroke: var(--link);
+}
+.traffic-chart polyline.chart-tx {
+  background: none;
+  stroke: var(--product);
+  stroke-dasharray: 5 3;
+}
+.dash-vitals {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+.dash-vitals dt {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+.dash-vitals dd {
+  margin: var(--space-1) 0 0;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+.dash-gauges,
+.dash-rank {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-3);
+}
+.dash-gauges li,
+.dash-rank li {
+  display: grid;
+  grid-template-columns: minmax(6rem, 0.9fr) minmax(3rem, 1.4fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+.dash-gauges li > span:last-child,
+.dash-rank li > span:last-child {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  text-align: right;
+}
+.dash-rank code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dash-routes {
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+}
+.dash-routes > summary {
+  cursor: pointer;
+  color: var(--link);
+  padding-block: var(--space-1);
+}
+#live-interfaces .meter {
+  min-width: 4rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .meter > span {
+    transition: none;
+  }
+}
+@media (forced-colors: active) {
+  .meter > span {
+    background: Highlight;
+  }
+}
+details.source-notice {
+  padding: var(--space-2) var(--space-3);
+}
+details.source-notice > summary {
+  cursor: pointer;
+  color: var(--text-body);
+  font-size: var(--text-sm);
+}
+details.source-notice > pre {
+  margin: var(--space-2) 0 0;
+}
+.dash-checks {
+  list-style: none;
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) 0 0;
+  border-top: 1px solid var(--border-subtle);
+  display: grid;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+.dash-checks li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.dash-checks li > span:first-child {
+  color: var(--text-muted);
+}
+/* Dashboard, second pass: what needs attention, chart periods, link names. */
+.dash-attention {
+  margin-bottom: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid color-mix(in oklab, var(--status-warn) 45%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--status-warn) 6%, var(--surface));
+}
+.dash-attention h3 {
+  margin: 0 0 var(--space-2);
+  font: var(--fw-semibold) var(--text-sm)/var(--leading-normal) var(--font-sans);
+  color: var(--text-strong);
+}
+.dash-attention .count,
+.dash-grid h4 .count {
+  color: var(--text-muted);
+  font-weight: var(--fw-regular);
+  font-variant-numeric: tabular-nums;
+}
+.dash-attention ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+.dash-attention li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
+}
+.dash-attention li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.dash-attention .btn {
+  flex: none;
+  min-height: 30px;
+  padding-block: var(--space-1);
+  font-size: var(--text-xs);
+}
+.range {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-1);
+}
+.range select {
+  width: auto;
+  min-width: 0;
+  max-width: 14rem;
+  min-height: 26px;
+  margin-right: auto;
+  padding-block: 0;
+  font-size: var(--text-xs);
+}
+.range button {
+  min-height: 26px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: var(--fw-medium) var(--text-xs)/1 var(--font-sans);
+  cursor: pointer;
+}
+.range button.selected {
+  background: var(--surface);
+  border-color: var(--border-strong);
+  color: var(--text-strong);
+}
+.range button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.link-name {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.link-name > span {
+  color: var(--text-strong);
+}
+.link-name > code {
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+}
+.spark {
+  display: block;
+  width: 60px;
+  height: 16px;
+}
+svg.spark polyline {
+  stroke: var(--link);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.management-panel .muted {
+  color: var(--text-muted);
+}
+.management-panel .refused {
+  color: var(--red-300, var(--status-down));
+  font-weight: var(--fw-medium);
+}
+.dash-half > .management-panel + .management-panel {
+  margin-top: var(--space-4);
+  height: auto;
+}
+.dash-half > .management-panel:first-child:not(:last-child) {
+  height: auto;
 }

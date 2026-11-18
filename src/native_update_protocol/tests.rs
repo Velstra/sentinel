@@ -12,6 +12,7 @@ fn offer() -> update::VerifiedOffer {
             image: "sentinel.raw".into(),
             sha256: "a".repeat(64),
             product: Some(update::PRODUCT.into()),
+            freshness: None,
         },
         manifest_sha256: "b".repeat(64),
         public_key_sha256: "c".repeat(64),

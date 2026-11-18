@@ -28,6 +28,32 @@ export interface Link {
     tx_pps: number;
   };
 }
+/** Packets one rule (or, with `rule` null, a zone's default action) has
+ * decided since the data plane started. */
+export interface RuleCounter {
+  rule: string | null;
+  policy: number;
+  accepted: number;
+  dropped: number;
+  packets: number;
+  bytes: number;
+}
+/** The member's own vitals. Every figure the appliance could not read is null
+ * or absent — never zero. */
+export interface Vitals {
+  uptime_seconds: number | null;
+  load: [number, number, number] | null;
+  cpus: number | null;
+  /** Share of the interval since the previous sample; null on the first. */
+  cpu_percent: number | null;
+  memory: { total_bytes: number; available_bytes: number } | null;
+  filesystems: {
+    name: string;
+    path: string;
+    total_bytes: number;
+    available_bytes: number;
+  }[];
+}
 export interface Telemetry {
   sequence: number;
   sampled_at: number;
@@ -39,7 +65,7 @@ export interface Telemetry {
   events_lost?: number;
   conntrack?: { total: number | null; states?: unknown[] };
   top_talkers?: string | null;
-  rule_counters?: unknown;
+  rule_counters?: { rules?: RuleCounter[] } | null;
   ha?: {
     role: string;
     cluster?: string;
@@ -57,6 +83,8 @@ export interface Telemetry {
     routes_unchanged?: boolean;
   };
   wireguard?: string | null;
+  /** Absent from a member running an image that predates it. */
+  system?: Vitals | null;
   errors: Record<string, string>;
 }
 export interface Pending {
@@ -192,6 +220,8 @@ export interface Host {
   member(): string;
   /** Updates observe only while their local System view is visible. */
   updatesVisible?(): boolean;
+  /** What the configuration calls each link: its zone and description. */
+  links?(): Record<string, { zone?: string; description?: string }>;
   refresh(): Promise<unknown>;
   navigate(
     destination:
@@ -202,6 +232,7 @@ export interface Host {
       | "config"
       | "flows"
       | "system"
+      | "routing:bgp"
       | "services:resolution",
   ): void;
   signOut(message: string): void;
@@ -218,6 +249,7 @@ export interface Editor {
   visible: boolean;
   busy: boolean;
   feedback: string;
+  warnings: string[];
   invalid: boolean;
   diff: string;
   uncertain: boolean;
@@ -248,6 +280,7 @@ export const emptyEditor = (): Editor => ({
   visible: false,
   busy: false,
   feedback: "No changes.",
+  warnings: [],
   invalid: false,
   diff: "",
   uncertain: false,

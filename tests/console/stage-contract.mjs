@@ -65,11 +65,56 @@ const GROUPS = [
   ]],
 ];
 
+// A validation that went through says exactly one thing. Since the API began
+// returning the candidate's advisories it may also carry them — as an array,
+// and as one `warning:` line each in the same order. The two must be the same
+// advisories: a line without an entry, or an entry without a line, is a reply
+// this verifier does not understand, and what it does not understand it
+// refuses. Any other key or line is still an unexpected state.
 export function requireValidation(reply) {
-  check(reply && !Array.isArray(reply) && reply.ok === true
-    && reply.output === "validation ok; nothing applied"
-    && Object.keys(reply).sort().join(",")==="ok,output", "Real validation refused or returned an unexpected state: "
-      + JSON.stringify(reply));
+  const shaped = !!reply && !Array.isArray(reply) && reply.ok === true && typeof reply.output === "string";
+  const keys = shaped ? Object.keys(reply).sort().join(",") : "";
+  const warnings = keys === "ok,output,warnings" ? reply.warnings : [];
+  const lines = shaped ? reply.output.split("\n") : [];
+  check(shaped && (keys === "ok,output" || keys === "ok,output,warnings")
+    && Array.isArray(warnings)
+    && warnings.every((w) => typeof w === "string" && w.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(w))
+    && lines[0] === "validation ok; nothing applied"
+    && lines.length === 1 + warnings.length
+    && warnings.every((w, i) => lines[i + 1] === "warning: " + w),
+    "Real validation refused or returned an unexpected state: " + JSON.stringify(reply));
+}
+
+// A rejected JavaScript promise alone is not evidence of input validation: a
+// transport failure, unauthorised request or server error also rejects. Both
+// the real HTTP response and the helper's specific diagnostic must agree.
+export function requireRefusal(reply, diagnostic) {
+  check(!!reply && !Array.isArray(reply)
+    && Object.keys(reply).sort().join(",") === "message,rejected,status"
+    && reply.rejected === true && reply.status === 400
+    && typeof diagnostic === "string" && diagnostic.length > 0
+    && reply.message === diagnostic,
+    "Expected a specific HTTP 400 refusal, not another failure: " + JSON.stringify(reply));
+}
+
+export async function refusedConfiguration(page, lines, diagnostic) {
+  const config = process.env.CONSOLE_CONFIG;
+  check(config, "A real private configuration is required for refusal verification");
+  const before = readFileSync(config);
+  const responses = page.responses.length;
+  try {
+    const refusal = await page.evaluate(`(async () => {
+      try { await configure(${JSON.stringify(lines)}); return {rejected:false}; }
+      catch (error) { return {rejected:true,status:error.status,message:error.message}; }
+    })()`);
+    requireRefusal(refusal, diagnostic);
+    equal(page.responses.slice(responses)
+      .filter(row => row.url.endsWith('/api/v1/configure')).map(row => row.status),
+      [400], "The actual configuration request was not exactly one HTTP 400");
+    return refusal.message;
+  } finally {
+    check(readFileSync(config).equals(before), "A refused configuration changed the saved document");
+  }
 }
 
 export async function stageContractTests(page) {
@@ -87,10 +132,46 @@ export async function stageContractTests(page) {
       {ok:1,output:"validation ok; nothing applied"},
       {ok:true,output:"validation ok; nothing applied",pending:false},
       {ok:true,output:"validation ok; nothing applied",saved:true},
-      {ok:true,output:"validation ok; nothing applied",pending:{id:"unexpected"}}]) {
+      {ok:true,output:"validation ok; nothing applied",pending:{id:"unexpected"}},
+      // Advisories are admitted only as the same list said twice.
+      {ok:true,output:"validation ok; nothing applied\nwarning: a rule is narrower than it reads"},
+      {ok:true,output:"validation ok; nothing applied\nwarning: a rule is narrower than it reads",warnings:[]},
+      {ok:true,output:"validation ok; nothing applied",warnings:["a rule is narrower than it reads"]},
+      {ok:true,output:"validation ok; nothing applied\nwarning: one",warnings:["another"]},
+      {ok:true,output:"validation ok; nothing applied\nwarning: one\nerror: refused",warnings:["one"]},
+      {ok:true,output:"validation ok; nothing applied\nwarning: one",warnings:"one"},
+      {ok:true,output:"validation ok; nothing applied\nwarning: ",warnings:[""]},
+      {ok:true,output:"validation ok; nothing applied\nwarning: one\nwarning: two",warnings:["two","one"]},
+      {ok:true,output:"validation ok; nothing applied\nwarning: one\ntwo",warnings:["one\ntwo"]},
+      ...[...Array.from({length:32},(_,i)=>String.fromCharCode(i)),
+        ...Array.from({length:33},(_,i)=>String.fromCharCode(127+i))].map(control=>({
+        ok:true,output:"validation ok; nothing applied\nwarning: raw"+control+"control",
+        warnings:["raw"+control+"control"],
+      })),
+      {ok:true,output:"validation ok; nothing applied",warnings:[],pending:false}]) {
       let refused = false;
       try { requireValidation(reply); } catch { refused = true; }
       check(refused, "A false-green validator reply was accepted: " + JSON.stringify(reply));
+    }
+    // And the two shapes a real validation has: with nothing to advise, and
+    // with advisories that agree with their lines.
+    for (const reply of [{ok:true,output:"validation ok; nothing applied"},
+      {ok:true,output:"validation ok; nothing applied",warnings:[]},
+      {ok:true,output:"validation ok; nothing applied\nwarning: one\nwarning: two",warnings:["one","two"]}]) {
+      requireValidation(reply);
+    }
+  });
+  await test("strict refusal verifier rejects unrelated failures and false refusals", () => {
+    const diagnostic = 'line 1 refused: services ssh port "65536": not a 1-65535 port';
+    const valid = {rejected:true,status:400,message:diagnostic};
+    requireRefusal(valid,diagnostic);
+    for (const reply of [null,{}, {...valid,rejected:false}, {...valid,status:undefined},
+      ...[200,401,403,409,500,503].map(status=>({...valid,status})),
+      {...valid,message:""}, {...valid,message:"the appliance could not be reached"},
+      {...valid,message:"a different input was refused"}, {...valid,output:diagnostic}]) {
+      let rejected = false;
+      try { requireRefusal(reply,diagnostic); } catch { rejected = true; }
+      check(rejected, "An unrelated failure counted as input refusal: "+JSON.stringify(reply));
     }
   });
 
@@ -200,13 +281,18 @@ export async function stageContractTests(page) {
     check(await page.evaluate(`!!document.getElementById(${JSON.stringify(box)}).querySelector('[aria-invalid="true"]')`),
       "Invalid actual field has no associated inline refusal");
     const command=`set ${path} ${key} ${value}`;
-    const reply=await page.evaluate(`configure([${JSON.stringify(command)}])`);
-    check(reply?.ok===false&&/^error:/.test(reply.output),"Backend accepted invalid input: "+JSON.stringify(reply));
+    const diagnostic=path==='services ssh'
+      ? 'line 1 refused: services ssh port "65536": not a 1-65535 port'
+      : 'update: url "javascript:alert(1)" must be an https:// or file:// URL';
+    await refusedConfiguration(page,[command],diagnostic);
     const cli=spawnSync(binary,["configure","--config",config,"--no-apply"],{
       input:command+"\ncommit\n",encoding:"utf8",timeout:15000,env:{...process.env,NO_COLOR:"1"},
     });
     const output=(cli.stdout||"")+(cli.stderr||"");
-    check(!cli.error&&cli.status!==null&&cli.status!==0&&/\berror:/i.test(output),"CLI did not reject invalid input: "+output);
+    // The API adds batch line attribution; the installed CLI prints the same
+    // underlying diagnostic with its own `error:` prefix and failure exit.
+    const cliDiagnostic=diagnostic.replace(/^line 1 refused: /,'');
+    check(!cli.error&&cli.status!==null&&cli.status!==0&&output.includes('error: '+cliDiagnostic),"CLI did not reject the specific invalid input: "+output);
     equal(readFileSync(config).toString(),before.toString(),"Rejected value modified the saved config");
     negatives.push({path,key,value,ui_refused:true,api_refused:true,cli_refused:true});
   });

@@ -321,7 +321,10 @@ fn copy_sparse_bounded(
     maximum: u64,
 ) -> Result<String> {
     let block = sink.block();
-    ensure!(block > 0 && CHUNK % block == 0, "invalid sparse block size");
+    ensure!(
+        block > 0 && CHUNK.is_multiple_of(block),
+        "invalid sparse block size"
+    );
     let mut buffer = vec![0u8; CHUNK];
     let mut total = 0u64;
     let mut hash = digest::Context::new(&digest::SHA256);

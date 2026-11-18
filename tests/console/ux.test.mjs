@@ -6,6 +6,7 @@ import {creationTests} from './creation.mjs';
 import {updateKeyTests} from './update-key.mjs';
 import {emptyPolicyTests} from './empty-policy.mjs';
 import {updateUrlTests} from './update-url.mjs';
+import {workflowTests} from './workflow.mjs';
 const page=await browser({width:1440,height:1000});
 const go=async key=>{await page.evaluate(`goto(${JSON.stringify(key)})`);await sleep(250);};
 try {
@@ -14,6 +15,7 @@ try {
  await updateKeyTests();
  await emptyPolicyTests();
  await updateUrlTests();
+ await workflowTests();
  await test('staged badge never claims a provisional network change is already clear',async()=>{
   const states=await page.evaluate(`(()=>{
    const oldStaged=staged,oldApplying=applying,rows=[];

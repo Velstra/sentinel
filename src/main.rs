@@ -11,6 +11,7 @@
 
 mod aaa;
 mod acme;
+mod admission;
 mod alert;
 mod api;
 mod api_session;
@@ -45,6 +46,7 @@ mod native_update;
 mod native_update_protocol;
 mod net;
 mod network_reconcile;
+mod observe;
 mod openapi;
 mod openconnect;
 mod passwd;
@@ -113,7 +115,12 @@ fn saved_config_path() -> std::path::PathBuf {
 /// read-only account from reading the config-sync secret — the machine's
 /// full-access token — out of `show configuration commands`.
 fn load_shown(path: &std::path::Path) -> Result<Appliance> {
-    redact::appliance(&Appliance::load(path)?, redact::Disclosure::from_env())
+    let appliance = if path == saved_config_path() {
+        Appliance::load_active(path)?
+    } else {
+        Appliance::load(path)?
+    };
+    redact::appliance(&appliance, redact::Disclosure::from_env())
 }
 use velstra_proto::{
     Counter, ListPortsRequest, StatsReport, velstra_control_client::VelstraControlClient,
@@ -408,12 +415,17 @@ enum Command {
     /// Internal root-only presence/absence proof for a protected state path.
     #[command(hide = true)]
     OwnedFileProbe { path: PathBuf },
+    /// Fixed, bounded read-only readiness probe used by live configuration.
+    #[command(hide = true)]
+    ServiceReadiness { unit: String },
     /// Internal root-only bounded regular-file read; returns an optional JSON string.
     #[command(hide = true)]
     OwnedFileRead {
         path: PathBuf,
         #[arg(long)]
         max_bytes: usize,
+        #[arg(long)]
+        private: bool,
     },
     /// Internal root-only independent update worker; no caller-provided paths.
     #[command(hide = true)]
@@ -431,16 +443,22 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Re-apply the console keyboard, locale and timezone from the saved config.
+    /// Internal finite local read capability, authorized independently of sudo.
+    #[command(hide = true)]
+    Observe {
+        #[arg(value_enum)]
+        operation: observe::Operation,
+    },
+    /// Re-apply the console keyboard, locale and timezone from active intent.
     ///
     /// Its own command because systemd owns the virtual console and re-runs
     /// `systemd-vconsole-setup` whenever one appears — which resets the keymap
     /// to the image's. This runs after it, and again whenever it runs, so the
     /// layout an operator chose is the one that survives.
     ApplyConsole {
-        /// The active appliance config to read the settings from.
-        #[arg(long, default_value = DEFAULT_CONFIG)]
-        config: PathBuf,
+        /// Explicit config to apply; otherwise use running intent, then saved.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Compile + install the Velstra agent config, then reload the data plane.
     Apply {
@@ -545,6 +563,9 @@ enum Command {
         /// pending management transaction.
         #[arg(long, hide = true)]
         commit_confirm: bool,
+        /// Original journal identity for a new timer's private snapshot.
+        #[arg(long, hide = true)]
+        original_config: Option<PathBuf>,
     },
     /// Deliver an alert for a failed unit (roadmap C23). Invoked by systemd's
     /// `OnFailure=` on the units Sentinel owns, not by hand — it reads the saved
@@ -652,6 +673,10 @@ enum ConfigAction {
     Check {
         /// Path to the appliance config (TOML).
         file: PathBuf,
+        /// Also require enabled physical interfaces to exist on this machine.
+        /// Omit for portable/offline configuration authoring.
+        #[arg(long)]
+        live: bool,
     },
     /// Parse a config file and print a normalized summary.
     Show {
@@ -745,9 +770,11 @@ async fn main() -> Result<()> {
         Command::UpdateJob { id } => update_jobs::run_worker(&id).map_err(Into::into),
         Command::System { command } => update_cli::run(command),
         Command::Configure { config, no_apply } => configure(&config, no_apply),
+        Command::ServiceReadiness { unit } => repl::service_readiness(&unit),
         Command::SyncConfig => configsync::flush(),
         Command::RefreshFirewall => refresh_firewall(),
         Command::Show { args } => show_op(&args),
+        Command::Observe { operation } => observe::run(operation),
         Command::Trace {
             in_interface,
             proto,
@@ -853,8 +880,12 @@ async fn main() -> Result<()> {
             print!("{}", system::owned_file_probe(&path)?);
             Ok(())
         }
-        Command::OwnedFileRead { path, max_bytes } => {
-            print!("{}", system::owned_file_read(&path, max_bytes)?);
+        Command::OwnedFileRead {
+            path,
+            max_bytes,
+            private,
+        } => {
+            print!("{}", system::owned_file_read(&path, max_bytes, private)?);
             Ok(())
         }
         Command::AgentQuery { command, socket } => {
@@ -862,16 +893,18 @@ async fn main() -> Result<()> {
             print!("{}", velstra::query_at(&path, &command)?);
             Ok(())
         }
-        Command::ApplyConsole { config } => {
-            let _lock = system::apply_lock()?;
-            let appliance = Appliance::load(&config)?;
-            mutation::advance()?;
-            net::apply_console_settings(&appliance)
-        }
+        Command::ApplyConsole { config } => apply_console(config.as_deref()),
         Command::Apply { file, out, reload } => {
             let _lock = system::apply_lock()?;
+            confirm::ensure_idle_for_write(reload.is_some())?;
+            safe_apply::ensure_writable(std::path::Path::new(DEFAULT_CONFIG))?;
+            safe_apply::ensure_writable(&file)?;
+            // The supplied file is a candidate, never its own authority to
+            // grandfather a legacy rule. Refuse before epoch/output/fetches.
+            let candidate = Appliance::load(&file)?;
+            admission::check_saved(std::path::Path::new(DEFAULT_CONFIG), true, &candidate)?;
             mutation::advance()?;
-            apply(&file, &out, reload.as_deref())
+            apply_candidate(&candidate, &out, reload.as_deref())
         }
         Command::ApplyPending { config, id } => {
             safe_apply::apply_pending(&config, &id, &live_apply(true))
@@ -890,7 +923,8 @@ async fn main() -> Result<()> {
         Command::ConfirmRollback {
             config,
             commit_confirm,
-        } => confirm_rollback(&config, commit_confirm),
+            original_config,
+        } => confirm_rollback(&config, commit_confirm, original_config.as_deref()),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::IdsWatch => {
             system::ignore_sigpipe();
@@ -1045,18 +1079,36 @@ fn live_apply(enabled: bool) -> repl::Apply {
 /// The `commit-confirm` timer runs this when its window expires; an operator can
 /// also run it (or `run confirm-rollback` from config mode) to drop an
 /// un-confirmed change at once.
-fn confirm_rollback(config: &std::path::Path, from_timer: bool) -> Result<()> {
-    confirm::rollback(&live_apply(true), config, from_timer)
+fn confirm_rollback(
+    config: &std::path::Path,
+    from_timer: bool,
+    original: Option<&std::path::Path>,
+) -> Result<()> {
+    confirm::rollback(&live_apply(true), config, from_timer, original)
 }
 
 /// The interactive configuration session — a VyOS/JunOS-style edit context.
 /// On a terminal it uses rustyline (history + tab-completion); for piped input
 /// (scripts/tests) it reads plain stdin lines. Both run `repl::exec_line`.
+fn configuration_interfaces(no_apply: bool) -> Vec<String> {
+    if no_apply {
+        Vec::new()
+    } else {
+        system::discover_interfaces()
+    }
+}
+
 fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
-    let mut session = Session::load(config)?;
+    let mut session = if no_apply {
+        Session::load(config)?
+    } else {
+        Session::load_live(config)?
+    };
     // Surface the interfaces the system actually provides, so they appear in the
     // config (unassigned) ready to be given a zone/address — VyOS-style.
-    session.merge_discovered(system::discover_interfaces());
+    // Off-box editing must not import the workstation's hardware into an
+    // appliance candidate, even when that candidate is later saved unchanged.
+    session.merge_discovered(configuration_interfaces(no_apply));
 
     // Apply on commit unless told not to (off-box editing). The live apply uses
     // hostnamectl/systemctl, which only work on the box.
@@ -1160,6 +1212,9 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
             ) {
                 break;
             }
+            if repl::failed_lines() > 0 {
+                break;
+            }
         }
         // Answer for what was refused. Scripts and the REST API judge by exit
         // status, and printing an error while exiting 0 told them a change had
@@ -1167,8 +1222,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         let failed = repl::failed_lines();
         if failed > 0 {
             anyhow::bail!(
-                "{failed} line(s) were refused — see the errors above; nothing they \
-                 asked for was applied"
+                "{failed} line(s) were refused; batch stopped at the first error. Earlier successful commits or saves remain in effect"
             );
         }
     }
@@ -1179,6 +1233,16 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 /// a live-only CLI edit by replaying the older saved boot configuration.
 fn refresh_firewall() -> Result<()> {
     let _lock = system::apply_lock()?;
+    // A failed restore may have left an already-restored firewall in service
+    // while RUNNING still describes the unconfirmed candidate. Do not replay
+    // that candidate over the unknown/mixed state. Armed schedule/feed refresh
+    // remains legitimate and is deliberately not frozen by this narrower gate.
+    if confirm::automatic_firewall_refresh_blocked()? {
+        eprintln!(
+            "firewall refresh deferred: commit-confirm rollback is running or failed; no policy was reloaded"
+        );
+        return Ok(());
+    }
     let source = firewall_refresh_source(
         std::path::Path::new(DEFAULT_CONFIG),
         std::path::Path::new(session::Session::RUNNING),
@@ -1210,11 +1274,20 @@ fn firewall_refresh_source<'a>(
 /// `out`, and (if given) reload the systemd `unit` running the data plane.
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
     let _lock = system::apply_lock()?;
+    apply_candidate(&Appliance::load(file)?, out, reload)
+}
+
+/// Caller holds apply.lock and either admitted this exact candidate or selected
+/// authoritative installed intent for an automatic refresh. Do not reread a
+/// user file after admission: it could have changed in between.
+fn apply_candidate(
+    candidate: &Appliance,
+    out: &std::path::Path,
+    reload: Option<&str>,
+) -> Result<()> {
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
-    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
-        &Appliance::load(file)?,
-    )));
+    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(candidate)));
     // This is the path `sentinel-fwsched.service` runs at every window
     // boundary, so it is where a schedule is decided by the clock. Saying so
     // here puts it in the journal beside the re-apply that acted on it, which
@@ -1254,6 +1327,12 @@ fn apply_boot(
     // stages through the same fixed temp names, so an interleaved writer could
     // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
     let _lock = system::apply_lock()?;
+    confirm::ensure_idle_for_write(true)?;
+    // Check both selected and default journals before even advancing the boot
+    // epoch. Their own recovery repeats the prior-boot check under its lock.
+    safe_apply::ensure_boot_recovery(std::path::Path::new(DEFAULT_CONFIG))?;
+    safe_apply::ensure_boot_recovery(config)?;
+    ensure_boot_baseline_matches(config, std::path::Path::new(session::Session::RUNNING))?;
     mutation::initialize_boot()?;
     mutation::advance()?;
     safe_apply::recover(config, &repl::Apply::off(), true, true)?;
@@ -1276,6 +1355,7 @@ fn apply_boot(
         .to_toml()
         .context("compiling routing config")?;
 
+    net::preflight_login_accounts(&appliance)?;
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -1303,22 +1383,90 @@ fn apply_boot(
     Ok(())
 }
 
+/// RUNNING is boot-local. Its absence permits genuine cold boot; an existing
+/// different active intent means this is a live replay of an older saved file.
+fn ensure_boot_baseline_matches(saved: &std::path::Path, running: &std::path::Path) -> Result<()> {
+    if let Some(text) = session::Session::read_running_at(running)? {
+        let active = Appliance::from_toml(&text).context("validating active boot baseline")?;
+        let saved = Appliance::load_lenient(saved)?;
+        anyhow::ensure!(
+            ha::revision(&active)? == ha::revision(&saved)?,
+            "running configuration has unsaved changes; boot-seed cannot replay saved intent during this boot; save the active configuration or explicitly revert it first"
+        );
+    }
+    Ok(())
+}
+
+fn apply_console(config: Option<&std::path::Path>) -> Result<()> {
+    let _lock = system::apply_lock()?;
+    let saved = std::path::Path::new(DEFAULT_CONFIG);
+    let appliance = if let Some(config) = config {
+        // Explicit CLI requests retain their selected-file semantics, but may
+        // not circumvent an independent rollback or management transaction.
+        confirm::ensure_idle_for_write(true)?;
+        safe_apply::ensure_writable(saved)?;
+        safe_apply::ensure_writable(config)?;
+        Appliance::load(config)?
+    } else {
+        if automatic_reapply_deferred(saved, "console refresh")? {
+            return Ok(());
+        }
+        Appliance::load_active(saved)?
+    };
+    mutation::advance()?;
+    net::apply_console_settings(&appliance)
+}
+
+fn automatic_reapply_deferred(saved: &std::path::Path, operation: &str) -> Result<bool> {
+    // Query both even if one is pending: corrupt state must not be hidden
+    // by a successful deferral caused by the other protection mechanism.
+    let cli_pending = confirm::automatic_reapply_pending()?;
+    let api_pending = safe_apply::has_pending(saved)?;
+    let deferred = cli_pending || api_pending;
+    if deferred {
+        eprintln!(
+            "{operation} deferred: configuration confirmation or recovery is pending; no settings were applied"
+        );
+    }
+    Ok(deferred)
+}
+
 /// Second boot stage: after networkd has brought the links up, apply the
 /// runtime-only network state that a reboot wipes and that could not be applied
 /// before the links existed — tc egress qdiscs (QoS), the Multi-WAN policy
 /// routes, and the IPsec SAs. Run by the `sentinel-boot-late` service.
 fn apply_boot_late(config: Option<&std::path::Path>) -> Result<()> {
-    // Lenient for the same reason as apply_boot: the second boot stage applies
-    // the same saved config, and must survive an unknown key just the same.
     let _lock = system::apply_lock()?;
-    let source = boot_late_source(
+    let saved = std::path::Path::new(DEFAULT_CONFIG);
+    if let Some(selected) = config {
+        confirm::ensure_idle_for_write(true)?;
+        safe_apply::ensure_writable(saved)?;
+        safe_apply::ensure_writable(selected)?;
+    } else if automatic_reapply_deferred(saved, "late network refresh")? {
+        return Ok(());
+    }
+    let appliance = boot_late_appliance(
         config,
-        std::path::Path::new(DEFAULT_CONFIG),
+        saved,
         std::path::Path::new(session::Session::RUNNING),
-    );
-    let appliance = Appliance::load_lenient(source)?;
+    )?;
     mutation::advance()?;
     net::apply_link_runtime(&appliance)
+}
+
+fn boot_late_appliance(
+    explicit: Option<&std::path::Path>,
+    saved: &std::path::Path,
+    running: &std::path::Path,
+) -> Result<Appliance> {
+    let source = boot_late_source(explicit, saved, running)?;
+    if explicit.is_none() && source == saved {
+        // Genuine boot/rollback compatibility applies only to saved intent
+        // when RUNNING is truly absent. Active and explicit inputs are strict.
+        Appliance::load_lenient(source)
+    } else {
+        Appliance::load(source)
+    }
 }
 
 /// Which configuration the second boot stage re-applies: the one a live commit
@@ -1339,11 +1487,15 @@ fn boot_late_source<'a>(
     explicit: Option<&'a std::path::Path>,
     saved: &'a std::path::Path,
     running: &'a std::path::Path,
-) -> &'a std::path::Path {
+) -> Result<&'a std::path::Path> {
     match explicit {
-        Some(path) => path,
-        None if running.is_file() => running,
-        None => saved,
+        Some(path) => Ok(path),
+        None => match running.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => Ok(running),
+            Ok(_) => anyhow::bail!("active network intent is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(saved),
+            Err(error) => Err(error).context("inspecting active network intent"),
+        },
     }
 }
 
@@ -2530,6 +2682,11 @@ fn show_held_links() {
 }
 
 fn show_op(args: &[String]) -> Result<()> {
+    if observe::needs_capability(&saved_config_path())
+        && let Some(operation) = observe::operation_for_show(args)
+    {
+        return observe::request(operation);
+    }
     let ip = system::bin("ip");
     let v: Vec<&str> = args.iter().map(String::as_str).collect();
     match v.as_slice() {
@@ -2584,10 +2741,8 @@ fn show_op(args: &[String]) -> Result<()> {
 
         // IPv4/IPv6 routing — served by Wren's RIB; the kernel FIB is the
         // fallback when the daemon isn't reachable.
-        ["ip", "route"] => wren_show_or(&["routes"], &ip, &["route", "show"]),
-        ["ip", "route", proto] => {
-            wren_show_or(&["routes", proto], &ip, &["route", "show", "proto", proto])
-        }
+        ["ip", "route"] => run_show(&ip, &["route", "show"]),
+        ["ip", "route", proto] => run_show(&ip, &["route", "show", "proto", proto]),
         ["ipv6", "route"] => run_show(&ip, &["-6", "route", "show"]),
 
         // BGP: vtysh-flavoured spellings on top of wren's tree.
@@ -2606,10 +2761,10 @@ fn show_op(args: &[String]) -> Result<()> {
         ["ha"] => {
             let mut status: serde_json::Value = serde_json::from_str(&velstra::query("ha-status")?)
                 .context("reading the data plane's HA status")?;
-            if let Ok(config) = config::Appliance::load(&saved_config_path()) {
-                if let Some(ha) = config.system.ha.filter(|h| h.enabled) {
-                    status["configured_mode"] = ha.mode.as_str().into();
-                }
+            if let Ok(config) = config::Appliance::load(&saved_config_path())
+                && let Some(ha) = config.system.ha.filter(|h| h.enabled)
+            {
+                status["configured_mode"] = ha.mode.as_str().into();
             }
             print!("{}", ha::render_status(&status));
             Ok(())
@@ -2658,6 +2813,7 @@ fn show_op(args: &[String]) -> Result<()> {
         // exactly as configured and look misconfigured.
         ["firewall", "zones"] | ["zones"] => show_zones(),
         ["firewall", "states"] => show_agent_query("firewall-states", "firewall connection states"),
+        ["firewall", "capacity"] => show_agent_query("capacity", "firewall map capacity"),
         ["firewall", "counters"] => show_agent_query("rule-stats", "rule packet counters"),
         // The newest events, read without consuming them: the console's live
         // view reads the same agent log through its own cursor.
@@ -2897,7 +3053,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show isis [neighbors|interfaces|database]\n  \
              show babel [neighbors|routes]\n  \
              show vrrp | show ha | show bfd [sessions]\n  \
-             show firewall [statistics|counters|events|states|log]\n  \
+             show firewall [statistics|capacity|counters|events|states|log]\n  \
              show flows [| top-talkers]        live state table / hosts by volume\n  \
              show nat                          NAT configuration\n  \
              show vpn [ipsec]                  IPsec security associations / connections\n  \
@@ -3027,6 +3183,9 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
             Ok(())
         }
         Err(e) => {
+            if observe::strict_child() {
+                return Err(e).with_context(|| format!("{what} unavailable"));
+            }
             println!("{what} unavailable: {e:#}");
             println!(
                 "(the agent serves this on {}; check `systemctl status velstra.service`)",
@@ -3186,9 +3345,15 @@ fn show_firewall_stats() -> Result<()> {
     // Prefer the agent's live counters. The journal scrape below is the fallback
     // for an agent without a query socket: it only ever shows whatever the last
     // periodic dump happened to contain, so it is a poor substitute, not a peer.
-    if let Ok(reply) = velstra::query("stats") {
-        print!("{reply}");
-        return Ok(());
+    match velstra::query("stats") {
+        Ok(reply) => {
+            print!("{reply}");
+            return Ok(());
+        }
+        Err(error) if observe::strict_child() => {
+            return Err(error).context("firewall statistics unavailable");
+        }
+        Err(_) => {}
     }
     let out = std::process::Command::new(system::bin("journalctl"))
         .args([
@@ -3725,9 +3890,20 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
             print!("{}", config::EXAMPLE);
             Ok(())
         }
-        ConfigAction::Check { file } => {
-            Appliance::load(&file)?;
-            println!("{} is valid", file.display());
+        ConfigAction::Check { file, live } => {
+            let appliance = Appliance::load(&file)?;
+            if live {
+                net::validate_present_interfaces(&appliance, &system::discover_interfaces())?;
+                println!("{} is valid for this host", file.display());
+            } else {
+                println!(
+                    "{} is valid (schema; hardware presence not checked)",
+                    file.display()
+                );
+            }
+            for warning in appliance.warnings() {
+                eprintln!("warning: {warning}");
+            }
             Ok(())
         }
         ConfigAction::Show { file } => {
@@ -3840,6 +4016,79 @@ async fn ports(endpoint: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{boot_late_source, firewall_events_since_query, firewall_log_args};
+
+    #[test]
+    fn console_refresh_distinguishes_automatic_from_an_explicit_selected_file() {
+        use clap::Parser;
+        match super::Cli::try_parse_from(["sentinel", "apply-console"])
+            .unwrap()
+            .command
+        {
+            super::Command::ApplyConsole { config } => assert!(config.is_none()),
+            _ => panic!("wrong dispatch"),
+        }
+        match super::Cli::try_parse_from([
+            "sentinel",
+            "apply-console",
+            "--config",
+            "/tmp/selected.toml",
+        ])
+        .unwrap()
+        .command
+        {
+            super::Command::ApplyConsole { config } => assert_eq!(
+                config.as_deref(),
+                Some(std::path::Path::new("/tmp/selected.toml"))
+            ),
+            _ => panic!("wrong dispatch"),
+        }
+    }
+
+    #[test]
+    fn boot_seed_only_accepts_missing_or_equal_active_intent_and_fails_closed_on_corruption() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "sentinel-boot-admission-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let saved = dir.join("saved.toml");
+        let running = dir.join("running.toml");
+        std::fs::write(&saved, "[system]\nhostname='saved'\n").unwrap();
+        super::ensure_boot_baseline_matches(&saved, &running).unwrap();
+        // Representation differences do not turn equal intent into drift.
+        std::fs::write(
+            &running,
+            "# same active intent\n[system]\nhostname = \"saved\"\n",
+        )
+        .unwrap();
+        super::ensure_boot_baseline_matches(&saved, &running).unwrap();
+        std::fs::write(&running, "[system]\nhostname='unsaved'\n").unwrap();
+        assert!(
+            super::ensure_boot_baseline_matches(&saved, &running)
+                .unwrap_err()
+                .to_string()
+                .contains("unsaved changes")
+        );
+        std::fs::write(&running, "not valid TOML").unwrap();
+        assert!(super::ensure_boot_baseline_matches(&saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        symlink("missing-active", &running).unwrap();
+        assert!(super::ensure_boot_baseline_matches(&saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        std::fs::create_dir(&running).unwrap();
+        assert!(super::ensure_boot_baseline_matches(&saved, &running).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_configuration_never_imports_the_editing_hosts_interfaces() {
+        assert!(super::configuration_interfaces(true).is_empty());
+    }
 
     #[test]
     fn owned_file_probe_cli_keeps_literal_path_values_after_the_option_terminator() {
@@ -3996,17 +4245,61 @@ mod tests {
         std::fs::write(&saved, "saved").unwrap();
         let _ = std::fs::remove_file(&running);
         // Nothing committed since boot: the saved configuration.
-        assert_eq!(boot_late_source(None, &saved, &running), saved.as_path());
+        assert_eq!(
+            boot_late_source(None, &saved, &running).unwrap(),
+            saved.as_path()
+        );
         // A commit ran before this stage got the lock: what it applied.
         std::fs::write(&running, "committed").unwrap();
-        assert_eq!(boot_late_source(None, &saved, &running), running.as_path());
+        assert_eq!(
+            boot_late_source(None, &saved, &running).unwrap(),
+            running.as_path()
+        );
         // A config named on the command line wins over both.
         let named = dir.join("named.toml");
         assert_eq!(
-            boot_late_source(Some(&named), &saved, &running),
+            boot_late_source(Some(&named), &saved, &running).unwrap(),
             named.as_path()
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn boot_late_only_absence_allows_lenient_saved_fallback() {
+        use std::os::unix::fs::symlink;
+        let scratch = crate::update::Scratch::new().unwrap();
+        let saved = scratch.join("saved.toml");
+        let running = scratch.join("running.toml");
+        std::fs::write(
+            &saved,
+            "[system]\nhostname='saved'\nfuture-unknown-setting=true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::boot_late_appliance(None, &saved, &running)
+                .unwrap()
+                .system
+                .hostname,
+            "saved"
+        );
+        assert!(
+            super::boot_late_appliance(Some(&saved), &saved, &running).is_err(),
+            "explicit input stays strict"
+        );
+        for bytes in [
+            "invalid = [",
+            "[system]\nhostname='active'\nfuture-unknown-setting=true\n",
+        ] {
+            std::fs::write(&running, bytes).unwrap();
+            assert!(super::boot_late_appliance(None, &saved, &running).is_err());
+        }
+        std::fs::remove_file(&running).unwrap();
+        symlink("missing-active", &running).unwrap();
+        assert!(boot_late_source(None, &saved, &running).is_err());
+        assert!(super::boot_late_appliance(None, &saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        std::fs::create_dir(&running).unwrap();
+        assert!(super::boot_late_appliance(None, &saved, &running).is_err());
     }
 
     #[test]

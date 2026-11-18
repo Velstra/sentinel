@@ -3,6 +3,24 @@
 import { browser, signIn, sleep, test, check, summary } from './harness.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 
+// The updates panel legitimately separates health from Identity. Check actual
+// ownership, reading order and rendered geometry, not an incidental sibling.
+const healthPlacement = `(() => {
+  const view = document.querySelector('#view-system');
+  const health = document.querySelector('#react-system-health');
+  const identity = document.querySelector('#sys-ident');
+  if (!view || !health || !identity || !health.isConnected || !identity.isConnected
+      || !view.contains(health) || !view.contains(identity)) return false;
+  const order = health.compareDocumentPosition(identity);
+  const visible = element => element.getClientRects().length > 0
+      && getComputedStyle(element).visibility === 'visible';
+  const first = health.getBoundingClientRect(), second = identity.getBoundingClientRect();
+  return !(order & Node.DOCUMENT_POSITION_DISCONNECTED)
+      && !!(order & Node.DOCUMENT_POSITION_FOLLOWING)
+      && visible(health) && visible(identity) && first.height > 0 && second.height > 0
+      && first.bottom <= second.top;
+})()`;
+
 const page = await browser({width: 1440, height: 1000});
 try {
   await page.goto(process.env.CONSOLE_URL);
@@ -17,11 +35,30 @@ try {
         actualShape: !!actual.clock && !!actual.systemd && !!actual.tpm && !!actual.network,
         received: !!management.getSnapshot().health,
         clock: document.querySelector('#react-system-health').textContent.includes('Appliance clock (UTC)'),
-        beforeIdentity: !!document.querySelector('#react-system-health').nextElementSibling.querySelector('#sys-ident'),
+        beforeIdentity: ${healthPlacement},
         overview: document.querySelector('#react-dashboard').textContent.includes('Open system health')
       };
     })()`);
     check(Object.values(facts).every(Boolean), 'system health is not backed by the real API/mounts: '+JSON.stringify(facts));
+  });
+  await test('health placement rejects missing, hidden, misplaced and reversed panels', async () => {
+    const result = await page.evaluate(`(() => {
+      const health = document.querySelector('#react-system-health');
+      const parent = health.parentNode, next = health.nextSibling;
+      const originallyHidden = health.hidden;
+      const restored = () => { health.hidden = originallyHidden; parent.insertBefore(health, next); };
+      const result = {};
+      try {
+        health.remove(); result.missing = !${healthPlacement}; restored();
+        health.hidden = true; result.hidden = !${healthPlacement}; restored();
+        document.body.append(health); result.outsideSystem = !${healthPlacement}; restored();
+        document.querySelector('#sys-ident').closest('.card').after(health);
+        result.reversed = !${healthPlacement};
+      } finally { restored(); }
+      result.recovered = ${healthPlacement};
+      return result;
+    })()`);
+    check(Object.values(result).every(Boolean), 'health placement admitted a broken surface: '+JSON.stringify(result));
   });
   await test('configure NTP opens the existing staged form without changing configuration', async () => {
     const result = await page.evaluate(`(async () => {
