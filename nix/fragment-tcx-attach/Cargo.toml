@@ -1,0 +1,14 @@
+[package]
+name = "fragment-tcx-attach-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "fragment-tcx-attach"
+path = "main.rs"
+
+[dependencies]
+aya = { git = "https://github.com/aya-rs/aya", rev = "6f6859fbc0857b792f78fe4a128c6808267cbfcf", default-features = false }

@@ -202,6 +202,36 @@ in pkgs.testers.runNixOSTest {
         assert "flow_detail" not in telemetry and "top_talkers" in telemetry, telemetry
         assert "states" in telemetry["conntrack"] and "nat_flows" in telemetry["conntrack"], telemetry
 
+    with subtest("on-appliance no-apply fleet writes cannot bypass a local CLI trial"):
+        candidate("fleet-must-not-overwrite-local-trial")
+        prior_active = fw.succeed("cat /run/sentinel/running.toml")
+        trial = ["set system hostname fleet-local-trial", "commit-confirm 1", "exit"]
+        fw.succeed("printf '%s\\n' " + " ".join(shlex.quote(line) for line in trial) + " | sentinel configure 2>&1")
+        # Reconcile starts the configured fleet timer. Queue only after it is
+        # stopped, so the explicit --no-apply request owns this signed command.
+        stop_timer()
+        queue(7, dict(action="apply-hostname"))
+        saved_before = fw.succeed("cat " + config)
+        running_before = fw.succeed("cat /run/sentinel/running.toml")
+        refused = fw.fail("sentinel fleet-poll --no-apply --config " + config + " 2>&1")
+        assert "explicitly confirm or revert" in refused, refused
+        assert sequence() == 7
+        assert last_request()["sequence"] == 6
+        controller.succeed("test ! -e /var/lib/fleet-test/command.json")
+        assert json.loads(fw.succeed("cat " + state))["result"]["state"] == "refused"
+        assert fw.succeed("cat " + config) == saved_before
+        assert fw.succeed("cat /run/sentinel/running.toml") == running_before
+        fw.fail("test -e " + pending)
+        fw.succeed("systemctl is-active --quiet sentinel-confirm.timer; test $(hostname) = fleet-local-trial")
+        fw.succeed("sentinel confirm-rollback")
+        fw.wait_until_succeeds("test $(hostname) = fleet-confirmed", timeout=30)
+        fw.wait_until_succeeds("test $(systemctl show --property=LoadState --value sentinel-confirm.service) = not-found", timeout=30)
+        stop_timer()
+        fw.fail("systemctl is-active --quiet sentinel-confirm.timer")
+        fw.succeed("test $(hostname) = fleet-confirmed")
+        assert fw.succeed("cat " + config) == saved_before
+        assert fw.succeed("cat /run/sentinel/running.toml") == prior_active
+
     with subtest("deleting fleet returns the appliance to standalone without a reboot"):
         configure(["delete fleet"])
         fw.fail("systemctl is-active sentinel-fleet.timer")
