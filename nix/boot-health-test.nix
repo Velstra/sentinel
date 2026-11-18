@@ -13,6 +13,20 @@ in pkgs.testers.runNixOSTest {
     services.velstra.appliance = lib.mkForce (pkgs.writeText "boot-health-factory.toml" ''
       [system]
       hostname = "unprovisioned-fw"
+      [[system.group]]
+      name = "viewers"
+      permission = "read-only"
+      [[system.group]]
+      name = "operators"
+      permission = "read-write"
+      [[system.login]]
+      username = "viewer"
+      group = "viewers"
+      [[system.login]]
+      username = "operator"
+      group = "operators"
+      [[system.login]]
+      username = "shellonly"
     '');
   };
   nodes.machine = { lib, ... }: {
@@ -43,6 +57,23 @@ in pkgs.testers.runNixOSTest {
         factory.fail("systemctl is-failed --quiet velstra.service")
         factory.fail("${checker} dataplane-enabled")
         factory.succeed("test $(systemctl --failed --plain --no-legend | wc -l) -eq 0")
+    with subtest("unconfigured IKE and multicast name discovery expose no listeners"):
+        factory.fail("systemctl is-active --quiet strongswan-swanctl.service")
+        factory.fail("systemctl is-active --quiet sentinel-mdns.service")
+        listeners = factory.succeed("ss -H -lunt")
+        for line in listeners.splitlines():
+            fields = line.split()
+            assert len(fields) >= 6, line
+            assert fields[4].rsplit(":", 1)[-1] not in {"500", "4500", "5353", "5355"}, listeners
+        factory.succeed("systemctl start strongswan-swanctl.service")
+        factory.fail("systemctl is-active --quiet strongswan-swanctl.service")
+        factory.fail("systemctl is-failed --quiet strongswan-swanctl.service")
+    with subtest("local login permissions do not turn viewers into root"):
+        factory.succeed("su operator -c 'sudo -n true'")
+        factory.fail("su viewer -c 'sudo -n true'")
+        factory.fail("su shellonly -c 'sudo -n true'")
+        factory.succeed("printf '%s\\n' 'set system login operator group viewers' commit save exit | sentinel configure")
+        factory.fail("su operator -c 'sudo -n true'")
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("velstra.service")
     machine.wait_for_unit("wren.service")
@@ -76,6 +107,12 @@ in pkgs.testers.runNixOSTest {
         machine.fail(verify + " --config /tmp/invalid-boot.toml")
         machine.succeed("printf 'different=true\\n' > /tmp/drifted-runtime.toml")
         machine.fail(verify + " --runtime /tmp/drifted-runtime.toml")
+    with subtest("portable schema validation is distinct from live missing-NIC validation"):
+        machine.succeed("printf '%s\\n' '[system]' 'hostname=\"missing-nic\"' '[[interface]]' 'name=\"missing0\"' 'zone=\"wan\"' 'address=\"dhcp\"' > /tmp/missing-nic.toml")
+        machine.succeed("sentinel config check /tmp/missing-nic.toml")
+        error = machine.fail("sentinel config check --live /tmp/missing-nic.toml 2>&1")
+        assert "missing0" in error, error
+        machine.fail(verify + " --config /tmp/missing-nic.toml")
 
     with subtest("a stopped selected dataplane blocks boot-complete instead of blessing"):
         machine.succeed("systemctl stop boot-complete.target velstra-boot-verify.service systemd-boot-check-no-failures.service")
