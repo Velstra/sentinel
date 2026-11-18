@@ -142,12 +142,15 @@ class ReleaseTests(unittest.TestCase):
 
     def test_source_check_catalog_rejects_missing_duplicate_and_stale_receipts(self):
         from types import SimpleNamespace
+        names = sorted(release.REQUIRED_SAFETY_CHECKS | {"first", "second"})
         with tempfile.TemporaryDirectory() as temp, patch.object(release, "source", return_value="a" * 40), \
-                patch.object(release, "run", return_value='["first", "second"]'), \
+                patch.object(release, "run", return_value=json.dumps(names)), \
                 patch.dict(os.environ, {"GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1"}):
             directory = Path(temp)
             args = SimpleNamespace(input=directory, output=directory / "complete.txt")
             base = {"source": "a" * 40, "run": "42-1", "completed_at": int(time.time())}
+            for name in release.REQUIRED_SAFETY_CHECKS:
+                (directory / f"{name}.json").write_text(json.dumps(base | {"check": name}))
             (directory / "first.json").write_text(json.dumps(base | {"check": "first"}))
             with self.assertRaises(ValueError): release.aggregate(args)
             (directory / "second.json").write_text(json.dumps(base | {"check": "first"}))
@@ -156,20 +159,33 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError): release.aggregate(args)
             (directory / "second.json").write_text(json.dumps(base | {"check": "second"}))
             release.aggregate(args)
-            self.assertEqual(len(json.loads(args.output.read_text())["checks"]), 2)
+            self.assertEqual(len(json.loads(args.output.read_text())["checks"]), len(names))
 
     def test_final_checks_reject_approval_delay_and_changed_catalog(self):
         receipt = {"source": "a" * 40, "run": "42-1", "check": "first", "completed_at": 100000}
+        safety_names = sorted(release.REQUIRED_SAFETY_CHECKS)
+        safety = [receipt | {"check": name} for name in safety_names]
         with patch.object(release.time, "time", return_value=100001):
-            release.validate_checks([receipt], ["first"], "a" * 40, "42-1")
+            release.validate_checks(safety + [receipt], safety_names + ["first"], "a" * 40, "42-1")
             for receipts, names in (([receipt], ["second"]), (["fixture"], ["first"]),
                                     ([receipt | {"run": "41-1"}], ["first"]),
                                     ([receipt | {"source": "b" * 40}], ["first"]),
                                     ([receipt | {"completed_at": True}], ["first"])):
                 with self.subTest(receipts=receipts, names=names), self.assertRaises(ValueError):
-                    release.validate_checks(receipts, names, "a" * 40, "42-1")
+                    release.validate_checks(safety + receipts, safety_names + names, "a" * 40, "42-1")
         with patch.object(release.time, "time", return_value=186401), self.assertRaises(ValueError):
-            release.validate_checks([receipt], ["first"], "a" * 40, "42-1")
+            release.validate_checks(safety + [receipt], safety_names + ["first"], "a" * 40, "42-1")
+
+    def test_known_release_blockers_cannot_disappear_from_the_plan_or_receipts(self):
+        names = sorted(release.REQUIRED_SAFETY_CHECKS)
+        release.validate_catalog(names + ["future-check"])
+        for missing in names:
+            reduced = [name for name in names if name != missing]
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "mandatory safety"):
+                release.validate_checks([], reduced, "a" * 40, "42-1")
+        for malformed in (None, [], [1], names + [names[0]], ["bad/name"], ["x"] * 257):
+            with self.subTest(catalog=malformed), self.assertRaises(ValueError):
+                release.validate_catalog(malformed)
 
 
 class RealSignatureTests(unittest.TestCase):
@@ -181,7 +197,7 @@ class RealSignatureTests(unittest.TestCase):
             bundle.mkdir()
             environment = {"GNUPGHOME": str(keyring), "RELEASE_VERSION": VERSION,
                            "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1",
-                           "RELEASE_CHECK_CATALOG": '{"check":["fixture"]}'}
+                           "RELEASE_CHECK_CATALOG": json.dumps({"check": sorted(release.REQUIRED_SAFETY_CHECKS)})}
             with patch.dict(os.environ, environment), patch.object(release, "source", return_value="a" * 40):
                 subprocess.run(["gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
                                 "--quick-generate-key", "Pipeline test only <test@example.invalid>", "ed25519", "sign", "0"],
@@ -202,7 +218,8 @@ class RealSignatureTests(unittest.TestCase):
                     "expected_sha256": "b" * 64, "source_sha256_before": "b" * 64, "source_sha256_after": "b" * 64,
                     "certificate_sha256": {n: release.digest(bundle / f"{n}.crt") for n in ("PK", "KEK", "db")}})
                 release.document(bundle / "source-checks.json", {"source": "a" * 40, "run": "123-1", "checks": [
-                    {"source": "a" * 40, "run": "123-1", "check": "fixture", "completed_at": int(time.time())}]})
+                    {"source": "a" * 40, "run": "123-1", "check": name, "completed_at": int(time.time())}
+                    for name in sorted(release.REQUIRED_SAFETY_CHECKS)]})
                 release.document(bundle / "source-sbom.provenance.json", {"source_commit": "a" * 40,
                     "scope": "source-lockfiles", "sbom_sha256": release.digest(bundle / "source-sbom.cdx.json")})
                 with patch.object(release, "run", side_effect=AssertionError("pre-sign validation must not call GPG")):

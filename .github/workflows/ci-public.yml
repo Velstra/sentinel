@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '23 2 * * *'
 
 permissions:
   contents: read
@@ -14,6 +16,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  kernel-verifier:
+    name: Kernel verifier (${{ matrix.kernel }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ['6-6', '6-12', '6-18']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          enable_kvm: true
+      - name: Require real KVM access
+        run: |
+          test -c /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Load the exact shipped object in the selected guest kernel
+        env:
+          KERNEL: ${{ matrix.kernel }}
+        run: |
+          set -o pipefail
+          nix build --cores 2 --max-jobs 1 -L \
+            ".#checks.x86_64-linux.ebpf-verifier-$KERNEL" \
+            --out-link "$RUNNER_TEMP/verifier-result" 2>&1 | tee "$RUNNER_TEMP/verifier.log"
+          cp "$RUNNER_TEMP/verifier-result/verifier.json" "$RUNNER_TEMP/verifier.json"
+      - name: Preserve actual kernel/object receipts and rejected-load diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verifier-${{ matrix.kernel }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/verifier.log
+            ${{ runner.temp }}/verifier.json
+          if-no-files-found: error
+          retention-days: 30
+
   release-signing-controls:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -63,6 +104,10 @@ jobs:
         run: python3 -B -m unittest nix.test_update_capacity nix.test_update_fixture nix.test_visible_mount nix.test_radio_units nix.test_ha_kernel_oracle -v
       - name: Immutable source cohort and legacy-fixture regressions
         run: python3 -B -m unittest discover -s tests -p 'test_source_pins.py' -v
+      - name: Differential oracle must fail closed on missing or failing traffic
+        run: |
+          python3 -B -m unittest discover -s nix/conformance -v
+          python3 -B -m unittest nix.test_nat_capacity_pressure -v
 
   source-sbom:
     runs-on: ubuntu-24.04
