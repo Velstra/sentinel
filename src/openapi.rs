@@ -724,7 +724,7 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/configure",
         id: "configure",
         summary: "Run a configuration script: `set` / `delete` / `commit` lines, as the CLI would.",
-        description: "Atomic configuration batch: set, delete, rollback, commit and save only. The whole candidate is validated before mutation; a refused batch returns ok:false and output with no partial application. A live commit returns an accepted provisional transaction requiring explicit confirmation after pending.ready becomes true. At most 256 KiB.",
+        description: "Atomic configuration batch: set, delete, rollback, commit and save only. The whole candidate is validated before mutation; a refused batch returns HTTP 400 with an error diagnostic and no partial application. A numbered line refusal identifies the submitted line; complete-candidate validation errors may be unnumbered. A live commit returns an accepted provisional transaction requiring explicit confirmation after pending.ready becomes true. At most 256 KiB.",
         parameters: &[],
         body: Some(("text/plain", text)),
         answer: "`{ok, output}` — the CLI's text.",

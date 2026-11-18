@@ -5126,6 +5126,39 @@ action="reject"
     }
 
     #[tokio::test]
+    async fn configure_invalid_candidate_returns_400_without_saving_or_admission() {
+        let path = seed("working");
+        let before = std::fs::read(&path).unwrap();
+        let app = router(state(path.clone()));
+        for tail in ["", "commit\nsave\n"] {
+            // Both setters are valid CLI paths, but the complete DNAT object
+            // lacks its mandatory zone and port. Exercise candidate validation,
+            // not the numbered per-line refusal branch.
+            let script = format!(
+                "set system hostname partial\nset nat destination incomplete to 10.0.0.5:80\n{tail}"
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/configure")
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .body(Body::from(script))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_string(response).await;
+            assert!(body.contains("nat destination"), "{body}");
+            assert!(!body.contains("line 2 refused:"), "{body}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_null());
+        }
+    }
+
+    #[tokio::test]
     async fn member_observations_require_auth_and_exact_configured_membership() {
         let app = router(state(seed("working")));
         for uri in [

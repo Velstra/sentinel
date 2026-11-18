@@ -1,0 +1,29 @@
+/* Retain the reader's mdBook theme, typography controls and keyboard navigation. */
+:root {
+  --sentinel-accent: #a13122;
+}
+.navy, .coal, .ayu {
+  --sentinel-accent: #ff937e;
+}
+.content main {
+  max-width: 76ch;
+  margin: 0 auto;
+  padding: 0 .5rem 3rem;
+  line-height: 1.65;
+}
+.content h1, .content h2, .content h3 {
+  line-height: 1.2;
+  letter-spacing: -.025em;
+}
+.content h1 {
+  border-top: .24rem solid var(--sentinel-accent);
+  padding-top: 1rem;
+}
+.content h2 { margin-top: 2.2rem; }
+.content main a:not(.header) { text-underline-offset: .18em; }
+.sidebar .active { font-weight: 700; }
+.content pre { border-radius: .4rem; }
+.content pre > code { padding: 1rem; line-height: 1.5; }
+.content table { display: block; overflow-x: auto; max-width: 100%; }
+.content table th, .content table td { padding: .5rem .7rem; text-align: left; }
+.content main :focus-visible { outline: .15rem solid var(--sentinel-accent); outline-offset: .15rem; }

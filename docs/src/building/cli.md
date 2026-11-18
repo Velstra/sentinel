@@ -1,53 +1,43 @@
-# Building the CLI & agent
+# Build the CLI and dataplane agent
 
-The image bundles these, but you can build each on its own.
+<a id="building-the-cli--agent"></a>
 
-## The `sentinel` CLI
+Use the CLI on a workstation to inspect commands and validate configurations. Runtime operations require the appliance services and appropriate privileges.
 
-```shell
-nix build .#sentinel
-./result/bin/sentinel --help
+<a id="the-sentinel-cli"></a>
+
+## Build the packaged CLI
+
+```sh
+nix build .#sentinel --out-link result-cli
+./result-cli/bin/sentinel --help
 ```
 
-Stable `rustc` is fine for the CLI (it does **not** need Fabric or the nightly
-toolchain). It is the `configure`/`commit`/`show`/`install`/`update` tool.
+The Nix package wraps external commands with their store paths.
 
-> **Why it's wrapped.** The build wraps the binary so every external tool it
-> shells out to (`hostname`, `ip`, `networkctl`, `sgdisk`, `dd`, `mdadm`, …) is
-> pinned to an absolute store path via `SENTINEL_*_BIN` env vars. Without this, a
-> `commit` on a NixOS box could fail with
-> `Failed to execute /run/current-system/sw/...` when a tool isn't on the admin's
-> `$PATH` or in sudo's `secure_path`. See `src/system.rs::bin`.
+<a id="dev-loop-without-nix"></a>
 
-### Dev loop (without Nix)
+## Run the Rust checks
 
-For fast iteration you can use Cargo directly — CI does exactly this:
-
-```shell
+```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-`velstra-proto` vendors its own `protoc`, so no system `protoc` is needed for the
-CLI.
+Run from the repository root on a development host.
 
-## The `velstra` eBPF agent
+<a id="the-velstra-ebpf-agent"></a>
 
-```shell
-nix build .#velstra        # the agent binary
-nix build .#velstra-ebpf   # just the compiled eBPF object
+## Build individual dataplane outputs
+
+```sh
+nix build .#velstra --out-link result-agent
+nix build .#velstra-ebpf --out-link result-ebpf
 ```
 
-This is the part that needs the pinned **nightly** toolchain (with `rust-src` +
-`bpf-linker`) and the `fabric` source. Two things worth knowing:
+Fabric and the eBPF compiler inputs are pinned. See [Reproduce a build](reproducibility.md).
 
-- **`velstra-ebpf` is a fixed-output derivation** (network-allowed, hash-pinned)
-  because `-Z build-std` can't fetch std's build-deps in a sealed sandbox.
-- The agent binary uses `remove-references-to` to remove a retained toolchain
-  path. That is one closure-reduction step, not a measurement of the complete
-  image. Inspect the actual built image's closure before making size claims.
+## Build boundary
 
-Both details are pinned-hash territory — if you bump the toolchain or Fabric, see
-[Reproducibility & pinned hashes](reproducibility.md).
+The eBPF Rust nightly and LLVM tooling must remain compatible. Review the pinned inputs when changing either. Removing build-time references from a binary is only one closure-reduction step, not proof of a small or toolchain-free appliance: inspect the final runtime closure and image. See [reproducibility](reproducibility.md).

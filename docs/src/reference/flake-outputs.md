@@ -1,64 +1,51 @@
-# Flake outputs
+# Choose a flake output
 
-The flake targets `x86_64-linux`. Query the checked-out source rather than
-relying on a frozen output or test count:
+<a id="flake-outputs"></a>
+
+Build from an x86-64 Linux checkout. The command determines whether you get an executable, boot media or a VM test.
+
+<a id="packages--nix-build-name"></a>
+
+## Packages
+
+| Goal | Output |
+|---|---|
+| Run the CLI | `nix build .#sentinel` |
+| Build the immutable disk image | `nix build .#sentinel-image` |
+| Build installation media | `nix build .#sentinel-iso` |
+| Obtain OVMF for a UEFI VM | `nix build .#qemu-firmware` |
+| Build the web frontend | `nix build .#sentinel-ui` |
+| Build Fabric, the eBPF object or Wren | `.#velstra`, `.#velstra-ebpf`, `.#wren` |
+
+<a id="nixos-configurations--nixosconfigurationsname"></a><a id="apps--nix-run-name"></a><a id="modules"></a><a id="useful-eval-queries"></a>
+
+## Run a VM or inspect outputs
 
 ```sh
-nix flake show
+nix run .#vm
+# From the build host, list the outputs of your checkout:
+nix flake show --no-write-lock-file
+```
+
+The VM app boots a development appliance. A disk image is a package and does not contain a VM launcher. The NixOS configurations and modules are listed separately by the flake.
+
+<a id="checks--nix-build-checksx86_64-linuxname--l"></a>
+
+## Select a check
+
+```sh
+nix build .#checks.x86_64-linux.quickstart -L
+```
+
+Use the [test catalog](tests.md) to select an image, protocol, management or recovery test. VM checks require KVM.
+
+## Evidence boundaries
+
+Query the current attributes instead of relying on a frozen package or test count:
+
+```sh
 nix eval --json .#packages.x86_64-linux --apply builtins.attrNames
 nix eval --json .#checks.x86_64-linux --apply builtins.attrNames
 ```
 
-## Packages
-
-Build with `nix build .#<name>`:
-
-| Name | Output |
-| --- | --- |
-| `sentinel` / `default` | Management CLI with wrapped tool paths. |
-| `sentinel-ui` | Locally bundled console assets; no runtime CDN. |
-| `velstra` | Fabric data-plane agent. |
-| `velstra-ebpf` | Fixed-output eBPF object. Keep its hash and Fabric source coherent. |
-| `wren` | Routing daemon. |
-| `sentinel-image` | Signed development raw GPT image with dm-verity and A/B slots. Included Secure Boot keys are not production trust. |
-| `sentinel-iso` | Installer ISO containing that raw image. |
-| `qemu-firmware` | OVMF firmware for the [VM quickstart](../operations/quickstart.md). |
-
-`sentinel-image` is a disk artifact, **not** a VM runner. This public package
-set does not expose an Enterprise certificate, a prebuilt QCOW2 or a production
-sysupdate bundle merely because related machinery exists elsewhere.
-
-## VM app and NixOS configurations
-
-```sh
-nix run .#vm
-```
-
-The `vm` app starts a disposable appliance configuration. It does not boot the
-exact verified-boot disk image. To test that image use the relevant
-[image checks](tests.md#run-a-real-vm-check).
-
-| Configuration | Purpose |
-| --- | --- |
-| `nixosConfigurations.appliance` | Base appliance and VM runner. |
-| `nixosConfigurations.sentinel-image` | Immutable disk-image configuration. |
-| `nixosConfigurations.sentinel-iso` | Installer ISO configuration. |
-
-Useful queries:
-
-```sh
-nix eval --raw .#nixosConfigurations.sentinel-image.config.image.filePath
-nix path-info .#sentinel-image
-```
-
-## Modules
-
-| Attribute | Purpose |
-| --- | --- |
-| `nixosModules.sentinel` | Sentinel CLI, appliance services and factory configuration. |
-| `nixosModules.applianceImage` | Shared immutable image builder. |
-| `nixosModules.applianceIso` | Shared installer ISO builder. |
-
-Module availability is not qualification of every downstream combination.
-Review [signing limitations](../architecture/secure-boot.md) before distributing
-an image and [test evidence](tests.md) before interpreting a green evaluation.
+Public image builds use development signing identities. A public package or module is not an Enterprise QCOW2/sysupdate certification. The `vm` application is a development VM, not necessarily a boot of the exact release disk. Evaluate, build and boot-test the intended artifact and dependency cohort separately.
