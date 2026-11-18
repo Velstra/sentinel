@@ -36,9 +36,11 @@ pub const PEER_SILENCE_MS: u64 = 10_000;
 pub const PEER_TIMEOUT_MS: u64 = 1_000;
 pub const STARTUP_DELAY_MS: u64 = 3_000;
 pub fn check_budget(lease_ms: u64, io_ms: u64) -> Result<()> {
+    // Match Wren's input bounds before arithmetic: both the budget and its
+    // error's suggested minimum must be safe for arbitrary parsed u64 values.
     ensure!(
-        (1..=MAX_LEASE_MS).contains(&lease_ms) && io_ms > 0,
-        "HA lease-ms must be 1..={MAX_LEASE_MS} and io-timeout-ms nonzero"
+        (1..=MAX_LEASE_MS).contains(&lease_ms) && (1..=MAX_LEASE_MS).contains(&io_ms),
+        "HA lease-ms and io-timeout-ms must be 1..={MAX_LEASE_MS}"
     );
     ensure!(
         2 * io_ms + POLL_MS + MARGIN_MS <= lease_ms,
@@ -156,6 +158,27 @@ pub fn derive(token: &str, label: &[u8], cluster: &str) -> String {
 pub fn cluster_id(token: &str) -> String {
     derive(token, b"Velstra Sentinel HA cluster v1\0", "")[..32].into()
 }
+
+fn pairing_cluster(primary: &Appliance, secondary: &Appliance, secret: &str) -> Result<String> {
+    let explicit = |a: &Appliance| {
+        a.system
+            .ha
+            .as_ref()
+            .map(|ha| ha.cluster.clone())
+            .filter(|cluster| !cluster.is_empty())
+    };
+    match (explicit(primary), explicit(secondary)) {
+        (Some(a), Some(b)) => {
+            ensure!(
+                a == b,
+                "members have different explicit HA cluster IDs; reconcile them before pairing"
+            );
+            Ok(a)
+        }
+        (Some(cluster), None) | (None, Some(cluster)) => Ok(cluster),
+        (None, None) => Ok(cluster_id(secret)),
+    }
+}
 fn valid_cluster(cluster: &str) -> bool {
     (16..=128).contains(&cluster.len())
         && cluster
@@ -259,7 +282,7 @@ pub fn guarded_interfaces(a: &Appliance) -> BTreeSet<String> {
     let mut names: BTreeSet<_> = if ha.enabled || !ha.sync_interface.is_empty() {
         a.interfaces
             .iter()
-            .filter(|i| !control.contains(&i.name))
+            .filter(|i| i.zone.is_some() && !control.contains(&i.name))
             .map(|i| i.name.clone())
             .collect()
     } else {
@@ -681,15 +704,7 @@ fn management_endpoint(a: &Appliance) -> Result<String> {
         .map(str::parse::<IpAddr>)
         .transpose()?
         .unwrap_or(state.ip());
-    Ok(SocketAddr::new(
-        ip,
-        if a.services.web.enable {
-            a.services.web.port.unwrap_or(8080)
-        } else {
-            8080
-        },
-    )
-    .to_string())
+    Ok(SocketAddr::new(ip, a.services.web.port.unwrap_or(8080)).to_string())
 }
 pub fn capture(a: &Appliance) -> Result<HaIdentity> {
     let ha = a.system.ha.as_ref().context("HA member identity missing")?;
@@ -710,6 +725,7 @@ pub fn capture(a: &Appliance) -> Result<HaIdentity> {
             .clone()
             .context("HA TLS identity missing")?,
         management_web: Some(a.services.web.clone()),
+        management_ssh: Some(a.services.ssh.clone()),
         state_listen: a
             .system
             .conntrack_sync
@@ -767,8 +783,22 @@ pub fn capture(a: &Appliance) -> Result<HaIdentity> {
 }
 /// Swap node-specific facts while retaining the complete shared desired policy.
 /// Applying the reverse swap produces the original primary document again.
-pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
+pub fn materialize_peer(a: Appliance) -> Result<Appliance> {
     let source = capture(&a)?;
+    project_peer(a, Some(source))
+}
+
+/// Project the actual receiver policy before TLS provisioning. With no source
+/// identity this is admission-only, never an activatable pairing document.
+/// The same projection is reused after capturing the real local TLS identity.
+fn project_peer(mut a: Appliance, source: Option<HaIdentity>) -> Result<Appliance> {
+    let source_sync = a
+        .system
+        .ha
+        .as_ref()
+        .context("HA missing")?
+        .sync_interface
+        .clone();
     let target = a
         .system
         .ha
@@ -824,13 +854,7 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
             a.interfaces.insert(position, entry.configuration);
         }
         for v in &mut a.protocols.vrrp {
-            if v.interface
-                == source
-                    .control
-                    .as_ref()
-                    .expect("captured control")
-                    .sync_interface
-            {
+            if v.interface == source_sync {
                 // Only the heartbeat binding is member-local. The VIP's
                 // address-interface stays shared and guarded.
                 v.interface = control.sync_interface.clone();
@@ -841,14 +865,9 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
         // proven correspondence; arbitrary ancestors (especially bridge
         // members) have no unambiguous peer mapping and must fail validation
         // rather than silently serving on a guessed link.
-        let source_sync = &source
-            .control
-            .as_ref()
-            .expect("captured control")
-            .sync_interface;
         for bindings in [&mut a.services.ntp.serve_on, &mut a.services.dns.serve_on] {
             for binding in bindings {
-                if binding == source_sync {
+                if binding == &source_sync {
                     *binding = control.sync_interface.clone();
                 }
             }
@@ -862,17 +881,27 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
     ha.heartbeat_peer = target.heartbeat_peer;
     ha.priority = Some(target.priority);
     ha.management_fingerprint = Some(target.management_fingerprint.clone());
-    ha.peer_identity = Some(source.clone());
+    ha.peer_identity = source.clone();
     let preempt = ha.preempt;
     a.system.hostname = target.hostname;
     if let Some(web) = target.management_web {
         a.services.web = web;
     }
+    if let Some(ssh) = target.management_ssh {
+        a.services.ssh = ssh;
+    } else {
+        ensure!(
+            a.services.ssh.listen_address.is_none(),
+            "peer SSH binding is unknown; refresh the HA peer identity before syncing a member-local SSH address"
+        );
+    }
     a.protocols.router_id = target.router_id;
-    a.system.config_sync.peers = vec![source.management_endpoint];
-    a.system.config_sync.peer_fingerprint = Some(source.management_fingerprint);
     a.system.conntrack_sync.listen = Some(target.state_listen);
-    a.system.conntrack_sync.peers = vec![source.state_listen];
+    if let Some(source) = source {
+        a.system.config_sync.peers = vec![source.management_endpoint];
+        a.system.config_sync.peer_fingerprint = Some(source.management_fingerprint);
+        a.system.conntrack_sync.peers = vec![source.state_listen];
+    }
     for i in &mut a.interfaces {
         if let Some(facts) = target.interfaces.get(&i.name) {
             i.address = facts.address.clone();
@@ -1090,6 +1119,43 @@ fn state_address(a: &Appliance, remote: IpAddr) -> Result<(String, String)> {
 /// How long the primary waits for the peer to apply and acknowledge pairing.
 const PAIR_ACK_SECS: u32 = 25;
 
+/// Pairing must not silently erase legitimate running-only intent. An exact
+/// retained plan can resume its own interrupted apply-before-persist boundary.
+fn ensure_pairing_baseline(saved: &str, active: &str, resume: Option<(&str, &str)>) -> Result<()> {
+    ensure!(
+        active == saved
+            || resume.is_some_and(|(previous, desired)| {
+                active == desired && (saved == previous || saved == desired)
+            }),
+        "running configuration has unsaved changes; save the intended configuration or explicitly revert it before HA pairing"
+    );
+    Ok(())
+}
+
+fn pairing_active_revision(config: &Path, running: &Path) -> Result<String> {
+    // Absence before a live commit is saved intent; invalid or inaccessible
+    // active state is never permission to overwrite it during enrollment.
+    revision(&Appliance::load_active_at(config, running)?)
+}
+
+fn ensure_pairing_management_bind(appliance: &Appliance) -> Result<()> {
+    let web = &appliance.services.web;
+    let address: IpAddr = web
+        .listen_address
+        .as_deref()
+        .unwrap_or("127.0.0.1")
+        .parse()
+        .context("HA pairing requires a valid explicit management listen-address")?;
+    let loopback = address.is_loopback()
+        || matches!(address, IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback()));
+    ensure!(
+        !loopback,
+        "HA pairing requires an explicit reachable services web listen-address on both members; default or configured loopback is not widened automatically"
+    );
+    ensure!(web.tls, "HA pairing requires management TLS");
+    Ok(())
+}
+
 pub fn pair(
     peer: &str,
     secret: &str,
@@ -1111,6 +1177,9 @@ pub fn pair(
         "--mode two-node conflicts with --witness"
     );
     let peer = numeric_endpoint(peer)?.to_string();
+    // Refuse an unreachable/default management listener before privilege
+    // escalation, locks, private plans, certificates or any peer request.
+    ensure_pairing_management_bind(&Appliance::load(config)?)?;
     if unsafe { libc::geteuid() } != 0 {
         // The already-authorized admin sudo policy is used without copying a
         // credential into sudo's command line or audit log.
@@ -1155,8 +1224,16 @@ pub fn pair(
     // retryable without reconstructing a different desired revision.
     let plan_path = Path::new("/var/lib/sentinel/ha-pair.json");
     let _transaction = system::apply_lock()?;
+    crate::confirm::ensure_idle_for_write(true)?;
+    crate::safe_apply::ensure_writable(Path::new(crate::session::DEFAULT_CONFIG))?;
+    crate::safe_apply::ensure_writable(config)?;
     let current = Appliance::load(config)?;
+    // Recheck the actual protected state under the apply lock too: the first
+    // preflight is not permission to race a later loopback configuration.
+    ensure_pairing_management_bind(&current)?;
     let current_revision = revision(&current)?;
+    let active_revision =
+        pairing_active_revision(config, Path::new(crate::session::Session::RUNNING))?;
     let plan: PairPlan = if let Some(text) = system::read_owned_file(plan_path)? {
         let saved: PairPlan = serde_json::from_str(&text)?;
         ensure!(
@@ -1180,8 +1257,15 @@ pub fn pair(
             current_revision == saved.previous || current_revision == revision(&saved.appliance)?,
             "local configuration changed during interrupted pairing; review the private pairing plan before retrying"
         );
+        ensure_pairing_baseline(
+            &current_revision,
+            &active_revision,
+            Some((&saved.previous, &revision(&saved.appliance)?)),
+        )?;
+        crate::admission::check(Some(&current), &saved.appliance)?;
         saved
     } else {
+        ensure_pairing_baseline(&current_revision, &active_revision, None)?;
         let pin = authenticate_peer(&peer, secret)?;
         let remote: Enrollment = serde_json::from_str(&system::curl_get(
             &format!("https://{peer}/api/v1/ha/enrollment"),
@@ -1193,8 +1277,11 @@ pub fn pair(
             revision(&remote.appliance)? == remote.revision,
             "inconsistent peer enrollment revision"
         );
+        ensure_pairing_management_bind(&remote.appliance)
+            .context("peer management listener is not ready for HA pairing")?;
         let mut local = current.clone();
-        let mut secondary = remote.appliance;
+        let remote_baseline = remote.appliance;
+        let mut secondary = remote_baseline.clone();
         let selected_mode =
             mode.unwrap_or_else(|| local.system.ha.as_ref().map_or(HaMode::Witness, |h| h.mode));
         ensure!(
@@ -1232,13 +1319,7 @@ pub fn pair(
             check_witness_rtt(witness_rtt(&witness)?, io)?;
         }
         let prepared = local.system.ha.clone().unwrap_or_default();
-        let cluster = local
-            .system
-            .ha
-            .as_ref()
-            .map(|h| h.cluster.clone())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| cluster_id(secret));
+        let cluster = pairing_cluster(&local, &secondary, secret)?;
         ensure!(
             local
                 .system
@@ -1371,9 +1452,30 @@ pub fn pair(
             .as_mut()
             .expect("member")
             .management_fingerprint = Some(pin.clone());
+        // Resolve receiver-local facts and admit BOTH projected policies before
+        // generating TLS or writing a durable pairing plan. Enrollment reads
+        // above provide the authoritative peer baseline; the peer rechecks it
+        // under its own lock before accepting the eventual POST.
+        let mut facts = if let Some(path) = identity {
+            serde_json::from_str::<HaIdentity>(&std::fs::read_to_string(path)?)?
+        } else {
+            capture(&secondary)?
+        };
+        facts.node = 2;
+        facts.management_endpoint = peer.clone();
+        facts.management_fingerprint = pin.clone();
+        facts.priority = 100;
+        local.system.ha.as_mut().expect("member").peer_identity = Some(facts);
+        crate::admission::check(Some(&current), &local)?;
+        let mut adjusted = project_peer(local.clone(), None)?;
+        adjusted.fleet = secondary.fleet.clone();
+        crate::admission::check(Some(&remote_baseline), &adjusted)?;
         // Generate/preflight the SAME persistent TLS identity the local API uses.
         let mut staged = system::PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
-        staged.file.write_all(local.to_toml()?.as_bytes())?;
+        // Pairing does not alter local web settings. The original document is
+        // valid; the candidate temporarily lacks its own TLS fingerprint and
+        // must not make TLS settings loading fall back to defaults.
+        staged.file.write_all(current.to_toml()?.as_bytes())?;
         let listen = SocketAddr::new(local_ip, local.services.web.port.unwrap_or(8080));
         let (cert, _) = crate::api::resolve_web_tls(
             &staged.path,
@@ -1388,16 +1490,6 @@ pub fn pair(
             .as_mut()
             .expect("member")
             .management_fingerprint = Some(local_pin);
-        let mut facts = if let Some(path) = identity {
-            serde_json::from_str::<HaIdentity>(&std::fs::read_to_string(path)?)?
-        } else {
-            capture(&secondary)?
-        };
-        facts.node = 2;
-        facts.management_endpoint = peer.clone();
-        facts.management_fingerprint = pin.clone();
-        facts.priority = 100;
-        local.system.ha.as_mut().expect("member").peer_identity = Some(facts);
         local.validate()?;
         let mut adjusted = materialize_peer(local.clone())?;
         adjusted.fleet = secondary.fleet.clone();
@@ -1750,6 +1842,152 @@ virtual-address=["10.10.0.254"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_tls_admission_projects_the_same_policy_as_complete_pairing() {
+        let ready = paired_fixture();
+        let complete = materialize_peer(ready.clone()).unwrap();
+        let mut pre_tls = ready;
+        pre_tls.system.ha.as_mut().unwrap().management_fingerprint = None;
+        // Fresh enrollment has no local TLS fingerprint yet. Ordinary full
+        // validation/projection must still reject that incomplete identity.
+        assert!(pre_tls.validate().is_err());
+        assert!(materialize_peer(pre_tls.clone()).is_err());
+        let projected = project_peer(pre_tls, None).unwrap();
+        let policy = |a: &Appliance| {
+            serde_json::to_value((&a.firewall, &a.zones, &a.interfaces, &a.rules)).unwrap()
+        };
+        assert_eq!(policy(&projected), policy(&complete));
+        assert!(
+            projected
+                .system
+                .ha
+                .as_ref()
+                .unwrap()
+                .peer_identity
+                .is_none()
+        );
+        assert!(complete.system.ha.as_ref().unwrap().peer_identity.is_some());
+        assert_eq!(projected.system.hostname, "secondary");
+        assert_eq!(
+            projected
+                .interfaces
+                .iter()
+                .find(|i| i.name == "sync0")
+                .unwrap()
+                .address
+                .as_deref(),
+            Some("10.20.0.2/24")
+        );
+    }
+
+    #[test]
+    fn pairing_management_preflight_requires_deliberate_reachable_tls_binding() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='pair-bind-test'\n").unwrap();
+        for address in [
+            None,
+            Some("127.0.0.1"),
+            Some("127.0.0.2"),
+            Some("::1"),
+            Some("::ffff:127.0.0.1"),
+        ] {
+            appliance.services.web.listen_address = address.map(str::to_string);
+            assert!(
+                ensure_pairing_management_bind(&appliance).is_err(),
+                "{address:?}"
+            );
+        }
+        for address in ["10.72.1.1", "2001:db8:72::1", "0.0.0.0", "::"] {
+            appliance.services.web.listen_address = Some(address.into());
+            assert!(
+                ensure_pairing_management_bind(&appliance).is_ok(),
+                "{address}"
+            );
+        }
+        appliance.services.web.tls = false;
+        assert!(ensure_pairing_management_bind(&appliance).is_err());
+    }
+
+    #[test]
+    fn pairing_loopback_preflight_preserves_config_and_sends_no_peer_request() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let config = scratch.join("saved.toml");
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        for binding in [
+            "",
+            "[services.web]\nlisten-address='127.0.0.1'\n",
+            "[services.web]\nlisten-address='::1'\n",
+        ] {
+            let text = format!("[system]\nhostname='pair-bind-test'\n{binding}");
+            std::fs::write(&config, &text).unwrap();
+            let error = pair(
+                &server.local_addr().unwrap().to_string(),
+                "disposable-pair-management-bind-secret",
+                &config,
+                None,
+                None,
+                Some(HaMode::TwoNode),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("listen-address"), "{error:#}");
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+            assert_eq!(
+                std::fs::read_dir(config.parent().unwrap()).unwrap().count(),
+                1
+            );
+            assert!(
+                matches!(server.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+
+    #[test]
+    fn config_sync_only_management_identity_honors_custom_web_port() {
+        let mut appliance = distinct_control_members();
+        appliance.services.web.enable = false;
+        appliance.services.web.listen_address = Some("192.0.2.1".into());
+        appliance.services.web.port = Some(9443);
+        assert_eq!(management_endpoint(&appliance).unwrap(), "192.0.2.1:9443");
+    }
+
+    #[test]
+    fn pairing_requires_saved_active_agreement_or_its_exact_retained_plan() {
+        ensure_pairing_baseline("saved", "saved", None).unwrap();
+        assert!(ensure_pairing_baseline("saved", "unsaved", None).is_err());
+        for (saved, active) in [
+            ("previous", "previous"),
+            ("previous", "desired"),
+            ("desired", "desired"),
+        ] {
+            ensure_pairing_baseline(saved, active, Some(("previous", "desired"))).unwrap();
+        }
+        for (saved, active) in [
+            ("previous", "unrelated"),
+            ("desired", "previous"),
+            ("unrelated", "desired"),
+        ] {
+            assert!(ensure_pairing_baseline(saved, active, Some(("previous", "desired"))).is_err());
+        }
+    }
+
+    #[test]
+    fn pairing_active_lookup_allows_absence_but_never_a_failed_or_malformed_read() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let config = scratch.join("saved.toml");
+        let running = scratch.join("running.toml");
+        std::fs::write(&config, "[system]\nhostname='saved'\n").unwrap();
+        let saved = revision(&Appliance::load(&config).unwrap()).unwrap();
+        assert_eq!(pairing_active_revision(&config, &running).unwrap(), saved);
+        std::fs::write(&running, "invalid TOML!").unwrap();
+        assert!(pairing_active_revision(&config, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        std::os::unix::fs::symlink(&config, &running).unwrap();
+        assert!(pairing_active_revision(&config, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        assert!(pairing_active_revision(&config, &running).is_err());
+    }
 
     fn two_node_members() -> Appliance {
         let mut primary = distinct_control_members();
@@ -2744,6 +2982,37 @@ mod tests {
         );
     }
     #[test]
+    fn ha_budget_rejects_oversized_io_without_overflow() {
+        let mut rejected = Vec::new();
+        for io in [MAX_LEASE_MS + 1, (1_u64 << 63) + IO_MS, u64::MAX] {
+            let result = std::panic::catch_unwind(|| check_budget(LEASE_MS, io));
+            rejected.push((io, matches!(result, Ok(Err(_)))));
+        }
+        assert!(
+            rejected.iter().all(|(_, rejected)| *rejected),
+            "oversized I/O budgets must return errors without panicking: {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn ha_budget_keeps_valid_limits_and_rejects_adjacent_invalid_limits() {
+        for (lease, io) in [(47, 1), (LEASE_MS, IO_MS), (250, 102), (10_000, 4_977)] {
+            check_budget(lease, io).unwrap();
+        }
+        for (lease, io) in [
+            (46, 1),
+            (250, 103),
+            (10_000, 4_978),
+            (10_001, 1),
+            (0, 1),
+            (250, 0),
+            (10_000, 10_000),
+        ] {
+            assert!(check_budget(lease, io).is_err(), "accepted {lease}/{io}");
+        }
+    }
+
+    #[test]
     fn the_witness_timing_budget_is_validated_and_reaches_every_consumer() {
         check_budget(LEASE_MS, IO_MS).unwrap();
         let error = check_budget(250, 150).unwrap_err().to_string();
@@ -2919,6 +3188,7 @@ mod tests {
         let mut a = paired_fixture();
         let mut extra = a.interfaces[0].clone();
         extra.name = "dmz0".into();
+        extra.zone = Some("dmz".into());
         extra.address = None;
         a.interfaces.push(extra);
         assert_eq!(
@@ -2928,6 +3198,65 @@ mod tests {
                 .collect()
         );
         assert!(!guarded_interfaces(&a).contains("sync0"));
+    }
+
+    #[test]
+    fn unzoned_management_is_reachable_without_forwarding_authority() {
+        let mut a = paired_fixture();
+        let mut mgmt = a.interfaces[0].clone();
+        mgmt.name = "mgmt0".into();
+        mgmt.zone = None;
+        mgmt.address = Some("198.51.100.1/24".into());
+        a.interfaces.push(mgmt);
+        assert!(!guarded_interfaces(&a).contains("mgmt0"));
+        assert!(guarded_interfaces(&a).contains("wan0"));
+        let ha = dataplane(&a).unwrap();
+        assert!(!ha.interfaces.contains(&"mgmt0".into()));
+    }
+
+    #[test]
+    fn peer_materialization_preserves_its_ssh_listener_not_the_senders() {
+        let mut a = paired_fixture();
+        a.services.ssh.listen_address = Some("192.0.2.1".into());
+        let mut ssh = a.services.ssh.clone();
+        ssh.listen_address = Some("192.0.2.2".into());
+        a.system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .management_ssh = Some(ssh);
+        let peer = materialize_peer(a).unwrap();
+        assert_eq!(
+            peer.services.ssh.listen_address.as_deref(),
+            Some("192.0.2.2")
+        );
+        let restored = materialize_peer(peer).unwrap();
+        assert_eq!(
+            restored.services.ssh.listen_address.as_deref(),
+            Some("192.0.2.1")
+        );
+    }
+
+    #[test]
+    fn pairing_never_overwrites_an_explicit_peer_cluster_even_before_enablement() {
+        let mut primary = paired_fixture();
+        let mut secondary = primary.clone();
+        secondary.system.ha.as_mut().unwrap().enabled = false;
+        secondary.system.ha.as_mut().unwrap().cluster = "another-cluster".into();
+        assert!(pairing_cluster(&primary, &secondary, "test-secret").is_err());
+        primary.system.ha = None;
+        assert_eq!(
+            pairing_cluster(&primary, &secondary, "test-secret").unwrap(),
+            "another-cluster"
+        );
+        secondary.system.ha = None;
+        assert_eq!(
+            pairing_cluster(&primary, &secondary, "test-secret").unwrap(),
+            cluster_id("test-secret")
+        );
     }
     #[test]
     fn masquerade_uses_shared_vip_and_refuses_ambiguous_identity() {

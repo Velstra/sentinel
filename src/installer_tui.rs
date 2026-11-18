@@ -811,16 +811,8 @@ pub fn run(disks: &[Disk], nic_names: &[String]) -> Result<Option<Answers>> {
             KeyCode::BackTab => next_focus(&mut app, -1),
             // In a list, or in a field offering suggestions, the arrows browse
             // it — which is what everyone tries first. Tab is what leaves.
-            KeyCode::Down => {
-                if !browse(&mut app, 1) {
-                    next_focus(&mut app, 1);
-                }
-            }
-            KeyCode::Up => {
-                if !browse(&mut app, -1) {
-                    next_focus(&mut app, -1);
-                }
-            }
+            KeyCode::Down if !browse(&mut app, 1) => next_focus(&mut app, 1),
+            KeyCode::Up if !browse(&mut app, -1) => next_focus(&mut app, -1),
             KeyCode::Left if app.focus_on_list() && app.page == Page::Target => {
                 cycle_raid(&mut app, -1)
             }
@@ -829,11 +821,8 @@ pub fn run(disks: &[Disk], nic_names: &[String]) -> Result<Option<Answers>> {
             }
             KeyCode::Char(' ') if app.focus_on_list() => toggle(&mut app),
             KeyCode::Char(' ') if app.on_ssh_toggle() => app.permit_ssh = !app.permit_ssh,
-            KeyCode::Esc => {
-                if !back(&mut app) {
-                    return Ok(None);
-                }
-            }
+            KeyCode::Esc if !back(&mut app) => return Ok(None),
+            KeyCode::Down | KeyCode::Up | KeyCode::Esc => {}
             // Enter confirms what is in front of you and moves on to the next
             // thing on the page; the page only turns when there is nothing left
             // on it. Turning the page on every Enter meant that confirming a

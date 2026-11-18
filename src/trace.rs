@@ -702,28 +702,28 @@ impl<'a> Walk<'a> {
         if r.proto != self.q.proto {
             return Some(format!("is for {}", r.proto));
         }
-        if let Some(t) = r.icmp_type {
-            if self.q.icmp_type != Some(t) {
-                return Some(format!("is for ICMP type {t}"));
-            }
+        if let Some(t) = r.icmp_type
+            && self.q.icmp_type != Some(t)
+        {
+            return Some(format!("is for ICMP type {t}"));
         }
         if r.port != 0 && r.port != self.dst_port {
             return Some(format!("is for port {}", r.port));
         }
-        if let Some(i) = &r.in_interface {
-            if *i != self.q.in_interface {
-                return Some(format!("applies on {i} only"));
-            }
+        if let Some(i) = &r.in_interface
+            && *i != self.q.in_interface
+        {
+            return Some(format!("applies on {i} only"));
         }
-        if let Some(c) = &r.src {
-            if contains(c, self.q.src).is_none() {
-                return Some(format!("source {} is not in {c}", self.q.src));
-            }
+        if let Some(c) = &r.src
+            && contains(c, self.q.src).is_none()
+        {
+            return Some(format!("source {} is not in {c}", self.q.src));
         }
-        if let Some(c) = &r.dst {
-            if contains(c, self.dst).is_none() {
-                return Some(format!("destination {} is not in {c}", self.dst));
-            }
+        if let Some(c) = &r.dst
+            && contains(c, self.dst).is_none()
+        {
+            return Some(format!("destination {} is not in {c}", self.dst));
         }
         None
     }

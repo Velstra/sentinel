@@ -89,10 +89,10 @@ pub struct AcmeConfig {
 fn domains(cert: &crate::config::Certificate) -> Vec<String> {
     let mut out = vec![cert.common_name.clone()];
     for san in &cert.subject_alt_names {
-        if let Some(name) = san.strip_prefix("DNS:") {
-            if !out.iter().any(|d| d == name) {
-                out.push(name.to_string());
-            }
+        if let Some(name) = san.strip_prefix("DNS:")
+            && !out.iter().any(|d| d == name)
+        {
+            out.push(name.to_string());
         }
     }
     out
@@ -195,10 +195,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
             }
         }
         None => {
-            if system::unit_active(ACME_TIMER) {
-                if let Err(e) = system::service_stop(ACME_TIMER) {
-                    eprintln!("warning: stopping {ACME_TIMER}: {e}");
-                }
+            if system::unit_active(ACME_TIMER)
+                && let Err(e) = system::service_stop(ACME_TIMER)
+            {
+                eprintln!("warning: stopping {ACME_TIMER}: {e}");
             }
             if path.exists() {
                 system::remove_file(path)?;

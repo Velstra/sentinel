@@ -893,10 +893,6 @@ mod tests {
                 "[system.config-sync]\npeer = [\"192.0.2.11\"]\nsecret = \"controller-chosen-sync\"\n",
             ),
             (
-                "system.conntrack-sync",
-                "[system.conntrack-sync]\npeer = [\"192.0.2.12\"]\n",
-            ),
-            (
                 "services.ssh",
                 "[services.ssh]\npassword-authentication = true\n",
             ),
@@ -962,6 +958,39 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    /// A valid pre-existing local credential must not let a controller turn on
+    /// state replication. Keep this separate from the other trust-anchor cases
+    /// so the rejection proves conntrack-sync itself is local-only, not merely
+    /// the credential needed by its authenticated transport.
+    #[test]
+    fn fleet_cannot_enable_conntrack_sync_using_an_existing_local_credential() {
+        let (path, mut a) = fixture();
+        a.system.config_sync.secret = Some("unit-test-preexisting-local-sync-credential".into());
+        crate::session::persist_appliance(&a, &path, false).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut candidate = a.clone();
+        candidate.system.conntrack_sync.peers = vec!["192.0.2.12".into()];
+        let toml = candidate.to_toml().unwrap();
+        Appliance::from_toml(&toml).expect("authenticated fixture must be schema-valid");
+        let error = deliver(
+            &path,
+            a.fleet.as_ref().unwrap(),
+            1,
+            Operation::Apply {
+                expected_revision: crate::ha::revision(&a).unwrap(),
+                toml,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("system.conntrack-sync")
+                && error.to_string().contains("local-only"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(safe_apply::status(&path).unwrap()["pending"].is_null());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     /// The check-in curl starts from an empty environment with `--disable`

@@ -85,6 +85,11 @@ pub fn shared_revision(a: &Appliance) -> Result<String> {
             a.system.hostname = String::new();
             a.system.config_sync = Default::default();
             a.system.conntrack_sync = Default::default();
+            // Keep the web table present: WebConsole::is_empty can otherwise
+            // omit a disabled, endpoint-less table, including its TLS setting.
+            // Only the endpoint is canonicalized; security policy still hashes.
+            a.services.web.listen_address = Some("127.0.0.1".into());
+            a.services.web.port = Some(8080);
             a.protocols.router_id = None;
             for interface in &mut a.interfaces {
                 interface.address = None;

@@ -216,8 +216,8 @@ fn reconcile_routes(wanted: &[Vec<String>]) -> Result<()> {
             continue;
         }
         let mut f = line.split_whitespace();
-        if let (Some(net), Some(peer)) = (f.next(), f.next()) {
-            if let Err(e) = system::ip_route(&[
+        if let (Some(net), Some(peer)) = (f.next(), f.next())
+            && let Err(e) = system::ip_route(&[
                 "del",
                 net,
                 "via",
@@ -226,9 +226,9 @@ fn reconcile_routes(wanted: &[Vec<String>]) -> Result<()> {
                 ROUTE_PROTOCOL,
                 "metric",
                 ROUTE_METRIC,
-            ]) {
-                eprintln!("warning: removing the route to {net} failed: {e}");
-            }
+            ])
+        {
+            eprintln!("warning: removing the route to {net} failed: {e}");
         }
     }
     for r in wanted {
@@ -423,6 +423,12 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         if previous_conf.is_some() {
             system::remove_file(conf_path)?;
             system::remove_file(secrets_path)?;
+            // The last configured tunnel must not leave factory IKE listeners
+            // or its credentials resident in an otherwise unused daemon. Never
+            // stop a daemon still serving another connection or established SA.
+            if system::unit_active("strongswan-swanctl.service") && system::swanctl_idle()? {
+                system::service_stop("strongswan-swanctl.service")?;
+            }
         }
         // Unconditionally: the routes outlive the config file they came from,
         // and leaving them is the plaintext case [`ROUTES_STATE`] describes.
@@ -434,6 +440,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     system::ensure_dir(Path::new(SWANCTL_RUNTIME_DIR))?;
     system::install_file(conf_path, &conf)?;
     system::install_ipsec_secret(secrets_path, &secrets)?;
+    // IPsec is opt-in, not an unconditional factory IKE listener. This apply
+    // runs after networkd (never inside the early before-networkd boot unit).
+    // Starting an already running daemon does not interrupt established SAs.
+    system::service_start("strongswan-swanctl.service")?;
     // Load when the rendered config changed, or unconditionally when a tunnel is
     // configured (a fresh boot re-asserts charon's state even if the tmpfs file
     // matches what a previous run wrote).

@@ -4,12 +4,12 @@ import { Management } from "./controller";
 import type { Host } from "./model";
 import { SystemUpdates } from "./updates-view";
 import {
-  Dashboard,
   Flows,
   ConfigEditor,
   Confirmation,
   ReactSystemHealth,
 } from "./components";
+import { Dashboard } from "./dashboard";
 import "./shell.css";
 import "./style.css";
 

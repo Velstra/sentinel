@@ -84,6 +84,16 @@ pub struct ApiState {
     directory: Arc<dyn Authenticator>,
 }
 
+impl ApiState {
+    fn appliance(&self) -> Result<Appliance> {
+        if self.apply.enabled {
+            Appliance::load_active(&self.config_path)
+        } else {
+            Appliance::load(&self.config_path)
+        }
+    }
+}
+
 /// Where signed-in sessions live when the machine token's directory cannot be
 /// determined. One file per session, 0600, beside the machine token.
 pub const DEFAULT_TOKENS_DIR: &str = "/var/lib/sentinel/api-tokens";
@@ -627,7 +637,7 @@ fn resolve_caller_at(state: &ApiState, presented: &str, now: u64) -> Option<Call
             permission: Permission::ReadWrite,
         });
     }
-    let appliance = Appliance::load(&state.config_path).ok()?;
+    let appliance = state.appliance().ok()?;
     let (user, permission) =
         crate::api_session::resolve(&state.tokens_dir, &appliance, presented, now)?;
     Some(Caller {
@@ -646,7 +656,7 @@ fn resolve_caller_at(state: &ApiState, presented: &str, now: u64) -> Option<Call
 /// directory account — which the configuration does not list — keep the
 /// session it signed in with.
 pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
-    let appliance = Appliance::load(&state.config_path)?;
+    let appliance = state.appliance()?;
     crate::api_session::sweep(&state.tokens_dir, &appliance, crate::aaa::unix_now())
 }
 
@@ -663,7 +673,8 @@ mod accounts_tests;
 /// way and a console that implied otherwise would invite somebody to delete a
 /// drop rule that is doing its job.
 async fn get_rule_hits(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
-    let appliance = Appliance::load(&state.config_path)
+    let appliance = state
+        .appliance()
         .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
     let cfg = crate::compile::compile(&appliance);
     let table = crate::velstra::query("flows --limit 0")
@@ -693,7 +704,8 @@ async fn get_trace(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<crate::trace::Query>,
 ) -> Result<Json<crate::trace::Trace>, ApiError> {
-    let appliance = Appliance::load(&state.config_path)
+    let appliance = state
+        .appliance()
         .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
     let answer = crate::trace::trace(&appliance, &query).map_err(ApiError::bad_request)?;
     Ok(Json(answer))
@@ -802,18 +814,17 @@ async fn get_metrics(
 /// account's stored hash, and what comes back is a new session's token, with
 /// its group's permission.
 ///
-/// **A shell account is not a management account.** An account with no group can
-/// log in to the box and gets nothing here, and it is told exactly that: a
-/// refusal an operator cannot act on is a support ticket.
+/// **A shell account is not automatically a management account.** Ordinary
+/// ungrouped accounts get no API grant; the explicitly configured, ungrouped
+/// bootstrap `admin` retains its recovery administrator grant.
 ///
-/// Failures are slowed and counted two ways. **Per account** the delay grows but
-/// there is no lockout — locking an administrator out of their own account is a
-/// denial of service anyone can trigger by guessing their name. **Per source IP**
-/// there IS a lockout: a single address grinding through passwords is stopped
-/// cold after enough failures, and while locked its guesses are refused *before*
-/// the expensive password hash runs — which is the point, since the hash is the
-/// work an attacker was trying to make the box do. A locked address is one
-/// address; the operator reaching the box from anywhere else is unaffected.
+/// Attempts are budgeted two ways: 30 per account in ten minutes, across all
+/// origins, and ten per origin before a fifteen-minute origin lockout. Both
+/// refuse even correct credentials while exhausted. The cross-origin account
+/// limit bounds distributed guessing but permits targeted account denial of
+/// service; it does not promise that another source bypasses the account limit.
+/// Successful sign-in clears both budgets. They are in memory, so an API
+/// restart clears them too.
 ///
 /// The address's attempt is counted when it is *let through*, not when it has
 /// failed. Counting afterwards let a burst of parallel guesses all pass the
@@ -869,9 +880,13 @@ async fn post_login(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    if username.is_empty() || password.is_empty() {
+    if !valid_account_name(&username)
+        || password.is_empty()
+        || password.len() > 4096
+        || code.len() > 64
+    {
         return Err(ApiError::bad_request(anyhow!(
-            "a username and a password are needed"
+            "use a valid username (at most 32 characters), a password of at most 4096 bytes and a valid one-time code"
         )));
     }
     // Guessing costs time whether or not the account exists, so a wrong username
@@ -880,6 +895,14 @@ async fn post_login(
     // so a couple of hundred concurrent guesses pinned every blocking thread (up
     // to 2 s each) and the API — and the console behind it — went dark.
     let attempts = note_attempt(&username);
+    if attempts > MAX_ACCOUNT_ATTEMPTS {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            anyhow!(
+                "too many sign-in attempts for this account; try again after the ten-minute window"
+            ),
+        ));
+    }
     tokio::time::sleep(attempt_delay(attempts)).await;
 
     let state = state.clone();
@@ -1065,11 +1088,12 @@ fn ask_the_directory(
     ))
 }
 
-/// A SHA-512-crypt hash of a password nobody has, at the default cost. An
+/// A yescrypt cost-5 hash used only for nonexistent/unpassworded accounts. An
 /// account that does not exist, or has no password, is checked against this,
 /// so a guess at it takes as long as a guess at a real account — and the time
 /// an answer took does not say which accounts exist.
-const DUMMY_HASH: &str = "$6$sentineldummyslt$gWTz2LKtX9wRySSrYDXWHlKKinC/5I8PRIAeolsSimBC6RmvfcyV149HC.mD2BSv9BrRFYp2CpVu0rjVMRsXM/";
+const DUMMY_HASH: &str =
+    "$y$j9T$0123456789012345678901$1VcHubGHqsZAACV5huXbEB8ftqsiYRf4gVxfgi745Y6";
 
 /// The whole of signing in, in one place so the refusals can be read together.
 ///
@@ -1089,7 +1113,8 @@ fn sign_in(
     // The per-attempt slowdown and its counting happen in `post_login`, before
     // this runs — and crucially off the blocking pool, awaited asynchronously —
     // so a flood of guesses cannot pin blocking threads here.
-    let appliance = Appliance::load(&state.config_path)
+    let appliance = state
+        .appliance()
         .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
     let login = appliance
         .system
@@ -1152,9 +1177,17 @@ fn sign_in(
     // a wrong password: the console always offers the field, and an account
     // that has no code ignores it.
     if let Some(secret) = login.and_then(|l| l.totp.as_deref()) {
-        match crate::aaa::totp_matches(secret, code, crate::aaa::unix_now()) {
+        // Replay records are durable appliance state, not sessions: sweeping
+        // expired API sessions or restarting this listener must not reset them.
+        let replay_dir = state
+            .tokens_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("totp-replay");
+        match crate::aaa::totp_consume(&replay_dir, username, secret, code, crate::aaa::unix_now())
+        {
             Ok(true) => {}
-            Ok(false) => return Err(refused("wrong one-time code")),
+            Ok(false) => return Err(refused("wrong or already consumed one-time code")),
             Err(e) => return Err(refused(&format!("one-time code: {e:#}"))),
         }
     }
@@ -1163,11 +1196,8 @@ fn sign_in(
     // back to the configured default group; without one it gets nothing, which
     // is what stops a configured server from handing management access to
     // everybody in the directory.
-    let group =
-        login
-            .and_then(|l| l.group.as_deref())
-            .or(appliance.system.aaa.default_group.as_deref());
-    let Some(group) = group else {
+    let Some((permission, grant)) = crate::api_session::grant(&appliance, username, via_directory)
+    else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             anyhow!(
@@ -1175,12 +1205,6 @@ fn sign_in(
             ),
         ));
     };
-    if !appliance.system.groups.iter().any(|g| g.name == group) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            anyhow!("{username} is in group {group:?}, which does not exist"),
-        ));
-    }
 
     // The username names the caller everywhere the session is used, and a
     // directory-authenticated account (RADIUS/LDAP/TACACS+ default-group)
@@ -1195,8 +1219,6 @@ fn sign_in(
 
     // A new session, under the grant just checked. The same grant is
     // recomputed on every use, so changing any of what it rests on ends it.
-    let (permission, grant) = crate::api_session::grant(&appliance, username, via_directory)
-        .ok_or_else(|| ApiError::internal(anyhow!("{username} was granted nothing")))?;
     let token = crate::api_session::open(
         &state.tokens_dir,
         username,
@@ -1237,6 +1259,7 @@ const MAX_TRACKED_ACCOUNTS: usize = 4096;
 
 /// How long the ten-minute forgiveness window lasts.
 const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_ACCOUNT_ATTEMPTS: u32 = 30;
 
 /// How long to slow a failed sign-in: 250 ms per attempt in the current window,
 /// capped at 2 s. Awaited asynchronously by [`post_login`], never slept on a
@@ -1252,14 +1275,13 @@ fn note_attempt(username: &str) -> u32 {
     // one. An account mid-attack has a recent entry and is never the victim.
     if map.len() >= MAX_TRACKED_ACCOUNTS && !map.contains_key(username) {
         map.retain(|_, (started, _)| started.elapsed() <= ATTEMPT_WINDOW);
-        if map.len() >= MAX_TRACKED_ACCOUNTS {
-            if let Some(oldest) = map
+        if map.len() >= MAX_TRACKED_ACCOUNTS
+            && let Some(oldest) = map
                 .iter()
                 .max_by_key(|(_, (started, _))| started.elapsed())
                 .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
-            }
+        {
+            map.remove(&oldest);
         }
     }
     let entry = map
@@ -1270,7 +1292,7 @@ fn note_attempt(username: &str) -> u32 {
     if entry.0.elapsed() > ATTEMPT_WINDOW {
         *entry = (std::time::Instant::now(), 0);
     }
-    entry.1 += 1;
+    entry.1 = entry.1.saturating_add(1);
     entry.1
 }
 
@@ -1280,11 +1302,10 @@ fn forget_attempts(username: &str) {
 
 // ---- per-IP lockout -------------------------------------------------------
 //
-// The per-account throttle above only slows a guesser; the per-IP lockout stops
-// one. It is keyed by the peer address, so a single machine spraying passwords
-// trips it while an operator arriving from any other address is untouched — and
-// a locked address is refused before the password hash runs, which is the DoS
-// the hash would otherwise let one address inflict.
+// The per-account budget is cross-origin; this separate peer-address budget
+// also stops a single source spraying many accounts. An exhausted source is
+// refused before expensive password hashing. Another source is still subject
+// to the shared account budget, not guaranteed independent access.
 
 /// One address's recent attempts: when the current window opened, how many
 /// attempts not yet followed by a good sign-in have landed in it, and, once
@@ -1352,6 +1373,7 @@ impl IpThrottle {
     /// caught up yet: the threshold is the most password checks one address can
     /// cause per window, however many requests it has in flight.
     fn reserve(&self, ip: std::net::IpAddr) -> Result<(), IpRefusal> {
+        let ip = throttle_source(ip);
         let mut map = self.records.lock().unwrap();
         let now = std::time::Instant::now();
         if let Some(until) = map.get(&ip).and_then(|r| r.locked_until) {
@@ -1404,7 +1426,25 @@ impl IpThrottle {
 
     /// Clear an address after a good sign-in from it.
     fn forget(&self, ip: std::net::IpAddr) {
-        self.records.lock().unwrap().remove(&ip);
+        self.records.lock().unwrap().remove(&throttle_source(ip));
+    }
+}
+
+/// Privacy addresses within one IPv6 /64 are one source for brute-force
+/// protection. Canonicalize mapped IPv4 too, so ::ffff:x cannot get a second
+/// budget. This never trusts forwarding headers supplied by the caller.
+fn throttle_source(ip: std::net::IpAddr) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv6Addr};
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let mut bytes = v6.octets();
+            bytes[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(bytes))
+        }
+        v4 => v4,
     }
 }
 
@@ -1492,7 +1532,7 @@ async fn ha_enrollment(
 ) -> Result<Response, ApiError> {
     require_ha_machine(&state, &caller)?;
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
-    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let appliance = state.appliance().map_err(ApiError::internal)?;
     let revision = crate::ha::revision(&appliance).map_err(ApiError::internal)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
@@ -1515,11 +1555,12 @@ async fn ha_pair(
 ) -> Result<Json<Value>, ApiError> {
     require_ha_machine(&state, &caller)?;
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
-    let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let local = state.appliance().map_err(ApiError::internal)?;
     request
         .appliance
         .validate()
         .map_err(ApiError::bad_request)?;
+    crate::admission::check(Some(&local), &request.appliance).map_err(ApiError::bad_request)?;
     if request.appliance.fleet != local.fleet {
         return Err(ApiError::bad_request(anyhow!(
             "HA enrollment cannot replace the member's fleet identity"
@@ -1545,20 +1586,20 @@ async fn ha_pair(
         .ok_or_else(|| {
             ApiError::bad_request(anyhow!("complete paired HA configuration required"))
         })?;
-    if let Some(existing) = local.system.ha.as_ref().filter(|h| h.enabled) {
-        if existing.cluster != next.cluster || existing.node() != next.node() {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                anyhow!("member already belongs to another active HA identity"),
-            ));
-        }
+    if let Some(existing) = local.system.ha.as_ref().filter(|h| h.enabled)
+        && (existing.cluster != next.cluster || existing.node() != next.node())
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            anyhow!("member already belongs to another active HA identity"),
+        ));
     }
     // Received enrollment must not enqueue a reverse configuration push.
     replace_config(&state, request.appliance)
 }
 
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
-    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let appliance = state.appliance().map_err(ApiError::internal)?;
     let mut value = serde_json::to_value(&appliance)
         .map_err(|e| ApiError::internal(anyhow!("serialising the configuration: {e}")))?;
     redact_secrets(&mut value);
@@ -1583,6 +1624,53 @@ async fn put_config(
         .map_err(|error| ApiError::internal(anyhow!("configuration task: {error}")))?
 }
 
+/// Advisories are public operator guidance, not another configuration export.
+/// Scrub even short secret values duplicated into a label, including the debug
+/// spelling used by warnings, and keep each warning on one display line.
+fn configuration_advisories(appliance: &Appliance) -> Vec<String> {
+    let mut secrets = redact::every_secret_value(appliance);
+    for secret in secrets.clone() {
+        let quoted = format!("{secret:?}");
+        secrets.push(quoted[1..quoted.len() - 1].to_string());
+    }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    appliance
+        .warnings()
+        .into_iter()
+        .map(|warning| {
+            let scrubbed = redact::scrub_text(&warning, &secrets);
+            let mut line = String::new();
+            for character in scrubbed.chars() {
+                if character.is_control() {
+                    line.extend(character.escape_debug());
+                } else {
+                    line.push(character);
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+/// Additive response fields leave admission/confirmation identities intact.
+/// `/configure` already has an output consumed by the UI warning renderer;
+/// document and whole-config callers use the structured array directly.
+fn with_configuration_advisories(mut response: Value, warnings: &[String]) -> Value {
+    if let Some(output) = response.get_mut("output")
+        && let Some(text) = output.as_str()
+    {
+        let mut text = text.to_string();
+        for warning in warnings {
+            text.push_str("\nwarning: ");
+            text.push_str(warning);
+        }
+        *output = Value::String(text);
+    }
+    response["warnings"] = json!(warnings);
+    response
+}
+
 /// All administrator writes use the same transaction; HA enrollment and
 /// config-sync retain their authenticated machine protocol and refuse a pending
 /// local transaction. Off-box CLI emulation has no live network to lock out.
@@ -1598,20 +1686,25 @@ fn management_replace(
     // always a document to compare with; the machine caller may be writing
     // the first.
     if caller.user.is_some() {
-        let current = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+        let current = state.appliance().map_err(ApiError::internal)?;
         refuse_machine_trust_change(caller, &current, &appliance)?;
     }
+    crate::admission::check_saved(&state.config_path, state.apply.enabled, &appliance)
+        .map_err(ApiError::bad_request)?;
     crate::safe_apply::ensure_writable(&state.config_path)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    ensure_no_cli_confirmation(state)?;
     if state.apply.enabled {
-        let seconds = Appliance::load(&state.config_path)
+        let warnings = configuration_advisories(&appliance);
+        let seconds = state
+            .appliance()
             .map_err(ApiError::internal)?
             .services
             .web
             .confirm_timeout
             .unwrap_or(60);
         crate::safe_apply::begin(&state.config_path, &appliance, &state.apply, seconds)
-            .map(Json)
+            .map(|response| Json(with_configuration_advisories(response, &warnings)))
             .map_err(ApiError::internal)
     } else {
         replace_config(state, appliance)
@@ -1746,7 +1839,7 @@ async fn get_config_document(
 }
 fn read_config_document(state: &ApiState, disclosure: Disclosure) -> Result<Response, ApiError> {
     let _lock = system::apply_lock().map_err(ApiError::internal)?;
-    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let appliance = state.appliance().map_err(ApiError::internal)?;
     let shown = redact::appliance(&appliance, disclosure).map_err(ApiError::internal)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
@@ -1783,7 +1876,7 @@ fn apply_document(
     let _lock = system::apply_lock().map_err(ApiError::internal)?;
     let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
         .map_err(ApiError::internal)?;
-    let previous = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let previous = state.appliance().map_err(ApiError::internal)?;
     let text = restore_withheld_credential(&request.toml, &previous)?;
     let candidate = Appliance::from_toml(&text).map_err(ApiError::bad_request)?;
     if crate::ha::revision(&previous).map_err(ApiError::internal)? != request.expected_revision {
@@ -1795,6 +1888,8 @@ fn apply_document(
     // Refused at review already, not only at apply: a diff the console shows
     // as reviewable should be one it can then apply.
     refuse_machine_trust_change(caller, &previous, &candidate)?;
+    crate::admission::check(Some(&previous), &candidate).map_err(ApiError::bad_request)?;
+    let warnings = configuration_advisories(&candidate);
     if request.validate_only {
         // The review diff is read back like the document itself: a context
         // line beside an edited `[system.config-sync]` would otherwise print
@@ -1804,15 +1899,17 @@ fn apply_document(
                 .and_then(|a| a.to_toml())
                 .map_err(ApiError::internal)
         };
-        return Ok(Json(
+        return Ok(Json(with_configuration_advisories(
             json!({"valid":true,"diff":crate::diff::unified(&shown(&previous)?, &shown(&candidate)?)}),
-        ));
+            &warnings,
+        )));
     }
     crate::safe_apply::ensure_writable(&state.config_path)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    ensure_no_cli_confirmation(state)?;
     let seconds = previous.services.web.confirm_timeout.unwrap_or(60);
     crate::safe_apply::begin(&state.config_path, &candidate, &state.apply, seconds)
-        .map(Json)
+        .map(|response| Json(with_configuration_advisories(response, &warnings)))
         .map_err(ApiError::internal)
 }
 
@@ -1986,8 +2083,12 @@ fn receive_synced_config(
         .map_err(ApiError::internal)?;
     crate::safe_apply::ensure_writable(&state.config_path)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
-    let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    ensure_no_cli_confirmation(state)?;
+    let local = state.appliance().map_err(ApiError::internal)?;
     let merged = merge_synced_config(incoming, &local).map_err(ApiError::bad_request)?;
+    // Admission precedes prepare: a refused policy must not consume the
+    // receiver's one-shot initial synchronization authorization.
+    crate::admission::check(Some(&local), &merged).map_err(ApiError::bad_request)?;
     let received = crate::configsync::shared_revision(&merged).map_err(ApiError::internal)?;
     crate::configsync::receive::prepare(
         &synchronized_marker(state),
@@ -2070,6 +2171,12 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
     incoming.system.hostname = local.system.hostname.clone();
     incoming.system.config_sync = local.system.config_sync.clone();
     incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
+    // The one HTTPS listener also carries config-sync when the web console is
+    // disabled. Keep its receiver-local endpoint; importing the sender's address
+    // can strand this member or expose a deliberately loopback-only service.
+    // TLS, authentication and other web settings remain synchronized policy.
+    incoming.services.web.listen_address = local.services.web.listen_address.clone();
+    incoming.services.web.port = local.services.web.port;
     // Shared link intent (MTU, VLAN tags/parents, bridges, services, zones) must
     // converge too. Preserve only the member's addressing/tunnel endpoint facts.
     for interface in &mut incoming.interfaces {
@@ -2102,13 +2209,23 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
     Ok(incoming)
 }
 
+/// Caller holds apply.lock; ordinary writes never accept a CLI trial implicitly.
+fn ensure_no_cli_confirmation(state: &ApiState) -> Result<(), ApiError> {
+    crate::confirm::ensure_idle_for_write(state.apply.enabled)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))
+}
+
 /// Validate, apply and persist a complete, receiver-safe appliance document.
 fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
         .map_err(ApiError::internal)?;
+    crate::admission::check_saved(&state.config_path, state.apply.enabled, &appliance)
+        .map_err(ApiError::bad_request)?;
     crate::safe_apply::ensure_writable(&state.config_path)
         .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
+    ensure_no_cli_confirmation(state)?;
+    let warnings = configuration_advisories(&appliance);
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
@@ -2116,7 +2233,7 @@ fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>,
         // disk, which still holds the previous config here (this handler applies
         // live first, persists below). `net::apply` is level-triggered, so
         // re-applying it rolls a partial failure back to last-good.
-        let last_good = Appliance::load(&state.config_path).ok();
+        let last_good = state.appliance().ok();
         repl::apply_live(&appliance, &state.apply, last_good.as_ref())
             .map_err(ApiError::internal)?;
     }
@@ -2140,27 +2257,14 @@ fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>,
         ));
     }
 
-    // A PUT saves as well as applies, so — like a CLI `save` — it makes the new
-    // config the baseline a pending commit-confirm would revert to. Left armed,
-    // that timer would "revert" to the config just saved: a no-op that silently
-    // defeats the safety net. Disarm it and report that, matching the CLI `save`.
-    let confirm_cancelled = if state.apply.enabled && crate::system::confirm_pending() {
-        crate::system::disarm_confirm();
-        true
-    } else {
-        false
-    };
-
     // Record what is now running, the same running-snapshot a CLI `commit` writes,
     // so a concurrent CLI session can tell the box has moved on under it. Only when
     // it was actually applied live, and best-effort like the CLI path.
-    if state.apply.enabled {
-        if let Ok(toml) = appliance.to_toml() {
-            let _ = crate::system::install_config_file(
-                Path::new(crate::session::Session::RUNNING),
-                &toml,
-            );
-        }
+    if state.apply.enabled
+        && let Ok(toml) = appliance.to_toml()
+    {
+        let _ =
+            crate::system::install_config_file(Path::new(crate::session::Session::RUNNING), &toml);
     }
 
     // An account whose password, second factor or group just changed must lose
@@ -2169,14 +2273,19 @@ fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>,
     if let Err(e) = sync_user_tokens(state) {
         eprintln!("warning: could not reconcile API sessions: {e:#}");
     }
-    Ok(Json(json!({
-        "applied": state.apply.enabled,
-        "saved": true,
-        "confirm_auto_revert_cancelled": confirm_cancelled,
-        "hostname": appliance.system.hostname,
-        "interfaces": appliance.interfaces.len(),
-        "rules": appliance.rules.len(),
-    })))
+    Ok(Json(with_configuration_advisories(
+        json!({
+            "applied": state.apply.enabled,
+            "saved": true,
+            // Retained for older clients; admission never implicitly confirms a
+            // separate CLI trial.
+            "confirm_auto_revert_cancelled": false,
+            "hostname": appliance.system.hostname,
+            "interfaces": appliance.interfaces.len(),
+            "rules": appliance.rules.len(),
+        }),
+        &warnings,
+    )))
 }
 
 /// Authenticated diagnostics, also available to read-only accounts. Collection
@@ -2257,15 +2366,38 @@ async fn get_show(
     .map_err(|e| ApiError::internal(anyhow!("running show: {e}")))?
     .map_err(|e| ApiError::internal(anyhow!("running show: {e}")))?;
     if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(ApiError::bad_request(anyhow!(if msg.is_empty() {
-            "show failed".to_string()
-        } else {
-            msg
-        })));
+        return Err(show_failure(disclosure, &out));
     }
     let body = String::from_utf8_lossy(&out.stdout).into_owned();
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+}
+
+/// Rendering/redaction happens only AFTER a configuration has parsed. A
+/// malformed private revision can therefore put an unknown, historical secret
+/// in the child's parser error even when the current config is healthy enough
+/// to authenticate a read-only account. A scrubber using today's secret list
+/// cannot make that output safe. Account callers receive no failed child
+/// output at all; the machine credential retains its existing diagnostics
+/// only when an explicit redaction header has not narrowed its disclosure.
+fn show_failure(disclosure: Disclosure, output: &std::process::Output) -> ApiError {
+    let message = if disclosure == Disclosure::Full {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            "show failed".to_string()
+        } else {
+            stderr
+        }
+    } else {
+        let exit = output
+            .status
+            .code()
+            .map_or_else(|| "terminated".to_string(), |code| code.to_string());
+        format!(
+            "Requested observation is unavailable or invalid (collector exit {exit}); \
+             check the view path and relevant service or configuration."
+        )
+    };
+    ApiError::bad_request(anyhow!(message))
 }
 
 /// The header through which a stack peer asks for this box's `show` output in
@@ -2329,7 +2461,7 @@ fn show_command(
 /// common provisional management transaction; a trailing `save` is accepted
 /// for CLI-style clients. Only configuration verbs are accepted: operational
 /// commands and arbitrary export paths cannot escape the transaction boundary.
-/// Refusals preserve the whole batch and are returned as `ok: false` plus the
+/// Refusals preserve the whole batch and are returned as HTTP 400 plus the
 /// validation output, with no partial application.
 async fn post_configure(
     State(state): State<Arc<ApiState>>,
@@ -2344,7 +2476,11 @@ async fn post_configure(
     tokio::task::spawn_blocking(move || -> Result<Json<Value>, ApiError> {
         let _transaction = system::apply_lock().map_err(ApiError::internal)?;
         let _file = system::lock_config_at(&state.config_path.with_extension("configure.lock")).map_err(ApiError::internal)?;
-        let mut candidate = session::Session::load(&state.config_path).map_err(ApiError::internal)?;
+        let mut candidate = if state.apply.enabled {
+            session::Session::load_live(&state.config_path)
+        } else {
+            session::Session::load(&state.config_path)
+        }.map_err(ApiError::internal)?;
         let mut commit = false;
         for (index, line) in body.lines().enumerate() {
             let words = repl::split_line(line);
@@ -2364,17 +2500,22 @@ async fn post_configure(
                 _ => Err(anyhow!("only set, delete, rollback, commit and save are accepted by the management configuration endpoint")),
             };
             if let Err(error) = result {
-                return Ok(Json(json!({"ok":false,"output":format!("error: line {} refused: {error:#}",index+1)})));
+                return Err(ApiError::bad_request(anyhow!("line {} refused: {error:#}", index + 1)));
             }
         }
         let appliance = match candidate.commit() {
             Ok(value) => value,
-            Err(error) => return Ok(Json(json!({"ok":false,"output":format!("error: {error:#}")}))),
+            Err(error) => return Err(ApiError::bad_request(error)),
         };
+        // A validation-only response must not promise that an unsafe candidate
+        // can be admitted by the subsequent commit request.
+        crate::admission::check_saved(&state.config_path, state.apply.enabled, &appliance)
+            .map_err(ApiError::bad_request)?;
+        let warnings = configuration_advisories(&appliance);
         let mut response = if commit { management_replace(&state, &caller, appliance)?.0 } else { json!({}) };
         response["ok"] = json!(true);
         response["output"] = json!(if response.get("pending").is_some() { "commit ok; provisional application started; confirmation required" } else if commit { "commit ok; configuration applied and saved" } else { "validation ok; nothing applied" });
-        Ok(Json(response))
+        Ok(Json(with_configuration_advisories(response, &warnings)))
     }).await.map_err(|e|ApiError::internal(anyhow!("configuration task: {e}")))?
 }
 
@@ -2498,7 +2639,7 @@ async fn get_choices(UrlPath(kind): UrlPath<String>) -> Result<Json<Value>, ApiE
 /// the console — if it is a peer, it is a member, and if it is not, the console
 /// would be claiming a relationship the appliance does not actually have.
 async fn get_stack(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
-    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let appliance = state.appliance().map_err(ApiError::internal)?;
     let cs = &appliance.system.config_sync;
     // Whether each peer has what this member committed. A peer that refused a
     // push as a conflict will refuse it every time until an operator decides
@@ -2573,7 +2714,7 @@ async fn get_stack_show(
     UrlPath((member, path)): UrlPath<(String, String)>,
 ) -> Result<Response, ApiError> {
     let endpoint = stack_show_endpoint(&path).map_err(ApiError::bad_request)?;
-    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let appliance = state.appliance().map_err(ApiError::internal)?;
     let cs = &appliance.system.config_sync;
     if !cs.peers.contains(&member) {
         return Err(ApiError::bad_request(anyhow!(
@@ -2626,7 +2767,7 @@ async fn stack_observation(
     member: String,
     endpoint: &'static str,
 ) -> Result<Response, ApiError> {
-    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let appliance = state.appliance().map_err(ApiError::internal)?;
     let cs = &appliance.system.config_sync;
     if !cs.peers.contains(&member) {
         return Err(ApiError::bad_request(anyhow!(
@@ -3141,6 +3282,10 @@ mod tests {
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-token-abc123";
+
+    // Dedicated failed-show disclosure regressions reuse this module's real
+    // account/HTTPS fixtures rather than introducing a second auth setup.
+    include!("api_show_disclosure_tests.rs");
 
     fn observer_context_fixture() -> crate::update_jobs::Snapshot {
         crate::update_jobs::Snapshot {
@@ -3889,7 +4034,7 @@ hostname = "sentinel-a"
 
 [system.config-sync]
 peer = ["10.43.0.41"]
-secret = "shared-secret"
+secret = "unit-test-shared-state-credential-32-bytes"
 
 [[interface]]
 name = "wan"
@@ -3918,7 +4063,7 @@ hostname = "sentinel-b"
 
 [system.config-sync]
 peer = ["10.43.0.40"]
-secret = "shared-secret"
+secret = "unit-test-shared-state-credential-32-bytes"
 
 [system.conntrack-sync]
 listen = "10.43.0.41:5429"
@@ -4116,6 +4261,80 @@ virtual-address = ["10.43.0.253"]
         assert_eq!(throttle.reserve(ip), Ok(()));
     }
 
+    #[test]
+    fn ipv6_privacy_addresses_and_ipv4_mapped_addresses_share_a_budget() {
+        let throttle = IpThrottle::new(16);
+        let first = "2001:db8:1:2::1".parse().unwrap();
+        let rotated = "2001:db8:1:2:abcd:1234:ffff:abcd".parse().unwrap();
+        for _ in 0..IP_MAX_FAILURES {
+            throttle.reserve(first).unwrap();
+        }
+        assert!(matches!(
+            throttle.reserve(rotated),
+            Err(IpRefusal::Locked(_))
+        ));
+        assert_eq!(throttle.reserve("2001:db8:1:3::1".parse().unwrap()), Ok(()));
+        throttle.forget(rotated);
+        assert_eq!(throttle.reserve(first), Ok(()));
+        assert_eq!(
+            throttle_source("::ffff:192.0.2.1".parse().unwrap()),
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn login_bounds_and_account_budget_are_enforced_before_password_work() {
+        let app = router(state(seed("login-boundary")));
+        let username = "audit-budget-user";
+        forget_attempts(username);
+        for _ in 0..MAX_ACCOUNT_ATTEMPTS {
+            note_attempt(username);
+        }
+        for (name, password, code, expected) in [
+            (
+                username.to_string(),
+                "wrong".to_string(),
+                String::new(),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                "x".repeat(4096),
+                "wrong".to_string(),
+                String::new(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "valid-name".to_string(),
+                "x".repeat(4097),
+                String::new(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "valid-name".to_string(),
+                "wrong".to_string(),
+                "0".repeat(65),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/login")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({"username":name,"password":password,"code":code}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        forget_attempts(username);
+    }
+
     /// The handler reads `ConnectInfo` and refuses a locked address up front — the
     /// point being that the refusal comes *before* the password hash, so a locked
     /// guesser cannot make the box spend that work. Proven by pre-loading the
@@ -4201,8 +4420,48 @@ virtual-address = ["10.43.0.253"]
         assert_eq!(session["user"], "vera");
         assert_eq!(session["permission"], "read-write");
 
+        // A consumed code cannot mint a second session, including after an
+        // API reconstruction and its ordinary expired-session sweep.
+        let replay = sign_in(&st, "vera", "a-good-password", &code).unwrap_err();
+        assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
+        sync_user_tokens(&st).unwrap();
+        let reopened = state(st.config_path.clone());
+        assert_eq!(
+            sign_in(&reopened, "vera", "a-good-password", &code)
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+
         // …and the code alone does not, because the password is still checked.
         assert!(sign_in(&st, "vera", "wrong", &code).is_err());
+    }
+
+    #[test]
+    fn builtin_admin_without_a_group_can_sign_in_and_an_explicit_group_demotes_it() {
+        let path = temp_config();
+        let hash = crate::passwd::hash("bootstrap-admin-password").unwrap();
+        let base = format!(
+            "[system]\nhostname='bootstrap-admin-test'\n\
+            [[system.group]]\nname='viewers'\npermission='read-only'\n\
+            [[system.login]]\nusername='admin'\nhashed-password='{hash}'\n"
+        );
+        std::fs::write(&path, &base).unwrap();
+        let st = state(path);
+        let signed = sign_in(&st, "admin", "bootstrap-admin-password", "").unwrap();
+        let token = signed["token"].as_str().unwrap();
+        assert_eq!(signed["permission"], "read-write");
+        assert!(resolve_caller(&st, token).unwrap().permission.may_write());
+        std::fs::write(&st.config_path, format!("{base}group='viewers'\n")).unwrap();
+        assert!(resolve_caller(&st, token).is_none());
+        let viewer = sign_in(&st, "admin", "bootstrap-admin-password", "").unwrap();
+        assert_eq!(viewer["permission"], "read-only");
+        std::fs::write(
+            &st.config_path,
+            "[system]\nhostname='bootstrap-admin-test'\n",
+        )
+        .unwrap();
+        assert!(resolve_caller(&st, viewer["token"].as_str().unwrap()).is_none());
     }
 
     /// The machine token is full access and has no account behind it — it is
@@ -4315,6 +4574,403 @@ virtual-address = ["10.43.0.253"]
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(value.to_string()))
             .unwrap()
+    }
+
+    fn advisory_candidate() -> Appliance {
+        Appliance::from_toml(
+            r#"
+[system]
+hostname="advisory-test"
+[[interface]]
+name="lan0"
+zone="lan"
+address="198.18.120.11/24"
+[[interface]]
+name="wan0"
+zone="wan"
+address="198.18.110.11/24"
+[[rule]]
+name="telnet"
+from="lan"
+to="wan"
+proto="tcp"
+port=23
+action="reject"
+"#,
+        )
+        .unwrap()
+    }
+
+    // Stored legacy policies remain readable and editable in unrelated fields;
+    // these fixtures intentionally model an upgrade, not a new unsafe policy.
+    fn seed_legacy_advisory() -> PathBuf {
+        let path = temp_config();
+        let mut baseline = advisory_candidate();
+        baseline.system.hostname = "working".into();
+        std::fs::write(&path, baseline.to_toml().unwrap()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn destination_zone_admission_refuses_all_management_entry_points_before_save() {
+        let path = seed("working");
+        let original = std::fs::read(&path).unwrap();
+        let candidate = advisory_candidate();
+        let revision = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let script = session::flatten_config(&session::render_appliance(&candidate)).join("\n");
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        for (method, uri, body) in [
+            ("PUT", "/api/v1/config", serde_json::to_string(&candidate).unwrap()),
+            ("POST", "/api/v1/configure", script.clone()),
+            ("POST", "/api/v1/configure", format!("{script}\ncommit\nsave\n")),
+            ("POST", "/api/v1/config/document", json!({"toml":candidate.to_toml().unwrap(),"expected_revision":revision,"validate_only":true}).to_string()),
+            ("POST", "/api/v1/config/document", json!({"toml":candidate.to_toml().unwrap(),"expected_revision":revision,"validate_only":false}).to_string()),
+            ("POST", "/api/v1/ha/pair", serde_json::to_string(&PairRequest {expected_revision: revision.clone(), appliance: candidate.clone()}).unwrap()),
+        ] {
+            let response = app.clone().oneshot(request_as(method, uri, TOKEN, body)).await.unwrap();
+            let status = response.status();
+            let body = body_string(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+            assert!(body.contains("telnet"), "{uri}: {body}");
+            assert_eq!(std::fs::read(&path).unwrap(), original, "{uri}");
+            assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_null(), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_zone_sync_refusal_does_not_consume_initial_authorization() {
+        let (safe, local) = legacy_pair();
+        let mut unsafe_policy = safe.clone();
+        let mut rule = advisory_candidate().rules.remove(0);
+        rule.from = "wan".into();
+        unsafe_policy.rules.push(rule);
+        unsafe_policy.validate().unwrap();
+        let st = sync_state(&local);
+        let original = std::fs::read(&st.config_path).unwrap();
+        let app = router(st.clone());
+        let response = app
+            .clone()
+            .oneshot(push(None, TOKEN, &unsafe_policy))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("telnet"), "{body}");
+        assert!(!synchronized_marker(&st).exists());
+        assert_eq!(std::fs::read(&st.config_path).unwrap(), original);
+        let response = app.oneshot(push(None, TOKEN, &safe)).await.unwrap();
+        let status = response.status();
+        assert_eq!(status, StatusCode::OK, "{}", body_string(response).await);
+        assert!(synchronized_marker(&st).exists());
+    }
+
+    #[tokio::test]
+    async fn api_advisory_configure_review_and_commit_include_existing_warnings() {
+        for commit in [false, true] {
+            let path = seed_legacy_advisory();
+            let before = std::fs::read(&path).unwrap();
+            let candidate = advisory_candidate();
+            let expected = candidate.warnings();
+            assert_eq!(expected.len(), 1);
+            let mut script =
+                session::flatten_config(&session::render_appliance(&candidate)).join("\n");
+            if commit {
+                script.push_str("\ncommit\nsave\n");
+            }
+            let response = router(state(path.clone()))
+                .oneshot(request_as("POST", "/api/v1/configure", TOKEN, script))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["warnings"], json!(expected));
+            assert_eq!(body["ok"], true);
+            let output = body["output"].as_str().unwrap();
+            for warning in &expected {
+                assert!(
+                    output
+                        .lines()
+                        .any(|line| line == format!("warning: {warning}"))
+                );
+            }
+            if commit {
+                assert!(output.starts_with("commit ok; configuration applied and saved"));
+                assert_eq!(
+                    Appliance::load(&path).unwrap().to_toml().unwrap(),
+                    candidate.to_toml().unwrap()
+                );
+            } else {
+                assert!(output.starts_with("validation ok; nothing applied"));
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+            assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn api_advisory_whole_config_put_reports_warnings_without_refusing() {
+        let path = seed_legacy_advisory();
+        let candidate = advisory_candidate();
+        let response = router(state(path.clone()))
+            .oneshot(put(
+                "/api/v1/config",
+                TOKEN,
+                &serde_json::to_string(&candidate).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["warnings"], json!(candidate.warnings()));
+        assert_eq!(body["saved"], true);
+        assert_eq!(body["applied"], false);
+        assert_eq!(
+            Appliance::load(&path).unwrap().to_toml().unwrap(),
+            candidate.to_toml().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn api_advisory_document_review_and_provisional_apply_retain_cas_and_revert() {
+        let path = seed_legacy_advisory();
+        let before = std::fs::read(&path).unwrap();
+        let app = router(state(path.clone()));
+        let candidate = advisory_candidate();
+        let revision = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let request = json!({
+            "toml":candidate.to_toml().unwrap(),
+            "expected_revision":revision,
+            "validate_only":true,
+        });
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/document", request.clone()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["warnings"], json!(candidate.warnings()));
+        assert_eq!(body["valid"], true);
+        assert!(body["diff"].as_str().unwrap().contains("advisory-test"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_null());
+
+        let mut admission = request.clone();
+        admission["validate_only"] = json!(false);
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/document", admission.clone()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let admitted: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(status, StatusCode::OK, "{admitted}");
+        assert_eq!(admitted["warnings"], json!(candidate.warnings()));
+        assert!(admitted["pending"]["id"].is_string());
+        assert_eq!(
+            Appliance::load(&path).unwrap().to_toml().unwrap(),
+            candidate.to_toml().unwrap()
+        );
+
+        let stale = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/document", admission))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale: Value = serde_json::from_str(&body_string(stale).await).unwrap();
+        assert!(stale.get("warnings").is_none());
+        let response = app
+            .oneshot(post_json(
+                "/api/v1/config/revert",
+                json!({"id":admitted["pending"]["id"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn api_advisory_clean_config_has_an_empty_array_and_unchanged_output() {
+        let path = seed("clean");
+        let before = std::fs::read(&path).unwrap();
+        let app = router(state(path.clone()));
+        for (script, output) in [
+            ("", "validation ok; nothing applied"),
+            (
+                "commit\nsave\n",
+                "commit ok; configuration applied and saved",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_as(
+                    "POST",
+                    "/api/v1/configure",
+                    TOKEN,
+                    script.into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["warnings"], json!([]));
+            assert_eq!(body["output"], output);
+            assert_eq!(body["ok"], true);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn destination_zone_admission_redacts_secrets_in_refused_rule_names() {
+        for secret in ["x", "admission-secret-\"quoted\\value\nend"] {
+            let path = seed("working");
+            let original = std::fs::read(&path).unwrap();
+            let mut candidate = advisory_candidate();
+            candidate.system.config_sync.secret = Some(secret.into());
+            candidate.rules[0].name = format!("label-{secret}");
+            candidate.validate().unwrap();
+            let response = router(state(path.clone()))
+                .oneshot(put(
+                    "/api/v1/config",
+                    TOKEN,
+                    &serde_json::to_string(&candidate).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let error = body["error"].as_str().unwrap();
+            assert!(
+                error.contains("destination-zone admission refused"),
+                "{error}"
+            );
+            assert!(error.contains(REDACTED), "{error}");
+            // The fixed guidance can legitimately contain a short secret like
+            // `x` (in "explicit"); only the echoed label is sensitive data.
+            assert!(!error.contains(&format!("label-{secret}")), "{error}");
+            let quoted = serde_json::to_string(&format!("label-{secret}")).unwrap();
+            assert!(!error.contains(&quoted[1..quoted.len() - 1]), "{error}");
+            if secret.len() > 1 {
+                assert!(!error.contains(secret), "{error}");
+                let escaped = serde_json::to_string(secret).unwrap();
+                assert!(!error.contains(&escaped[1..escaped.len() - 1]), "{error}");
+            }
+            assert!(!error.chars().any(char::is_control), "{error:?}");
+            assert!(error.contains("explicit destination"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn api_advisory_redacts_short_and_escaped_secrets_in_success_responses() {
+        for secret in ["x", "advisory-secret-\"quoted\\value\nend"] {
+            let path = seed("working");
+            let mut candidate = advisory_candidate();
+            candidate.rules[0].action = crate::config::Action::Accept;
+            candidate.system.config_sync.secret = Some(secret.into());
+            candidate.rules[0].name = format!("label-{secret}");
+            candidate.validate().unwrap();
+            let response = router(state(path))
+                .oneshot(put(
+                    "/api/v1/config",
+                    TOKEN,
+                    &serde_json::to_string(&candidate).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let warnings = body["warnings"].as_array().unwrap();
+            assert_eq!(warnings.len(), 1);
+            let warning = warnings[0].as_str().unwrap();
+            let quoted = format!("{secret:?}");
+            assert!(!warning.contains(secret));
+            assert!(!warning.contains(&quoted[1..quoted.len() - 1]));
+            assert!(warning.contains(REDACTED));
+            assert!(!warning.chars().any(char::is_control));
+        }
+    }
+
+    #[test]
+    fn api_advisory_control_characters_cannot_inject_output_or_change_pending_identity() {
+        let mut candidate = advisory_candidate();
+        let zone = "wan\nerror: injected\r\t\u{1b}";
+        candidate.interfaces[1].zone = Some(zone.into());
+        candidate.rules[0].to = Some(zone.into());
+        let warnings = configuration_advisories(&candidate);
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].chars().any(char::is_control));
+        assert!(warnings[0].contains("wan\\nerror: injected\\r\\t\\u{1b}"));
+        let before = json!({
+            "accepted":true,"applied":false,"saved":false,
+            "pending":{"id":"unchanged-id","revision":"unchanged-revision","ready":false},
+            "output":"commit ok; provisional application started; confirmation required",
+        });
+        let response = with_configuration_advisories(before.clone(), &warnings);
+        for field in ["accepted", "applied", "saved", "pending"] {
+            assert_eq!(response[field], before[field]);
+        }
+        let lines: Vec<_> = response["output"].as_str().unwrap().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("warning: "));
+        assert!(!lines.iter().any(|line| line.starts_with("error:")));
+    }
+
+    #[tokio::test]
+    async fn api_advisory_does_not_bypass_write_auth_or_refused_batches() {
+        let path = seed("working");
+        let mut previous = Appliance::load(&path).unwrap();
+        let account = Appliance::from_toml(
+            "[system]\nhostname='viewer'\n[[system.group]]\nname='viewers'\npermission='read-only'\n[[system.login]]\nusername='viewer'\ngroup='viewers'\n",
+        ).unwrap();
+        previous.system.groups = account.system.groups;
+        previous.system.logins = account.system.logins;
+        session::persist_appliance(&previous, &path, false).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let state = state(path.clone());
+        let viewer = open_test_session(&state, "viewer");
+        let app = router(state);
+        let candidate = advisory_candidate();
+        let revision = crate::ha::revision(&previous).unwrap();
+        for (method, uri, body) in [
+            ("PUT", "/api/v1/config", serde_json::to_string(&candidate).unwrap()),
+            ("POST", "/api/v1/configure", "set rule telnet from lan\ncommit\n".into()),
+            ("POST", "/api/v1/config/document", json!({"toml":candidate.to_toml().unwrap(),"expected_revision":revision,"validate_only":true}).to_string()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_as(method, uri, &viewer, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert!(body.get("warnings").is_none());
+        }
+        let response = app
+            .oneshot(request_as(
+                "POST",
+                "/api/v1/configure",
+                TOKEN,
+                "set system hostname changed\nset nonsense invalid\ncommit\n".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(body.get("warnings").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_null());
     }
 
     #[tokio::test]
@@ -4464,7 +5120,7 @@ virtual-address = ["10.43.0.253"]
                 )
                 .await
                 .unwrap();
-            assert!(body_string(response).await.contains("\"ok\":false"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
         }
     }
@@ -5534,7 +6190,7 @@ virtual-address = ["10.43.0.253"]
     /// grant the configuration gives it today: accounts have no standing token
     /// file any more, so a test that needs an account's bearer signs it in.
     fn open_test_session(state: &ApiState, user: &str) -> String {
-        let appliance = Appliance::load(&state.config_path).unwrap();
+        let appliance = state.appliance().unwrap();
         let (permission, grant) = crate::api_session::grant(&appliance, user, false).unwrap();
         crate::api_session::open(
             &state.tokens_dir,
@@ -5753,6 +6409,96 @@ virtual-address = ["10.43.0.253"]
         s3.firewall.stateful = false;
         let p3 = merge_synced_config(s3.clone(), &p2).unwrap();
         assert_eq!(shared_revision(&p3).unwrap(), shared_revision(&s3).unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_config_sync_preserves_distinct_management_endpoints_both_directions() {
+        use crate::configsync::shared_revision;
+        let (mut a, mut b) = legacy_pair();
+        a.services.web.listen_address = Some("10.43.0.40".into());
+        a.services.web.port = Some(8443);
+        b.services.web.listen_address = Some("10.43.0.41".into());
+        b.services.web.port = Some(9443);
+        let base = shared_revision(&a).unwrap();
+        assert_eq!(base, shared_revision(&b).unwrap());
+        let a_state = sync_state(&a);
+        let b_state = sync_state(&b);
+        let mut a_changed = a.clone();
+        a_changed.interfaces[0].mtu = Some(1400);
+        let response = router(b_state.clone())
+            .oneshot(push(Some(&base), TOKEN, &a_changed))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            body_string(response).await
+        );
+        let mut b_changed = Appliance::load(&b_state.config_path).unwrap();
+        assert_eq!(b_changed.services.web.bind(), "10.43.0.41:9443");
+        assert_eq!(b_changed.interfaces[0].mtu, Some(1400));
+        assert_eq!(
+            shared_revision(&a_changed).unwrap(),
+            shared_revision(&b_changed).unwrap()
+        );
+
+        // A real reverse API push carries the backup's endpoint, but only its
+        // shared policy is imported by the primary.
+        b_changed.firewall.stateful = false;
+        let response = router(a_state.clone())
+            .oneshot(push(Some(&base), TOKEN, &b_changed))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            body_string(response).await
+        );
+        let a_received = Appliance::load(&a_state.config_path).unwrap();
+        assert_eq!(a_received.services.web.bind(), "10.43.0.40:8443");
+        assert!(!a_received.firewall.stateful);
+        assert_eq!(a_received.interfaces[0].mtu, Some(1400));
+        assert_eq!(
+            shared_revision(&a_received).unwrap(),
+            shared_revision(&b_changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_management_endpoint_normalization_does_not_hide_web_security_policy() {
+        use crate::configsync::shared_revision;
+        let (mut a, mut b) = legacy_pair();
+        a.services.web.listen_address = Some("127.0.0.1".into());
+        a.services.web.port = Some(8443);
+        b.services.web.listen_address = Some("10.43.0.41".into());
+        b.services.web.port = Some(9443);
+        assert_eq!(shared_revision(&a).unwrap(), shared_revision(&b).unwrap());
+        for change in [0, 1, 2] {
+            let mut incoming = a.clone();
+            match change {
+                0 => incoming.services.web.enable = true,
+                1 => incoming.services.web.tls = false,
+                _ => incoming.services.web.confirm_timeout = Some(180),
+            }
+            assert_ne!(
+                shared_revision(&incoming).unwrap(),
+                shared_revision(&b).unwrap()
+            );
+            let received = merge_synced_config(incoming.clone(), &b).unwrap();
+            assert_eq!(received.services.web.bind(), "10.43.0.41:9443");
+            assert_eq!(received.services.web.enable, incoming.services.web.enable);
+            assert_eq!(received.services.web.tls, incoming.services.web.tls);
+            assert_eq!(
+                received.services.web.confirm_timeout,
+                incoming.services.web.confirm_timeout
+            );
+            assert_eq!(
+                shared_revision(&received).unwrap(),
+                shared_revision(&incoming).unwrap()
+            );
+        }
     }
 
     // ---- browser-facing headers ------------------------------------------

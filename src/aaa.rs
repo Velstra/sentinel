@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::{ToSocketAddrs, UdpSocket};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---- MD5 (RFC 1321) -------------------------------------------------------
@@ -210,25 +211,187 @@ fn hotp(secret: &[u8], counter: u64) -> u32 {
 /// Whether `code` is the current one-time code for `secret`, allowing one step
 /// either side. `now` is a Unix time, so the check is testable without waiting
 /// for a clock.
+#[cfg(test)]
 pub fn totp_matches(secret_base32: &str, code: &str, now: u64) -> Result<bool> {
+    Ok(totp_counter(secret_base32, code, now)?.is_some())
+}
+
+fn totp_counter(secret_base32: &str, code: &str, now: u64) -> Result<Option<u64>> {
     let secret = base32_decode(secret_base32).context("the account's TOTP secret")?;
-    let typed: u32 = code
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("a one-time code is six digits"))?;
-    if code.trim().len() != 6 {
+    let code = code.trim();
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
         bail!("a one-time code is six digits");
     }
-    let step = (now / TOTP_STEP) as i64;
+    let typed: u32 = code.parse()?;
+    let step = now / TOTP_STEP;
+    let mut matched = None;
     for delta in -TOTP_SKEW..=TOTP_SKEW {
-        let counter = (step + delta).max(0) as u64;
+        let Some(counter) = step.checked_add_signed(delta) else {
+            continue;
+        };
         // Constant-time enough: both sides are six-digit integers, so there is
         // no length to leak and the comparison is one machine word.
         if hotp(&secret, counter) == typed {
-            return Ok(true);
+            // Record the greatest matching counter, including a coincidentally
+            // identical neighbouring code, so changing the clock cannot replay it.
+            matched = Some(counter);
         }
     }
-    Ok(false)
+    Ok(matched)
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TotpUse {
+    version: u8,
+    identity: String,
+    counter: u64,
+}
+
+fn totp_identity(user: &str, secret: &str) -> Result<String> {
+    // Decode first: base32 case or padding changes do not reset replay protection.
+    let key = base32_decode(secret)?;
+    let mut material = b"sentinel-totp-replay-v1\0".to_vec();
+    material.extend_from_slice(&(user.len() as u64).to_be_bytes());
+    material.extend_from_slice(user.as_bytes());
+    material.extend_from_slice(&key);
+    Ok(ring::digest::digest(&ring::digest::SHA256, &material)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Validate and consume a code, durably, before a management session is issued.
+/// The directory must be on persistent state, OUTSIDE the session sweep. One
+/// non-replaced lock inode serializes threads and independent API processes;
+/// replacing the JSON state never replaces the lock. Persistence failures and
+/// corrupt state refuse authentication, rather than silently permitting replay.
+/// This is per-appliance protection, not a distributed HA replay database.
+pub fn totp_consume(dir: &Path, user: &str, secret: &str, code: &str, now: u64) -> Result<bool> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let Some(counter) = totp_counter(secret, code, now)? else {
+        return Ok(false);
+    };
+    let identity = totp_identity(user, secret)?;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {
+            if let Some(parent) = dir.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).context("creating persistent TOTP replay directory"),
+    }
+    let metadata = std::fs::symlink_metadata(dir)?;
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "TOTP replay directory is not a private owned directory"
+    );
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)?;
+    let lock_path = dir.join(format!("{identity}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .context("opening TOTP replay lock")?;
+    let locked = lock.metadata()?;
+    anyhow::ensure!(
+        locked.is_file()
+            && locked.uid() == unsafe { libc::geteuid() }
+            && locked.mode() & 0o077 == 0
+            && locked.nlink() == 1,
+        "TOTP replay lock is not a private owned regular file"
+    );
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("locking TOTP replay state");
+        }
+    }
+    // A writer waiting on an old inode must not read/update state under a new
+    // writer's independent lock. Cleanup never unlinks these stable lock files.
+    let named = std::fs::symlink_metadata(&lock_path)?;
+    anyhow::ensure!(
+        named.dev() == locked.dev() && named.ino() == locked.ino(),
+        "TOTP replay lock was replaced"
+    );
+    let path = dir.join(format!("{identity}.json"));
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o077 == 0
+                    && metadata.nlink() == 1
+                    && metadata.len() <= 1024,
+                "TOTP replay state is not a private bounded regular file"
+            );
+            let mut body = Vec::new();
+            file.take(1025).read_to_end(&mut body)?;
+            let previous: TotpUse =
+                serde_json::from_slice(&body).context("corrupt TOTP replay state")?;
+            anyhow::ensure!(
+                previous.version == 1 && previous.identity == identity,
+                "TOTP replay state has an invalid identity or version"
+            );
+            if counter <= previous.counter {
+                return Ok(false);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("reading persistent TOTP replay state"),
+    }
+    let record = TotpUse {
+        version: 1,
+        identity: identity.clone(),
+        counter,
+    };
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).context("entropy for TOTP replay staging")?;
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let stage = dir.join(format!(".{identity}.{nonce}.tmp"));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&stage)?;
+        file.write_all(&serde_json::to_vec(&record)?)?;
+        file.sync_all().context("syncing TOTP replay state")?;
+        std::fs::rename(&stage, &path)?;
+        directory
+            .sync_all()
+            .context("syncing TOTP replay directory")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
+    result?;
+    // Closing the descriptor releases flock, only after durable consumption.
+    Ok(true)
 }
 
 /// The code that is current for `secret` at `now`.
@@ -250,9 +413,19 @@ pub fn totp_secret() -> String {
     // A failure here means no entropy source, and a predictable second factor
     // is worse than none — so this is a panic rather than a fallback.
     getrandom::getrandom(&mut raw).expect("no entropy source for a TOTP secret");
-    raw.iter()
-        .map(|b| ALPHABET[(b & 0x1f) as usize] as char)
-        .collect()
+    let mut out = String::with_capacity(32);
+    let mut buffer = 0u32;
+    let mut bits = 0;
+    for byte in raw {
+        buffer = (buffer << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((buffer >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    debug_assert_eq!(bits, 0);
+    out
 }
 
 // ---- RADIUS (RFC 2865) ----------------------------------------------------
@@ -263,6 +436,63 @@ const RADIUS_ACCESS_REJECT: u8 = 3;
 const RADIUS_ATTR_USER_NAME: u8 = 1;
 const RADIUS_ATTR_USER_PASSWORD: u8 = 2;
 const RADIUS_ATTR_NAS_IDENTIFIER: u8 = 32;
+const RADIUS_ATTR_MESSAGE_AUTHENTICATOR: u8 = 80;
+
+fn hmac_md5(key: &[u8], message: &[u8]) -> [u8; 16] {
+    let mut block = [0u8; 64];
+    if key.len() > block.len() {
+        block[..16].copy_from_slice(&md5(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner: Vec<u8> = block.iter().map(|b| b ^ 0x36).collect();
+    inner.extend_from_slice(message);
+    let mut outer: Vec<u8> = block.iter().map(|b| b ^ 0x5c).collect();
+    outer.extend_from_slice(&md5(&inner));
+    md5(&outer)
+}
+
+/// Validate every TLV before interpreting any authentication attribute. A
+/// Message-Authenticator is mandatory exactly once, with its RFC 3579 length.
+fn radius_message_authenticator(packet: &[u8]) -> Result<usize> {
+    anyhow::ensure!(
+        (20..=4096).contains(&packet.len()),
+        "the RADIUS packet has an invalid length"
+    );
+    let declared = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    anyhow::ensure!(
+        declared == packet.len(),
+        "the RADIUS packet length does not match its datagram"
+    );
+    let mut offset = 20;
+    let mut authenticator = None;
+    while offset < packet.len() {
+        anyhow::ensure!(
+            offset + 2 <= packet.len(),
+            "truncated RADIUS attribute header"
+        );
+        let code = packet[offset];
+        let len = packet[offset + 1] as usize;
+        anyhow::ensure!(
+            code != 0 && len >= 2 && offset + len <= packet.len(),
+            "invalid RADIUS attribute length or type"
+        );
+        if code == RADIUS_ATTR_MESSAGE_AUTHENTICATOR {
+            anyhow::ensure!(len == 18, "invalid RADIUS Message-Authenticator length");
+            anyhow::ensure!(
+                authenticator.is_none(),
+                "duplicate RADIUS Message-Authenticator"
+            );
+            authenticator = Some(offset + 2);
+        }
+        offset += len;
+    }
+    authenticator.ok_or_else(|| {
+        anyhow!(
+            "RADIUS Message-Authenticator is required; legacy unauthenticated responses are refused"
+        )
+    })
+}
 
 /// Hide the password the way RFC 2865 §5.2 says: XOR each 16-octet block with
 /// `MD5(secret + previous block)`, where the first previous block is the request
@@ -271,7 +501,7 @@ const RADIUS_ATTR_NAS_IDENTIFIER: u8 = 32;
 /// rather than leaving for somebody to discover.
 fn hide_password(password: &str, secret: &str, authenticator: &[u8; 16]) -> Vec<u8> {
     let mut padded = password.as_bytes().to_vec();
-    while padded.len() % 16 != 0 || padded.is_empty() {
+    while !padded.len().is_multiple_of(16) || padded.is_empty() {
         padded.push(0);
     }
     let mut out = Vec::with_capacity(padded.len());
@@ -327,6 +557,11 @@ pub fn radius_authenticate(
     timeout: Duration,
     nas_identifier: &str,
 ) -> Result<bool> {
+    anyhow::ensure!(!secret.is_empty(), "a RADIUS shared secret is required");
+    anyhow::ensure!(
+        password.len() <= 128,
+        "RADIUS PAP passwords may not exceed 128 bytes"
+    );
     let mut authenticator = [0u8; 16];
     getrandom::getrandom(&mut authenticator).context("entropy for the RADIUS authenticator")?;
     let mut identifier = [0u8; 1];
@@ -342,12 +577,16 @@ pub fn radius_authenticate(
         RADIUS_ATTR_NAS_IDENTIFIER,
         nas_identifier.as_bytes(),
     )?);
+    attrs.extend_from_slice(&attr(RADIUS_ATTR_MESSAGE_AUTHENTICATOR, &[0; 16])?);
 
     let length = (20 + attrs.len()) as u16;
     let mut packet = vec![RADIUS_ACCESS_REQUEST, identifier[0]];
     packet.extend_from_slice(&length.to_be_bytes());
     packet.extend_from_slice(&authenticator);
     packet.extend_from_slice(&attrs);
+    let message_offset = radius_message_authenticator(&packet)?;
+    let message_authenticator = hmac_md5(secret.as_bytes(), &packet);
+    packet[message_offset..message_offset + 16].copy_from_slice(&message_authenticator);
 
     let target = (server, port)
         .to_socket_addrs()
@@ -366,16 +605,23 @@ pub fn radius_authenticate(
         .send_to(&packet, target)
         .with_context(|| format!("sending to the RADIUS server {server}"))?;
 
-    let mut buf = [0u8; 4096];
+    // The logical packet is bounded by its declared Length. RFC 2865 §3
+    // requires ignoring trailing UDP padding; it is not part of either MAC.
+    let mut buf = [0u8; 4097];
     let (n, from) = socket
         .recv_from(&mut buf)
         .with_context(|| format!("no answer from the RADIUS server {server}"))?;
     if from != target {
         bail!("a RADIUS answer arrived from {from}, which is not the server that was asked");
     }
-    if n < 20 {
-        bail!("the RADIUS server answered with a runt packet");
-    }
+    anyhow::ensure!(n >= 20, "the RADIUS server answered with a runt packet");
+    let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    anyhow::ensure!(
+        (20..=4096).contains(&declared) && declared <= n,
+        "the RADIUS reply has an invalid or truncated declared length"
+    );
+    let response = &buf[..declared];
+    let message_offset = radius_message_authenticator(response)?;
     if buf[1] != identifier[0] {
         bail!("the RADIUS answer does not match the request that was sent");
     }
@@ -384,12 +630,22 @@ pub fn radius_authenticate(
     // socket first can say Access-Accept.
     let mut check = vec![buf[0], buf[1], buf[2], buf[3]];
     check.extend_from_slice(&authenticator);
-    check.extend_from_slice(&buf[20..n]);
+    check.extend_from_slice(&response[20..]);
     check.extend_from_slice(secret.as_bytes());
-    if md5(&check) != buf[4..20] {
+    if !crate::api::ct_eq(&md5(&check), &buf[4..20]) {
         bail!(
             "the RADIUS answer failed its authenticator — wrong shared secret, or not the server"
         );
+    }
+    // RFC 3579 §3.2: calculate with the ORIGINAL Request Authenticator,
+    // not the Response Authenticator, and a zero Message-Authenticator value.
+    // Never retry without this check for old servers (BlastRADIUS downgrade).
+    let mut authenticated = response.to_vec();
+    authenticated[4..20].copy_from_slice(&authenticator);
+    authenticated[message_offset..message_offset + 16].fill(0);
+    let expected = hmac_md5(secret.as_bytes(), &authenticated);
+    if !crate::api::ct_eq(&expected, &response[message_offset..message_offset + 16]) {
+        bail!("the RADIUS answer failed its Message-Authenticator");
     }
     match buf[0] {
         RADIUS_ACCESS_ACCEPT => Ok(true),
@@ -932,9 +1188,173 @@ mod tests {
     #[test]
     fn a_generated_secret_is_usable() {
         let s = totp_secret();
-        assert_eq!(s.len(), 20);
-        assert_eq!(base32_decode(&s).unwrap().len(), 12);
+        assert_eq!(s.len(), 32);
+        assert_eq!(base32_decode(&s).unwrap().len(), 20);
         assert_ne!(s, totp_secret(), "two secrets in a row were identical");
+    }
+
+    const REPLAY_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    fn replay_dir() -> std::path::PathBuf {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "sentinel-totp-replay-{}-{serial}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        parent.join("totp-replay")
+    }
+
+    #[test]
+    fn consumed_totp_is_durable_across_reopen_and_backward_clock_steps() {
+        let dir = replay_dir();
+        let now = 1_111_111_110;
+        let code = totp_at(REPLAY_SECRET, now).unwrap();
+        assert!(totp_consume(&dir, "alice", REPLAY_SECRET, &code, now).unwrap());
+        assert!(!totp_consume(&dir, "alice", REPLAY_SECRET, &code, now).unwrap());
+        assert!(!totp_consume(&dir, "alice", REPLAY_SECRET, &code, now + 30).unwrap());
+        let old = totp_at(REPLAY_SECRET, now - 30).unwrap();
+        assert!(!totp_consume(&dir, "alice", REPLAY_SECRET, &old, now - 30).unwrap());
+        assert!(totp_consume(&dir, "bob", REPLAY_SECRET, &code, now).unwrap());
+        let next = totp_at(REPLAY_SECRET, now + 30).unwrap();
+        assert!(totp_consume(&dir, "alice", REPLAY_SECRET, &next, now + 30).unwrap());
+        assert!(
+            !totp_consume(
+                &dir,
+                "alice",
+                &REPLAY_SECRET.to_lowercase(),
+                &next,
+                now + 30
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn totp_replay_state_is_private_and_its_lock_inode_never_changes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = replay_dir();
+        let now = 1_111_111_110;
+        let identity = totp_identity("alice", REPLAY_SECRET).unwrap();
+        let lock = dir.join(format!("{identity}.lock"));
+        for at in [now, now + 30, now + 60] {
+            let before = std::fs::metadata(&lock).ok().map(|m| m.ino());
+            let code = totp_at(REPLAY_SECRET, at).unwrap();
+            assert!(totp_consume(&dir, "alice", REPLAY_SECRET, &code, at).unwrap());
+            let after = std::fs::metadata(&lock).unwrap();
+            if let Some(before) = before {
+                assert_eq!(before, after.ino());
+            }
+            assert_eq!(after.mode() & 0o777, 0o600);
+        }
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        let body = std::fs::read_to_string(dir.join(format!("{identity}.json"))).unwrap();
+        assert!(!body.contains(REPLAY_SECRET));
+        assert!(!body.contains("alice"));
+    }
+
+    #[test]
+    fn totp_replay_refuses_corrupt_oversized_symlink_or_nonregular_state() {
+        use std::os::unix::fs::{OpenOptionsExt, symlink};
+        let now = 1_111_111_110;
+        let code = totp_at(REPLAY_SECRET, now).unwrap();
+        for kind in [
+            "corrupt",
+            "oversized",
+            "symlink",
+            "directory",
+            "public",
+            "fifo",
+        ] {
+            let dir = replay_dir();
+            assert!(totp_consume(&dir, "alice", REPLAY_SECRET, &code, now).unwrap());
+            let identity = totp_identity("alice", REPLAY_SECRET).unwrap();
+            let path = dir.join(format!("{identity}.json"));
+            std::fs::remove_file(&path).unwrap();
+            match kind {
+                "symlink" => symlink(dir.join("absent"), &path).unwrap(),
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                "fifo" => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "public" => {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o644)
+                        .open(&path)
+                        .unwrap();
+                }
+                _ => std::fs::write(
+                    &path,
+                    if kind == "oversized" {
+                        vec![b'x'; 2048]
+                    } else {
+                        b"{".to_vec()
+                    },
+                )
+                .unwrap(),
+            }
+            // A dangling symlink may return ENOENT from open(O_NOFOLLOW)
+            // only on unusual platforms; Linux rejects it with ELOOP.
+            assert!(
+                totp_consume(&dir, "alice", REPLAY_SECRET, &code, now).is_err(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_processes_can_consume_a_totp_only_once() {
+        let dir = replay_dir();
+        let mut processes = Vec::new();
+        for _ in 0..8 {
+            processes.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "aaa::tests::totp_process_worker", "--nocapture"])
+                    .env("SENTINEL_TEST_TOTP_REPLAY_DIR", &dir)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let mut accepted = 0;
+        for process in processes {
+            let output = process.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            accepted +=
+                usize::from(String::from_utf8_lossy(&output.stdout).contains("TOTP_CONSUMED=true"));
+        }
+        assert_eq!(accepted, 1);
+        // A newly started process must still reject it after every writer exited.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "aaa::tests::totp_process_worker", "--nocapture"])
+            .env("SENTINEL_TEST_TOTP_REPLAY_DIR", &dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("TOTP_CONSUMED=false"));
+    }
+
+    #[test]
+    fn totp_process_worker() {
+        let Some(dir) = std::env::var_os("SENTINEL_TEST_TOTP_REPLAY_DIR") else {
+            return;
+        };
+        let now = 1_111_111_110;
+        let code = totp_at(REPLAY_SECRET, now).unwrap();
+        println!(
+            "TOTP_CONSUMED={}",
+            totp_consume(Path::new(&dir), "alice", REPLAY_SECRET, &code, now).unwrap()
+        );
     }
 
     /// The username goes into `uid=<here>,ou=…`, so a username with a comma in
@@ -1041,6 +1461,108 @@ mod tests {
         // An empty password still occupies a block — a zero-length attribute is
         // malformed, and some servers drop the whole packet for it.
         assert_eq!(hide_password("", "shared", &auth).len(), 16);
+    }
+
+    #[test]
+    fn hmac_md5_matches_rfc_2202_independent_vectors() {
+        assert_eq!(
+            hex(&hmac_md5(&[0x0b; 16], b"Hi There")),
+            "9294727a3638bb1c13f48ef8158bfc9d"
+        );
+        assert_eq!(
+            hex(&hmac_md5(b"Jefe", b"what do ya want for nothing?")),
+            "750c783e6ab0b503eaa86e310a5db738"
+        );
+        assert_eq!(
+            hex(&hmac_md5(
+                &[0xaa; 80],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd"
+        );
+    }
+
+    #[test]
+    fn radius_interoperates_with_an_independent_authenticated_udp_peer() {
+        use std::io::{BufRead, BufReader};
+        for mode in [
+            "accept",
+            "padded-accept",
+            "reject",
+            "missing",
+            "duplicate",
+            "short-attribute",
+            "truncated-attribute",
+            "zero-type",
+            "trailing-byte",
+            "wrong-length",
+            "wrong-message-authenticator",
+            "wrong-response-authenticator",
+        ] {
+            let python = option_env!("SENTINEL_TEST_PYTHON_BIN").unwrap_or("/usr/bin/python3");
+            let mut peer = std::process::Command::new(python)
+                .args(["-c", include_str!("../tests/radius_peer.py"), mode])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("Python 3 is required for the independent RADIUS peer");
+            let mut port = String::new();
+            BufReader::new(peer.stdout.as_mut().unwrap())
+                .read_line(&mut port)
+                .unwrap();
+            let result = radius_authenticate(
+                "127.0.0.1",
+                port.trim().parse().unwrap(),
+                "independent-radius-fixture-secret",
+                "alice",
+                "radius-fixture-password",
+                Duration::from_secs(3),
+                "sentinel-test",
+            );
+            let output = peer.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            match mode {
+                "accept" | "padded-accept" => assert!(result.unwrap()),
+                "reject" => assert!(!result.unwrap()),
+                _ => assert!(result.is_err(), "{mode} unexpectedly accepted"),
+            }
+        }
+    }
+
+    #[test]
+    fn radius_refuses_invalid_pap_inputs_before_opening_a_socket() {
+        assert!(
+            radius_authenticate(
+                "invalid.invalid",
+                1812,
+                "",
+                "alice",
+                "password",
+                Duration::from_secs(1),
+                "sentinel"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("shared secret")
+        );
+        assert!(
+            radius_authenticate(
+                "invalid.invalid",
+                1812,
+                "secret",
+                "alice",
+                &"p".repeat(129),
+                Duration::from_secs(1),
+                "sentinel"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("128")
+        );
     }
 
     /// The START body, pinned octet by octet against RFC 8907 §5.1 — written

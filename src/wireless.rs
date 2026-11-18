@@ -199,13 +199,11 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         // root.
         system::install_private_file(&path, &body)?;
         desired.insert(i.name.clone());
-        if changed {
-            if let Err(e) = system::radio_restart(&unit(&i.name, ap)) {
-                eprintln!(
-                    "warning: (re)starting the radio on {} failed (applies on next commit/boot): {e}",
-                    i.name
-                );
-            }
+        if changed && let Err(e) = system::radio_restart(&unit(&i.name, ap)) {
+            eprintln!(
+                "warning: (re)starting the radio on {} failed (applies on next commit/boot): {e}",
+                i.name
+            );
         }
     }
 

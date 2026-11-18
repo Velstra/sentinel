@@ -297,13 +297,11 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
             // config against the old rules.
             system::install_file(rules, &rules_body)?;
             system::install_file(conf, &yaml)?;
-            if changed {
-                if let Err(e) = system::service_restart(SURICATA_UNIT) {
-                    eprintln!(
-                        "warning: (re)starting {SURICATA_UNIT} failed \
+            if changed && let Err(e) = system::service_restart(SURICATA_UNIT) {
+                eprintln!(
+                    "warning: (re)starting {SURICATA_UNIT} failed \
                          (applies on next start): {e}"
-                    );
-                }
+                );
             }
             // Restarted on every apply, not only when the rendered files changed:
             // the watcher reads the saved appliance config on start, and the
@@ -324,10 +322,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                 if let Err(e) = system::service_restart(WATCH_UNIT) {
                     eprintln!("warning: (re)starting {WATCH_UNIT} failed: {e}");
                 }
-            } else if system::unit_active(WATCH_UNIT) {
-                if let Err(e) = system::service_stop(WATCH_UNIT) {
-                    eprintln!("warning: stopping {WATCH_UNIT}: {e}");
-                }
+            } else if system::unit_active(WATCH_UNIT)
+                && let Err(e) = system::service_stop(WATCH_UNIT)
+            {
+                eprintln!("warning: stopping {WATCH_UNIT}: {e}");
             }
         }
         None => {
@@ -335,10 +333,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                 if let Err(e) = system::service_stop(SURICATA_UNIT) {
                     eprintln!("warning: stopping {SURICATA_UNIT}: {e}");
                 }
-                if system::unit_active(WATCH_UNIT) {
-                    if let Err(e) = system::service_stop(WATCH_UNIT) {
-                        eprintln!("warning: stopping {WATCH_UNIT}: {e}");
-                    }
+                if system::unit_active(WATCH_UNIT)
+                    && let Err(e) = system::service_stop(WATCH_UNIT)
+                {
+                    eprintln!("warning: stopping {WATCH_UNIT}: {e}");
                 }
                 system::remove_file(conf)?;
                 system::remove_file(rules)?;

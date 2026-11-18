@@ -288,10 +288,14 @@ pub fn read_revision(config_path: &Path, n: usize) -> Result<String> {
 /// revision), and reset the session's candidate to it. Idempotent — the revision
 /// is a full, already-validated config.
 pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
+    let _lock = crate::system::apply_lock()?;
     let cfg = session.config_path().to_path_buf();
     let content = read_revision(&cfg, n)?;
     // Parse + validate before touching anything live.
     let appliance = Appliance::from_toml(&content).context("the archived revision is invalid")?;
+    // An operator-selected revision is a new policy transition, unlike the
+    // protected automatic rollback journal. Refuse before apply or persistence.
+    crate::admission::check_saved(&cfg, act.enabled, &appliance)?;
 
     if act.enabled {
         // A revert to an archived revision: `None`, so a partial broad-apply
@@ -362,6 +366,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn archived_ambiguous_deny_is_a_new_transition_not_an_automatic_recovery() {
+        let dir = Directory::new("admission");
+        let cfg = dir.config();
+        let original = "[system]\nhostname = 'current'\n";
+        std::fs::write(&cfg, original).unwrap();
+        let archived = r#"
+[system]
+hostname = "old"
+[zone.lan]
+[zone.wan]
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "192.0.2.1/24"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "198.51.100.1/24"
+[[rule]]
+name = "ambiguous"
+from = "lan"
+to = "wan"
+action = "drop"
+proto = "tcp"
+port = 443
+"#;
+        Appliance::from_toml(archived).unwrap();
+        archive_config(&cfg, archived, 10).unwrap();
+        let mut session = Session::load(&cfg).unwrap();
+        let refusal = rollback(&mut session, &Apply::off(), 0).unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains("destination-zone admission"),
+            "{refusal:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        assert_eq!(list_revisions(&cfg).len(), 1);
+        assert_eq!(session.commit().unwrap().system.hostname, "current");
     }
 
     #[test]

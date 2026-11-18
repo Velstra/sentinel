@@ -159,13 +159,11 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         // Only when the dial itself changed. A restart re-dials, and re-dialling
         // a working uplink because an unrelated setting moved is a WAN outage
         // nobody asked for.
-        if changed {
-            if let Err(e) = system::radio_restart(&unit(&i.name)) {
-                eprintln!(
-                    "warning: (re)dialling {} failed (applies on next commit/boot): {e}",
-                    i.name
-                );
-            }
+        if changed && let Err(e) = system::radio_restart(&unit(&i.name)) {
+            eprintln!(
+                "warning: (re)dialling {} failed (applies on next commit/boot): {e}",
+                i.name
+            );
         }
     }
 

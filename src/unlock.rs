@@ -105,16 +105,7 @@ fn find_luks_data() -> Result<Option<String>> {
     let partition = crate::install::part_path(&disk, crate::install::DATA_PART);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let out = Command::new(system::bin("lsblk"))
-            .args([
-                "--properties-by=blkid",
-                "--json",
-                "--list",
-                "--paths",
-                "--output",
-                "NAME,FSTYPE,TYPE",
-                &partition,
-            ])
+        let out = data_probe_command(&partition, system::is_root())
             .output()
             .context("probing the boot disk's data volume")?;
         if !out.status.success() {
@@ -129,6 +120,30 @@ fn find_luks_data() -> Result<Option<String>> {
             DataVolume::AwaitArray => bail!("boot data RAID array did not assemble within 30s"),
         }
     }
+}
+
+fn data_probe_command(partition: &str, is_root: bool) -> Command {
+    // Direct blkid probing needs permission to read the block device. lsblk
+    // can otherwise succeed but return null FSTYPE for an ordinary admin,
+    // making show version falsely report an unknown data format. Do not use
+    // cached labels as a substitute for checking the actual boot disk.
+    let mut command = if is_root {
+        Command::new(system::bin("lsblk"))
+    } else {
+        let mut command = Command::new("sudo");
+        command.args(["-n", &system::bin("lsblk")]);
+        command
+    };
+    command.args([
+        "--properties-by=blkid",
+        "--json",
+        "--list",
+        "--paths",
+        "--output",
+        "NAME,FSTYPE,TYPE",
+        partition,
+    ]);
+    command
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -240,6 +255,29 @@ fn open(dev: &str, passphrase: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_status_probes_real_signatures_with_noninteractive_read_privilege() {
+        for root in [true, false] {
+            let command = data_probe_command("/dev/vda6", root);
+            let args: Vec<_> = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args.last().map(String::as_str), Some("/dev/vda6"));
+            assert!(args.iter().any(|arg| arg == "--properties-by=blkid"));
+            if root {
+                assert_eq!(
+                    command.get_program(),
+                    std::ffi::OsStr::new(&system::bin("lsblk"))
+                );
+                assert!(!args.iter().any(|arg| arg == "-n"));
+            } else {
+                assert_eq!(command.get_program(), "sudo");
+                assert_eq!(&args[..2], &["-n", &system::bin("lsblk")]);
+            }
+        }
+    }
 
     fn probe(rows: serde_json::Value) -> Result<DataVolume> {
         classify_data_tree(

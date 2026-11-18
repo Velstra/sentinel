@@ -233,10 +233,9 @@ pub(crate) fn retire_drifted(
             .lines()
             .find_map(|line| line.strip_prefix("Kind="))
             .is_some_and(|kind| {
-                !link
-                    .linkinfo
+                link.linkinfo
                     .as_ref()
-                    .is_some_and(|info| info.info_kind.as_deref() == Some(kind))
+                    .is_none_or(|info| info.info_kind.as_deref() != Some(kind))
             })
         {
             retired.insert(iface.name.clone());
@@ -410,10 +409,10 @@ fn attachments(files: &BTreeMap<String, String>) -> BTreeMap<String, String> {
             continue;
         };
         for line in body.lines() {
-            if let Some((key, child)) = line.split_once('=') {
-                if matches!(key, "VLAN" | "MACVLAN" | "MACsec" | "Tunnel") {
-                    out.insert(child.to_string(), parent.to_string());
-                }
+            if let Some((key, child)) = line.split_once('=')
+                && matches!(key, "VLAN" | "MACVLAN" | "MACsec" | "Tunnel")
+            {
+                out.insert(child.to_string(), parent.to_string());
             }
         }
     }

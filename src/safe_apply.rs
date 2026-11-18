@@ -184,7 +184,22 @@ fn read(path: &Path) -> Result<Option<Pending>> {
         pending.version == 1,
         "unsupported pending configuration journal"
     );
+    ensure!(
+        valid_boot_id(&pending.boot),
+        "invalid pending configuration boot identity"
+    );
     Ok(Some(pending))
+}
+
+fn valid_boot_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
 }
 fn write(path: &Path, pending: &Pending) -> Result<()> {
     system::install_ha_secret(&journal(path), &serde_json::to_string(pending)?)
@@ -203,13 +218,39 @@ fn clear(path: &Path) -> Result<()> {
 /// Every CLI/API writer cooperates; a save must never replace the rollback
 /// target, nor may a concurrent commit silently invalidate its confirmation.
 pub fn ensure_writable(path: &Path) -> Result<()> {
-    if !INTERNAL.with(Cell::get) {
-        if let Some(pending) = read(path)? {
-            ensure!(!pending.recovery_failed, "{RECOVERY_FAILED_HINT}");
-            anyhow::bail!(
-                "configuration confirmation pending; confirm or revert it before another write"
-            );
-        }
+    if !INTERNAL.with(Cell::get)
+        && let Some(pending) = read(path)?
+    {
+        ensure!(!pending.recovery_failed, "{RECOVERY_FAILED_HINT}");
+        anyhow::bail!(
+            "configuration confirmation pending; confirm or revert it before another write"
+        );
+    }
+    Ok(())
+}
+
+/// Automatic refreshes defer a recognized transaction but must surface a
+/// corrupt/unreadable journal, rather than report a healthy successful apply.
+pub(crate) fn has_pending(path: &Path) -> Result<bool> {
+    Ok(read(path)?.is_some())
+}
+
+fn require_prior_boot(pending: &Pending) -> Result<()> {
+    ensure!(
+        pending.boot != boot()?,
+        "same-boot configuration confirmation pending; boot recovery is only permitted after a genuine reboot"
+    );
+    Ok(())
+}
+
+/// Admission before boot initialization changes any state. The actual recovery
+/// repeats this check under the same locks; callers cannot turn a live trial
+/// into a boot recovery by restarting its boot-seed unit.
+pub(crate) fn ensure_boot_recovery(path: &Path) -> Result<()> {
+    let _lock = system::apply_lock()?;
+    let _file = system::lock_config_at(&path.with_extension("transaction.lock"))?;
+    if let Some(pending) = read(path)? {
+        require_prior_boot(&pending)?;
     }
     Ok(())
 }
@@ -230,8 +271,12 @@ pub fn status(path: &Path) -> Result<Value> {
 /// Snapshot and journal BEFORE applying. Recovery is armed before any network
 /// mutation, and the final confirmation window starts after reconciliation.
 pub fn begin(path: &Path, candidate: &Appliance, act: &Apply, seconds: u32) -> Result<Value> {
-    // Only a live apply arms the CLI's timer, so only one can collide with it.
-    let commit_confirm = || act.enabled && commit_confirm_pending();
+    // --no-apply may still persist a provisional configuration. Only truly
+    // off-box editing (no appliance runtime) may bypass the PID1 admission.
+    let commit_confirm = || {
+        crate::confirm::ensure_idle_for_write(act.enabled)?;
+        Ok(false)
+    };
     begin_with(
         path,
         candidate,
@@ -247,26 +292,12 @@ pub fn begin(path: &Path, candidate: &Appliance, act: &Apply, seconds: u32) -> R
     )
 }
 
-/// Whether the CLI's `commit-confirm` is pending: its timer armed, or its
-/// rollback already running (the timer goes inactive the moment it fires).
-fn commit_confirm_pending() -> bool {
-    std::process::Command::new(system::bin("systemctl"))
-        .args([
-            "is-active",
-            "--quiet",
-            &format!("{}.timer", system::CONFIRM_UNIT),
-            &format!("{}.service", system::CONFIRM_UNIT),
-        ])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn begin_with(
     path: &Path,
     candidate: &Appliance,
     act: &Apply,
     seconds: u32,
-    commit_confirm_pending: impl FnOnce() -> bool,
+    commit_confirm_pending: impl FnOnce() -> Result<bool>,
     apply: impl FnOnce(&Appliance, Option<&Appliance>) -> Result<()>,
 ) -> Result<Value> {
     ensure!(
@@ -281,18 +312,20 @@ fn begin_with(
     // is armed: the two must never be pending at once, or the CLI timer's
     // rollback and a CLI `confirm` would act on this transaction.
     ensure!(
-        !commit_confirm_pending(),
+        !commit_confirm_pending()?,
         "a CLI commit-confirm is pending; `confirm` it or let it roll back before \
          applying a management change"
     );
     let saved = system::read_owned_file(path)?.context("safe apply requires a saved baseline")?;
     Appliance::from_toml(&saved).context("validating the rollback baseline")?;
     let running = if act.enabled {
-        session::Session::running_snapshot().unwrap_or_else(|| saved.clone())
+        session::Session::read_running_at(Path::new(session::Session::RUNNING))?
+            .unwrap_or_else(|| saved.clone())
     } else {
         saved.clone()
     };
     let previous = Appliance::from_toml(&running)?;
+    crate::admission::check(Some(&previous), candidate)?;
     if act.enabled {
         let out = std::process::Command::new(system::bin("systemctl"))
             .args(["is-active", "sentinel-apply-recovery.timer"])
@@ -329,7 +362,10 @@ fn begin_with(
         // The API can restart itself (port/TLS changes) without terminating the
         // operation. Only the independent unit may mark the revision ready.
         if let Err(error) = launch_worker(path, &pending.id) {
-            recover(path, &Apply::off(), true, true)?;
+            // No live reconciliation: the worker has not acknowledged launch.
+            // Any ambiguously started child waits for apply.lock and must
+            // re-read this journal's identity before its first side effect.
+            recover(path, &Apply::off(), true, false)?;
             return Err(error);
         }
         return Ok(
@@ -418,9 +454,15 @@ pub fn apply_pending(path: &Path, id: &str, act: &Apply) -> Result<()> {
         "provisional journal revision mismatch"
     );
     let previous = Appliance::from_toml(&pending.running)?;
-    if let Err(error) = complete_with(path, &mut pending, &candidate, act, |next| {
-        repl::apply_live(next, act, Some(&previous))
-    }) {
+    // Re-check the protected journal before publishing its candidate, including
+    // journals written by an earlier executable. Admission failure uses the
+    // same owned recovery path as a failed reconciliation, never a new write.
+    let applied = crate::admission::check(Some(&previous), &candidate).and_then(|()| {
+        complete_with(path, &mut pending, &candidate, act, |next| {
+            repl::apply_live(next, act, Some(&previous))
+        })
+    });
+    if let Err(error) = applied {
         pending.deadline_ms = 0;
         let _ = write(path, &pending);
         record_outcome(path, &pending, OutcomeKind::ApplyFailed);
@@ -537,9 +579,12 @@ fn recover_with(
     let Some(mut pending) = read(path)? else {
         return Ok(false);
     };
-    // A reboot always recovers: rendering the saved bytes needs no live apply,
-    // so a box that gave up is one restart away from a known configuration.
-    if !booting {
+    // Only a genuine later boot may render a prior-boot baseline without live
+    // reconciliation. A public boot-seed invocation during the original boot
+    // must not erase its active API transaction or leave RUNNING divergent.
+    if booting {
+        require_prior_boot(&pending)?;
+    } else {
         if pending.recovery_failed {
             // The timer has nothing left to do; an explicit request is told why.
             ensure!(!force, "{RECOVERY_FAILED_HINT}");
@@ -665,6 +710,62 @@ mod tests {
     fn next() -> Appliance {
         Appliance::from_toml("[system]\nhostname=\"provisional\"\n").unwrap()
     }
+    fn legacy_destination_zone_policy() -> Appliance {
+        Appliance::from_toml(
+            "[system]\nhostname='working'\n[[interface]]\nname='wan0'\nzone='wan'\naddress='198.18.110.11/24'\n[[rule]]\nname='telnet'\nfrom='wan'\nto='wan'\nproto='tcp'\nport=23\naction='reject'\n",
+        ).unwrap()
+    }
+    #[test]
+    fn destination_zone_admission_precedes_journal_persistence_and_reconciliation() {
+        let path = fixture();
+        let original = std::fs::read(&path).unwrap();
+        let error = begin_with(
+            &path,
+            &legacy_destination_zone_policy(),
+            &Apply::off(),
+            60,
+            || Ok(false),
+            |_, _| panic!("refused policy reached reconciliation"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("telnet"), "{error:#}");
+        assert!(read(&path).unwrap().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn destination_zone_legacy_unrelated_edit_and_owned_recovery_remain_available() {
+        let path = fixture();
+        let mut candidate = legacy_destination_zone_policy();
+        std::fs::write(&path, candidate.to_toml().unwrap()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        candidate.system.hostname = "provisional".into();
+        begin(&path, &candidate, &Apply::off(), 60).unwrap();
+        assert_eq!(
+            Appliance::load(&path).unwrap().system.hostname,
+            "provisional"
+        );
+        assert!(recover(&path, &Apply::off(), true, false).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn destination_zone_worker_rechecks_old_journal_before_publishing_candidate() {
+        let path = fixture();
+        let original = std::fs::read(&path).unwrap();
+        begin(&path, &next(), &Apply::off(), 60).unwrap();
+        let mut pending = read(&path).unwrap().unwrap();
+        let refused = legacy_destination_zone_policy();
+        pending.candidate = refused.to_toml().unwrap();
+        pending.candidate_revision = crate::ha::revision(&refused).unwrap();
+        pending.ready = false;
+        write(&path, &pending).unwrap();
+        let error = apply_pending(&path, &pending.id, &Apply::off()).unwrap_err();
+        assert!(format!("{error:#}").contains("telnet"), "{error:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(read(&path).unwrap().is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
     #[test]
     fn unconfirmed_revision_restores_exact_saved_bytes_and_runtime() {
         let path = fixture();
@@ -734,7 +835,7 @@ mod tests {
                 &next(),
                 &Apply::off(),
                 60,
-                || false,
+                || Ok(false),
                 |_, _| anyhow::bail!("failed network apply")
             )
             .is_err()
@@ -759,12 +860,30 @@ mod tests {
             &next(),
             &Apply::off(),
             60,
-            || true,
+            || Ok(true),
             |_, _| panic!("nothing may be applied over a pending commit-confirm"),
         )
         .unwrap_err();
         assert!(refused.to_string().contains("commit-confirm"), "{refused}");
         assert!(read(&path).unwrap().is_none(), "no journal may be written");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn a_failed_cli_protection_query_cannot_authorize_a_management_write() {
+        let path = fixture();
+        let original = std::fs::read(&path).unwrap();
+        let refused = begin_with(
+            &path,
+            &next(),
+            &Apply::off(),
+            60,
+            || anyhow::bail!("cannot inspect commit-confirm unit state"),
+            |_, _| panic!("failed admission must precede every network mutation"),
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("cannot inspect"));
+        assert!(read(&path).unwrap().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
@@ -836,6 +955,9 @@ mod tests {
         assert!(revert(&path, &id, &Apply::off()).is_err());
         assert!(recover_with(&path, &Apply::off(), true, false, |_| panic!("no churn")).is_err());
         // …and a reboot still renders the saved bytes and ends the journal.
+        let mut prior_boot = read(&path).unwrap().unwrap();
+        prior_boot.boot = "00000000-0000-0000-0000-000000000000".into();
+        write(&path, &prior_boot).unwrap();
         assert!(
             recover_with(&path, &Apply::off(), false, true, |_| panic!(
                 "boot never applies live"
@@ -873,6 +995,9 @@ mod tests {
     fn reboot_never_boots_an_unconfirmed_revision() {
         let path = fixture();
         begin(&path, &next(), &Apply::off(), 3600).unwrap();
+        let mut prior_boot = read(&path).unwrap().unwrap();
+        prior_boot.boot = "00000000-0000-0000-0000-000000000000".into();
+        write(&path, &prior_boot).unwrap();
         assert!(
             recover_with(&path, &Apply::off(), false, true, |_| panic!(
                 "boot must render after recovery, never apply live here"
@@ -880,6 +1005,73 @@ mod tests {
             .unwrap()
         );
         assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn same_boot_recovery_cannot_erase_or_rewrite_an_active_transaction() {
+        let path = fixture();
+        assert!(!has_pending(&path).unwrap());
+        ensure_boot_recovery(&path).unwrap();
+        begin(&path, &next(), &Apply::off(), 3600).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let pending = std::fs::read(journal(&path)).unwrap();
+        assert!(has_pending(&path).unwrap());
+        assert!(
+            ensure_boot_recovery(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("same-boot")
+        );
+        assert!(
+            recover_with(&path, &Apply::off(), true, true, |_| panic!(
+                "must not apply"
+            ))
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(journal(&path)).unwrap(), pending);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn launch_cleanup_fences_an_ambiguously_started_worker_before_mutation() {
+        let path = fixture();
+        let original = std::fs::read(&path).unwrap();
+        let transaction = begin(&path, &next(), &Apply::off(), 3600).unwrap();
+        let id = transaction["pending"]["id"].as_str().unwrap();
+        assert!(recover(&path, &Apply::off(), true, false).unwrap());
+        assert!(
+            apply_pending(&path, id, &Apply::off())
+                .unwrap_err()
+                .to_string()
+                .contains("no longer pending")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!has_pending(&path).unwrap());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn boot_and_automatic_refresh_refuse_malformed_or_nonregular_journals() {
+        use std::os::unix::fs::symlink;
+        let path = fixture();
+        for content in ["not json", "{}"] {
+            std::fs::write(journal(&path), content).unwrap();
+            assert!(has_pending(&path).is_err());
+            assert!(ensure_boot_recovery(&path).is_err());
+        }
+        std::fs::remove_file(journal(&path)).unwrap();
+        begin(&path, &next(), &Apply::off(), 3600).unwrap();
+        let mut pending = read(&path).unwrap().unwrap();
+        pending.boot = "not-a-boot-id".into();
+        write(&path, &pending).unwrap();
+        assert!(has_pending(&path).is_err());
+        assert!(ensure_boot_recovery(&path).is_err());
+        std::fs::remove_file(journal(&path)).unwrap();
+        symlink("missing-journal", journal(&path)).unwrap();
+        assert!(has_pending(&path).is_err());
+        assert!(ensure_boot_recovery(&path).is_err());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

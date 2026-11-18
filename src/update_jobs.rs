@@ -943,10 +943,10 @@ fn observed_boot_entry(
     } else if left.is_some() || done.is_some() {
         return Err(refused());
     }
-    if let crate::boot_entry::Image::Release(version) = entry.image {
-        if row["version"] != version {
-            return Err(refused());
-        }
+    if let crate::boot_entry::Image::Release(version) = entry.image
+        && row["version"] != version
+    {
+        return Err(refused());
     }
     let hashes: Vec<_> = row["cmdline"]
         .as_str()
@@ -1624,6 +1624,8 @@ pub fn run_worker(id: &str) -> JobResult<()> {
                 // take one final saved-config/file-pin/boot/safe-apply CAS;
                 // this is the first-write authorization linearization point.
                 check_snapshot(config, &job.expected, true)?;
+                update::require_fresh_offer(&current_channel, &offer.verified)
+                    .map_err(|_| Error(Code::MetadataRefused))?;
                 Ok(())
             };
             let staged = install::update_from_channel_guarded(
@@ -1813,6 +1815,7 @@ mod tests {
                     image: "sentinel_2.1.0+build.raw".into(),
                     sha256: "1".repeat(64),
                     product: Some(update::PRODUCT.into()),
+                    freshness: None,
                 },
                 manifest_sha256: "2".repeat(64),
                 public_key_sha256: sample().public_key_sha256,
@@ -2521,18 +2524,18 @@ mod tests {
         let proc_stat = format!("/proc/{pid}/stat");
 
         let mut cleanup = None;
-        if let Ok(current) = std::fs::read_to_string(&proc_stat) {
-            if process_identity(&current).1 == expected_start {
-                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-                if fd >= 0 {
-                    let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
-                    // Check identity again after pinning the fd. If the old
-                    // process vanished/reused its PID, do not signal this fd.
-                    if std::fs::read_to_string(&proc_stat)
-                        .is_ok_and(|now| process_identity(&now).1 == expected_start)
-                    {
-                        cleanup = Some(FixtureProcess(file));
-                    }
+        if let Ok(current) = std::fs::read_to_string(&proc_stat)
+            && process_identity(&current).1 == expected_start
+        {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd >= 0 {
+                let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+                // Check identity again after pinning the fd. If the old
+                // process vanished/reused its PID, do not signal this fd.
+                if std::fs::read_to_string(&proc_stat)
+                    .is_ok_and(|now| process_identity(&now).1 == expected_start)
+                {
+                    cleanup = Some(FixtureProcess(file));
                 }
             }
         }

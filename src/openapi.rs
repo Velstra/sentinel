@@ -89,6 +89,15 @@ pub fn document() -> Value {
                 "bearer": { "type": "http", "scheme": "bearer" }
             },
             "schemas": {
+                "TelemetryFrame": telemetry_frame_schema(),
+                "SystemVitals": system_vitals_schema(),
+                "TelemetryEvent": {
+                    "description": "JSON data of an SSE event named telemetry: initially collecting, then full frames. JSON snapshot endpoints wait for a full frame.",
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/TelemetryFrame" },
+                        { "type": "object", "additionalProperties": false, "required": ["collecting"], "properties": { "collecting": { "const": true } } }
+                    ]
+                },
                 "Error": {
                     "type": "object",
                     "required": ["error"],
@@ -147,6 +156,51 @@ fn any_object() -> Value {
 
 fn text() -> Value {
     json!({ "type": "string" })
+}
+
+fn telemetry_frame() -> Value {
+    json!({"$ref":"#/components/schemas/TelemetryFrame"})
+}
+
+fn telemetry_stream() -> Value {
+    json!({"type":"string",
+        "description":"Server-sent events, not a single JSON document. Each telemetry event's data is a TelemetryEvent. Unchanged route tables may be omitted in later stream frames.",
+        "x-event-name":"telemetry",
+        "x-event-data-schema":{"$ref":"#/components/schemas/TelemetryEvent"}})
+}
+
+fn telemetry_frame_schema() -> Value {
+    json!({"type":"object","additionalProperties":true,
+    "description":"One collected node-local frame. Extra dataplane/routing fields remain forward compatible. An older member may omit system entirely; absence or null is unknown, never a healthy zero.",
+    "required":["sequence","sampled_at","interfaces","errors"],
+    "properties":{
+        "sequence":{"type":"integer","minimum":0,"description":"Collector sequence, increasing between samples of this collector run; not persistent across restart."},
+        "sampled_at":{"type":"integer","minimum":0,"description":"Sample timestamp in Unix seconds."},
+        "interfaces":{"type":"array","items":{"type":"object","additionalProperties":true},"description":"Per-link cumulative counters and nullable interval rates."},
+        "errors":{"type":"object","additionalProperties":{"type":"string"},"description":"Unavailable data sources. Their absence is not proof that an unsupported source was sampled."},
+        "system":{"$ref":"#/components/schemas/SystemVitals"}
+    }})
+}
+
+fn system_vitals_schema() -> Value {
+    json!({"type":["object","null"],"additionalProperties":true,
+    "description":"Optional additive system observations from procfs/statvfs, without child processes. Older peers omit this object. Unreadable scalar observations are null, while unreadable or duplicate filesystems produce no row.",
+    "required":["uptime_seconds","load","cpus","cpu_percent","memory","filesystems"],
+    "properties":{
+        "uptime_seconds":{"type":["integer","null"],"minimum":0,"description":"Whole seconds since boot, or null when unavailable."},
+        "load":{"type":["array","null"],"minItems":3,"maxItems":3,"items":{"type":"number","minimum":0},"description":"Linux 1-, 5-, and 15-minute load averages, in that order; not percentages or normalized per CPU."},
+        "cpus":{"type":["integer","null"],"minimum":1,"description":"Available parallelism visible to the collector process, which may reflect CPU affinity or quotas; not a physical-core inventory."},
+        "cpu_percent":{"type":["number","null"],"minimum":0,"description":"Aggregate busy CPU time as a percentage of the interval between two samples, with idle/iowait excluded. Null for the first sample, reset or an unavailable measurement; not the lifetime load average."},
+        "memory":{"type":["object","null"],"required":["total_bytes","available_bytes"],"properties":{
+            "total_bytes":{"type":"integer","minimum":0},
+            "available_bytes":{"type":"integer","minimum":0,"description":"Kernel MemAvailable estimate in bytes, including reclaimable memory; not MemFree."}}},
+        "filesystems":{"type":"array","maxItems":3,"description":"At most data, root and runtime; identical filesystem IDs are emitted only once (first path wins), so a name may be absent.","items":{
+            "type":"object","required":["name","path","total_bytes","available_bytes"],"properties":{
+                "name":{"type":"string","enum":["data","root","runtime"]},
+                "path":{"type":"string","description":"Observed appliance path: /var/lib/sentinel, / or /run."},
+                "total_bytes":{"type":"integer","minimum":0},
+                "available_bytes":{"type":"integer","minimum":0,"description":"Space available to an unprivileged writer (statvfs f_bavail), in bytes; not reserved root-only space."}}}}
+    }})
 }
 
 fn update_context() -> Value {
@@ -247,7 +301,7 @@ const OPERATIONS: &[Operation] = &[
         parameters: &[],
         body: None,
         answer: "Full telemetry frame, or 503 while collection is unavailable.",
-        answer_shape: Some(("application/json", any_object)),
+        answer_shape: Some(("application/json", telemetry_frame)),
         open: false,
     },
     Operation {
@@ -259,7 +313,7 @@ const OPERATIONS: &[Operation] = &[
         parameters: &[("member", "path", "Exact configured stack member.")],
         body: None,
         answer: "Full peer telemetry frame. No caching.",
-        answer_shape: Some(("application/json", any_object)),
+        answer_shape: Some(("application/json", telemetry_frame)),
         open: false,
     },
     Operation {
@@ -283,7 +337,7 @@ const OPERATIONS: &[Operation] = &[
         parameters: &[],
         body: None,
         answer: "SSE telemetry events, one JSON snapshot per event.",
-        answer_shape: Some(("text/event-stream", text)),
+        answer_shape: Some(("text/event-stream", telemetry_stream)),
         open: false,
     },
     Operation {
@@ -427,7 +481,7 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/login",
         id: "login",
         summary: "Sign in as an account and open a session.",
-        description: "Checks the account's password and, when it has one, its one-time code — both in this one request — and opens a session: a new token, valid for 30 minutes without use and 12 hours in all, and ended early by signing out or by any change to the account's password, second factor or group. Every refused credential answers the same 401. Throttled per address and per account; a lock-out answers 429 with the seconds remaining.",
+        description: "Checks the account's password and, when it has one, its one-time code — both in this one request — and opens a session: a new token, valid for 30 minutes without use and 12 hours in all, and ended early by signing out or by any change to the account's password, second factor or group. Refused credentials answer 401. Throttled requests answer 429 with an origin-lockout or account-window diagnostic. Account limits also refuse correct credentials from other origins until the window expires; successful sign-in clears both budgets. These budgets are in memory and reset when the API restarts.",
         parameters: &[],
         body: Some(("application/json", login_body)),
         answer: "The session's token and what it may do.",
@@ -872,5 +926,81 @@ pub(crate) mod tests {
         let back: Value = serde_json::from_str(&pretty()).unwrap();
         assert_eq!(back["openapi"], "3.1.0");
         assert_eq!(back["info"]["title"], "Velstra Sentinel");
+    }
+
+    #[test]
+    fn telemetry_json_and_sse_share_the_additive_frame_contract() {
+        let doc = document();
+        for path in [
+            "/api/v1/telemetry/snapshot",
+            "/api/v1/stack/{member}/telemetry",
+        ] {
+            assert_eq!(
+                doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"],
+                telemetry_frame()
+            );
+        }
+        let stream = &doc["paths"]["/api/v1/telemetry"]["get"]["responses"]["200"]["content"]["text/event-stream"]
+            ["schema"];
+        assert_eq!(stream["type"], "string");
+        assert_eq!(stream["x-event-name"], "telemetry");
+        assert_eq!(
+            stream["x-event-data-schema"]["$ref"],
+            "#/components/schemas/TelemetryEvent"
+        );
+        let event = &doc["components"]["schemas"]["TelemetryEvent"]["oneOf"];
+        assert_eq!(event[0], telemetry_frame());
+        assert_eq!(event[1]["properties"]["collecting"]["const"], true);
+        let frame = &doc["components"]["schemas"]["TelemetryFrame"];
+        assert_eq!(
+            frame["properties"]["system"]["$ref"],
+            "#/components/schemas/SystemVitals"
+        );
+        assert!(
+            !frame["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("system")),
+            "older peers must not be required to invent system vitals"
+        );
+        assert_eq!(frame["additionalProperties"], true);
+    }
+
+    #[test]
+    fn system_vitals_document_nullable_observations_and_real_units() {
+        let schema = system_vitals_schema();
+        assert_eq!(schema["type"], json!(["object", "null"]));
+        let properties = &schema["properties"];
+        for name in ["uptime_seconds", "load", "cpus", "cpu_percent", "memory"] {
+            assert!(
+                properties[name]["type"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("null")),
+                "{name}"
+            );
+        }
+        assert_eq!(properties["load"]["minItems"], 3);
+        assert_eq!(properties["load"]["maxItems"], 3);
+        assert_eq!(properties["filesystems"]["type"], "array");
+        assert_eq!(properties["filesystems"]["maxItems"], 3);
+        assert!(
+            properties["cpu_percent"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("first sample")
+        );
+        assert!(
+            properties["memory"]["properties"]["available_bytes"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("MemAvailable")
+        );
+        assert!(
+            properties["filesystems"]["items"]["properties"]["available_bytes"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("f_bavail")
+        );
     }
 }

@@ -14,17 +14,16 @@
 //!
 //! The server's TLS identity is a leaf issued by the on-box PKI ([`crate::pki`]),
 //! resolved through [`crate::pki::leaf_paths`]. The per-user passwords are hashed
-//! into the SHA-512 crypt form `ocserv`'s `plain` auth backend expects; we compute
-//! the hash with `openssl passwd -6` (already a Sentinel dependency, used by the
-//! PKI) rather than shelling out to the interactive `ocpasswd` tool, and derive
-//! the salt deterministically from the user name so the rendered file is stable
-//! across applies (change-detection keeps a live server undisturbed).
+//! with the same random-salted yescrypt cost5 helper as local logins. `ocserv`'s
+//! `plain` backend verifies crypt(3) hashes through libxcrypt. Valid existing
+//! hashes are reused when the password is unchanged, preserving live sessions
+//! during unrelated applies without deterministic salts or a fast password
+//! fingerprint. The ephemeral credential file is recreated after boot.
 
-use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::config::{Appliance, OpenConnectServer};
 use crate::system;
@@ -41,14 +40,7 @@ const OCPASSWD: &str = "/run/sentinel/ocserv/ocpasswd";
 /// The systemd unit that runs `ocserv` from the rendered config. Present but idle
 /// (`wantedBy = []`) until Sentinel (re)starts it here.
 const OCSERV_UNIT: &str = "ocserv.service";
-
-/// Whether writing `body` to `path` would change what is already there (or the
-/// file is absent) — the same change-detect the other appliers use.
-fn file_changed(path: &Path, body: &str) -> bool {
-    std::fs::read_to_string(path)
-        .map(|c| c != body)
-        .unwrap_or(true)
-}
+const MAX_CREDENTIAL_FILE: usize = 1024 * 1024;
 
 /// Split a validated IPv4 CIDR pool (`10.99.0.0/24`) into its network address and
 /// dotted netmask, the pair `ocserv` wants as `ipv4-network` + `ipv4-netmask`.
@@ -158,56 +150,46 @@ fn ocserv_conf_body(oc: &OpenConnectServer) -> String {
     s
 }
 
-/// The deterministic crypt salt for `name`: the user name reduced to the crypt
-/// salt charset (`[A-Za-z0-9.]`, dropping the `_`/`-` the name may also carry),
-/// capped at crypt's 16-char limit. Deterministic so the hash — and thus the whole
-/// rendered file — is stable across applies. Falls back to a fixed string when the
-/// name reduces to nothing (e.g. all `_`/`-`).
-fn ocpasswd_salt(name: &str) -> String {
-    let mut salt: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.')
-        .take(16)
-        .collect();
-    if salt.is_empty() {
-        salt.push_str("sentinel");
+/// Parse only Sentinel's root-private credential file format. Corrupt or
+/// ambiguous state is an error, never a reason to silently regenerate secrets.
+fn cached_hashes(body: Option<&str>) -> Result<BTreeMap<String, String>> {
+    let mut hashes = BTreeMap::new();
+    let Some(body) = body else { return Ok(hashes) };
+    ensure!(
+        body.len() <= MAX_CREDENTIAL_FILE,
+        "OpenConnect credential cache exceeds read bound"
+    );
+    for line in body.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(':').collect();
+        ensure!(
+            fields.len() == 3 && fields[1] == "*",
+            "invalid OpenConnect credential cache entry"
+        );
+        let name = fields[0];
+        ensure!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+            "invalid OpenConnect credential cache identity"
+        );
+        crate::passwd::validate_hash(fields[2])
+            .context("invalid OpenConnect cached password hash")?;
+        ensure!(
+            hashes
+                .insert(name.to_string(), fields[2].to_string())
+                .is_none(),
+            "duplicate OpenConnect credential cache identity"
+        );
     }
-    salt
-}
-
-/// Hash `password` into the SHA-512 crypt form (`$6$<salt>$…`) `ocserv`'s `plain`
-/// backend verifies with `crypt(3)`. We reuse `openssl passwd -6` (already on the
-/// box for the PKI) and feed the password over stdin so it never lands in the
-/// process argument list. The salt is passed explicitly so the output is
-/// deterministic for change-detection.
-fn hash_password(password: &str, salt: &str) -> Result<String> {
-    let mut child = Command::new(system::bin("openssl"))
-        .args(["passwd", "-6", "-salt", salt, "-stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| "spawning `openssl passwd` to hash an OpenConnect password")?;
-    child
-        .stdin
-        .take()
-        .context("openssl passwd stdin")?
-        .write_all(format!("{password}\n").as_bytes())
-        .context("writing password to openssl passwd")?;
-    let out = child
-        .wait_with_output()
-        .context("waiting for openssl passwd")?;
-    if !out.status.success() {
-        anyhow::bail!("`openssl passwd -6` failed (exit {:?})", out.status.code());
-    }
-    let hash = String::from_utf8(out.stdout)
-        .context("openssl passwd produced non-UTF-8 output")?
-        .trim()
-        .to_string();
-    if !hash.starts_with("$6$") {
-        anyhow::bail!("`openssl passwd -6` produced an unexpected hash: {hash:?}");
-    }
-    Ok(hash)
+    ensure!(
+        !hashes.is_empty(),
+        "an existing OpenConnect credential cache must contain an account"
+    );
+    Ok(hashes)
 }
 
 /// Assemble one `ocpasswd` line from a name and a pre-computed hash: the
@@ -220,10 +202,19 @@ fn ocpasswd_line(name: &str, hash: &str) -> String {
 /// Render the `ocpasswd` credential file (0600) for `oc` — one hashed line per
 /// user. The passwords are hashed here, never emitted in clear, and never land in
 /// `ocserv.conf`.
-fn ocpasswd_body(oc: &OpenConnectServer) -> Result<String> {
+fn ocpasswd_body(oc: &OpenConnectServer, previous: Option<&str>) -> Result<String> {
+    let hashes = cached_hashes(previous)?;
     let mut s = String::from("# rendered by sentinel — OpenConnect credentials (0600)\n");
     for u in &oc.users {
-        let hash = hash_password(&u.password, &ocpasswd_salt(&u.name))?;
+        let previous = hashes.get(&u.name);
+        let hash = match previous {
+            Some(hash)
+                if hash.starts_with("$y$j9T$") && crate::passwd::verify(&u.password, hash)? =>
+            {
+                hash.clone()
+            }
+            _ => crate::passwd::hash_nonempty(&u.password)?,
+        };
         s.push_str(&ocpasswd_line(&u.name, &hash));
         s.push('\n');
     }
@@ -239,6 +230,7 @@ fn ocpasswd_body(oc: &OpenConnectServer) -> Result<String> {
 /// dependencies may not be ready, in which case the config applies on the next
 /// commit/boot.
 pub fn apply(appliance: &Appliance) -> Result<()> {
+    let _transaction = system::apply_lock()?;
     let conf_path = Path::new(OCSERV_CONF);
     let passwd_path = Path::new(OCPASSWD);
 
@@ -259,15 +251,21 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     };
 
     system::ensure_dir(Path::new(OCSERV_RUNTIME_DIR))?;
+    let previous = system::read_owned_private(passwd_path, MAX_CREDENTIAL_FILE)?;
     let conf = ocserv_conf_body(oc);
-    let passwd = ocpasswd_body(oc)?;
-    let changed = file_changed(conf_path, &conf) || file_changed(passwd_path, &passwd);
-    system::install_file(conf_path, &conf)?;
-    system::install_ipsec_secret(passwd_path, &passwd)?;
-    if changed {
-        if let Err(e) = system::service_restart(OCSERV_UNIT) {
-            eprintln!("warning: (re)starting ocserv failed (applies on next commit/boot): {e}");
-        }
+    let passwd = ocpasswd_body(oc, previous.as_deref())?;
+    let conf_changed =
+        system::read_owned_regular(conf_path, MAX_CREDENTIAL_FILE)?.as_deref() != Some(&conf);
+    let passwd_changed = previous.as_deref() != Some(&passwd);
+    let changed = conf_changed || passwd_changed;
+    if conf_changed {
+        system::install_file(conf_path, &conf)?;
+    }
+    if passwd_changed {
+        system::install_ha_secret(passwd_path, &passwd)?;
+    }
+    if changed && let Err(e) = system::service_restart(OCSERV_UNIT) {
+        eprintln!("warning: (re)starting ocserv failed (applies on next commit/boot): {e}");
     }
     Ok(())
 }
@@ -376,14 +374,25 @@ mod tests {
     }
 
     #[test]
-    fn salt_is_deterministic_and_in_charset() {
-        // Stable across calls, and the `-`/`_` a name may carry are dropped.
-        assert_eq!(ocpasswd_salt("alice"), "alice");
-        assert_eq!(ocpasswd_salt("a-b_c.d"), "abc.d");
-        // A name that reduces to nothing falls back to a fixed non-empty salt.
-        assert_eq!(ocpasswd_salt("--__"), "sentinel");
-        // Never exceeds crypt's 16-char cap.
-        assert!(ocpasswd_salt(&"x".repeat(40)).len() <= 16);
+    fn cached_credentials_refuse_malformed_duplicate_or_excessive_cost_state() {
+        let valid = "$6$salt123456789012$mrQIS8eBOuKvq23qeHhMYQGqzyaljxGgVQih9JxYJi7aMYM4TCNknwxRRFgrzIi20LVUXbUyY.j.yJDZCzyaC/";
+        assert!(cached_hashes(None).unwrap().is_empty());
+        assert!(cached_hashes(Some("# existing comment\n")).is_err());
+        assert!(cached_hashes(Some(&format!("alice:*:{valid}\n"))).is_ok());
+        for body in [
+            String::new(),
+            "# incomplete cache\n".to_string(),
+            "alice:*:not-a-hash".to_string(),
+            format!("alice:*:{valid}\nalice:*:{valid}\n"),
+            format!("alice:unexpected-group:{valid}\n"),
+            format!("a b:*:{valid}\n"),
+            format!("alice:*:{valid}:extra\n"),
+            format!("alice:*:$y$jBT${}${}\n", "s".repeat(22), "h".repeat(43)),
+            "x".repeat(MAX_CREDENTIAL_FILE + 1),
+        ] {
+            assert!(cached_hashes(Some(&body)).is_err());
+            assert!(ocpasswd_body(&server(), Some(&body)).is_err());
+        }
     }
 
     #[test]
@@ -396,15 +405,59 @@ mod tests {
 
     #[test]
     fn ocpasswd_body_hashes_each_user() {
-        // Exercises the real `openssl passwd -6` to prove the render produces a
-        // valid crypt line per user and never leaks the plaintext password. Skips
-        // when `openssl` isn't on PATH — the sealed build sandbox (rustPlatform's
-        // checkPhase, before the wrapper sets SENTINEL_OPENSSL_BIN) has no openssl;
-        // the pure line/salt format is covered by the tests above regardless.
-        let Ok(body) = ocpasswd_body(&server()) else {
-            return;
-        };
-        assert!(body.contains("alice:*:$6$alice$"), "{body}");
+        // The real pinned libxcrypt helper is required; failures cannot turn
+        // into a silently skipped green test.
+        let body = ocpasswd_body(&server(), None).unwrap();
+        assert!(body.contains("alice:*:$y$j9T$"), "{body}");
         assert!(!body.contains("s3cr3t"), "plaintext must not leak: {body}");
+        let hash = &cached_hashes(Some(&body)).unwrap()["alice"];
+        assert!(
+            hash.len() < 128,
+            "ocserv1.4.0 cpass buffer must fit the hash"
+        );
+        assert!(crate::passwd::verify("s3cr3t", hash).unwrap());
+        assert!(!crate::passwd::verify("wrong", hash).unwrap());
+        assert_eq!(ocpasswd_body(&server(), Some(&body)).unwrap(), body);
+        // A fresh boot gets a fresh random salt, not a username-derived one.
+        assert_ne!(ocpasswd_body(&server(), None).unwrap(), body);
+        // The shared compatibility entry point must not relax local creation.
+        assert!(crate::passwd::hash("s3cr3t").is_err());
+    }
+
+    #[test]
+    fn credentials_rotate_on_password_change_and_removed_users_do_not_linger() {
+        let original = ocpasswd_body(&server(), None).unwrap();
+        let mut oc = server();
+        oc.users[0].password = "new public fixture password".into();
+        oc.users.push(OpenConnectUser {
+            name: "bob".into(),
+            password: "new public fixture password".into(),
+        });
+        let changed = ocpasswd_body(&oc, Some(&original)).unwrap();
+        let hashes = cached_hashes(Some(&changed)).unwrap();
+        assert!(!crate::passwd::verify("s3cr3t", &hashes["alice"]).unwrap());
+        assert!(crate::passwd::verify(&oc.users[0].password, &hashes["alice"]).unwrap());
+        assert_ne!(
+            hashes["alice"], hashes["bob"],
+            "separate identities need independent salts"
+        );
+        oc.users.remove(0);
+        let removed = ocpasswd_body(&oc, Some(&changed)).unwrap();
+        assert!(!cached_hashes(Some(&removed)).unwrap().contains_key("alice"));
+        assert_eq!(cached_hashes(Some(&removed)).unwrap()["bob"], hashes["bob"]);
+    }
+
+    #[test]
+    fn legacy_hash_is_migrated_once_without_breaking_existing_short_vpn_passwords() {
+        let legacy = "alice:*:$6$salt123456789012$mrQIS8eBOuKvq23qeHhMYQGqzyaljxGgVQih9JxYJi7aMYM4TCNknwxRRFgrzIi20LVUXbUyY.j.yJDZCzyaC/\n";
+        let body = ocpasswd_body(&server(), Some(legacy)).unwrap();
+        assert!(body.contains("alice:*:$y$j9T$"));
+        assert!(!body.contains("$6$"));
+        assert_eq!(ocpasswd_body(&server(), Some(&body)).unwrap(), body);
+        for password in [String::new(), "p".repeat(512), "bad\npassword".into()] {
+            let mut oc = server();
+            oc.users[0].password = password;
+            assert!(ocpasswd_body(&oc, Some(&body)).is_err());
+        }
     }
 }

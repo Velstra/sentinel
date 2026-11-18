@@ -627,16 +627,16 @@ impl WrenConfig {
         // OSPFv3 externals are static-only in wren (its `Ospf3` has just
         // `redistribute-static`, no `redistribute` array). A source we could not
         // map to a wren field must fail loudly here — never silently vanish.
-        if let Some(o) = &self.ospf3 {
-            if !o.redistribute_unsupported.is_empty() {
-                anyhow::bail!(
-                    "wren OSPFv3 can only redistribute static routes (supported set: [\"static\"]); \
+        if let Some(o) = &self.ospf3
+            && !o.redistribute_unsupported.is_empty()
+        {
+            anyhow::bail!(
+                "wren OSPFv3 can only redistribute static routes (supported set: [\"static\"]); \
                      `[protocols.ospf3] redistribute` names {:?}, which have no OSPFv3 field in the \
                      wren daemon — drop them (OSPFv3 externals are static-only) or redistribute those \
                      sources via OSPFv2/another protocol",
-                    o.redistribute_unsupported
-                );
-            }
+                o.redistribute_unsupported
+            );
         }
         toml::to_string_pretty(self).context("serializing the wren config")
     }
@@ -1040,10 +1040,10 @@ fn compile_filter(
             .into_iter()
             .map(|r| {
                 let mut prefix = r.prefix.clone();
-                if let Some(list_name) = &r.match_prefix_list {
-                    if let Some(pl) = prefix_lists.get(list_name.as_str()) {
-                        prefix.extend(pl.entries.iter().map(expand_prefix_entry));
-                    }
+                if let Some(list_name) = &r.match_prefix_list
+                    && let Some(pl) = prefix_lists.get(list_name.as_str())
+                {
+                    prefix.extend(pl.entries.iter().map(expand_prefix_entry));
                 }
                 WrenFilterRule {
                     prefix,

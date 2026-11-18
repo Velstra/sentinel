@@ -26,6 +26,7 @@ a concurrent rebuild cannot change the executable underneath a running test.
 | `ux` | Switch cancellation/keyboard activation; suggestion disclosure; invalid/valid numbers and URLs; rule port ranges; retryable diagnostics; identifier labels; shared alignment and HA mobile copy |
 | `layout` | Every palette destination at 1440, 390 and 320 px; associated input labels; overlapping grid fields; clipped controls outside intentional scroll regions; no document overflow |
 | `console` | Navigation/tabs, create panels, staged changes, persistence/defaults, authentication/permissions, dialog flows, secrets; includes the strict Stage contract below and a separate grammar-field exposure inventory |
+| `workflow` | Change dock (fixed, never occluding, review with masked credentials, one Apply), actionable empty lists, rule columns and filter, interface link column, setting search and its catalogue freshness, page index, first-steps list; 1440 and 390 px. Runs inside `ux`; standalone execution is available for focused diagnosis |
 | `stage-contract` | Explicit form/value cases: actual controls and physical Stage clicks, strict real API and installed CLI validation, unchanged-value feedback and invalid inputs. Runs inside `console`; standalone execution is available for focused diagnosis |
 | `update-url` | Shared default/Add/Edit channel URL policy: invalid schemes, HTTPS/offline mirrors, keyboard Stage, associated error and focus recovery at 1440/390/320 px. Runs inside `ux`; standalone execution is available for diagnosis |
 | `react` | Dashboard/flows/editor, safe apply/confirm/expiry, drafts, mobile navigation, both themes and sensitive-state cleanup |
@@ -49,6 +50,15 @@ return HTTP errors for those reads; the console must show unavailable status and
 retain diagnostic details. Negative authentication/validation tests deliberately
 produce refusal responses. Do not label those runs "zero HTTP errors", suppress
 the evidence, or infer hardware/HA/data-plane certification from frontend tests.
+
+The setting search reads `src/settings-index.json`. After adding, renaming or
+moving a console field, regenerate it from the masks the console builds and
+rebuild, otherwise the `workflow` freshness test fails:
+
+```sh
+CONSOLE_TEST_FILE=settings-index.mjs tests/console/run.sh target/debug/sentinel
+cargo build
+```
 
 Also run the production asset and code checks:
 

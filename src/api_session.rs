@@ -106,16 +106,32 @@ fn is_session_name(name: &str) -> bool {
 /// any of them is a different digest, which is what ends the session.
 pub fn grant(appliance: &Appliance, user: &str, directory: bool) -> Option<(Permission, String)> {
     let login = appliance.system.logins.iter().find(|l| l.username == user);
-    let group =
-        login
-            .and_then(|l| l.group.as_deref())
-            .or(appliance.system.aaa.default_group.as_deref())?;
-    let permission = appliance
-        .system
-        .groups
-        .iter()
-        .find(|g| g.name == group)?
-        .permission;
+    if !directory && login.is_none() {
+        return None;
+    }
+    if directory && !appliance.system.aaa.has_servers() {
+        return None;
+    }
+    // Match the existing Unix bootstrap exception, not a new grant: only a
+    // configured builtin admin with no explicit group has administrator access.
+    // An explicit read-only group still demotes it; a directory named admin or
+    // an arbitrary ungrouped local login never inherits bootstrap privileges.
+    let bootstrap = login.is_some_and(|l| l.username == "admin" && l.group.is_none());
+    let group = login.and_then(|l| l.group.as_deref()).or_else(|| {
+        directory
+            .then_some(appliance.system.aaa.default_group.as_deref())
+            .flatten()
+    });
+    let permission = if bootstrap {
+        Permission::ReadWrite
+    } else {
+        appliance
+            .system
+            .groups
+            .iter()
+            .find(|g| Some(g.name.as_str()) == group)?
+            .permission
+    };
     let material = serde_json::json!({
         "user": user,
         "login": login.is_some(),
@@ -124,7 +140,10 @@ pub fn grant(appliance: &Appliance, user: &str, directory: bool) -> Option<(Perm
         "own-group": login.and_then(|l| l.group.as_deref()),
         "group": group,
         "permission": permission,
-        "directory": directory && appliance.system.aaa.has_servers(),
+        "bootstrap-admin": bootstrap,
+        // An endpoint/secret/TLS policy change withdraws sessions granted by
+        // the old directory trust, not only removing the last server entirely.
+        "directory-trust": directory.then_some(&appliance.system.aaa),
     });
     Some((permission, sha256_hex(material.to_string().as_bytes())))
 }
@@ -298,4 +317,71 @@ fn write_record(dir: &Path, record: &Record, create: bool) -> Result<()> {
         std::fs::rename(&target, &path).with_context(|| format!("replacing {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured() -> Appliance {
+        Appliance::from_toml(
+            "[system]\nhostname='grant-test'\n\
+             [[system.group]]\nname='viewers'\npermission='read-only'\n\
+             [[system.group]]\nname='operators'\npermission='read-write'\n\
+             [[system.login]]\nusername='admin'\n\
+             [[system.login]]\nusername='shell-user'\n\
+             [system.aaa]\ndefault-group='operators'\n\
+             [[system.aaa.radius]]\nserver='192.0.2.9'\nsecret='directory-secret'\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bootstrap_admin_matches_unix_grant_but_explicit_groups_can_demote_it() {
+        let mut appliance = configured();
+        assert_eq!(
+            grant(&appliance, "admin", false).unwrap().0,
+            Permission::ReadWrite
+        );
+        assert!(grant(&appliance, "shell-user", false).is_none());
+        assert!(grant(&appliance, "not-configured", false).is_none());
+        let original = grant(&appliance, "admin", false).unwrap().1;
+        appliance.system.logins[0].group = Some("viewers".into());
+        let demoted = grant(&appliance, "admin", false).unwrap();
+        assert_eq!(demoted.0, Permission::ReadOnly);
+        assert_ne!(original, demoted.1);
+        appliance.system.logins.remove(0);
+        assert!(grant(&appliance, "admin", false).is_none());
+        // A directory account named admin gets only the explicit default-group,
+        // not the deleted local account's bootstrap grant.
+        appliance.system.aaa.default_group = Some("viewers".into());
+        assert_eq!(
+            grant(&appliance, "admin", true).unwrap().0,
+            Permission::ReadOnly
+        );
+        appliance.system.aaa.default_group = None;
+        assert!(grant(&appliance, "admin", true).is_none());
+    }
+
+    #[test]
+    fn directory_trust_changes_revoke_grants_but_do_not_revoke_local_password_sessions() {
+        let mut appliance = configured();
+        let directory = grant(&appliance, "directory-user", true).unwrap().1;
+        let local = grant(&appliance, "admin", false).unwrap().1;
+        appliance.system.aaa.radius[0].secret = "replacement-secret".into();
+        assert_ne!(
+            directory,
+            grant(&appliance, "directory-user", true).unwrap().1
+        );
+        assert_eq!(local, grant(&appliance, "admin", false).unwrap().1);
+        let changed_secret = grant(&appliance, "directory-user", true).unwrap().1;
+        appliance.system.aaa.radius[0].server = "192.0.2.10".into();
+        assert_ne!(
+            changed_secret,
+            grant(&appliance, "directory-user", true).unwrap().1
+        );
+        appliance.system.aaa.radius.clear();
+        assert!(grant(&appliance, "directory-user", true).is_none());
+        assert!(grant(&appliance, "admin", true).is_none());
+    }
 }
