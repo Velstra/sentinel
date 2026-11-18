@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Automatic management TLS renewal and OS release metadata
 
 ## OSQA-008: preserve the key while renewing automatic certificates
@@ -44,7 +48,7 @@ not installed-image or complete-feature certification.
 
 ## Scoped installed-candidate follow-up
 
-Standalone OpenStack C actually booted signed disposable QA4, SHA256
+Standalone cloud node C actually booted signed disposable QA4, SHA256
 `66d60a48348e256d779f35e2bccfd67576b83bf23ff822cecb7d0828fa61014f`.
 Installed verity/store partition bytes match that donor; automatic health
 assessment makes slotA permanent without manual blessing. FallbackB and the

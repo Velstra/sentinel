@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # OTA boot and journal identity
 
 The update job model distinguishes physical A/B slots from UKI filenames.

@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Historical routing and dataplane safety backports
 
 These notes preserve earlier findings and intermediate hashes. Statements below
@@ -72,7 +76,7 @@ verifying WAN source translation, unique translated ports and byte-exact replies
 It inspects the real TCX egress link/program and actual agent command, not a
 classic-TC listing that cannot see modern Aya attachments.
 
-These are scoped component regressions. New immutable-image, native OpenStack,
+These are scoped component regressions. New immutable-image, native cloud-network,
 GUI and HA evidence must still be bound to the final candidate. Source backports
 do not waive signed commits or production release criteria.
 
@@ -104,7 +108,7 @@ are a separate path and are not certified by these TCP/UDP assertions.
 ## Fabric established NAPT ports across rolling upgrades (OSQA-190)
 
 `fabric-ha-napt-port.patch` follows all three earlier Fabric patches. The real
-mixed-version OpenStack trace replicated the existing reverse NAT entry, yet
+mixed-version cloud trace replicated the existing reverse NAT entry, yet
 the upgraded owner changed WAN source port39759 to57646 for the same TCP
 sequence; the independent server reset the changed tuple. A new allocator must
 not replace a live binding with its preferred candidate.

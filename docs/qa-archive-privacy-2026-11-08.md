@@ -1,7 +1,11 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Configuration archive credential boundary (OSQA-011)
 
 Scope: a local source fix and its regression tests. This is not a statement
-that the frozen OpenStack image, physical appliances, or a production release
+that the frozen cloud image, physical appliances, or a production release
 has been upgraded or certified. Original failing evidence remains retained.
 
 ## Defect and intended access

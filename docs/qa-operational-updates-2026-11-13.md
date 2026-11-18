@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Operational OTA CLI and console
 
 Both interfaces use update_jobs; neither owns the image writer. The new CLI is
