@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Peer write context and configuration-sync boundaries
 
 Scope: source corrections for OSQA-009/012/171, not a production certificate.

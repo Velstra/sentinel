@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Default-capacity signed OTA gate: implemented, execution pending
 
 Run in release CI/build infrastructure, never on a customer appliance:
@@ -80,7 +84,7 @@ and small actual-loopback TLS/fixture unit tests are separate HOST evidence.
 They do not close OSQA015 or certify the future combined source/image.
 
 The intended VM scope is plaintext ext4 only. LUKS-backed ext4, mdraid ext4,
-an independent default-path OpenStack boot, native hardware and a deliberately
+an independent default-path cloud boot, native hardware and a deliberately
 bad-image fallback remain separately required scopes; the existing bootfallback
 gate still provides that distinct regression. Do not label this gate as all
 installer options, all release checks, native HA, or production certification.

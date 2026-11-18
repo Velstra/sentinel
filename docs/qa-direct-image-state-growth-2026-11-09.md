@@ -1,8 +1,12 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Direct-image persistent-state growth
 
 ## Problem and safety boundary
 
-OSQA-174 was observed on the isolated OpenStack standalone node: a direct RAW
+OSQA-174 was observed on the isolated cloud standalone node: a direct RAW
 import on a 10 GiB root disk still had the image's 128 MiB data partition.
 The installer was not run, so its existing target-disk expansion did not run
 either. This observation does not establish a failure of encrypted or RAID
