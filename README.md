@@ -3,6 +3,10 @@
 Firewall and routing appliance with an immutable A/B OS, a CLI and an embedded
 web console. Both interfaces manage the same `appliance.toml`.
 
+Release status: development candidate, not approved for production. The 1.0
+audit still has open dataplane, HA and supply-chain blockers. HA is experimental;
+keep independent management access and a recovery console.
+
 ## Build and install
 
 Build host: x86_64 Linux with [Nix and flakes](docs/src/building/prerequisites.md).
@@ -61,6 +65,7 @@ nix build .#checks.x86_64-linux.quickstart .#checks.x86_64-linux.bootfallback -L
 
 [Browser/UI tests](tests/console/README.md) ·
 [Full test catalog](docs/src/reference/tests.md) ·
+[Dataplane support and oracle tests](docs/src/reference/dataplane-support.md) ·
 [Build outputs](docs/src/reference/flake-outputs.md)
 
 ## Documentation

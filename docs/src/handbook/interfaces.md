@@ -5,6 +5,27 @@ optionally a virtual type (VLAN, bridge, bond, tunnel, …). The interface name
 is either a real NIC (`eth0`), a VLAN subinterface (`eth0.20`), or a name you
 pick for a virtual device (`wg0`, `br0`, `gre1`).
 
+## Bind physical identity before assigning zones
+
+Match the physical NIC's permanent MAC and cable role before reusing a name.
+Predictable names can change after device replacement, firmware changes or VM
+hot-plug; a new device that inherits a name must not silently inherit a trust
+decision. Use `sentinel show interfaces` and `ip -details link show` to inspect
+the inventory, then pin each physical role:
+
+```text
+set interface wan0 hw-id 52:54:00:10:00:01
+set interface wan0 zone wan
+set interface wan0 address dhcp
+```
+
+Replace the example MAC with the real permanent hardware identity. `hw-id`
+creates a `.link` name binding when the device appears; it is **not** MAC
+cloning, and a commit does not guarantee an immediate rename of an already
+active NIC. Keep console access and verify the binding after a controlled
+reboot before relying on it. Bind the management NIC separately on each HA
+member. Do not copy the primary's physical MAC bindings to the secondary.
+
 ## Common fields
 
 | Field | Meaning |
@@ -16,6 +37,7 @@ pick for a virtual device (`wg0`, `br0`, `gre1`).
 | `disabled` | Administratively disable this NIC (`true`/`false`). |
 | `mtu` | Link MTU in bytes (e.g. `1492` for PPPoE, `9000` jumbo). |
 | `mac` | Override the link MAC (MAC cloning), e.g. `52:54:00:12:34:56`. |
+| `hw-id` | Match a physical NIC by permanent MAC and assign its declared name when it appears. |
 
 ```text
 set interface eth0 zone wan
@@ -70,12 +92,15 @@ When the data plane cannot start at all (a datapath the kernel refuses, a
 crash loop), **every zoned interface stays dark — including the LAN the web
 console is usually served on.** Plan for that before it happens:
 
-- **Dedicate a management port with no zone.** An unzoned interface is never
-  filtered and never held, so it stays reachable whatever the data plane does.
+- **Dedicate a management port with no zone.** It is outside the zoned
+  data-plane hold and should have its own tested address and SSH listener.
   Give it an address on an isolated management network, bind the console and
   SSH to it (`set services web listen-address …`, `set services ssh
   listen-address …`), and consider `set interface <name> ip
   disable-forwarding true` so it is a way in, not a path through the box.
+  Binding a local address does not enforce allowed ingress interfaces: Linux
+  can route traffic arriving elsewhere to that address. Verify the actual
+  isolation policy from every untrusted segment, including on the HA standby.
 - **Enable the serial console** (`set system console device ttyS0`, see
   [System & management](system.md#the-serial-console)) — the way in when the
   network is the thing that is broken.
@@ -228,8 +253,8 @@ set interface eth1 router-advert prefix 2001:db8:0:1::/64
 
 ## Egress QoS (bufferbloat)
 
-`qos` shapes traffic leaving an interface — CAKE on a WAN uplink kills
-bufferbloat outright.
+`qos` shapes traffic leaving an interface. Measure latency under load when
+choosing a WAN rate; selecting CAKE alone is not a performance guarantee.
 
 | Field | Meaning |
 |---|---|

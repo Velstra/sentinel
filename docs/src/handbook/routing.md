@@ -5,6 +5,28 @@ configures static routes, the IGPs (OSPF/OSPFv3, RIP/RIPng, Babel, IS-IS), BGP,
 first-hop redundancy (VRRP), liveness (BFD), VRFs and multicast. Route policy
 (prefix-lists, route-maps) lives under `policy`.
 
+## Qualification status
+
+Sentinel is under development, not a qualified production release. Static
+routes, base BGP, OSPFv2, BFD and VRRP are the core routing qualification scope;
+that is not a guarantee that every advertised option or peer combination has
+passed. Use [the test inventory](../reference/tests.md) to reproduce specific
+checks and verify learned routes in the kernel with `sentinel show ip route`.
+
+OSPFv3, RIP/RIPng, Babel, IS-IS, multicast, EVPN and extended BGP address
+families/features are **experimental**. Configuration acceptance or an adjacency
+between two Wren instances is not third-party interoperability certification.
+HA pairing is also experimental and has additional
+[failure-mode limits](ha.md); ordinary VRRP is not split-brain fencing.
+
+Two multicast options need particular care:
+
+- IGMP/MLD proxy membership signaling exists, but its proxy forwarding-cache
+  hook is not implemented. Do not rely on it to deliver multicast data between
+  interfaces.
+- PIM `spt-threshold` is accepted as configuration but does not drive a runtime
+  source-tree threshold. It must not be used as a traffic-engineering control.
+
 Start with a router-id (a 32-bit id written as an IPv4 address):
 
 ```text
@@ -62,7 +84,7 @@ Per-neighbor fields (`set protocols bgp neighbor <ip> …`):
 | `bfd` (+`bfd-auth-*`) | Run a BFD session to the peer for fast failure detection. |
 | `description` | Free-form label. |
 
-## OSPF (v2) & OSPFv3 (IPv6)
+## OSPFv2 and experimental OSPFv3
 
 ```text
 set protocols ospf interface eth1 area 0.0.0.0
@@ -79,7 +101,7 @@ Common fields: `interface <if> [area <id>]`, `area`, `router-priority`, `cost`,
 `hello-interval`/`dead-interval`, `graceful-restart`, `bfd`, `vrf`. OSPFv3 adds
 `instance-id`.
 
-## RIP / RIPng / Babel / IS-IS
+## Experimental RIP / RIPng / Babel / IS-IS
 
 ```text
 set protocols rip interface eth1
@@ -147,8 +169,9 @@ global timing defaults under `protocols bfd` (`min-tx`, `min-rx`,
 
 - **`protocols vrf <name>`** — a named isolated routing table (`table`, `rd`,
   `interface`, `import`/`export`).
-- **`protocols multicast`** — IGMP/MLD querier + RFC 4605 proxy (`igmp`, `mld`,
-  `igmp-version`, per-`interface` `role` querier/upstream/downstream).
+- **`protocols multicast`** — experimental IGMP/MLD query/membership controls
+  (`igmp`, `mld`, `igmp-version`, per-`interface` `role`
+  querier/upstream/downstream). Proxy data forwarding is not implemented.
 - **`policy prefix-list <name> rule <seq>`** (`prefix`/`ge`/`le`) and
   **`policy route-map <name> rule <seq>`** (`action`, `match …`, `set …`) build
   reusable route filters. Attach them to a BGP neighbor (`import`/`export`), a
@@ -236,7 +259,7 @@ goes, and a name that stopped resolving would move it without the configuration
 having changed. The families are deliberately not checked against each other — an
 IPv4 route via an IPv6 next hop is RFC 5549.
 
-## Multicast and VRFs
+## VRFs and experimental multicast
 
 Both have their own tab in the console and their own `show`:
 
@@ -252,16 +275,18 @@ show multicast          # the kernel's forwarding cache
 show vrf                # the instances that are running
 ```
 
-Multicast is not forwarded by default: a router has to be told to listen for the
-reports that say who wants a group. An interface either faces receivers
-(`downstream`) or faces the source (`upstream`).
+The multicast example configures membership signaling only. An interface either
+faces receivers (`downstream`) or the source (`upstream`), but the IGMP/MLD proxy
+does not install the kernel forwarding entries needed to carry the data. A
+successful commit or `show multicast` output must not be treated as proof that
+a receiver gets the stream. Verify delivery from an independent sender to a
+receiver before relying on any experimental multicast topology.
 
-### Between segments: PIM-SM
+### Experimental PIM-SM
 
-The querier and the RFC 4605 proxy carry multicast *within* a segment. A proxy
-has one upstream and forwards whatever was asked for. **PIM-SM** (RFC 7761)
-routes it *between* segments: it picks a path per group and can have several
-neighbours.
+PIM-SM has a separate kernel multicast-routing path. Its presence does not
+complete the IGMP/MLD proxy's missing data-forwarding hook. The following is
+development configuration, not a supported multicast deployment recipe:
 
 ```text
 set protocols multicast interface eth0 role querier
@@ -289,9 +314,9 @@ wants a group, PIM is what decides whether the group reaches the segment at all.
 | `rp-address` | The rendezvous point. Required when enabled. |
 | `interface` | A link PIM speaks on. Repeatable. |
 | `hello-interval` | Seconds between Hellos (default 30). |
-| `spt-threshold` | kbit/s above which a group leaves the shared tree for the source's own. `0` switches on the first packet; unset keeps the shared tree, which holds less state. |
+| `spt-threshold` | Accepted configuration only; no runtime threshold behavior is implemented. |
 
-## BGP: aggregates, authorisations, confederation, RPKI
+## Experimental BGP aggregates, authorisations, confederation and RPKI
 
 ```text
 set protocols bgp aggregate 10.0.0.0/8 summary-only true
@@ -315,7 +340,7 @@ OSPFv3 is the exception: the daemon has `redistribute-static` and nothing else,
 so static is the only source it can carry, and the CLI offers only that rather
 than accepting a value that would be refused on apply.
 
-## EVPN: one tenant network across several boxes
+## Experimental EVPN
 
 BGP carries *who is where* — a MAC learned on this box is announced to the others
 (RFC 7432 type-2), a subnet behind it as a prefix (RFC 9136 type-5). The data

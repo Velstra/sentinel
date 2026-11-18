@@ -4,6 +4,20 @@ The `system` tree holds host-wide identity and the management surfaces —
 who can log in, and how the box syncs to an HA peer. SSH daemon tuning lives
 next door under `services ssh`.
 
+## Persistent logs
+
+Installed images retain `/var/log` on the data partition. The journal is bounded
+to 128 MiB, keeps 256 MiB free and expires entries after 14 days. Before an
+update or when diagnosing an earlier boot:
+
+```sh
+journalctl --list-boots --merge
+journalctl --merge -u velstra.service -u wren.service
+```
+
+`--merge` includes retained logs from earlier machine IDs on an unprovisioned,
+stateless test VM. It does not retrieve logs from remote cluster members.
+
 ## Hostname
 
 ```text
@@ -14,26 +28,57 @@ The hostname is applied live on commit and shown in the prompt.
 
 ## Login accounts
 
-`system login <user>` defines a local account, VyOS-style. Accounts are
-created on commit (the built-in `admin` always exists); each carries any number
-of SSH public keys and an optional pre-hashed login password.
+`system login <user>` defines a local account. Accounts are created on commit;
+each carries SSH public keys and an optional login password.
 
 | Command | Meaning |
 |---|---|
 | `set system login <user> ssh-key <openssh-key>` | An OpenSSH public key allowed to log in as this user (repeatable). |
-| `set system login <user> hashed-password <hash>` | A crypt(3) hash (`$6$…`) for console + sudo — never a plaintext password. |
+| `set system login <user> password <password>` | Hash a new local password with yescrypt; do not put plaintext commands in shell history or scripts. |
+| `set system login <user> hashed-password <hash>` | Import a supported crypt(3) hash, never a plaintext password. |
 | `set system login <user> totp <base32-secret>` | A one-time-code secret. The account then needs a code as well as a password. |
 
-The password is for the console and `sudo`; **SSH stays key-only** unless you
-also enable password auth on the daemon (below). Generate a hash off-box:
+**SSH stays key-only** unless you also enable password auth on the daemon
+(below). A local `read-write` group grants administrator access, including
+passwordless sudo; read-only and ordinary ungrouped users do not receive it.
+The configured, ungrouped built-in `admin` retains bootstrap administrator
+access in both CLI and API; explicitly assigning it a read-only group removes
+that exception. This does not grant administrator access to other ungrouped
+accounts. Removing a managed account locks it, removes its managed SSH keys and
+administrator group, and terminates its existing login sessions and user jobs.
+Homes are not deleted. Demotion also expires old sessions. Use another
+administrator or a recovery console when removing or demoting your own account.
+
+New local passwords use yescrypt cost 5 (16 MiB), with a random salt. Existing
+MD5-, SHA-256- and SHA-512-crypt hashes remain verifiable by the API; there is no
+automatic rehash. The OS/PAM policy is unchanged: imported MD5 and SHA-256 hashes
+do not grant password-based SSH/console access. Reset those passwords to yescrypt
+before relying on OS login. The API's compatibility helper does not weaken the
+system-wide crypt policy. Rotate legacy local passwords to migrate them. Imported yescrypt costs
+are bounded (up to 32 MiB), and passwords must be 8–511 bytes with no NUL or line
+break. These limits apply to local Unix/API accounts. Rendered OpenConnect VPN
+credentials also use cost-5 yescrypt, but retain their existing non-empty
+password-length compatibility. The root-private runtime credential file reuses
+an unchanged password's validated hash; a legacy SHA-512 hash migrates on apply.
+OpenConnect tunnel/restart acceptance still needs the final image's VM results.
+To import a hash generated off-box, use an interactive password prompt:
 
 ```text
-$ mkpasswd -m sha-512        # or: openssl passwd -6
+$ mkpasswd --method=yescrypt --rounds=5
 
 admin@fw-a# set system login alice ssh-key ssh-ed25519 AAAAC3Nz…I alice@laptop
 admin@fw-a# set system login alice ssh-key ssh-ed25519 AAAAC3Nz…J alice@phone
-admin@fw-a# set system login alice hashed-password $6$xsalt$hash…
+admin@fw-a# set system login alice hashed-password $y$j9T$<salt>$<digest>
 ```
+
+The persistent, root-private `/var/lib/sentinel/login-accounts.json` registry
+keeps each managed local UID stable across boots and reserves retired UIDs.
+Retired `admin` accounts are not silently recreated with bootstrap privileges.
+When upgrading an appliance without this registry, only currently configured
+accounts are adopted: manually review Unix users removed before the upgrade.
+Do not delete the registry to reset an account; corruption or UID drift fails
+closed. These lifecycle changes still require the final image's VM login/SSH
+acceptance results before release qualification.
 
 ## SSH daemon
 
@@ -52,16 +97,43 @@ set services ssh port 2222
 set services ssh listen-address 10.0.0.1
 ```
 
+A listen address selects the destination IP, not an allowed ingress interface.
+Linux can deliver traffic arriving on another interface to that local IP. An
+unzoned management NIC is deliberately unfiltered; its address is **not** an
+implicit management-only boundary. The same applies to the Web console's listen
+address and HA's receiving management API.
+
+For example, deny SSH and HTTPS to management address `10.0.0.1` from an existing
+`lan` zone, while keeping direct access on the separate management NIC and
+forwarding to other hosts on those ports:
+
+```text
+set firewall rule deny-lan-management from lan
+set firewall rule deny-lan-management proto tcp
+set firewall rule deny-lan-management port 22,8080
+set firewall rule deny-lan-management destination 10.0.0.1/32
+set firewall rule deny-lan-management family ipv4
+set firewall rule deny-lan-management action drop
+commit-confirm 2
+```
+
+Use the actual service ports and management IP. Repeat for **each untrusted
+ingress zone** and every exposed management address; IPv6 needs a separate rule
+with `family ipv6` and the exact host `/128`. Use a destination match, not a broad
+`to` rule or a combined source/destination rule. Verify both management access
+and the intended denial before `confirm` and `save`; keep a local recovery
+console. This is opt-in network policy, not automatic interface isolation.
+
 ## HA config sync
 
-Leased active/passive HA uses two members and an independent witness. The witness
-issues short-lived forwarding authority, enforced by a persistent kernel guard;
-a missing heartbeat alone never authorizes two nodes. Follow the
-[HA pairing and recovery guide](https://github.com/Velstra/sentinel/blob/main/docs/ha-phase3.md)
-for witness provisioning and `sentinel ha pair <peer-endpoint>` (the token is
-read from stdin with `--secret-stdin`, or prompted for without echo).
-Pairing authenticates the first TLS connection before sending the bearer and
-records both member profiles in canonical `appliance.toml`.
+HA is **experimental**. Fenced pairing has witness and witnessless `two-node`
+modes with different partition behavior; neither is equivalent to legacy VRRP
+plus config sync. Follow the current [HA pairing and recovery guide](ha.md)
+before using `sentinel ha pair <peer-endpoint>`. The token is read from stdin
+with `--secret-stdin`, or prompted for without echo. Pairing authenticates the
+first TLS connection before sending the bearer and records both member profiles
+in canonical `appliance.toml`. Review the guide's known failure modes and retain
+an independent management/console recovery path.
 
 `system config-sync` delivers desired policy through the management API. CLI
 commits and API updates queue a durable revision, with retries for an unavailable
@@ -77,16 +149,38 @@ in `system.ha.peer-identity` rather than an inferred address.
 | `secret` | Shared machine enrollment credential. It also enables the receiving HTTPS API. |
 | `peer-fingerprint` | Base64 SHA-256 management TLS public-key pin. Pairing records the authenticated peer pin. |
 
+The receiving API always honors `services.web.listen-address` and `port`, even
+when `services.web.enable = false`. A secret alone leaves the default listener
+on `127.0.0.1:8080`; it does not expose every address. Set a reachable control
+address explicitly on **each** peer before remote synchronization or pairing.
+Address binding is not ingress-interface isolation; apply the explicit
+management ACL above where required.
+
 Outside leased HA, legacy config sync can target multiple receivers. It preserves
-existing receiver-local address and identity facts; a new static interface must
+the receiver's web listen address/port and existing local address/identity facts;
+other web settings, including TLS, remain synchronized policy. A new static interface must
 already have its receiver facts declared. Drive changes from one node to avoid
 competing desired states. Legacy VRRP/config-sync alone does not provide the
 witness's split-brain fencing guarantees.
 
+Before upgrading an existing legacy-sync pair, reconcile outstanding changes
+and verify delivery on both members, then upgrade both to the same reviewed
+version. The new endpoint-aware shared revision can reject a queued old base as
+a conflict. Preserve its outbox and receive-journal evidence for recovery; never
+delete participation fences to force an otherwise refused first synchronization.
+
 ## HA conntrack sync
 
-With a pair credential, conntrack sync uses mutually authenticated framed TCP and
-a default 50ms poll interval. It transfers complete snapshots, updates and
+Conntrack sync requires an explicit 32–1024-byte `system.config-sync.secret`
+and at least one state peer. Sentinel derives the authenticated state credential
+from that secret; it never selects unauthenticated UDP, invents a credential or
+widens a management bind. The explicitly configured secret activates the shared
+API with the listener settings above, including in state-only configurations.
+Config sync uses HTTPS for policy delivery;
+conntrack sync uses mutually authenticated framed TCP for flow state. They are
+separate services.
+
+The TCP transport uses a default 50ms poll interval. It transfers complete snapshots, updates and
 deletions for NAT, dual-stack firewall and SYN-proxy splice state. Kernel reads
 are batched; configuration/policy generations fence incompatible state. Leased HA
 also binds every transfer to the current witness authority. A former master
@@ -101,14 +195,16 @@ an independent declared underlay outside the fenced data links.
 | Field | Meaning |
 |---|---|
 | `listen` | Local state endpoint, numeric `IP:port` in leased HA (default port `5429`). |
-| `peer` | State receiver endpoint. Leased HA requires one explicit peer. |
-| `interval` | Optional legacy interval in seconds; omit it in leased mode to use 50ms. |
+| `peer` | Explicit state receiver endpoint. At least one is required; leased HA requires exactly one. |
+| `interval` | Optional poll interval in seconds; omit it in leased mode to use 50ms. |
 
-Without a pair credential, the legacy trusted-link UDP mode remains available
-with a default one-second interval and repeatable peers. It is unauthenticated
-and does not provide leased HA fencing. Authenticated TCP protects integrity but
-not confidentiality: use an isolated HA network or a dedicated control
-WireGuard tunnel when flow metadata must remain private.
+Legacy unsigned UDP and listen-only state replication are disabled. Before
+upgrading, [migrate both members or remove the old state-sync block](ha.md#migrate-legacy-state-sync)
+deliberately; an incompatible saved configuration is rejected, not downgraded.
+Authenticated TCP protects integrity, not confidentiality: use an isolated HA
+network or a dedicated control WireGuard tunnel when flow metadata must remain
+private. Credential validation and transport selection alone do not establish
+successful HA flow-failover qualification.
 
 ## A second factor
 
@@ -125,14 +221,38 @@ prints **the code that is current right now**. Check the phone agrees before you
 walk away: somebody who enrolled the wrong account finds out here rather than at
 the next sign-in, locked out.
 
+Newly generated secrets contain 160 bits (32 base32 characters). Treat the
+printed secret and URI as credentials; do not put them in screenshots or issue
+attachments.
+
 The code is checked **after** the password and never instead of it, so a wrong
 password and a wrong code are the same refusal from outside — there is nothing to
 probe.
+
+An accepted code's counter is durably consumed before issuing a session, so it
+cannot be reused on that appliance after an API restart or reboot while its
+persistent state is retained. Wait for the next 30-second code for another
+login. The private replay state fails closed if corrupt or unwritable; deleting
+it is not a safe login workaround. This protection is **per appliance**, not a
+cluster-global replay guarantee. Keep time synchronized on every member.
 
 Two places it deliberately does not apply. The **serial console** has no second
 factor: it is the port you reach for when the network this box manages is the
 thing that is broken. **SSH** has none either — that belongs to sshd's own
 configuration, not here.
+
+## Web sign-in limits
+
+Sign-in attempts share an origin budget: ten attempts in a ten-minute window
+trigger a 15-minute lockout for subsequent attempts. IPv6 addresses in the
+same /64 share that budget. A separate account
+budget permits 30 attempts in a ten-minute window, across origins.
+
+The account limit also blocks a correct password from another origin. Someone
+targeting a known account can therefore temporarily deny web access; keep an
+independent SSH or serial recovery path. Successful sign-in clears both budgets.
+These limits are held in memory and reset when the API restarts; they are not
+cluster-wide or persistent protection.
 
 ## Where a password is checked
 
@@ -158,10 +278,15 @@ set system aaa radius 10.0.0.50 secret a-shared-secret
 set system aaa radius 10.0.0.50 timeout 2
 ```
 
-PAP only. CHAP would hide the password from the wire but needs the server to
-hold it in plaintext, which is the worse trade. RFC 2865 hides the password with
-MD5 against the shared secret — **that is not encryption in any modern sense**,
-so a RADIUS server belongs on a segment you already trust.
+The client uses PAP with a mandatory Message-Authenticator (attribute 80,
+HMAC-MD5). The server must include a valid Message-Authenticator in every
+Access-Accept and Access-Reject; missing, duplicate or invalid authenticators
+are refused. There is no legacy unsigned-response downgrade. Configure the
+RADIUS server accordingly before relying on it for access.
+
+RADIUS/UDP password hiding and integrity checks do not provide modern transport
+confidentiality. Use an isolated trusted network or a protected tunnel; do not
+expose this exchange on an untrusted network.
 
 ### LDAP
 

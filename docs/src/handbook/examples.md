@@ -110,58 +110,15 @@ routes as `proto ospf`.
 
 ## Active/standby HA pair {#ha-pair}
 
-Identical firewalls share a LAN virtual IP with [VRRP](routing.md#vrrp), keep
-their configs in step with [config sync](system.md#ha-config-sync), and mirror the
-connection table with [conntrack sync](system.md#ha-conntrack-sync). Edit the
-**active** node; the standbys receive every commit, and established NAT'd flows
-survive a failover. VRRP, config-sync and conntrack-sync are each N-node capable,
-so the same pattern scales from a pair to a cluster — this example uses three.
+HA is **experimental**. Use the current [pairing guide](ha.md), which separates
+witness authority, witnessless two-node mode and legacy VRRP. Prepare distinct
+member identities and an independent management recovery path before pairing.
 
-The three boxes take real addresses `.2` / `.3` / `.4`; the VIP clients use is
-`.1`. Priority orders the failover (`fw-a` → `fw-b` → `fw-c`).
-
-**Active `fw-a` (priority 200, real address `.2`):**
-
-```text
-set system hostname fw-a
-set interface eth1 zone lan
-set interface eth1 address 10.0.0.2/24            # real address
-set protocols vrrp lan-vip interface eth1
-set protocols vrrp lan-vip vrid 20
-set protocols vrrp lan-vip priority 200
-set protocols vrrp lan-vip virtual-address 10.0.0.1   # the VIP clients use
-set protocols vrrp lan-vip prefix-length 24
-set system config-sync secret <shared-token>
-set system config-sync peer 10.0.0.3
-set system config-sync peer 10.0.0.4
-set system conntrack-sync peer 10.0.0.3
-set system conntrack-sync peer 10.0.0.4
-commit
-save
-```
-
-**Standbys `fw-b` (`.3`, priority 100) and `fw-c` (`.4`, priority 90)** — each only
-arms sync and lists the *other* nodes as conntrack peers; the rest arrives from
-`fw-a`:
-
-```text
-# fw-b:
-set interface eth1 zone lan
-set interface eth1 address 10.0.0.3/24
-set system config-sync secret <shared-token>
-set system conntrack-sync peer 10.0.0.2
-set system conntrack-sync peer 10.0.0.4
-commit
-save
-```
-
-From then on, any `commit` on `fw-a` pushes the running config to `.3` and `.4`,
-which apply and persist it, while all three continuously mirror their conntrack
-tables. `show vrrp` shows `fw-a` as master holding `10.0.0.1`; kill it and `fw-b`
-takes the VIP within a second or two — with the established connections already in
-its conntrack table, so they don't drop.
-
-> For just a pair, drop `fw-c` and the `.4` peers — the same config with two nodes.
+VRRP, config sync and conntrack sync configured separately do not form a fenced
+cluster and do not guarantee that an established NAT connection survives a
+partition or failover. Do not copy one member's addresses, hardware bindings or
+SSH listener to another. Run the exact pairing and flow-continuity tests for
+the image you intend to use; a matching configuration file is not that proof.
 
 ---
 

@@ -49,7 +49,9 @@ sentinel show nat
 ```
 
 The batch retains installer accounts and configures DHCP WAN, LAN DHCP/DNS,
-outbound masquerading and a LAN-only HTTPS console on port 8443. The complete
+outbound masquerading and HTTPS bound to the LAN address on port 8443. Binding
+selects a destination address; it does not isolate that address from other
+ingress interfaces. The complete
 TOML sample is [quickstart.toml](https://github.com/Velstra/sentinel/blob/main/examples/quickstart.toml); do not
 replace the saved configuration with it without retaining your accounts.
 
@@ -66,6 +68,6 @@ See [management recovery](configure.md).
 Zoned interfaces stay down until the dataplane attaches. For recovery, retain
 serial/local console access or an unzoned management interface; see
 [interface recovery](../handbook/interfaces.md#zoned-links-stay-down-until-the-firewall-has-them).
-HA and fleet setup are separate procedures in the
-[HA guide](https://github.com/Velstra/sentinel/blob/main/docs/ha-phase3.md) and
-[fleet guide](https://github.com/Velstra/sentinel/blob/main/docs/fleet-phase5.md).
+HA and fleet setup are separate procedures in the current
+[HA guide](../handbook/ha.md) and [fleet guide](../handbook/fleet.md). HA is
+experimental; start with a recovery-accessible lab, not a production pair.

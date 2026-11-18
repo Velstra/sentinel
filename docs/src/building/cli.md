@@ -45,10 +45,9 @@ This is the part that needs the pinned **nightly** toolchain (with `rust-src` +
 
 - **`velstra-ebpf` is a fixed-output derivation** (network-allowed, hash-pinned)
   because `-Z build-std` can't fetch std's build-deps in a sealed sandbox.
-- The agent binary is scrubbed with `remove-references-to` to drop a dangling
-  string reference to the 892 MiB nightly toolchain (embedded in std's
-  panic-location paths) — this keeps the appliance image closure tiny
-  (~38 MiB instead of ~899 MiB).
+- The agent binary uses `remove-references-to` to remove a retained toolchain
+  path. That is one closure-reduction step, not a measurement of the complete
+  image. Inspect the actual built image's closure before making size claims.
 
 Both details are pinned-hash territory — if you bump the toolchain or Fabric, see
 [Reproducibility & pinned hashes](reproducibility.md).

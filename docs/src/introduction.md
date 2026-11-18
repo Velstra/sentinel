@@ -4,6 +4,12 @@
 OS, built on the [Velstra Fabric](https://github.com/Velstra/fabric) eBPF/XDP
 data plane and packaged with NixOS.
 
+**Development status:** production release qualification is incomplete. HA and
+advanced routing have explicit limits; read [dataplane support](reference/dataplane-support.md)
+and [routing status](handbook/routing.md#qualification-status) before testing.
+Do not treat a package version, successful build or signed development image
+as a production release approval.
+
 Where *Velstra Fabric* is the engine — an XDP firewall, router, load balancer,
 and VXLAN/Geneve overlay with an HA control plane — **Sentinel is the appliance
 on top**: an open-source firewall/router box, Rust-and-eBPF all the way down.
@@ -18,7 +24,8 @@ and immutable, the way real appliance OSes (Talos, VyOS, OPNsense) are:
   `/nix/store` only if it matches — tamper detection at block level. Root is a
   volatile `tmpfs`; the one persistent partition holds the editable config.
 - **Secure Boot.** The whole boot chain (systemd-boot + the UKI) is signed; the
-  appliance ships PK/KEK/db enrollment payloads so the firmware enforces it.
+  appliance ships PK/KEK/db enrollment payloads for test enforcement. The default
+  keys are development material in the Nix store, not production trust.
 - **A/B updates with auto-rollback.** Two store slots; an update writes the
   inactive one and systemd-boot's automatic boot assessment rolls back if the new
   slot fails to come up cleanly three times.

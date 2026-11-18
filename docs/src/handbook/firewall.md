@@ -6,6 +6,12 @@ default action) is set globally and overridden per zone; and `rule`s open
 specific proto/port/source between zones. NAT (masquerade, port-forward,
 NAT64, NPTv6) lives under `nat`.
 
+This is a development candidate. Fragmented NAT, RELATED ICMP/PMTU and capacity
+limits are not production-qualified. Read the
+[support matrix and conformance gate](../reference/dataplane-support.md) before
+deploying; routed traffic currently uses kernel forwarding plus TC egress, not
+an established-flow XDP redirect fast path.
+
 ## Zones & posture
 
 A zone is just a name you assign to interfaces (`set interface eth0 zone wan`).
@@ -469,10 +475,15 @@ set nat source wan-masq to 203.0.113.10
 
 The upstream must route this address back to the appliance. One enabled source
 NAT rule is allowed per zone. Removing `to` restores masquerading. Both modes
-allocate collision-safe source ports and update IP and transport checksums.
-ICMPv4 echo requests use collision-safe translated identifiers, including when
+translate source ports and update IP and transport checksums.
+ICMPv4 echo requests use translated identifiers, including when
 the original identifier is zero. Replies restore the internal address and
 identifier; their mappings expire with the configured ICMP timeout.
+
+**Development limitation:** allocation searches a bounded candidate window.
+Collisions can reject a new connection even with free map capacity. Logical
+expiry is not a guarantee that its physical slot has been reclaimed. See the
+[dataplane support matrix](../reference/dataplane-support.md) before deployment.
 
 
 #### Deterministic CGNAT
@@ -932,9 +943,18 @@ mappings. Ordinary rule edits retain the existing sessions.
 
 ```text
 show firewall states     # active IPv4/IPv6 tuples, phase and idle time (JSON)
+show firewall capacity   # kernel state-map occupancy and sampling status (JSON)
 show firewall counters   # named L3/L4 rule packet/byte/accept/drop totals (JSON)
 show firewall events     # newest 100 packet events (JSON lines); consumes nothing
 ```
+
+`capacity` reports raw entries in `CONNTRACK`, `FW_FLOWS` and `SYN_FLOWS`,
+including expired entries still occupying the kernel maps. It is not a count
+of active connections or a supported connection limit. A complete, consistent
+sample warns at 80% occupancy; a failed or changing sample reports `unknown`.
+The response includes its sampling age. Even matching scans are non-atomic;
+`observed-below-threshold` is not a health guarantee. Eviction counts are not
+currently available. An older agent without this query reports it unavailable.
 
 Use `log true` on a rule to emit its accepted and dropped packet events. Events
 carry its stable rule ID and name, protocol, addresses, ports, interface index

@@ -10,6 +10,7 @@
 - [Building the CLI & agent](building/cli.md)
 - [Reproducibility & pinned hashes](building/reproducibility.md)
 - [Software bill of materials](building/sbom.md)
+- [Third-party notices](building/notices.md)
 
 # Architecture
 
@@ -30,6 +31,8 @@
 
 - [The configuration CLI](handbook/cli.md)
 - [System & management](handbook/system.md)
+- [High availability](handbook/ha.md)
+- [Fleet management](handbook/fleet.md)
 - [Interfaces](handbook/interfaces.md)
 - [Firewall & NAT](handbook/firewall.md)
 - [Routing (protocols)](handbook/routing.md)
@@ -42,6 +45,7 @@
 
 - [Flake outputs](reference/flake-outputs.md)
 - [Test suite (nixosTests)](reference/tests.md)
+- [Dataplane support & conformance](reference/dataplane-support.md)
 
 ---
 

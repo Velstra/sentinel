@@ -5,6 +5,9 @@ authors = ["Velstra"]
 language = "en"
 src = "src"
 
+[build]
+create-missing = false
+
 [output.html]
 default-theme = "ayu"
 preferred-dark-theme = "ayu"

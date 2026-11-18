@@ -76,8 +76,9 @@ error names the relevant `bootctl set-default ''`, `set-preferred ''` or
 `--allow-unsigned` paths enforce this boot-selection preflight.
 
 `--allow-unsigned` (`src/install.rs::update`) skips signature/digest verification
-and `dd`s from the device as given — the trusted re-seal path. It does **not**
-skip boot-selection preflight or the active-device refusal checks.
+for an explicitly trusted Community source. It does **not** skip boot-selection
+preflight or the active slot's identical-GUID refusal: re-sealing the running
+image is refused. Native Enterprise images do not admit this Community writer.
 
 The running ESP is auto-mounted at `/boot` (systemd-gpt-auto, read-only); the
 updater remounts it read-write in place rather than re-mounting the device.
