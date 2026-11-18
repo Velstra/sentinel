@@ -6,7 +6,8 @@ language = "en"
 src = "src"
 
 [output.html]
-default-theme = "ayu"
+additional-css = ["sentinel.css"]
+default-theme = "light"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/Velstra/sentinel"
 edit-url-template = "https://github.com/Velstra/sentinel/edit/main/docs/{path}"
