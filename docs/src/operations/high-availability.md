@@ -1,40 +1,53 @@
-# Verify witness-backed HA
+# Choose an HA election mode
 
-Use two matching Sentinel appliances and a reachable, independent witness when a partition must leave at most one node authorized to forward. The witness grants a timed lease; a kernel guard enforces its expiration on data interfaces.
+Two Sentinel appliances can form an active/standby pair on their own. Add an independent witness when a complete break between the peers must still leave at most one member authorized to forward.
+
+| Mode | Who grants forwarding authority? | If the two members lose every path to each other |
+|---|---|---|
+| Two-node | The peers elect the active member using authenticated heartbeats. | Each can conclude that the other is down. Both can become active. Independent heartbeat paths reduce this risk. |
+| Witness | A third system grants a time-limited lease to one member. | A member needs a valid lease to keep forwarding. The kernel blocks its guarded data interfaces after expiry. If neither member can reach the witness, both can end up fenced. |
 
 ## Prepare the control path
 
-Use distinct member control addresses and matching logical data-interface names. The control link and its underlying links must stay outside the fenced data interfaces. Allow each member to reach the witness and the secondary management API. Set a strong enrollment secret on the secondary, using the site’s credential-handling procedure.
+Use two matching appliances with distinct control addresses, matching logical data-interface names, and working console access. Keep the control path out of the fenced data interfaces and their underlying links. Configure the secondary’s HTTPS management endpoint and enrollment credential.
+
+The examples use secondary `192.0.2.12:8080` and witness `192.0.2.13:5440`. Replace them with your own endpoints. Run **one** pairing command on the primary. It prompts for the secondary’s credential.
+
+## Pair two nodes without a witness
+
+Leave the witness address unset on the prepared primary. Select two-node mode explicitly:
+
+```sh
+sentinel ha pair 192.0.2.12:8080 --mode two-node
+sentinel show ha
+```
+
+Check the mode and role on **both** members, and make sure the backup is ready. Under normal connectivity, expect one master and one backup. If every heartbeat path fails, neither peer can distinguish a failed partner from a network partition.
+
+<a id="verify-witness-backed-ha"></a>
 
 ## Enroll the witness and pair the members
 
-On a member, derive the witness key from the pair enrollment credential. Enter the credential at the prompt:
+Witness is the default mode for a newly configured pair. For this mode, first run `sentinel ha witness-key` on a member and enter the enrollment credential. Configure the independent witness with the derived cluster ID and key, allow both members’ control addresses, and start the witness. [Witness configuration and timing](ha-reference.md).
 
 ```sh
-sentinel ha witness-key
+sentinel ha pair 192.0.2.12:8080 --mode witness --witness 192.0.2.13:5440
+sentinel show ha
 ```
 
-Configure the witness with the returned cluster ID and derived key; restrict it to the two member control addresses. Configure the primary with its intended witness while HA is disabled. Then pair from the primary, using the secondary’s actual HTTPS management endpoint:
-
-```sh
-sentinel ha pair 192.0.2.12:8080
-```
-
-The address is illustrative; use your dedicated control network. The command prompts for the enrollment credential. The witness receives its derived key only. For enrollment, topology, timing and recovery settings, see the [HA configuration reference](ha-reference.md).
+Check the owner and remaining lease on the master and readiness on the backup. The witness grants authority. The member’s kernel enforces the deadline even if its control process is paused.
 
 ## Observe the owner, then verify a failover
 
-```sh
-sentinel show ha
-sentinel show vrrp
-```
-
-Check each member’s role, authority and replica readiness. Run failover acceptance on an isolated evaluation network with a continuous test flow and console access to both members. If the active member loses its lease, the old member must stop forwarding. The standby needs valid authority and sufficient replica state to take over; state continuity depends on the workload and replication status.
+On both members, run `sentinel show ha` for authority and readiness and `sentinel show vrrp` for virtual-address state. In an isolated evaluation network, follow a continuous test flow across failover. Session continuity depends on the workload and replica state.
 
 ## Run the multi-VM acceptance test
 
+On a KVM-enabled x86-64 build host, choose the fixture for your deployment:
+
 ```sh
+nix build .#checks.x86_64-linux.ha-two-node -L
 nix build .#checks.x86_64-linux.ha-witness-failover -L
 ```
 
-The fixture pauses the former active process while its kernel remains alive, monitors a client connection, and checks that the old path does not continue forwarding after expiry. Do not extrapolate lab timings into a deployment SLA.
+The first fixture runs a pair without a witness. The second pauses the former active process while its kernel remains alive and checks that the old path stops forwarding after its authority expires.
