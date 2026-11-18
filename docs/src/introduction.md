@@ -9,7 +9,7 @@ Sentinel is a firewall and router for x86-64 UEFI systems. Fabric applies packet
 | Try the appliance on a workstation | [Start a VM](operations/quickstart.md) | Log in and inspect both interfaces. |
 | Change a remote firewall safely | [Apply a change remotely](operations/configure.md) | An unconfirmed change returns to the saved configuration. |
 | Find the rule that decides a packet | [Trace a packet](handbook/firewall.md#asking-before-you-send-packet-trace) | Follow NAT, the configured route and the matching rule before sending traffic. |
-| Evaluate HA during a partition | [Verify witness-backed HA](operations/high-availability.md) | Check who holds the lease and what happens when it expires. |
+| Choose how an HA pair elects a primary | [Compare the two HA modes](operations/high-availability.md) | Verify the active member and how each mode handles a partition. |
 | Review an image before rollout | [Stage an update](operations/update.md) | Verify the offer and distinguish a staged image from a successful boot. |
 
 ## First look on an appliance
