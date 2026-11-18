@@ -16,8 +16,14 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      SENTINEL_TEST_MKPASSWD_BIN: /usr/bin/mkpasswd
     steps:
       - uses: actions/checkout@v4
+      - name: Install the real password-hashing test helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends whois
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
