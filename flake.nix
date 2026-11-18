@@ -13695,7 +13695,10 @@
             assert "pool 0.nixos.pool.ntp.org iburst" in initial, initial
             assert "allow " not in initial, initial
             for node in (fw, upstream):
-                node.succeed("systemd-run --unit=ntp-evidence tcpdump -U -nn -i eth1 -w /tmp/ntp.pcap udp port 123")
+                # `any` remains valid while the upstream link is down. Wait
+                # for the capture header before the deliberate link change.
+                node.succeed("systemd-run --unit=ntp-evidence tcpdump -U -nn -i any -w /tmp/ntp.pcap 'arp or udp port 123'")
+                node.wait_until_succeeds("test -s /tmp/ntp.pcap", timeout=10)
 
             # A late upstream and a dead RTC must recover without restarting
             # chronyd after connectivity becomes available.
@@ -13730,19 +13733,31 @@
             # upstream's IP) and opens the NTP server socket for the LAN.
             fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q '10.0.0.1'", timeout=30)
             try:
+                # A clock assertion cannot distinguish an unreachable source
+                # from time discipline. Prove the restored physical link first.
+                fw.wait_until_succeeds("ping -c1 -W1 10.0.0.99", timeout=10)
+                upstream.wait_until_succeeds("ping -c1 -W1 10.0.0.1", timeout=10)
+                # The initial iburst can be exhausted while the source is
+                # deliberately down. Chrony's default minpoll is 64 seconds;
+                # the failed-source receipt shows Poll=7 (128s), already beyond
+                # the old 120s limit. Allow normal retry and sample acquisition,
+                # without a manual burst, daemon restart or faster public polls.
                 fw.wait_until_succeeds(
-                    "chronyc -n tracking | grep -q '10.0.0.99'", timeout=120
+                    "chronyc -n tracking | grep -q '10.0.0.99'", timeout=300
                 )
             except Exception:
                 for node in (fw, upstream):
                     for command in (
                         "chronyc -n tracking", "chronyc -n sources -v", "chronyc -n activity",
-                        "ip -brief address", "ip route", "ss -ulnp",
+                        "chronyc -n ntpdata", "ip -brief address", "ip -details link show eth1",
+                        "ip -details address show eth1", "ip route", "ip neigh", "ss -ulnp",
+                        "sysctl net.ipv4.conf.all.arp_ignore net.ipv4.conf.eth1.arp_ignore net.ipv4.conf.all.arp_filter net.ipv4.conf.eth1.arp_filter",
+                        "ping -c1 -W1 10.0.0.99", "ping -c1 -W1 10.0.0.1",
                         "journalctl -u chronyd --no-pager -n 80",
-                        "tcpdump -nn -vv -r /tmp/ntp.pcap",
                     ):
                         print(node.name, command, node.execute(command))
                     node.succeed("systemctl stop ntp-evidence.service")
+                    print(node.name, "NTP/ARP capture", node.execute("tcpdump -nn -vv -r /tmp/ntp.pcap"))
                     node.copy_from_machine("/tmp/ntp.pcap", "ntp-evidence/" + node.name)
                 raise
             assert fw.succeed("systemctl show chronyd -p MainPID --value").strip() == pid
