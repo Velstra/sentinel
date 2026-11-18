@@ -1,0 +1,62 @@
+name: Operator documentation
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'scripts/check_book.py'
+      - '.github/workflows/docs.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'scripts/check_book.py'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install mdBook 0.4.52
+        run: |
+          archive="$RUNNER_TEMP/mdbook.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-musl.tar.gz \
+            --output "$archive"
+          echo "c96bdabf3754d9e016fb803c1565a41050434479b2dc1e02a87c8d0da7524c6c  $archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/mdbook-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/mdbook-bin" mdbook
+          echo "$RUNNER_TEMP/mdbook-bin" >> "$GITHUB_PATH"
+      - name: Build the book and check chapter links
+        run: |
+          mdbook build docs
+          python3 scripts/check_book.py docs/book
+      - name: Package GitHub Pages site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: docs/book
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: sentinel-operator-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Publish the operator guide
+        id: publish
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

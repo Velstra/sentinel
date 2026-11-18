@@ -1,357 +1,57 @@
-# Updating (A/B + rollback)
+# Review and stage an appliance update
 
-OS updates are **A/B**: a new image is written to the inactive store slot and the
-bootloader is switched to it. If the new slot fails to boot cleanly, systemd-boot
-rolls back automatically. The architecture is in
-[A/B update slots](../architecture/ab-updates.md); this is the operator view.
+<a id="updating-ab--rollback"></a>
+
+Use an installed A/B appliance. Record the current slot and keep console access. Follow the route for your update source: a signed channel offer or a locally obtained image.
+
+<a id="signed-updates-update-check--update-install"></a><a id="bounded-metadata-and-atomic-channel-promotion"></a>
 
 ## Signed channel: local CLI or Web UI
 
-On the live A/B appliance, as an administrator:
-
-```shell
+```sh
 sudo sentinel system status
 sudo sentinel system update check --wait
 sudo sentinel system status
-# Review the offered version, image digest and signing identity first.
+```
+
+Review the offered version, image digest and signing identity. To stage the offer you reviewed, substitute its actual ID and the job ID returned by the first command:
+
+```sh
 sudo sentinel system update stage --offer <exact-offer-id>
 sudo sentinel system update job <job-id> --wait
 ```
 
-Output is JSON. Submissions return a durable job; `--wait` observes it for at
-most five minutes without owning or cancelling it. Disconnects and API restarts
-do not stop the independent worker. If a submission's outcome is unknown, inspect
-`system status` using its request correlation; do not resubmit it blindly.
+In **System → System updates**, run **Check signed channel**, inspect the offer, then choose **Download & stage update**. A reconnect or expired wait does not cancel a submitted job. Inspect `system status` before retrying. A change to trust, configuration or boot identity requires a fresh offer.
 
-In **System → System updates**, refresh, **Check signed channel**, review the
-exact verified offer, then **Download & stage update**. CLI jobs appear in the
-same retained history. Changes to configuration, trust or boot identity require
-a fresh check/review. Pending config changes, remote member selection, read-only
-accounts and stale observations cannot authorize Stage.
-
-Staging replaces the inactive slot and selects a counted next boot. It does not
-reboot or claim a successful boot. Inspect boot selection and cluster readiness
-before rebooting one member at a time. There is no trust/downgrade override.
-Native Enterprise `update check` uses this worker too; the former unreviewed
-`update install` path is refused. Off-box/no-apply consoles cannot run OTA jobs.
+<a id="local-images-are-signature-checked-by-default"></a><a id="usb-sticks-and-other-block-devices"></a><a id="downgrades"></a>
 
 ## Community local-image updates
 
-```shell
-# from a new raw image (built with `nix build .#sentinel-image`) plus its
-# signed digest velstra-sentinel.raw.sha256(.sig) beside it
+Obtain the raw image and its matching signed proof. Validate the expected release identity and configure the trusted public key before staging. Preserve the other bootable slot.
+
+```sh
+sentinel show version
 sentinel update /path/to/velstra-sentinel.raw --commit
-
-# from a USB stick the image was dd'd onto, with the release's proof from
-# another medium (a signed manifest, or the signed digest)
-sentinel update /dev/sdX --commit --signature /mnt/release/manifest.json.sig
-
-# a trusted device as given, without verification (see --allow-unsigned)
-sentinel update /dev/sdX --commit --allow-unsigned
 ```
 
-What happens:
+The example expects a matching `.sha256` and `.sig` beside the image as documented by the release. A disk or USB source requires a separately supplied release proof. Review the identified target and version before authorizing a write.
 
-1. the image's signature is **verified** (see below) unless `--allow-unsigned`;
-2. a release older than the running one is **refused** unless
-   `--allow-downgrade` (when the proof states a version);
-3. the **active** slot is detected (via `/dev/mapper/usr`);
-4. the image is read once and hashed in full against the signed digest —
-   nothing is written unless it matches;
-5. the new image's store + verity are written to the **inactive** slot from that
-   same open file, re-hashed on the way, so an image that changes underneath
-   (a rewritten file, a swapped stick) is refused before the slot is activated;
-6. that slot is re-typed to the verity GPT GUIDs;
-7. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
-8. `loader.conf` prefers the new slot with `preferred sentinel-<inactive>*`,
-   retaining `default sentinel-*` so an exhausted candidate can fall back.
-
-Before any inactive-slot write, both signed and unsigned commits require the
-**running UEFI systemd-boot version 260 or newer** and no nonempty firmware
-default, preferred or one-shot entry override. Older/non-systemd loaders and
-malformed or unreadable EFI state are refused. Sentinel does not silently clear
-firmware variables: inspect the override named in the error and explicitly
-review the suggested `bootctl` clearing command before retrying. Bootloader
-maintenance is a separate operation, not a package-manager update on the node.
-A hard per-slot `default` is unsafe here: systemd-boot 260 honors that selection
-even when its boot counter reaches zero.
-
-Without `--commit`, the plan is printed but nothing is written.
-
-### Local images are signature-checked by default
-
-A local `sentinel update <image>` now **verifies the image before writing it** —
-the same authenticity gate the channel path applies, so a local install is no
-longer a way around it. It looks for a detached Ed25519 proof beside the image
-(`<image>.sha256.sig`, else `<image>.sig`), or takes the one named by
-`--signature <file>`, and verifies it against a pinned release key, tried in
-order:
-
-1. `--pubkey <pem|file:path>` on the command line;
-2. the saved `[update]` channel's `public-key`;
-3. a release key baked into the image at `/etc/sentinel/release.pem`.
-
-If no key is available, or the signature is missing or does not verify, the write
-is **refused** and nothing is touched. For multi-GiB appliance images, sign a
-small digest file instead: OpenSSL's direct Ed25519 operation buffers its input
-and can fail for large files. The digest file contains only the 64 hex digits
-(optionally followed by a newline), not a filename.
-
-```shell
-sha256sum velstra-sentinel.raw | cut -d ' ' -f 1 > velstra-sentinel.raw.sha256
-openssl pkeyutl -sign -inkey release-priv.pem -rawin \
-  -in velstra-sentinel.raw.sha256 -out velstra-sentinel.raw.sha256.sig
-```
-
-The updater verifies the signed digest and then hashes the entire image. A
-supplied digest takes precedence; invalid or missing signatures fail closed,
-even if a raw signature also exists. Older images still accept direct signatures:
-
-```shell
-openssl pkeyutl -sign -inkey release-priv.pem -rawin \
-  -in velstra-sentinel.raw -out velstra-sentinel.raw.sig
-```
-
-A raw signature is verified on a private copy of the image, and that copy is
-what is installed.
-
-### USB sticks and other block devices
-
-Nothing can sit "beside" `/dev/sdX`, and a stick is larger than the image on it,
-so a raw signature cannot say where the image ends. A block device is proven by
-`--signature` naming one of:
-
-- `…/manifest.json.sig` — the channel's signed release manifest (copy the
-  channel directory to a second medium). It names the image's SHA-256 and the
-  release version, so the downgrade check below applies.
-- `…/velstra-sentinel.raw.sha256.sig` — the signed digest (above).
-
-The device is read up to the end of the image its own partition table describes
-(the backup GPT header), and those bytes must hash to the signed value.
-
-### Downgrades
-
-Every old release stays validly signed forever, so a signature alone cannot stop
-a mirror — or anybody in the path — from serving an old manifest and putting a
-box back onto a release with known holes. `update install`, and a local update
-proven by a signed manifest, therefore refuse a release whose version is lower
-than the running one (`show version`, `sentinel:` line), comparing versions the
-semver way (`1.0.0-rc.1` < `1.0.0` < `1.0.1` < `1.10.0`). The same version is
-allowed — that is a re-install. `--allow-downgrade` installs an older release
-deliberately and says so; `update check` reports an older release as "NOT an
-update". A signed digest or raw signature states no version, so for those the
-updater says it could not check rather than refusing.
-
-What this does not give is **freeze** protection: a mirror that keeps serving
-the current (or an older) manifest hides newer releases, and nothing signed says
-how old a manifest may be. The channel protocol carries no expiry yet.
-
-Manifests may carry `"product": "velstra-sentinel"`. When present it must match,
-so a manifest signed for another product by a shared key is refused; manifests
-signed before the field existed are still accepted (and are older releases, so
-the downgrade check covers their replay).
-
-```json
-{"version":"1.1.0","image":"velstra-sentinel.raw","sha256":"…","product":"velstra-sentinel"}
-```
-
-> **`--allow-unsigned` is the trusted-operator escape hatch.** A re-seal from the
-> booted medium or a trusted block device with no proof at hand; pass
-> `--allow-unsigned` to write it exactly as given. It is loud and logged — never
-> silent — so it can't be mistaken for a verified update.
-
-## Signed updates (`update check` / `update install`)
-
-The **channel** updater refuses any image whose release manifest isn't signed by
-a key you have pinned, and any release older than the running one (see
-Downgrades above). Pin the channel in config (roadmap C13):
-
-```shell
-configure
-set update url https://updates.velstra.example/sentinel
-set update public-key file:/etc/sentinel/release.pem
-commit
-save
-```
-
-- `url` is the channel base — an `https://` (or `file://` for an offline
-  mirror) directory holding the signed `manifest.json` and the images it names.
-- `public-key` is the pinned Ed25519 release-signing key, PEM. `file:<path>`
-  reads it from disk (so the key can live in the immutable image rather than the
-  config); an inline PEM also works.
-- The fetch is the pinned curl with `--disable` and an **empty environment**:
-  `HTTPS_PROXY`/`ALL_PROXY`, `SSLKEYLOGFILE`, `CURL_CA_BUNDLE`/`SSL_CERT_FILE`
-  and `~/.curlrc` are ignored. An `https://` channel is checked against the
-  system trust store; proxies are not supported.
-- The whole `[update]` section is local-only: a fleet controller cannot change
-  it (see the fleet documentation).
-
-Both fields are required — `commit` rejects a half-specified channel. With a
-channel pinned:
-
-```shell
-sentinel update check            # fetch + verify the manifest, report the version
-sentinel update install --commit # re-verify, then write the inactive A/B slot
-```
-
-`check` fetches the manifest, verifies its detached signature against the pinned
-`public-key`, and only then trusts the version + image digest it names.
-`install` re-verifies the signature **and** the image's SHA-256 before writing
-anything — the authenticity gate in front of the verified-boot slot switch
-below. An unsigned or wrong-key manifest is refused; no slot is touched.
+<a id="what-an-expired-subscription-does--and-does-not--do"></a><a id="show-subscription"></a>
 
 ## Named channels and subscriptions
 
-A box can know several channels at once — a community channel anyone can use,
-and a subscription channel carrying **tested, delayed-stability images**. That
-is the whole commercial model: the code is the same and open, what a
-subscription buys is verification work, never withheld features.
-
-```shell
-configure
-set update channel community url https://updates.velstra.example/community
-set update channel community public-key file:/etc/sentinel/community.pem
-set update channel enterprise url https://updates.velstra.example/enterprise
-set update channel enterprise public-key file:/etc/sentinel/enterprise.pem
-set update channel enterprise subscription-key <key>
-set update channel enterprise        # ← selects the active channel
-commit
-save
-```
-
-- **Each channel has its own `public-key`, on purpose.** A channel is only as
-  trustworthy as the key that vouches for it: the enterprise channel's releases
-  are signed by a different key than the community channel's, so trusting one
-  never means trusting the other. `url` and `public-key` are required per
-  channel; `https://` only (or `file://` for an air-gapped mirror).
-- **`set update channel <name>`** with nothing after the name selects which
-  channel `update check`/`install` use. A selection that names no defined
-  channel is refused at `commit`, not discovered during an incident.
-- The single-channel form above (`set update url …`) keeps working unchanged —
-  it is the unnamed *default* channel, and a box configured before named
-  channels existed loses nothing on upgrade.
-- **`subscription-key` is a secret.** It is sent to the channel server as a
-  bearer token, redacted by the read API, and masked everywhere it is shown —
-  `show subscription` prints only its last four characters. (One deliberate
-  exception: `show configuration` prints it in full, like every other secret in
-  the config document, because that document is what gets replayed onto a
-  second appliance and a masked value replayed is a corrupted config.)
-
-### What an expired subscription does — and does not — do
-
-**An expired or rejected subscription never disables the appliance.** The box
-keeps routing, keeps filtering, keeps its configuration, and keeps serving its
-console. The one and only consequence is that *new images from that channel*
-are unavailable: the channel server answers 401/403, and `update check` reports
-it plainly —
-
-```
-channel "enterprise": this subscription is not valid for this channel (HTTP 401).
-The appliance keeps running unchanged — only new images from this channel are
-unavailable. Renew the subscription with your vendor, or correct the key …
-```
-
-There is no phone-home timer, no nag screen, no degraded data plane. A firewall
-whose vendor relationship lapses is still a firewall.
-
-### `show subscription`
-
-The state, as facts this box holds:
-
-```
-channels:
-  community
-  enterprise (active)
-active channel: enterprise
-url:            https://updates.velstra.example/enterprise
-subscription:   key configured (ends …a1b2)
-last check:     2026-08-24 10:12:03 UTC — release 0.4.0 available
-expiry:         not reported by the channel server — nothing is assumed
-```
-
-`last check` is whatever the most recent `update check`/`install` actually
-said — never a fresh fetch (a `show` must not be the thing that talks to the
-internet). Expiry is shown **only if the server reports one**; today the
-channel protocol carries no expiry, so the honest answer is "not reported",
-not a locally computed countdown.
-
-## The rollback guarantee
-
-The new slot boots with `+3` tries. A clean boot (no failed units) is **blessed**
-permanent. If it fails three times, systemd-boot marks it bad and boots the
-**previous** slot — which is untouched, because the update only ever wrote the
-inactive one. So a bad update self-heals without intervention.
-
-To roll back deliberately, point `default` back at the other slot from the
-systemd-boot menu (or re-run an update with the known-good image).
+A configured channel specifies a base URL and trusted public key. Licensed channels may additionally require a subscription credential. Use `sentinel show subscription` to inspect the selected channel. Do not share a full configuration dump, which can include secrets. An expired entitlement prevents new downloads from the licensed channel; the installed appliance continues forwarding.
 
 ## Reboot to activate
 
-Unlike `commit` (which is live and never reboots), an OS image update takes effect
-on the **next reboot** into the new slot. Schedule the reboot when convenient; the
-running slot keeps serving until then.
+Staging prepares the inactive slot and its next boot entry. It does not reboot the appliance. Check boot selection, management reachability and peer readiness first; update one HA member at a time. After reboot, run `sentinel show version` and `bootctl status` and test traffic on your normal management and data paths.
 
-## Verifying
+<a id="the-rollback-guarantee"></a><a id="verifying"></a>
 
-```shell
-nix build .#checks.x86_64-linux.update -L
+## Verify fallback separately
+
+```sh
+nix build .#checks.x86_64-linux.bootfallback -L
 ```
 
-The test verifies the slot is written, re-typed, and the bootloader switched. The
-cross-reboot switch itself isn't auto-tested (OVMF `machine.reboot()` hangs in the
-harness); the bless/rollback mechanism is proven in the `verified-boot` test.
-
-## Bounded metadata and atomic channel promotion
-
-The channel reader prefers `release.json`: one JSON object with `schema = 1`,
-`manifest` (base64 of the exact signed bytes) and `signature` (base64 of the
-64-byte Ed25519 signature). The envelope is at most 128 KiB and its decoded
-manifest at most 64 KiB. The pinned key authenticates the exact manifest bytes
-before any release fields are trusted; the envelope is not a new trust root.
-
-Only an absent endpoint (HTTP 404, or a missing local file for a file channel)
-allows compatibility fallback to `manifest.json` and `manifest.json.sig`.
-Malformed, oversized, unauthorized, timed-out or incorrectly signed envelopes
-never fall back. Publishers must keep the old root manifest/signature pair
-frozen while upgrading legacy readers, upload immutable versioned resources
-first, and promote only the single envelope object last. Both public and native
-Enterprise readers must be upgraded before production channel migration.
-
-Connections are limited to ten seconds. Metadata has a 60-second overall and
-15-second no-progress budget. Image downloads have a separate six-hour overall,
-60-second no-progress and 64-GiB transfer ceiling (native Enterprise resources
-retain their stricter individual limits). Limits are enforced during transfer,
-including chunked responses, with appliance-pinned curl 8.4 or newer. Incomplete
-downloads are removed and failures leave the active slot unchanged. On Linux,
-the curl child is killed automatically if its update owner exits.
-
-Channel RAW images are staged sparsely in an anonymous 0600 file on the mounted
-ext4 state filesystem (`/var/lib/sentinel`), not in RAM-backed `/tmp` and not
-in an operator-selected `TMPDIR`. Every zero byte still contributes to the
-signed image digest and exact logical length; only nonzero blocks allocate
-payload space. The open descriptor survives through whole-image verification
-and partition copying, and is automatically reclaimed when the updater exits.
-There is no persistent image cache to clear after a crash.
-
-The updater checks a reserve of the greater of 512 MiB or 5% of the state filesystem,
-with additional metadata headroom, and refuses an extent that exceeds its
-staging budget. Concurrent unrelated filesystem writers can still consume
-space; such allocation or sync failures safely refuse the update. A genuine
-signed dense image can require more staging space than a sparse release.
-Missing/unmounted/volatile/read-only state and insufficient capacity are
-explicit errors; the updater never deletes configuration, archives, logs or a
-fallback slot to make room. The recommended 32 GiB appliance disk provides room
-for state and releases; a smaller disk that can boot is not a guarantee that
-every future release will fit. The bounded ESP copy is verified before any
-inactive-slot payload is overwritten.
-
-Only one image update can run at a time, including signed local and deliberately
-unsigned local writes. A second writer receives `another update is in progress`.
-This update lock does not block ordinary configuration commits or metadata
-checks while a download is in progress.
-
-The persistent subscription identity is published only after its private contents
-are complete and synced. Concurrent first use converges on one identity;
-corrupt or insecure existing files are refused rather than silently replaced
-with a new subscription seat. No deployed node is changed by a source update:
-fresh image and OTA/rollback qualification are required before rollout.
+On a KVM build host, this runs the failed-boot fixture. [Boot slots and fallback](../architecture/ab-updates.md) explains the difference between a boot failure and an application regression.

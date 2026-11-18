@@ -1,57 +1,31 @@
-# Verified boot (dm-verity)
+# Verify the operating-system store
 
-The Nix store ships on a **dm-verity-protected** partition whose root hash is
-baked into the Unified Kernel Image (UKI). The kernel mounts `/nix/store` only if
-the partition's contents hash to that exact root hash — any tampering with the
-store is detected at block level and refuses to mount.
+<a id="verified-boot-dm-verity"></a>
 
-## How it's assembled
+The kernel reads the immutable Nix store through dm-verity. A root hash embedded in the unified kernel image anchors the verification tree.
 
-`nix/image.nix` imports NixOS' `image/repart.nix` and enables the
-`verityStore` module. The build is two-stage:
+## Inspect a booted image
 
-1. build the erofs store + its dm-verity hash tree, compute the **root hash**;
-2. bake that root hash into the UKI, and inject the UKI into the ESP.
+```sh
+sentinel show version
+findmnt /nix/store
+lsblk -f
+```
 
-The shipped artifact is `system.build.finalImage` (the two-stage verity build) —
-**not** `system.build.image`, which is the unsealed single-pass variant with no
-bootloader. (Newer nixpkgs renames `finalImage` → `image`; on the pinned 25.05 it
-is `finalImage`.) The Secure-Boot wrapper `finalImageSigned` is built on top of
-it — see [Secure Boot](secure-boot.md).
+Check the boot identity, the read-only store and the separately mounted data partition. A development VM has a different boot path.
 
-## The filesystem layout at runtime
+<a id="how-its-assembled"></a><a id="the-filesystem-layout-at-runtime"></a>
 
-- **`/`** is a volatile `tmpfs` (`mode=0755`) — nothing on the root path
-  survives a reboot.
-- **`/nix/store`** is a bind from `/usr/nix/store` (the verity-protected `/usr`).
-  The pinned verityStore module does **not** set this bind itself, so the image
-  config does — without it the initrd's `find-nixos-closure` can't see the store
-  and drops to emergency mode.
-- **`/var/lib/sentinel`** is the ext4 `data` partition (addressed by
-  `LABEL=data`), the one writable, persistent partition.
+## Know what is protected
 
-## Gotchas that cost real debugging
+dm-verity checks the contents of the system store as they are read. Configuration, credentials and certificates live on the writable data filesystem. Protect data at rest with [installer encryption](../operations/install.md#disk-encryption-luks2). [Secure Boot](secure-boot.md) verifies the code and kernel image upstream of the root hash.
 
-These are pinned-nixpkgs-25.05 specifics worth keeping in mind if you touch
-`nix/image.nix`:
+<a id="gotchas-that-cost-real-debugging"></a><a id="verifying-it-boots"></a>
 
-- **Minimize'd partitions collapse to 4K.** The verity store + hash partitions
-  are `Minimize`-marked; with auto image-sizing they shrink to 4K. Set explicit
-  `repartConfig.SizeMinBytes` floors (store ≈ 2560M, store-verity ≈ 192M).
-- **`image.repart.imageSize` doesn't exist** in 25.05 (added later) — size via
-  `SizeMinBytes` on partitions instead.
-- **Sector size 512.** OVMF/UEFI needs 512-byte sectors, not repart's default
-  4096 — set `image.repart.sectorSize = 512`.
-- **`/usr/bin/env` activation step** is skipped (`system.activationScripts
-  .usrbinenv = ""`) because `/usr` is read-only — the nixpkgs verity-appliance
-  pattern.
+## Validate the image
 
-## Verifying it boots
-
-The `verified-boot` test boots the **real** image in QEMU/OVMF and asserts it
-reaches multi-user with the verity store mounted (and that a clean boot is
-"blessed" — see [A/B updates](ab-updates.md)):
-
-```shell
+```sh
 nix build .#checks.x86_64-linux.verified-boot -L
 ```
+
+The fixture boots the image under QEMU/OVMF and checks the verified system reaches multi-user operation.
