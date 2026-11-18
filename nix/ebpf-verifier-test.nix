@@ -3,7 +3,7 @@ let
   packages = self.packages.x86_64-linux;
   programs = [
     "velstra_ha_exit" "velstra_ha_guard" "velstra" "velstra_main"
-    "velstra_guest_delivery" "velstra_forward" "velstra_v6" "velstra_local"
+    "velstra_guest_delivery" "velstra_forward" "velstra_v4_state" "velstra_v6" "velstra_local"
     "velstra_v6_state" "velstra_egress" "velstra_egress_v4" "velstra_egress_v6"
     "velstra_egress_v6_state" "velstra_masquerade"
     "velstra_bum" "velstra_icmp_nat" "velstra_egress_icmp" "velstra_deferred_snat"

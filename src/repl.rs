@@ -977,6 +977,24 @@ pub(crate) fn service_readiness(unit: &str) -> Result<()> {
 
 fn service_ready_root(service: ReadinessService) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    if matches!(service, ReadinessService::Dataplane) {
+        let compiled = read_previous_file(Path::new(DEFAULT_VELSTRA_OUT))?
+            .context("compiled dataplane configuration is missing")?;
+        if !system::compiled_dataplane_enabled(&compiled)? {
+            // Factory intent deliberately selects no NIC. Success means that
+            // the service is actually inactive, not failed/starting or still
+            // running an obsolete attachment. Never waive readiness for a
+            // configured interface, even if it is missing or has no carrier.
+            let mut command = std::process::Command::new(system::bin("systemctl"));
+            command.args(["show", "--property=ActiveState", "--value", service.unit()]);
+            let state = readiness_process(&mut command, deadline)?;
+            anyhow::ensure!(
+                inactive_dataplane_ready(&state),
+                "unconfigured dataplane service is not inactive"
+            );
+            return Ok(());
+        }
+    }
     let mut command = std::process::Command::new(system::bin("systemctl"));
     command.args(["is-active", "--quiet", service.unit()]);
     readiness_process(&mut command, deadline).context("checking service active state")?;
@@ -997,6 +1015,10 @@ fn service_ready_root(service: ReadinessService) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn inactive_dataplane_ready(state: &[u8]) -> bool {
+    state == b"inactive\n"
 }
 
 /// Private runner used only for the two fixed readiness commands above. The
@@ -6374,6 +6396,23 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("ROLLBACK INCOMPLETE"), "{message}");
+    }
+
+    #[test]
+    fn unconfigured_dataplane_readiness_is_not_a_waiver_for_failed_services() {
+        assert!(inactive_dataplane_ready(b"inactive\n"));
+        for state in [
+            b"active\n".as_slice(),
+            b"failed\n",
+            b"activating\n",
+            b"deactivating\n",
+            b"",
+            b"inactive",
+            b"unknown\n",
+            b"inactive\nfailed\n",
+        ] {
+            assert!(!inactive_dataplane_ready(state));
+        }
     }
 
     #[test]

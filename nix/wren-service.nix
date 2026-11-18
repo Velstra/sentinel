@@ -78,6 +78,12 @@ in
         RuntimeDirectory = "wren";
         ReadWritePaths = [ "/run/velstra/ha" ];
         ExecStart = "${cfg.package}/bin/wren --config /run/sentinel/wren.toml --backend kernel --socket /run/wren/wren.sock";
+        # A successful reload means kernel reconciliation completed, not merely
+        # that a signal was delivered. Keep validation and execution on one pin.
+        ExecReload = [
+          "${cfg.package}/bin/wren --config /run/sentinel/wren.toml check"
+          "${cfg.package}/bin/wren --socket /run/wren/wren.sock reload"
+        ];
         Restart = "on-failure";
         RestartSec = 2;
         # Programming the kernel FIB (netlink) needs CAP_NET_ADMIN; the raw

@@ -21,7 +21,7 @@
     # Reviewed public integrations; update these URLs and the lock together.
     # The former appliance backports are now included upstream.
     fabric = {
-      url = "github:Velstra/fabric/e0a802c43477fb43ef329717112867878faf12bf";
+      url = "github:Velstra/fabric/9168f8512f1e72bbef84de56683025c3076ccd0f";
       flake = false;
     };
     # Test-only deployed allocator. Never advance this with the production pin:
@@ -33,7 +33,7 @@
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
     wren = {
-      url = "github:Velstra/wren/53be10eca77aac36a88f9a53d6c08051d3050acd";
+      url = "github:Velstra/wren/e61062454b692e70622199c284e88278b5025f6d";
       flake = false;
     };
   };
@@ -71,6 +71,47 @@
       pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
         (import ./nix/compact-tests.nix);
       lib = nixpkgs.lib;
+
+      # Verify existing imported hashes without enabling legacy hashes in PAM.
+      # Newly generated passwords still use cost-5 yescrypt.
+      passwordCrypt = (pkgs.libxcrypt.override {
+        enableHashes = "strong,md5crypt,sha256crypt";
+      }).overrideAttrs (old: {
+        passthru = old.passthru // {
+          enabledCryptSchemeIds = old.passthru.enabledCryptSchemeIds ++ [ "1" "5" ];
+        };
+      });
+      passwordHasher = (pkgs.mkpasswd.override { libxcrypt = passwordCrypt; }).overrideAttrs (old: {
+        preConfigure = (old.preConfigure or "") + ''
+          # Native Perl also supplies libcrypt. Select this helper's library
+          # for both pkg-config roles before Makefile probes run.
+          export PKG_CONFIG_PATH="${passwordCrypt}/lib/pkgconfig"
+          export PKG_CONFIG_PATH_FOR_BUILD="$PKG_CONFIG_PATH"
+          test "$(pkg-config --variable=libdir libcrypt)" = "${passwordCrypt}/lib"
+        '';
+        doInstallCheck = true;
+        installCheckPhase = ''
+          runHook preInstallCheck
+          while IFS= read -r expected; do
+            setting="''${expected%\$*}$"
+            actual=$(printf '%s\n' 'fixture-known-password' | "$out/bin/mkpasswd" --stdin --salt="$setting")
+            test "$actual" = "$expected"
+            wrong=$(printf '%s\n' 'wrong-password' | "$out/bin/mkpasswd" --stdin --salt="$setting")
+            test "$wrong" != "$expected"
+          done <<'HASH_VECTORS'
+          $1$salt1234$Wf.nqwASZ/FlosX3JiWwn1
+          $5$salt123456789012$46s4249.s4ZRpbNtgdkvjvoVha8c02t7F7e0Y7EhpK3
+          $6$salt123456789012$mrQIS8eBOuKvq23qeHhMYQGqzyaljxGgVQih9JxYJi7aMYM4TCNknwxRRFgrzIi20LVUXbUyY.j.yJDZCzyaC/
+          $6$rounds=10000$roundssalt123456$5cSUgK06b0pS3KiK585T5lrZX0iAOud2KghDBdNjDP9p9BAdsFs9lACaunaoDbiJ7Q1IPKN2x3EiPHEqYdHdO.
+          HASH_VECTORS
+          generated=$(printf '%s\n' 'fixture-new-password' | "$out/bin/mkpasswd" --stdin --method=yescrypt --rounds=5)
+          case "$generated" in
+            '$y$j9T$'*) ;;
+            *) echo 'password helper did not generate cost-5 yescrypt' >&2; exit 1 ;;
+          esac
+          runHook postInstallCheck
+        '';
+      });
 
       # Compile and test React in the sandbox. Cargo embeds these exact assets;
       # neither the appliance nor an isolated browser needs Node or a CDN.
@@ -135,11 +176,12 @@
         '';
         nativeBuildInputs = [ pkgs.protobuf ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
-        # The password tests hash with the same `openssl passwd` the appliance
-        # uses, on purpose — a hash this box cannot recompute is a login nobody
-        # can fix. The build sandbox has no PATH to find it on, so it is named
-        # here as well as in the wrapper below; without it `nix build` fails in
-        # the check phase on a dependency the binary itself resolves fine.
+        # Tests use the same immutable password implementation as the wrapper.
+        SENTINEL_TEST_MKPASSWD_BIN = "${passwordHasher}/bin/mkpasswd";
+        SENTINEL_TEST_CRYPT_LIB = "${passwordCrypt}/lib/libcrypt.so.2";
+        # The privileged observer bypasses the environment-changing wrapper.
+        SENTINEL_OBSERVE_HELPER_BIN = "${placeholder "out"}/bin/sentinel";
+        SENTINEL_OBSERVE_WREN_BIN = "${wrenPkg}/bin/wren";
         SENTINEL_OPENSSL_BIN = "${pkgs.openssl.bin}/bin/openssl";
         # The peer-observation integration test exercises real pinned HTTPS.
         SENTINEL_CURL_BIN = "${pkgs.curl.bin}/bin/curl";
@@ -186,6 +228,7 @@
             --set SENTINEL_PAIR_SELF_BIN  $out/bin/sentinel \
             --set SENTINEL_TIMEDATECTL_BIN ${pkgs.systemd}/bin/timedatectl \
             --set SENTINEL_SYSCTL_BIN     ${pkgs.procps}/bin/sysctl \
+            --set SENTINEL_PKILL_BIN      ${pkgs.procps}/bin/pkill \
             --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
             --set SENTINEL_LDAPWHOAMI_BIN ${pkgs.openldap}/bin/ldapwhoami \
             --set SENTINEL_OCCTL_BIN      ${pkgs.ocserv}/bin/occtl \
@@ -195,6 +238,7 @@
             --set SENTINEL_TIMEOUT_BIN    ${pkgs.coreutils}/bin/timeout \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
+            --set SENTINEL_MKPASSWD_BIN   ${passwordHasher}/bin/mkpasswd \
             --set SENTINEL_LEGO_BIN       ${pkgs.lego}/bin/lego \
             `# --set-default, not --set: this names DATA rather than a binary,
              # and a newer database (or a test) has a legitimate reason to point
@@ -217,6 +261,7 @@
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
             --set SENTINEL_USERADD_BIN    ${pkgs.shadow}/bin/useradd \
             --set SENTINEL_USERMOD_BIN    ${pkgs.shadow}/bin/usermod \
+            --set SENTINEL_GPASSWD_BIN    ${pkgs.shadow}/bin/gpasswd \
             --set SENTINEL_ID_BIN         ${pkgs.coreutils}/bin/id \
             --set SENTINEL_CHMOD_BIN      ${pkgs.coreutils}/bin/chmod \
             --set SENTINEL_RM_BIN         ${pkgs.coreutils}/bin/rm \
@@ -248,9 +293,10 @@
       # binary is named `wren` and serves both as the daemon and the `wren
       # show …` client against its control socket.
       wrenPkg = pkgs.rustPlatform.buildRustPackage {
-        pname = "wren";
-        version = "0.1.0";
+        pname = "velstra-wren";
+        version = (builtins.fromTOML (builtins.readFile "${wren}/Cargo.toml")).workspace.package.version;
         src = wren;
+        meta.homepage = "https://github.com/Velstra/wren";
         cargoLock.lockFile = "${wren}/Cargo.lock";
         cargoBuildFlags = [
           "-p"
@@ -331,14 +377,19 @@
       # The eBPF object, compiled as a FIXED-OUTPUT derivation. `-Z build-std`
       # needs std's own build-deps, which a sealed offline sandbox can't fetch —
       # so this derivation is allowed network (that's what a FOD grants) and is
-      # pinned by its output hash, keeping the result reproducible. First build
-      # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-ZaTzCatwITEGJNS4INPaXyogZSVFNk/dBzHruAHtFgg=";
+      # pinned by its measured output hash. The source stamp below also prevents
+      # reusing a cached object after advancing the userspace source pin.
+      ebpfHash = "sha256-otLvkMiV31a7agSVNSIvAYa+2qD71WrpGZkRiar1PEc=";
+      ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
+      ebpfSourceStamp = ''
+        printf '%s' '${ebpfSourceIdentity}' > source-id
+        llvm-objcopy --add-section .velstra.source-id=source-id target/bpfel-unknown-none/release/velstra
+      '';
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
         src = fabric;
-        nativeBuildInputs = [ nightly pkgs.bpf-linker pkgs.python3 pkgs.llvm ];
+        nativeBuildInputs = [ nightly pkgs.bpf-linker pkgs.python3 pkgs.llvm pkgs.git pkgs.cacert ];
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
@@ -350,8 +401,8 @@
         unsafeDiscardReferences.out = true;
 
         buildPhase = ''
-          export HOME=$TMPDIR
           export CARGO_HOME=$TMPDIR/cargo
+          export CARGO_NET_GIT_FETCH_WITH_CLI=true
           # Same flags aya-build uses for the BPF target, plus the explicit
           # bpf-linker selection.
           export RUSTFLAGS='--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clinker=bpf-linker -Clink-arg=--btf'
@@ -359,12 +410,13 @@
           # *other* workspace members (aya-build -> cargo-platform) declare a
           # rustc newer than this pinned nightly. They aren't compiled when
           # building velstra-ebpf, so ignore the version gate.
-          cargo build -p velstra-ebpf --bins --release \
+          cargo build --locked -p velstra-ebpf --bins --release \
             --target bpfel-unknown-none -Z build-std=core \
             --ignore-rust-version
           llvm-objcopy --dump-section .BTF=btf.bin target/bpfel-unknown-none/release/velstra
           python3 ${./scripts/sanitize-btf.py} btf.bin
           llvm-objcopy --update-section .BTF=btf.bin target/bpfel-unknown-none/release/velstra
+          ${ebpfSourceStamp}
         '';
         installPhase = ''
           cp target/bpfel-unknown-none/release/velstra "$out"
@@ -387,11 +439,15 @@
           pkgs.bpf-linker
           pkgs.removeReferencesTo
           pkgs.makeWrapper
+          pkgs.llvm
         ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         # Replace the agent's build.rs with the shim that copies the pre-built
         # eBPF object — so this build is fully offline (no build-std here).
         postPatch = ''
+          # An old fixed-output cache entry must not be paired with new source.
+          llvm-objcopy --dump-section .velstra.source-id=ebpf-source-id ${velstra-ebpf} ebpf-inspected.o
+          test "$(cat ebpf-source-id)" = '${ebpfSourceIdentity}'
           cp ${./nix/velstra-build-shim.rs} velstra-app/build.rs
         '';
         # The nightly toolchain's precompiled std embeds its own source paths in
@@ -416,13 +472,15 @@
         doCheck = false;
       };
 
-      # The exact public pre-backport dataplane used by deployed QA7 images.
+      # Public pre-backport source fixture, not the byte-identical QA7 image.
       # Test-only: exercise real mixed-allocator HA, not a synthetic map writer
       # or a runtime hotpatch. Its independently measured old BPF hash remains
       # fixed while the production source pin advances independently.
-      legacy-napt-ebpf = velstra-ebpf.overrideAttrs (_: {
+      legacy-napt-ebpf = velstra-ebpf.overrideAttrs (old: {
         src = fabric-legacy-napt;
-        outputHash = "sha256-dpvGqzkkpxS8BlGtEHsgstx/zmWDX9HRk/MFLe33dFE=";
+        # Immutable unpatched legacy fixture; not the later DSCP-backported ELF.
+        outputHash = "sha256-foJKSk0w0HxCthdR0nBTL1WPxv2X24Vg3V3hRAGb61k=";
+        buildPhase = lib.replaceStrings [ ebpfSourceStamp ] [ "" ] old.buildPhase;
       });
       legacy-napt-velstra = velstra.overrideAttrs (_: {
         src = fabric-legacy-napt;
@@ -431,6 +489,11 @@
           outputHashes = ayaOutputHashes;
         };
         VELSTRA_EBPF_OBJ = legacy-napt-ebpf;
+        # This historical fixture predates source stamps; production never uses
+        # this override or its independently pinned legacy object.
+        postPatch = ''
+          cp ${./nix/velstra-build-shim.rs} velstra-app/build.rs
+        '';
       });
 
       # Run the state-replication acceptance test with real kernel LRU maps in
@@ -478,6 +541,8 @@
         default = sentinel;
         inherit sentinel velstra velstra-ebpf;
         sentinel-ui = sentinelFrontend;
+        password-hasher = passwordHasher;
+        password-crypt = passwordCrypt;
         wren = wrenPkg;
         # The flashable verified-boot disk image (dm-verity store + UKI). Note:
         # `finalImage` is the two-stage verity build with the roothash-bearing
@@ -518,9 +583,8 @@
       nixosModules.sentinel =
         { pkgs, lib, ... }:
         {
-          # Retain the appliance's verified LTS kernel ABI across the base
-          # upgrade. Linux 6.18 currently exceeds the IPv6 egress verifier
-          # budget with both the old and new object; it is not certified.
+          # Retain the appliance's LTS kernel ABI across base upgrades. The
+          # separate three-kernel verifier matrix does not change the image ABI.
           boot.kernelPackages = lib.mkDefault pkgs.linuxPackages_6_12;
           fileSystems."/sys/fs/bpf" = { device = "bpffs"; fsType = "bpf"; options = [ "nosuid" "nodev" "noexec" ]; };
           imports = [
@@ -528,6 +592,7 @@
             ./nix/velstra-service.nix
             ./nix/wren-service.nix
             ./nix/time-sync.nix
+            (import ./nix/observe-capability.nix { inherit sentinel; })
           ];
           # `sentinel` is the CLI; `ppp` provides `pppd` + its bundled `pppoe.so`
           # plugin for `type = pppoe` uplinks (roadmap C5). The plugin dir is
@@ -1470,6 +1535,14 @@
           };
 
           services.strongswan-swanctl.enable = true;
+          # Keep the immutable daemon available, but expose no factory IKE
+          # sockets. ipsec::apply writes the private runtime config before
+          # starting it, both on commit and during the late boot reconciliation.
+          systemd.services.strongswan-swanctl = {
+            wantedBy = lib.mkForce [ ];
+            serviceConfig.ExecCondition =
+              "${pkgs.coreutils}/bin/test -s /run/sentinel/swanctl/swanctl.conf";
+          };
           # The stock daemon's ExecStartPost reloads /etc/swanctl/swanctl.conf.
           # Include the product's PRIVATE runtime document by reference so a
           # normal charon restart restores the applied tunnels, not an empty
@@ -1641,6 +1714,32 @@
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
       checks.${system} = {
+        login-lifecycle = import ./nix/login-lifecycle-test.nix { inherit pkgs self; };
+        auth-bounds = import ./nix/auth-bounds-test.nix { inherit pkgs self; };
+        observe-readonly = import ./nix/observe-readonly-test.nix { inherit pkgs self; };
+        wren-static-reload = import ./nix/sentinel-wren-adapter-test.nix { inherit pkgs self; };
+        # Known failures remain hard release gates, never expected-pass smoke tests.
+        dataplane-conformance = import ./nix/dataplane-conformance.nix { inherit pkgs self; };
+        tcp-reset-validation = import ./nix/tcp-reset-validation-test.nix { inherit pkgs self; };
+        nat-capacity-pressure = import ./nix/nat-capacity-pressure-test.nix {
+          inherit pkgs self;
+          counts = [ 1 64 12000 15000 16000 17000 20000 ];
+        };
+        ebpf-verifier-6-6 = import ./nix/ebpf-verifier-test.nix {
+          inherit pkgs self;
+          kernelPackages = pkgs.linuxPackages_6_6;
+          label = "6-6";
+        };
+        ebpf-verifier-6-12 = import ./nix/ebpf-verifier-test.nix {
+          inherit pkgs self;
+          kernelPackages = pkgs.linuxPackages_6_12;
+          label = "6-12";
+        };
+        ebpf-verifier-6-18 = import ./nix/ebpf-verifier-test.nix {
+          inherit pkgs self;
+          kernelPackages = pkgs.linuxPackages_6_18;
+          label = "6-18";
+        };
         ota-stage = import ./nix/ota-stage-test.nix { inherit pkgs self; };
         ota-publication-failure = import ./nix/ota-stage-test.nix {
           inherit pkgs self;
@@ -2054,7 +2153,10 @@
           # The system's real NIC (eth0) is discovered and shows up in the config,
           # ready to assign — VyOS-style. (The minimal factory config has no
           # interfaces of its own.)
-          machine.succeed("sentinel configure --no-apply <<< 'show' | grep -q eth0")
+          # Offline editing must never import the editing host's NICs. Inspect
+          # live discovery separately, without an early-closing grep/pipefail.
+          assert "eth0" in machine.succeed("sentinel configure <<< 'show'")
+          assert "eth0" not in machine.succeed("sentinel configure --no-apply <<< 'show'")
 
           # Edit + commit AS THE ADMIN USER (not root) — exercises the real
           # privilege path: admin writes the config (wheel-group), sentinel
@@ -3226,7 +3328,7 @@
           for m in (left, right):
               m.wait_for_unit("multi-user.target")
               m.wait_for_unit("sentinel-boot.service")
-              m.wait_for_unit("strongswan-swanctl.service")
+              m.fail("systemctl is-active --quiet strongswan-swanctl.service")
           left.wait_until_succeeds("ping -c1 -W2 10.0.0.2", timeout=30)
 
           psk = "velstra-route-based-secret"
@@ -3708,7 +3810,7 @@
           for m in (left, right):
               m.wait_for_unit("multi-user.target")
               m.wait_for_unit("sentinel-boot.service")
-              m.wait_for_unit("strongswan-swanctl.service")
+              m.fail("systemctl is-active --quiet strongswan-swanctl.service")
               m.wait_until_succeeds("ip addr show proto0 | grep -q 10.100", timeout=30)
 
           # The WAN underlay is up on both ends (set at the NixOS level).
@@ -3737,6 +3839,7 @@
           # Sentinel rendered swanctl.conf (no PSK in it) + a 0600 secrets file.
           for m in (left, right):
               conf = m.succeed("cat /run/sentinel/swanctl/swanctl.conf")
+              m.wait_for_unit("strongswan-swanctl.service")
               assert "conn-site {" in conf, conf
               assert psk not in conf, "psk leaked into swanctl.conf"
               m.succeed("grep -q 'version = 2' /run/sentinel/swanctl/swanctl.conf")
@@ -3808,6 +3911,10 @@
               "commit save exit | sentinel configure\""
           )
           left.wait_until_fails("ip route show 10.100.2.0/24 | grep -q via", timeout=30)
+          left.wait_until_fails("systemctl is-active --quiet strongswan-swanctl.service", timeout=30)
+          listeners = left.succeed("ss -H -lun")
+          assert not any(line.split()[4].rsplit(":", 1)[-1] in {"500", "4500"}
+                         for line in listeners.splitlines()), listeners
         '';
       };
 
@@ -8022,16 +8129,15 @@
             assert "backend 10.2.0.2:80" in shown, f"the pool is missing: {shown}"
             # A second service on the same (zone, proto, port) is refused rather
             # than silently overwriting the first in the datapath's map.
-            # (`|| true`: the REPL reports the rejection and carries on, so the
-            # message — not the exit status — is what this asserts on.)
-            clash = fw.succeed(
+            # Both the exit status and specific diagnostic must prove refusal.
+            clash = fw.fail(
                 "su admin -c \"printf '%s\\n' "
                 "'set load-balancer clash zone wan' "
                 "'set load-balancer clash vip 10.1.0.1' "
                 "'set load-balancer clash proto tcp' "
                 "'set load-balancer clash port 9090' "
                 "commit exit "
-                "| sentinel configure\" 2>&1 || true"
+                "| sentinel configure\" 2>&1"
             )
             assert "already fronts" in clash, f"the duplicate was accepted: {clash}"
             fw.fail("grep -q 'name = \"clash\"' /var/lib/sentinel/appliance.toml")
@@ -8134,11 +8240,9 @@
             dst_rule("10.2.0.99/32")
             client.fail("curl -s --max-time 5 http://10.2.0.2/ | grep -q hello-from-server")
             # A rule naming both ends is refused at commit rather than enforcing one
-            # of them — the data plane ranks a single end per rule. Declared in full
-            # in one session: `commit` above did not `save`, so a fresh session
-            # starts from the saved config and would otherwise build an incomplete
-            # rule and fail on that instead.
-            both = fw.succeed(
+            # of them — the data plane ranks a single end per rule. Declare the
+            # complete new rule so a refusal cannot be due to missing fields.
+            both = fw.fail(
                 "su admin -c \"printf '%s\\n' "
                 "'set firewall rule two-ends from wan' "
                 "'set firewall rule two-ends proto tcp' "
@@ -8147,7 +8251,7 @@
                 "'set firewall rule two-ends source 10.1.0.2/32' "
                 "'set firewall rule two-ends destination 10.2.0.2/32' "
                 "commit exit "
-                "| sentinel configure\" 2>&1 || true"
+                "| sentinel configure\" 2>&1"
             )
             assert "not both" in both, f"a two-ended rule was accepted: {both}"
 
@@ -8193,20 +8297,18 @@
 
             # Lifting the limit restores full throughput, which is what proves the
             # earlier shortfall came from the bucket and not from the network.
-            # Redeclared in full without the limit: `commit` above did not `save`,
-            # so a fresh session starts from the saved config and a bare `delete`
-            # would drop the whole rule rather than just its budget.
+            # Fresh sessions inherit active intent, including unsaved settings.
+            # Omitting the limit from a repeated `set` does not remove it.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
-                "'set firewall rule limited from wan' "
-                "'set firewall rule limited proto tcp' "
-                "'set firewall rule limited port 80' "
-                "'set firewall rule limited action accept' "
-                "'set firewall rule limited destination 10.2.0.2/32' "
+                "'delete firewall rule limited limit' "
+                "'delete firewall rule limited burst' "
                 "commit exit "
                 "| sentinel configure\""
             )
             fw.wait_for_unit("velstra.service")
+            compiled = fw.succeed("cat /run/sentinel/velstra.toml")
+            assert "limit = 2" not in compiled and "burst = 2" not in compiled, compiled
             again = int(client.succeed(
                 "n=0; for i in $(seq 1 10); do "
                 "curl -s --max-time 2 http://10.2.0.2/ >/dev/null 2>&1 && n=$((n+1)); "
@@ -9443,8 +9545,10 @@
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
+                "'set interface eth1 address 10.1.0.1/24' "
+                "'set firewall zone local local true' "
                 "'set firewall rule refuse from wan' "
-                "'set firewall rule refuse to wan' "
+                "'set firewall rule refuse to local' "
                 "'set firewall rule refuse action reject' "
                 "'set firewall rule refuse proto tcp' "
                 "'set firewall rule refuse port 9999' "
@@ -13511,6 +13615,7 @@
             upstream =
               { ... }:
               {
+                environment.systemPackages = [ pkgs.tcpdump ];
                 virtualisation.vlans = [ 1 ];
                 networking = {
                   useDHCP = false;
@@ -13542,6 +13647,7 @@
                 virtualisation.vlans = [ 1 ];
                 virtualisation.memorySize = 2048;
                 services.velstra.interface = lib.mkForce "eth1";
+                environment.systemPackages = [ pkgs.tcpdump ];
               };
             client =
               { ... }:
@@ -13588,6 +13694,8 @@
             initial = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
             assert "pool 0.nixos.pool.ntp.org iburst" in initial, initial
             assert "allow " not in initial, initial
+            for node in (fw, upstream):
+                node.succeed("systemd-run --unit=ntp-evidence tcpdump -U -nn -i eth1 -w /tmp/ntp.pcap udp port 123")
 
             # A late upstream and a dead RTC must recover without restarting
             # chronyd after connectivity becomes available.
@@ -13621,9 +13729,22 @@
             # The fw synchronises to the upstream (its Reference ID becomes the
             # upstream's IP) and opens the NTP server socket for the LAN.
             fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q '10.0.0.1'", timeout=30)
-            fw.wait_until_succeeds(
-                "chronyc -n tracking | grep -q '10.0.0.99'", timeout=120
-            )
+            try:
+                fw.wait_until_succeeds(
+                    "chronyc -n tracking | grep -q '10.0.0.99'", timeout=120
+                )
+            except Exception:
+                for node in (fw, upstream):
+                    for command in (
+                        "chronyc -n tracking", "chronyc -n sources -v", "chronyc -n activity",
+                        "ip -brief address", "ip route", "ss -ulnp",
+                        "journalctl -u chronyd --no-pager -n 80",
+                        "tcpdump -nn -vv -r /tmp/ntp.pcap",
+                    ):
+                        print(node.name, command, node.execute(command))
+                    node.succeed("systemctl stop ntp-evidence.service")
+                    node.copy_from_machine("/tmp/ntp.pcap", "ntp-evidence/" + node.name)
+                raise
             assert fw.succeed("systemctl show chronyd -p MainPID --value").strip() == pid
             assert abs(int(fw.succeed("date +%s")) - int(upstream.succeed("date +%s"))) < 5
 
@@ -13635,14 +13756,15 @@
             fw.wait_until_succeeds("chronyc -n tracking | grep -q '10.0.0.99'", timeout=120)
             fw.wait_until_succeeds("ss -uln | grep -q ':123'", timeout=10)
 
-            # Deliberately NOT asserted here: that `show version` and
-            # `timedatectl` agree. They disagree in this VM — the kernel reports
-            # NTPSynchronized=yes while `adjtimex` still has STA_UNSYNC set — and
-            # the cause is unexplained. Pinning it would pin the VM's oddity
-            # rather than the appliance's behaviour. The verdict's own logic is
-            # unit-tested in `clock.rs`; the synchronised case is checked on
-            # hardware, where a box really does reach a time server.
-
+            # Initial boot can be unsynchronised. After the configured source
+            # disciplines the clock, the CLI must agree with systemd's kernel
+            # status, including when chrony leaves STA_UNSYNC set.
+            fw.wait_until_succeeds(
+                "test $(timedatectl show -p NTPSynchronized --value) = yes", timeout=90
+            )
+            version = fw.succeed("sentinel show version")
+            clock = next(line for line in version.splitlines() if line.startswith("clock:"))
+            assert " — synchronised" in clock, version
 
             # The fw now serves time; (re)start the client's chrony so it bursts
             # against the now-serving fw, then confirm it synchronises through it.

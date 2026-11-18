@@ -150,7 +150,7 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecStart = "${cfg.sentinel}/bin/sentinel apply-console --config /var/lib/sentinel/appliance.toml";
+        ExecStart = "${cfg.sentinel}/bin/sentinel apply-console";
       };
     };
 

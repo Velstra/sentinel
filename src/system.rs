@@ -218,6 +218,12 @@ fn locale_names() -> Vec<String> {
 
 /// Reload the velstra data plane so it picks up a freshly written config.
 pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+    if unit == "velstra.service" && !compiled_dataplane_enabled(next)? {
+        // An unprovisioned appliance has no selected interfaces. Stop an old
+        // attachment too when the last binding is removed; do not restart the
+        // agent onto its fallback NIC or treat a skipped ExecCondition as Ready.
+        return service_stop(unit);
+    }
     if unit == "wren.service" {
         // Wren's SIGHUP handles static routes without disturbing adjacencies.
         // Other reload areas still have documented supervision limitations;
@@ -237,6 +243,30 @@ pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Resu
         "reload"
     };
     reload_agent(unit, command)
+}
+
+/// The compiler always emits an explicit interface array, including `[]` for
+/// an unprovisioned appliance. Missing or malformed bindings are not permission
+/// to turn a configured firewall off. This is a presence check, not a substitute
+/// for full compiler/dataplane validation.
+pub(crate) fn compiled_dataplane_enabled(bytes: &[u8]) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Compiled {
+        interface: Vec<Binding>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Binding {
+        name: String,
+        policy: u32,
+    }
+    let compiled: Compiled = toml::from_str(std::str::from_utf8(bytes)?)
+        .context("reading compiled dataplane interface bindings")?;
+    for binding in &compiled.interface {
+        anyhow::ensure!(!binding.name.is_empty(), "empty compiled interface name");
+        // Deserializing the policy as u32 also rejects negative/noninteger IDs.
+        let _ = binding.policy;
+    }
+    Ok(!compiled.interface.is_empty())
 }
 
 fn static_routes_only_changed(previous: Option<&[u8]>, next: &[u8]) -> bool {
@@ -3037,6 +3067,30 @@ mod tests {
         ));
         assert!(!static_routes_only_changed(None, after));
         assert!(!static_routes_only_changed(Some(b"not TOML"), after));
+    }
+
+    #[test]
+    fn only_explicit_empty_compiled_bindings_disable_the_dataplane() {
+        assert!(!compiled_dataplane_enabled(b"interface = []\n").unwrap());
+        assert!(compiled_dataplane_enabled(b"[[interface]]\nname='missing0'\npolicy=0\n").unwrap());
+        for invalid in [
+            "",
+            "policy=[]",
+            "interface=false",
+            "interface={}",
+            "[[interface]]\nname='eth0'",
+            "[[interface]]\npolicy=1",
+            "[[interface]]\nname=''\npolicy=1",
+            "[[interface]]\nname=3\npolicy=1",
+            "[[interface]]\nname='eth0'\npolicy=-1",
+            "[[interface]]\nname='eth0'\npolicy=true",
+        ] {
+            assert!(
+                compiled_dataplane_enabled(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(compiled_dataplane_enabled(&[255]).is_err());
     }
 
     #[test]
