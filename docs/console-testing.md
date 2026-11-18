@@ -5,7 +5,18 @@ throwaway TOML document, a loopback listener and `--no-apply`: no workstation
 networking, physical firewall or production configuration is changed. Node and
 Chromium are build/test dependencies, never appliance runtime dependencies.
 
-From the repository root, run the complete frontend gate:
+## Run a focused suite
+
+From the repository root:
+
+```sh
+cargo build --locked
+CONSOLE_TEST_FILE=layout.test.mjs tests/console/run.sh target/debug/sentinel
+```
+
+## Run the frontend gate
+
+Select the suites below for the change being verified:
 
 ```sh
 cargo build

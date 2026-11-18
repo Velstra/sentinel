@@ -3917,7 +3917,8 @@ async function applyStagedNow(tail) {{
   // before any write; HTTP 400 preserves the entire batch. Validate has no
   // commit and must also leave the staged list intact.
   const committed = tail.includes("commit");
-  // Attribute a numbered refusal to what was submitted, not a later draft.
+  // Attribute a numbered refusal to the immutable submitted batch, not a
+  // draft the operator changed while the request was in flight.
   const batch = staged.map((entry) => ({{ label: entry.label, cmds: entry.cmds.slice() }}));
   const sent = batch.flatMap((entry) => entry.cmds);
   let r;
@@ -3947,9 +3948,9 @@ async function applyStagedNow(tail) {{
   await refresh();
 }}
 
-// The API numbers physical request lines. Never infer blame from an unnumbered
-// candidate-level error, a permission/transport failure, or an out-of-range
-// line (including a trailing commit/save). This requires no replay request.
+// The API numbers physical request lines. Unnumbered candidate errors,
+// permission/transport failures and trailing commit/save never justify blame.
+// This path must not replay configuration requests to identify a refusal.
 function refusedChange(error, batch) {{
   if (error.status !== 400) return null;
   const match = /^line ([1-9][0-9]*) refused:/.exec(error.message || "");

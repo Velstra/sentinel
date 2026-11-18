@@ -1,16 +1,25 @@
 # Velstra Sentinel
 
-Firewall and routing appliance with an immutable A/B OS, a CLI and an embedded
-web console. Both interfaces manage the same `appliance.toml`.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-on-dark.svg">
+  <img src=".github/brand/logo.svg" alt="Velstra Sentinel" height="72">
+</picture>
 
-Release status: development candidate, not approved for production. The 1.0
-audit still has open dataplane, HA and supply-chain blockers. HA is experimental;
-keep independent management access and a recovery console.
+Sentinel is an open-source firewall and router for x86-64 UEFI machines. Test a policy change with a timed rollback, trace a hypothetical packet against the compiled configuration, and use witnessed HA when a former owner must stop forwarding after a partition.
 
-## Build and install
+**[Read the Sentinel operator guide](https://velstra.github.io/sentinel/)**
 
-Build host: x86_64 Linux with [Nix and flakes](docs/src/building/prerequisites.md).
-Users only need the resulting ISO, not Nix.
+| Try it | What to verify |
+|---|---|
+| [Start a VM](https://velstra.github.io/sentinel/operations/quickstart.html) | Inspect two virtual NICs and log in with your installer-created account. |
+| [Change a remote firewall](https://velstra.github.io/sentinel/operations/configure.html) | Confirm from a second session or allow rollback to the saved baseline. |
+| [Trace a packet](https://velstra.github.io/sentinel/handbook/firewall.html#asking-before-you-send-packet-trace) | Identify the matching rule, translations and configured route. |
+| [Evaluate HA](https://velstra.github.io/sentinel/operations/high-availability.html) | Check witness authority and standby readiness before failover. |
+| [Stage an update](https://velstra.github.io/sentinel/operations/update.html) | Review the selected image and stage it on the inactive slot. |
+
+## Build locally
+
+On x86-64 Linux with Nix flakes:
 
 ```sh
 git clone https://github.com/Velstra/sentinel.git
@@ -18,38 +27,9 @@ cd sentinel
 nix build .#sentinel-iso --out-link result-iso
 ```
 
-Boot `result-iso/iso/velstra-sentinel-installer.iso`, follow the installer,
-then eject the ISO and reboot. Installation erases the selected disks.
-Source builds use development signing keys, not production trust.
+Boot `result-iso/iso/velstra-sentinel-installer.iso` in a UEFI VM with a new blank disk. Source images use development signing keys. For a disposable CLI evaluation use `nix run .#vm`. [Build prerequisites](https://velstra.github.io/sentinel/building/prerequisites.html)
 
-For QEMU or Proxmox, follow the [VM quickstart](docs/src/operations/quickstart.md).
-For a development VM instead of the installed image:
-
-```sh
-nix run .#vm
-```
-
-## Use
-
-On the installed appliance:
-
-```sh
-sentinel show interfaces
-sentinel show version
-sentinel config check /var/lib/sentinel/appliance.toml
-sentinel configure
-```
-
-Use `set`, `commit` and `save` in the configuration session.
-The [CLI guide](docs/src/handbook/cli.md) explains the workflow.
-The [quickstart configuration](examples/quickstart.cli) adds WAN DHCP, LAN,
-NAT and HTTPS management; adapt its interface names before applying it.
-Confirm provisional web changes with **Keep change**, or they roll back.
-
-## Test and develop
-
-Run these on a workstation, not on an installed appliance. Cargo builds need
-Rust; UI tests additionally need Node.js and Chromium.
+## Test and contribute
 
 ```sh
 cargo fmt --all -- --check
@@ -57,26 +37,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-With Nix and writable `/dev/kvm`, run actual appliance VM checks:
+[VM and browser test catalog](https://velstra.github.io/sentinel/reference/tests.html) · [Contribution terms](CONTRIBUTING.md) · [AGPL-3.0-or-later](LICENSE)
 
-```sh
-nix build .#checks.x86_64-linux.quickstart .#checks.x86_64-linux.bootfallback -L
-```
+## Release status
 
-[Browser/UI tests](tests/console/README.md) ·
-[Full test catalog](docs/src/reference/tests.md) ·
-[Dataplane support and oracle tests](docs/src/reference/dataplane-support.md) ·
-[Build outputs](docs/src/reference/flake-outputs.md)
-
-## Documentation
-
-[Install](docs/src/operations/install.md) ·
-[Configuration](docs/src/operations/configure.md) ·
-[Firewall/NAT](docs/src/handbook/firewall.md) ·
-[Routing](docs/src/handbook/routing.md) ·
-[HA](docs/ha-phase3.md) ·
-[A/B updates](docs/src/operations/update.md)
-
-## License
-
-[AGPL-3.0-or-later](LICENSE). See [contribution terms](CONTRIBUTING.md).
+This is a development candidate, not a production release certificate. HA remains experimental. Review the [dataplane support matrix](docs/src/reference/dataplane-support.md) and [test evidence requirements](docs/src/reference/tests.md) before deployment. Development signing keys are not production trust identities.
