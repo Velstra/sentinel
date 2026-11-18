@@ -1,0 +1,308 @@
+name: Community release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version matching Cargo.toml (v1.0.0 or v1.0.0-rc.1)'
+        type: string
+        required: true
+      publish:
+        description: 'Publish after all checks and independent environment approvals'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: community-release
+  cancel-in-progress: false
+
+env:
+  # Explicit per-transfer cap; leave unset to prevent large artifact storage.
+  RELEASE_ARTIFACT_BYTE_BUDGET: ${{ vars.RELEASE_ARTIFACT_BYTE_BUDGET || '0' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+      - name: Require reviewed source, explicit storage allowance and full history
+        id: plan
+        env:
+          REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1 # Start a new run; never reuse old approvals.
+          test "$RELEASE_ARTIFACT_BYTE_BUDGET" -gt 0
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          python3 scripts/check_repository_hygiene.py --history
+          python3 -B -m unittest discover -s tests -p 'test_community_release.py' -v
+          python3 -c 'import os,sys; sys.path.insert(0,"scripts"); from community_release import version; print("version="+version(os.environ["REQUESTED_VERSION"]))' >> "$GITHUB_OUTPUT"
+          echo "matrix=$(python3 scripts/community_release.py checks)" >> "$GITHUB_OUTPUT"
+          python3 scripts/check_release_environment.py community-signing
+          python3 scripts/check_release_environment.py community-attestation
+          python3 scripts/check_release_environment.py community-publish
+
+  regressions:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          enable_kvm: true
+      - name: Execute every exported check, without cache-only certification
+        env:
+          CHECK: ${{ matrix.check }}
+        run: |
+          test -r /dev/kvm && test -w /dev/kvm
+          python3 scripts/community_release.py checks --check "$CHECK" --output "$RUNNER_TEMP/$CHECK.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: check-${{ matrix.check }}
+          path: ${{ runner.temp }}/${{ matrix.check }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+      - name: Build the versioned factory intermediate (not a distributable release)
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          bash scripts/release-tools.sh python3 scripts/community_release.py build --version "$RELEASE_VERSION" --output "$RUNNER_TEMP/factory"
+          python3 scripts/community_release.py budget --input "$RUNNER_TEMP/factory"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: factory-not-for-distribution
+          path: ${{ runner.temp }}/factory
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  sign:
+    # Tags build/test only. Signing/publication is an explicit main-branch dispatch.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: [plan, build, regressions]
+    environment: community-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      VELSTRA_PK_CERT_SHA256: ${{ vars.VELSTRA_PK_CERT_SHA256 }}
+      VELSTRA_KEK_CERT_SHA256: ${{ vars.VELSTRA_KEK_CERT_SHA256 }}
+      VELSTRA_DB_CERT_SHA256: ${{ vars.VELSTRA_DB_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+      - name: Recheck protection and obtain the exact intermediate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ needs.build.outputs.artifact }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          python3 scripts/check_release_environment.py community-signing --approved
+          python3 scripts/release_transfer.py --id "$ARTIFACT" --digest "$DIGEST" --output "$RUNNER_TEMP/factory"
+          bash scripts/release-tools.sh true
+      - name: Load firmware identity only on the dedicated signing runner
+        env:
+          VELSTRA_DB_KEY_PEM: ${{ secrets.VELSTRA_DB_KEY_PEM }}
+          VELSTRA_PK_CERT: ${{ vars.VELSTRA_PK_CERT }}
+          VELSTRA_KEK_CERT: ${{ vars.VELSTRA_KEK_CERT }}
+          VELSTRA_DB_CERT: ${{ vars.VELSTRA_DB_CERT }}
+          VELSTRA_PK_AUTH_BASE64: ${{ vars.VELSTRA_PK_AUTH_BASE64 }}
+          VELSTRA_KEK_AUTH_BASE64: ${{ vars.VELSTRA_KEK_AUTH_BASE64 }}
+          VELSTRA_DB_AUTH_BASE64: ${{ vars.VELSTRA_DB_AUTH_BASE64 }}
+        run: python3 scripts/release_identity.py firmware
+      - name: Replace all demo PE signatures and enrollment material
+        run: |
+          bash scripts/release-tools.sh python3 scripts/community_release.py sign --version "$RELEASE_VERSION" --input "$RUNNER_TEMP/factory" --identity "$RELEASE_IDENTITY" --output "$RUNNER_TEMP/signed"
+          python3 scripts/community_release.py budget --input "$RUNNER_TEMP/signed"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signed-disk
+          path: ${{ runner.temp }}/signed
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Remove this job's private key
+        if: always()
+        run: |
+          python3 -c 'import os,pathlib; p=os.environ.get("VELSTRA_DB_KEY"); pathlib.Path(p).unlink(missing_ok=True) if p else None'
+
+  package:
+    needs: [plan, sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      VELSTRA_PK_CERT_SHA256: ${{ vars.VELSTRA_PK_CERT_SHA256 }}
+      VELSTRA_KEK_CERT_SHA256: ${{ vars.VELSTRA_KEK_CERT_SHA256 }}
+      VELSTRA_DB_CERT_SHA256: ${{ vars.VELSTRA_DB_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          enable_kvm: true
+      - name: Fetch the exact signed disk; no private keys enter this job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ needs.sign.outputs.artifact }}
+          DIGEST: ${{ needs.sign.outputs.digest }}
+        run: python3 scripts/release_transfer.py --id "$ARTIFACT" --digest "$DIGEST" --output "$RUNNER_TEMP/signed"
+      - name: Package and boot the actual signed disk twice
+        run: |
+          test -r /dev/kvm && test -w /dev/kvm
+          bash scripts/release-tools.sh python3 scripts/community_release.py package --version "$RELEASE_VERSION" --input "$RUNNER_TEMP/signed" --output "$RUNNER_TEMP/release"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: check-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/checks
+      - name: Download the same pinned source cataloger as public CI
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          syft-version: v1.54.1
+      - name: Require a complete current-run catalog and produce the source SBOM
+        env:
+          SYFT_BIN: ${{ steps.syft.outputs.cmd }}
+        run: |
+          python3 scripts/community_release.py aggregate --input "$RUNNER_TEMP/checks" --output "$RUNNER_TEMP/release/source-checks.json"
+          bash scripts/release-tools.sh python3 scripts/generate_sbom.py --syft "$SYFT_BIN" --output-dir "$RUNNER_TEMP/sbom"
+          cp "$RUNNER_TEMP/sbom/sbom.cdx.json" "$RUNNER_TEMP/release/source-sbom.cdx.json"
+          cp "$RUNNER_TEMP/sbom/sbom.provenance.json" "$RUNNER_TEMP/release/source-sbom.provenance.json"
+          python3 scripts/community_release.py budget --input "$RUNNER_TEMP/release"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tested-release
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  seal:
+    needs: [plan, package]
+    runs-on: ubuntu-24.04
+    environment: community-attestation
+    timeout-minutes: 60
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      digest: ${{ steps.upload.outputs.artifact-digest }}
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      VELSTRA_GPG_FINGERPRINT: ${{ vars.VELSTRA_GPG_FINGERPRINT }}
+      RELEASE_CHECK_CATALOG: ${{ needs.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Fetch the exact tested artifact and recheck protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ needs.package.outputs.artifact }}
+          DIGEST: ${{ needs.package.outputs.digest }}
+        run: |
+          python3 scripts/check_release_environment.py community-attestation --approved
+          python3 scripts/release_transfer.py --id "$ARTIFACT" --digest "$DIGEST" --output "$RUNNER_TEMP/release"
+          python3 scripts/community_release.py validate --input "$RUNNER_TEMP/release"
+      - name: Load only the checksum signing identity
+        env:
+          VELSTRA_GPG_PRIVATE_KEY: ${{ secrets.VELSTRA_GPG_PRIVATE_KEY }}
+        run: |
+          python3 scripts/release_identity.py gpg
+      - name: Sign the complete artifact inventory
+        run: |
+          gpg --batch --import "$RELEASE_IDENTITY/release.asc"
+          python3 scripts/community_release.py seal --input "$RUNNER_TEMP/release"
+          python3 scripts/community_release.py budget --input "$RUNNER_TEMP/release"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: authenticated-release
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Remove this job's signing identity
+        if: always()
+        run: |
+          gpgconf --kill all
+          python3 -c 'import os,pathlib,shutil; p=os.environ.get("RELEASE_IDENTITY"); shutil.rmtree(p) if p and pathlib.Path(p).parent==pathlib.Path(os.environ["RUNNER_TEMP"]) and pathlib.Path(p).name.startswith("sentinel-identity-") else None'
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: [plan, seal]
+    runs-on: ubuntu-24.04
+    environment: community-publish
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      VELSTRA_GPG_FINGERPRINT: ${{ vars.VELSTRA_GPG_FINGERPRINT }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_CHECK_CATALOG: ${{ needs.plan.outputs.matrix }}
+      RELEASE_PUBLISH_REQUESTED: ${{ inputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Independently validate the exact release before any public write
+        env:
+          ARTIFACT: ${{ needs.seal.outputs.artifact }}
+          DIGEST: ${{ needs.seal.outputs.digest }}
+          VELSTRA_GPG_PUBLIC_KEY: ${{ vars.VELSTRA_GPG_PUBLIC_KEY }}
+        run: |
+          python3 scripts/check_release_environment.py community-publish --approved
+          python3 scripts/release_transfer.py --id "$ARTIFACT" --digest "$DIGEST" --output "$RUNNER_TEMP/release"
+          printf '%s\n' "$VELSTRA_GPG_PUBLIC_KEY" | gpg --batch --import
+          python3 scripts/community_release.py verify --input "$RUNNER_TEMP/release"
+      - name: Publish without overwriting an existing release
+        run: |
+          python3 scripts/publish_community.py --directory "$RUNNER_TEMP/release"

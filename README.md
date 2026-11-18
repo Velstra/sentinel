@@ -42,3 +42,5 @@ cargo test --workspace --locked
 ## Release status
 
 This is a development candidate, not a production release certificate. HA remains experimental. Review the [dataplane support matrix](docs/src/reference/dataplane-support.md) and [test evidence requirements](docs/src/reference/tests.md) before deployment. Development signing keys are not production trust identities.
+
+Maintainers: [build, qualify and publish downloadable images](docs/releases.md).
