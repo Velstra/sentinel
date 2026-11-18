@@ -248,13 +248,31 @@ in pkgs.testers.runNixOSTest {
         # Both VIPs and actual data-plane acknowledgement, not desired election
         # state alone. The 1500ms ceiling follows the real replica freshness
         # budget; the 1000ms peer timeout cannot satisfy a 1-second assertion.
-        while True:
-            code, _ = secondary.execute(py('import json,time,subprocess; r=json.load(open("/run/velstra/ha/role.json")); a=json.load(open("/run/velstra/ha/agent.json")); assert r["authority"]["owner"]==2 and a["forwarding_term"]==r["authority"]["term"]>0 and r["vips_ready"] and r["deadline_ns"]>time.clock_gettime_ns(time.CLOCK_BOOTTIME); assert "10.1.0.100/24" in subprocess.check_output(["ip","-o","address","show","eth1"],text=True); assert "10.2.0.100/24" in subprocess.check_output(["ip","-o","address","show","eth2"],text=True)'))
-            elapsed = time.monotonic() - started
-            assert elapsed <= 1.5, f"warm two-node promotion exceeded replica budget: {elapsed:.3f}s"
-            if code == 0:
-                break
-            time.sleep(0.005)
+        # Observe in one guest process instead of starting a Python interpreter
+        # and crossing the driver channel on every failed poll. Keep the HOST
+        # deadline measured from before SIGSTOP, including command/return costs:
+        # this changes observation overhead, not the allowed failover budget.
+        probe = "\n".join([
+            "import json,time,subprocess",
+            "deadline=time.monotonic()+1.5",
+            "while time.monotonic()<deadline:",
+            "    r=json.load(open('/run/velstra/ha/role.json'))",
+            "    a=json.load(open('/run/velstra/ha/agent.json'))",
+            "    if r['authority']['owner']==2 and a['forwarding_term']==r['authority']['term']>0 and r['vips_ready'] and r['deadline_ns']>time.clock_gettime_ns(time.CLOCK_BOOTTIME):",
+            "        wan=subprocess.check_output(['ip','-o','address','show','eth1'],text=True)",
+            "        lan=subprocess.check_output(['ip','-o','address','show','eth2'],text=True)",
+            "        if '10.1.0.100/24' in wan and '10.2.0.100/24' in lan:",
+            "            print(json.dumps({'role':r,'agent':a}))",
+            "            break",
+            "    time.sleep(0.005)",
+            "else:",
+            "    raise AssertionError('standby did not acknowledge forwarding and both VIPs')",
+        ])
+        code, observation = secondary.execute(py(probe))
+        elapsed = time.monotonic() - started
+        print("promotion observation", observation, "host elapsed", elapsed)
+        assert elapsed <= 1.5, f"warm two-node promotion exceeded replica budget: {elapsed:.3f}s"
+        assert code == 0, observation
         successor = json.loads(secondary.succeed("cat /run/velstra/ha/role.json"))["authority"]
         assert successor["term"] > owner["term"] and successor["policy"] == owner["policy"], (owner, successor)
         primary.succeed(py('import json,time; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==1 and r["deadline_ns"]<time.clock_gettime_ns(time.CLOCK_BOOTTIME)'))
