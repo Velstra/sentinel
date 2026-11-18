@@ -1,9 +1,38 @@
 # Real EFI/verity, production API/CLI/systemctl pins and transient units.
-# No metadata/download/Stage request or simulated healthy boot is used.
+# Refused Check admission, no metadata/download/Stage request or fake boot state.
 { pkgs, self }:
 let
   lib = pkgs.lib;
   sentinel = self.packages.x86_64-linux.sentinel;
+  timer = pkgs.writeShellScript "qa-ota-confirmation-systemd-run" ''
+    set -euo pipefail
+    args=()
+    for arg in "$@"; do
+      if test "$arg" = --on-active=1min; then
+        args+=(--on-active=5s)
+      else
+        args+=("$arg")
+      fi
+    done
+    exec ${pkgs.systemd}/bin/systemd-run "''${args[@]}"
+  '';
+  hostname = pkgs.writeShellScript "qa-ota-confirmation-hostname" ''
+    set -euo pipefail
+    if test -e /run/qa-ota-fail-restore &&
+       test "''${1:-}" = "$(${pkgs.coreutils}/bin/cat /run/qa-ota-restore-hostname)"; then
+      ${pkgs.nettools}/bin/hostname guard-partial-restore
+      ${pkgs.coreutils}/bin/touch /run/qa-ota-partial-restore
+      echo 'disposable fixture: actual restore failed after hostname mutation' >&2
+      exit 1
+    fi
+    exec ${pkgs.nettools}/bin/hostname "$@"
+  '';
+  faultCli = sentinel.overrideAttrs (old:
+    assert lib.hasInfix "${builtins.unsafeDiscardStringContext pkgs.nettools}/bin/hostname" old.buildCommand;
+    assert lib.hasInfix "${builtins.unsafeDiscardStringContext pkgs.systemd}/bin/systemd-run" old.buildCommand;
+    { buildCommand = builtins.replaceStrings
+        [ "${pkgs.nettools}/bin/hostname" "${pkgs.systemd}/bin/systemd-run" ]
+        [ "${hostname}" "${timer}" ] old.buildCommand; });
   publicKey = pkgs.runCommand "qa-confirmation-disposable-public-key" {
     nativeBuildInputs = [ pkgs.openssl ];
   } ''
@@ -34,6 +63,9 @@ in pkgs.testers.runNixOSTest {
       listen-address = "127.0.0.1"
     '');
     environment.etc."qa-confirmation-release.pub".source = publicKey;
+    # Include the disposable fault wrapper in the sealed image's store without
+    # replacing the production sentinel on PATH or the API service executable.
+    environment.etc."qa-confirmation-fault-cli".source = "${faultCli}/bin/sentinel";
     environment.etc."qa-confirmation-guard.py".source = ./ota-confirmation-probe.py;
     environment.systemPackages = [ pkgs.python3 pkgs.util-linux ];
     virtualisation = {
@@ -61,12 +93,14 @@ in pkgs.testers.runNixOSTest {
         machine.wait_for_unit(unit, timeout=120)
     machine.succeed("test -d /sys/firmware/efi/efivars && dmsetup info --target verity usr")
     machine.succeed("test $(systemctl --failed --no-legend --plain | wc -l) -eq 0")
-    output = machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-confirmation-guard.py --sentinel ${sentinel}/bin/sentinel", timeout=210)
+    output = machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-confirmation-guard.py --sentinel ${sentinel}/bin/sentinel --fault-sentinel ${faultCli}/bin/sentinel", timeout=240)
     print(output, flush=True)
     proof = json.loads(output)
     assert proof["all_selected_checks_passed"] is True
     assert proof["real_efi_verity"] is True and proof["channel_requests"] == 0
-    assert len(proof["phases"]) == 3
+    assert len(proof["phases"]) == 4
+    assert proof["refused_check_requests"] == {"api_http": 409, "cli_exit": 1}
+    assert proof["check_admitted"] is False and proof["stage_called"] is False
     Path(os.environ["out"], "confirmation.json").write_text(json.dumps(proof, indent=2))
     machine.succeed("systemctl is-active sentinel-boot.service velstra.service wren.service sentinel-api.service")
     machine.succeed("test $(systemctl --failed --no-legend --plain | wc -l) -eq 0")
