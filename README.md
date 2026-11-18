@@ -1,5 +1,10 @@
 # Velstra Sentinel
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-on-dark.svg">
+  <img src=".github/brand/logo.svg" alt="Velstra Sentinel" height="72">
+</picture>
+
 Firewall and routing appliance with an immutable A/B OS, a CLI and an embedded
 web console. Both interfaces manage the same `appliance.toml`.
 
