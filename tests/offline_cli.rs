@@ -125,3 +125,37 @@ fn offline_export_refuses_a_destination_symlink_without_touching_its_target() {
     assert_eq!(fs::read_to_string(victim).unwrap(), original);
     assert!(link.is_symlink());
 }
+
+#[test]
+fn quickstart_cli_and_document_do_not_promise_destination_zone_enforcement() {
+    let fixture = Fixture::new();
+    let result = fixture.configure(include_str!("../examples/quickstart.cli"));
+    assert!(result.status.success(), "{result:?}");
+    assert!(
+        !String::from_utf8_lossy(&result.stderr).contains("warning:"),
+        "{result:?}"
+    );
+    let saved: toml::Value = fs::read_to_string(fixture.0.join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let sample: toml::Value = include_str!("../examples/quickstart.toml").parse().unwrap();
+    for document in [&saved, &sample] {
+        assert_eq!(
+            document["zone"]["lan"]["default_action"].as_str(),
+            Some("accept")
+        );
+        assert_eq!(
+            document["zone"]["wan"]["default_action"].as_str(),
+            Some("drop")
+        );
+        let rules = document["rule"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["name"].as_str(), Some("wan-dhcp"));
+        assert!(rules[0].get("to").is_none());
+    }
+    assert_eq!(
+        saved["services"]["dns"]["upstream"],
+        sample["services"]["dns"]["upstream"]
+    );
+}

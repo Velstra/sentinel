@@ -9,14 +9,12 @@ set interface eth1 dhcp-server pool-offset 100
 set interface eth1 dhcp-server pool-size 50
 set interface eth1 dhcp-server dns 192.168.50.1
 set firewall zone wan default-action drop
+# LAN may initiate traffic to all destinations, not only the WAN zone.
 set firewall zone lan default-action accept
 set firewall rule wan-dhcp from wan
 set firewall rule wan-dhcp proto udp
 set firewall rule wan-dhcp port 68
 set firewall rule wan-dhcp action accept
-set firewall rule lan-outbound from lan
-set firewall rule lan-outbound to wan
-set firewall rule lan-outbound action accept
 set nat source wan-masquerade zone wan
 set services dns upstream 1.1.1.1
 set services dns upstream 9.9.9.9
