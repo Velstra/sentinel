@@ -1,122 +1,43 @@
-# The configuration CLI
+# Use the configuration CLI
 
-Everything on a Sentinel appliance is driven from one place: `sentinel
-configure`, a VyOS/vtysh-style candidate session. You edit a **candidate**
-config, `compare` it against what's running, then `commit` it (apply live)
-and/or `save` it (persist across reboot).
+<a id="the-configuration-cli"></a>
 
-```text
-$ sentinel configure
-admin@sentinel# set system hostname fw-a
-admin@sentinel*# set interface eth0 zone wan
-admin@sentinel*# set interface eth0 address dhcp
-admin@sentinel*# commit
-✔ commit ok: applied live (not persisted — `save` to keep across reboot)
-admin@fw-a# save
-✔ saved /var/lib/sentinel/appliance.toml (persists across reboot)
-admin@fw-a# exit
-```
+Run `sentinel configure` on the appliance. Edits belong to a candidate until you apply them. A star in the prompt signals outstanding changes.
 
-A `*` in the prompt marks uncommitted edits. On the appliance you can also type
-`configure` and `show` directly (shell aliases), and the interactive shell
-offers Tab-completion and `?` at every level.
-
-## One grammar
-
-The shell has exactly one rule: **every command names a path in the config
-tree**. There is no implicit `set` and no mode switching — a line always means
-one thing. Press `<Tab>` (or type `?`) after any word to see the valid
-continuations, each with a one-line description.
+## Try a harmless edit
 
 ```text
-admin@fw-a# set services ssh ?
-  enable                    run the SSH daemon (true|false; default true)
-  port                      TCP port sshd listens on (default 22)
-  listen-address            restrict sshd to one local address (default: all)
-  password-authentication   allow password logins over SSH (default false)
+set system hostname edge-lab
+compare
+discard
 ```
 
-## Editing the candidate
+The diff shows the hostname change. Discarding it leaves the running configuration untouched. Use `?` or Tab after a path to discover the next field.
 
-| Command | What it does |
+<a id="one-grammar"></a><a id="editing-the-candidate"></a><a id="applying--persisting"></a>
+
+## Choose a command
+
+| Command in the session | Result |
 |---|---|
-| `set <path> <value>` | Set a configuration value. |
-| `delete <path>` | Remove a node, or clear a field. |
-| `show [section]` | Show the candidate config (optionally one section). |
-| `edit <path>` | Descend into a subtree (VyOS-style context); `up` / `top` to leave. |
-| `compare` | Diff the candidate vs the saved config (or vs/between archived revisions). |
-| `discard` | Drop all uncommitted edits. |
+| `show`, `set`, `delete` | Inspect or edit the candidate. |
+| `edit`, `up`, `top` | Move through the configuration tree. |
+| `compare`, `discard` | Review or abandon pending edits. |
+| `commit`, `save` | Apply to the running system, then persist across reboot. |
+| `commit-confirm 2`, `confirm` | Apply provisionally with a two-minute window, then accept. Save explicitly for persistence. |
+| `show system commit`, `compare N` | List saved revisions or compare against revision N. |
+| `rollback N` | Apply and persist an archived revision. `0` is the newest. |
 
-Values that are lists (a rule's `source`, a service's `serve-on`, …) accept a
-comma-separated set and are additive; `delete` clears them. Repeatable keyed
-nodes (a login, a BGP neighbor, a firewall rule) are addressed by their name or
-key.
+<a id="operational-commands-run-show--show"></a>
 
-## Applying & persisting
+## Inspect the running appliance
 
-| Command | What it does |
-|---|---|
-| `commit` | Apply the candidate to the **running** system (live). Not persisted. |
-| `save` | Persist the running config to `/var/lib/sentinel/appliance.toml` (survives reboot). |
-| `commit-confirm [mins]` | Apply live **and** arm an auto-rollback timer (default 10 min). If you don't `confirm`, the box reverts to the saved config — your safety net for a remote change that might cut your own access. |
-| `confirm` | Keep a `commit-confirm` change (cancel the pending rollback). |
-| `rollback <N>` | Revert the running system to archived revision `N` (`0` = newest) and persist it. |
-
-A commit that changed **management access** — an account's key or password, the
-SSH daemon or the web console, or a firewall decision on the path to them — says
-so when it has not been saved, and names what changed:
-
-```text
-admin@fw-a*# commit
-✔ commit ok: applied live (not persisted — `save` to keep across reboot)
-warning: this commit changed management access and has not been saved.
-  changed: system login admin ssh-key
-  The next boot loads the saved configuration instead, where that setting still has
-  the previous value — if that is how you reach this box, the way in goes back
-  with it. `save` writes this configuration to disk, so what you just committed
-  is what boots.
+```sh
+sentinel show interfaces
+sentinel show ip route
+sentinel show ip bgp summary
+sentinel show firewall statistics
+sentinel show nat
 ```
 
-It is a warning, not a refusal: locking yourself out on purpose (a lab box, a
-scripted provision) is allowed. `commit-confirm` does not print it — reverting to
-the saved config is what its timer is for.
-
-Every `save` archives a timestamped revision under
-`/var/lib/sentinel/archive/` (the newest 50 are kept). `show system commit`
-lists them; `compare <N>` diffs the candidate against a revision, and
-`compare <N> <M>` diffs two revisions.
-
-> **Immutable OS.** The commit applies the config to the *running* system
-> (networkd units, the eBPF data plane, the routing daemon, service configs)
-> without rebuilding the OS image. The image itself is A/B-updated separately —
-> see [the commit model](../architecture/commit-model.md) and
-> [A/B updates](../architecture/ab-updates.md).
-
-## Operational commands (`run show` / `show`)
-
-Outside of edits, `sentinel show …` (or `run show …` inside a session, or just
-`show …` at the appliance shell) reports live state:
-
-| Command | Shows |
-|---|---|
-| `show interfaces` | Live interfaces and addresses. |
-| `show ip route` / `show ipv6 route` | The routing table (via the wren RIB). |
-| `show ip bgp [neighbors\|summary]` | BGP routes / sessions. |
-| `show ip ospf [neighbors\|database]`, `show ipv6 ospf3 …` | OSPF / OSPFv3 state. |
-| `show isis …`, `show babel …`, `show ip rip`, `show ipv6 ripng` | Other IGPs. |
-| `show vrrp`, `show bfd` | First-hop redundancy / liveness sessions. |
-| `show firewall [statistics\|log]` | Firewall summary, per-rule counters, the eBPF log. |
-| `show firewall log [<lines>\|since <period>]` | Deeper than the default fifty lines, or a period: `15m`, `1h`, `6h`, `24h`, `7d` — see [Firewall & NAT](firewall.md#what-was-already-refused-firewall-log). |
-| `show nat` | NAT configuration summary. |
-| `show vpn ipsec [sas\|connections]` | IPsec security associations / loaded connections. |
-| `show pki` | Local CAs + issued certificates (with expiry). |
-| `show arp` | The ARP / neighbour table. |
-| `show configuration` | The saved configuration, in config syntax. |
-| `show log [velstra\|wren]` | Recent service log. |
-| `show version` | Software versions, which image is running (verity root hash + slot), and whether the clock is synchronised. |
-| `report --controller <url>` | Hand a Velstra controller this box's counters (`--dry-run` prints them instead). |
-| `trace --in <if> <proto> <src> <dst> [port]` | Where a packet would go and which rule decides it, walked from the configuration without sending anything — see [Firewall & NAT](firewall.md#asking-before-you-send-packet-trace). |
-
-The rest of this handbook is a tour of the config tree, section by section,
-each with the commands it exposes and a worked example. The final chapter,
-[Example configurations](examples.md), ties them together into complete boxes.
+At a configuration prompt, prefix operational commands with `run`. See [remote changes](../operations/configure.md) for a worked confirmation and recovery sequence.
