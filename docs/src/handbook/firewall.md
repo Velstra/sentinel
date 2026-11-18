@@ -18,6 +18,12 @@ With a matching guest-deny rule, the important result can look like this:
 verdict:   drop (no-ssh-from-guests)
 ```
 
+The command reads the saved configuration by default. To test a proposed TOML file before applying it, pass the same packet to the candidate. JSON exposes the verdict, deciding rule and intermediate steps for comparison:
+
+```sh
+sentinel trace --config ./candidate.toml --json --in lan0 tcp 10.0.0.200 10.9.0.10 22
+```
+
 Read the ingress zone, route, NAT translations and matched rule above the verdict. The model uses compiled configuration. Established connection state, dynamic routes and current multi-WAN health require live inspection. The web console exposes the same walk under **Policy → Packet trace**.
 
 ## Zones & posture
