@@ -28,6 +28,41 @@ class RepositoryHygieneTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(root), "add", "source.rs", "renamed.bin", "symlink"], check=True)
             self.assertEqual(hygiene.check(root), ["renamed.bin"])
 
+    def test_compressed_image_names_are_rejected(self):
+        for suffix in hygiene.IMAGE_SUFFIXES:
+            for compression in ("", ".xz", ".gz", ".zst"):
+                self.assertTrue(hygiene.image_artifact("disk" + suffix + compression))
+
+    def test_deleted_historical_images_remain_blocked_without_reading_their_contents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(root), *args])
+            git("init", "--quiet")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            git("config", "core.hooksPath", "/dev/null")
+            names = ("old image.qcow2", "nested/new\nline.RAW.zst")
+            for name in names:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("DISPOSABLE FIXTURE, NOT A DISK")
+            git("add", "--", *names)
+            git("commit", "--quiet", "-m", "historical fixture")
+            git("rm", "--", *names)
+            git("commit", "--quiet", "-m", "deletion is not removal from history")
+            self.assertEqual(hygiene.check(root), [])
+            self.assertEqual(set(hygiene.check_history(root)), set(names))
+            with self.assertRaises(subprocess.CalledProcessError):
+                hygiene.check_history(root, "--all")
+
+    def test_shallow_history_is_refused(self):
+        from unittest.mock import patch
+        with patch.object(hygiene.subprocess, "check_output", return_value="true\n"):
+            with self.assertRaisesRegex(ValueError, "complete Git checkout"):
+                hygiene.check_history(Path("/unused"))
+
 
 if __name__ == "__main__":
     unittest.main()

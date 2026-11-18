@@ -14,6 +14,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repository-history:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prevent image history from being merged back
+        run: |
+          python3 -B -m unittest discover -s tests -p 'test_repository_hygiene.py' -v
+          python3 scripts/check_repository_hygiene.py --history
+
   rust:
     runs-on: ubuntu-latest
     env:
