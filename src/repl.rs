@@ -35,7 +35,7 @@ pub struct Apply {
     /// The systemd unit running the routing daemon (reloaded after writing).
     pub wren_unit: String,
     /// Whether to actually touch the live system. Off-box / in tests this is
-    /// false: `commit` validates + saves only.
+    /// false: `commit` validates only; `save` persists without live apply.
     pub enabled: bool,
 }
 
@@ -158,7 +158,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             let view: Vec<&str> = full.iter().map(String::as_str).collect();
             session.delete(&view)
         }
-        "show" => {
+        "show" => (|| -> Result<()> {
             // What you are looking at is *your* candidate. If somebody else has
             // committed since you started, say so here — this is where an
             // operator looks to find out what the box is doing, and letting them
@@ -176,10 +176,10 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             let full = with_ctx(rest);
             match full.first() {
                 None => print!("{}", session.show()),
-                Some(section) => print!("{}", session.show_only(section)),
+                Some(section) => print!("{}", session.show_checked(section)?),
             }
             Ok(())
-        }
+        })(),
         "edit" => {
             if rest.is_empty() {
                 Err(anyhow!("edit needs a path, e.g. `edit firewall rule web`"))
@@ -215,7 +215,8 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             Ok(exe) => {
                 let status = std::process::Command::new(exe).args(rest).status();
                 match status {
-                    Ok(_) => Ok(()),
+                    Ok(status) if status.success() => Ok(()),
+                    Ok(status) => Err(anyhow!("operational command failed: {status}")),
                     Err(e) => Err(anyhow!("running operational command: {e}")),
                 }
             }
@@ -236,7 +237,12 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                 session.ensure_current()?;
             }
             let to = rest.first().map(Path::new);
-            session.save(to).map(|p| {
+            let saved = if act.enabled {
+                session.save(to)
+            } else {
+                session.save_offline(to)
+            };
+            saved.map(|p| {
                 eprintln!(
                     "{} saved {} (persists across reboot)",
                     ui::green("✔"),
@@ -496,12 +502,6 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     let saved_before = crate::config::Appliance::load(session.config_path()).ok();
     let running_before = Session::running_snapshot()
         .and_then(|toml| crate::config::Appliance::from_toml(&toml).ok());
-    // Whether the console note further down applies: a `commit` applies live but
-    // does not save, so the console (which reads the saved file) lags only when
-    // this commit actually changed something. `session.commit()` clears the dirty
-    // flag, so it must be read here, before the commit — reading it afterwards
-    // (as the note used to) always saw `false`, so the note never printed.
-    let had_uncommitted_edits = session.dirty();
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -539,19 +539,6 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // persist — `save` writes the boot config so a change survives reboot.
     let old_host = system::current_hostname();
     eprintln!("commit: {summary}; applying to the running system…");
-    // The console and the REST API read the *saved* file, so a commit alone
-    // never reaches them: an account granted management access with `commit`
-    // still cannot sign in, and the console keeps showing the configuration
-    // before the change. Say so rather than let it be discovered.
-    if appliance.services.web.enable && had_uncommitted_edits {
-        eprintln!(
-            "{}",
-            ui::yellow(
-                "note: the web console reads the saved configuration, so it still shows \
-                 the previous one — `save` to make them match"
-            )
-        );
-    }
     // The reconcile target for a failed broad apply: the config the box was
     // running before this commit (the live snapshot, or the saved file if there
     // is no snapshot yet). `net::apply` is level-triggered, so re-applying it
@@ -8111,6 +8098,56 @@ mod tests {
         for bad in ["no", "do", "end", "interface", "shwo"] {
             assert!(!is_known_command(bad), "{bad} should be unknown");
         }
+    }
+
+    #[test]
+    fn invalid_show_sections_are_counted_as_command_failures() {
+        // The REPL counter is process-wide; isolate from parallel refusal tests.
+        use std::os::unix::process::CommandExt;
+        if std::env::args().next().as_deref() != Some("sentinel-show-errors-child") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg0("sentinel-show-errors-child")
+                .args([
+                    "--exact",
+                    "repl::tests::invalid_show_sections_are_counted_as_command_failures",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut session = Session::empty();
+        let act = Apply::off();
+        let mut context = Vec::new();
+        let before = failed_lines();
+        assert!(!exec_line(
+            &mut session,
+            &act,
+            &mut context,
+            "show configuration"
+        ));
+        assert_eq!(failed_lines(), before + 1);
+        assert!(!exec_line(
+            &mut session,
+            &act,
+            &mut context,
+            "show nonsense"
+        ));
+        assert_eq!(failed_lines(), before + 2);
+        assert!(!exec_line(&mut session, &act, &mut context, "show system"));
+        assert_eq!(failed_lines(), before + 2);
+        let error = session
+            .show_checked("configuration")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("run show config"));
     }
 
     #[test]

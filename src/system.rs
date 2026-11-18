@@ -1177,6 +1177,45 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
     install_owned_atomic(path, contents, false)
 }
+
+/// Off-box exports never invoke sudo or depend on appliance runtime paths.
+/// Stage beside the destination so replacement is atomic even in sticky /tmp.
+/// Do not replace another account's file or follow a destination symlink.
+pub fn install_offline_config_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _transaction = apply_lock()?;
+    if crate::mutation::intent_path(path) {
+        crate::mutation::advance()?;
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let write = || -> Result<()> {
+        match path.symlink_metadata() {
+            Ok(info) => anyhow::ensure!(
+                info.is_file() && info.uid() == unsafe { libc::geteuid() },
+                "offline destination must be a regular file owned by the current user"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut stage = PrivateStage::create(parent, 0o600)?;
+        stage
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        stage.file.write_all(contents.as_bytes())?;
+        stage.file.sync_all()?;
+        std::fs::rename(&stage.path, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    };
+    write().with_context(|| format!(
+        "saving offline configuration to {}: use a writable directory and a destination owned by your account; no privilege escalation was attempted",
+        path.display()
+    ))
+}
 /// Root-private atomic state for credentials and interrupted HA transactions.
 pub fn install_ha_secret(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -1236,7 +1275,11 @@ fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()
     // Escalation must preserve atomic replacement too: install into a sibling,
     // flush it, then rename. Installing over the live path exposes a truncated
     // document to the peer/API and leaves it truncated if install is interrupted.
-    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
+    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)
+        .with_context(|| format!(
+            "staging configuration for {} in /run/sentinel; for off-box editing use configure --no-apply and save to a writable path",
+            path.display()
+        ))?;
     staged.file.write_all(contents.as_bytes())?;
     staged.file.sync_all()?;
     // The destination can itself be /run/sentinel (running.toml). A basename
@@ -3331,6 +3374,49 @@ mod tests {
             b"public test fixture bytes\n"
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn offline_config_in_shared_tmp_is_private_and_atomic() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Directly under /tmp: a user-owned child directory would miss the bug.
+        let mut reservation = PrivateStage::create(Path::new("/tmp"), 0o600).unwrap();
+        use std::io::Write;
+        reservation.file.write_all(b"previous").unwrap();
+        for content in ["first offline config", "second offline config"] {
+            install_offline_config_file(&reservation.path, content).unwrap();
+            assert_eq!(std::fs::read_to_string(&reservation.path).unwrap(), content);
+            let metadata = std::fs::metadata(&reservation.path).unwrap();
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        // Atomic replacement must not truncate the originally opened inode.
+        use std::io::{Read, Seek};
+        // The reservation was opened write-only; inspect the old inode through
+        // a separate descriptor obtained before a subsequent replacement.
+        let mut old = std::fs::File::open(&reservation.path).unwrap();
+        install_offline_config_file(&reservation.path, "third").unwrap();
+        old.rewind().unwrap();
+        let mut bytes = String::new();
+        old.read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "second offline config");
+    }
+
+    #[test]
+    fn offline_config_refuses_symlinks_and_reports_the_destination() {
+        let victim = PrivateStage::create(Path::new("/tmp"), 0o600).unwrap();
+        std::fs::write(&victim.path, "preserve").unwrap();
+        let link = victim.path.with_extension("symlink");
+        std::os::unix::fs::symlink(&victim.path, &link).unwrap();
+        let error = install_offline_config_file(&link, "replacement").unwrap_err();
+        assert!(format!("{error:#}").contains("regular file owned"));
+        assert!(error.to_string().contains(&link.display().to_string()));
+        assert_eq!(std::fs::read_to_string(&victim.path).unwrap(), "preserve");
+        std::fs::remove_file(link).unwrap();
+        let missing = victim.path.join("missing-parent/config.toml");
+        let error = install_offline_config_file(&missing, "replacement").unwrap_err();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+        assert!(error.to_string().contains("no privilege escalation"));
     }
 
     #[test]

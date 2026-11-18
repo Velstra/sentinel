@@ -8872,7 +8872,15 @@ impl Session {
 
     /// Render the candidate scoped to one top-level section — the VyOS
     /// `show <path>` view. Unknown sections yield an error line.
+    #[cfg(test)]
     pub fn show_only(&self, section: &str) -> String {
+        self.show_checked(section)
+            .unwrap_or_else(|error| format!("error: {error}\n"))
+    }
+
+    /// Interactive/batch commands must propagate a rejected section, not print
+    /// an error as a successful command. The string view remains for inventory.
+    pub fn show_checked(&self, section: &str) -> Result<String> {
         match section {
             // Every section the tree can configure. `load-balancer` and `evpn`
             // were missing here while being settable, committable and
@@ -8883,15 +8891,15 @@ impl Session {
             | "fleet" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
-                    format!("(no {section} configuration)\n")
+                    Ok(format!("(no {section} configuration)\n"))
                 } else {
-                    out
+                    Ok(out)
                 }
             }
-            other => format!(
-                "error: unknown section {other:?} (system | interfaces | firewall | nat | \
+            other => bail!(
+                "unknown section {other:?} (system | interfaces | firewall | nat | \
                  load-balancer | protocols | policy | services | multiwan | vpn | pki | evpn | \
-                 update | fleet)\n"
+                 update | fleet). Use `show` for the candidate or `run show config` for operational configuration"
             ),
         }
     }
@@ -9906,6 +9914,14 @@ impl Session {
     /// Persist the (validated) candidate to disk. Writes to `path` or, if given,
     /// `to`.
     pub fn save(&mut self, to: Option<&Path>) -> Result<PathBuf> {
+        self.save_with_mode(to, false)
+    }
+
+    pub fn save_offline(&mut self, to: Option<&Path>) -> Result<PathBuf> {
+        self.save_with_mode(to, true)
+    }
+
+    fn save_with_mode(&mut self, to: Option<&Path>, offline: bool) -> Result<PathBuf> {
         let _lock = crate::system::apply_lock()?;
         let appliance = self.materialize()?;
         self.admit(&appliance)?;
@@ -9921,7 +9937,7 @@ impl Session {
         }
         // Archive only when saving the box's own config, not an ad-hoc
         // `save <path>` export.
-        let written = persist_appliance(&appliance, &path, to.is_none())?;
+        let written = persist_appliance_mode(&appliance, &path, to.is_none(), offline)?;
         self.dirty = false;
         Ok(written)
     }
@@ -9947,9 +9963,17 @@ impl Session {
 /// revision. Archiving is best-effort — a failed archive must never fail the
 /// save that already landed.
 pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> Result<PathBuf> {
-    // Serialise against a concurrent apply / another persist: `install_config_file`
-    // stages through a fixed temp name, so two writers at once could corrupt the
-    // saved config. Held only for this write; never nested inside an `apply_live`.
+    persist_appliance_mode(appliance, path, archive, false)
+}
+
+fn persist_appliance_mode(
+    appliance: &Appliance,
+    path: &Path,
+    archive: bool,
+    offline: bool,
+) -> Result<PathBuf> {
+    // Serialize admission, replacement and archival against other local writers.
+    // The writer itself uses an exclusive, private staging file and atomic rename.
     let _lock = crate::system::apply_lock()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -9958,7 +9982,11 @@ pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> R
     let _file = crate::system::lock_config_at(&path.with_extension("transaction.lock"))?;
     crate::safe_apply::ensure_writable(path)?;
     let toml = appliance.to_toml()?;
-    crate::system::install_config_file(path, &toml)?;
+    if offline {
+        crate::system::install_offline_config_file(path, &toml)?;
+    } else {
+        crate::system::install_config_file(path, &toml)?;
+    }
     if archive {
         // How far back an operator can roll is a policy, not a constant: a box
         // changed twice a year wants a longer memory than one changed twice a

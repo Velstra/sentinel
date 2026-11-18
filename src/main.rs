@@ -1126,7 +1126,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         if !act.enabled {
             eprintln!(
                 "{}",
-                ui::yellow("  (off-box: commit validates + saves only; not applying)")
+                ui::yellow("  (off-box: commit validates; save writes the file; no live apply)")
             );
         }
         // `List` completion shows all candidates at once (like bash) instead of
