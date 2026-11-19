@@ -1432,6 +1432,7 @@ impl Ssh {
         self.enable
             && self.port.is_none()
             && self.listen_address.is_none()
+            && self.loglevel.is_none()
             && !self.password_authentication
     }
 }
@@ -1511,8 +1512,11 @@ impl WebConsole {
     /// lines. Preserve legal filename bytes, but refuse empty/NUL/line breaks
     /// before a value can be saved or rendered as a separate command.
     pub(crate) fn validate_tls_path(field: &str, path: &str) -> Result<()> {
-        if path.is_empty() || path.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
-            bail!("services web {field}: path must be nonempty and must not contain NUL, CR or LF");
+        if path.is_empty() || path.chars().any(crate::textcheck::is_forbidden) {
+            bail!(
+                "services web {field}: path must be nonempty and must not contain NUL, CR, LF or \
+                 another control character"
+            );
         }
         Ok(())
     }
@@ -7099,6 +7103,7 @@ impl Rule {
 /// because it was a compile-time property of the structs and the same structs
 /// are read by both a strict `config check` and a must-not-fail boot apply. See
 /// [`Appliance::parse_toml`].
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum UnknownKeys {
     /// An unknown key fails the parse, naming the key. For anything a person
     /// initiates.
@@ -7106,6 +7111,17 @@ enum UnknownKeys {
     /// An unknown key is logged and dropped. For a boot-time apply of a saved
     /// config, where an unconfigured appliance is the worse outcome.
     Warn,
+}
+
+impl UnknownKeys {
+    /// The same leniency, for a forbidden character in a received document:
+    /// only the boot-time apply neutralises rather than refuses.
+    fn screen(self) -> crate::textcheck::Screen {
+        match self {
+            UnknownKeys::Reject => crate::textcheck::Screen::Refuse,
+            UnknownKeys::Warn => crate::textcheck::Screen::Neutralise,
+        }
+    }
 }
 
 impl Appliance {
@@ -7131,6 +7147,11 @@ impl Appliance {
     /// they do not know — `serde_ignored` reports each ignored path and this
     /// decides whether that is a refusal or a warning.
     fn parse_toml(toml_text: &str, unknown: UnknownKeys) -> Result<Self> {
+        // The document as received, before serde has a chance to drop a field a
+        // `skip_serializing_if` would later hide from `validate` (CTRL-08).
+        if let Some(neutralised) = crate::textcheck::screen_toml(toml_text, unknown.screen())? {
+            return Self::parse_json(&neutralised, unknown);
+        }
         let mut ignored = Vec::new();
         let de = toml::Deserializer::new(toml_text);
         let mut appliance: Appliance =
@@ -7138,12 +7159,18 @@ impl Appliance {
                 .context("parsing TOML config")?;
         Self::account_for_unknown(&ignored, unknown)?;
         appliance.normalize();
+        if unknown == UnknownKeys::Warn {
+            crate::fieldcheck::quarantine(&mut appliance);
+        }
         appliance.validate()?;
         Ok(appliance)
     }
 
     /// The JSON half of [`Self::parse_toml`].
     fn parse_json(json_text: &str, unknown: UnknownKeys) -> Result<Self> {
+        if let Some(neutralised) = crate::textcheck::screen_json(json_text, unknown.screen())? {
+            return Self::parse_json(&neutralised, unknown);
+        }
         let mut ignored = Vec::new();
         let mut de = serde_json::Deserializer::from_str(json_text);
         let mut appliance: Appliance =
@@ -7152,6 +7179,9 @@ impl Appliance {
         de.end().context("trailing data after JSON config")?;
         Self::account_for_unknown(&ignored, unknown)?;
         appliance.normalize();
+        if unknown == UnknownKeys::Warn {
+            crate::fieldcheck::quarantine(&mut appliance);
+        }
         appliance.validate()?;
         Ok(appliance)
     }
@@ -7336,8 +7366,21 @@ impl Appliance {
         serde_json::to_string_pretty(self).context("serializing to JSON")
     }
 
-    /// Reject configs that parse but are not coherent.
+    /// Reject configs that parse but are not coherent, or that hold a value
+    /// that would be read as syntax by a file generated from it.
+    ///
+    /// The one validator every path runs — `config check`, `commit`, the API
+    /// document endpoints, config-sync, fleet push and archive rollback — so a
+    /// check that lives here holds everywhere, and one that lives only in a CLI
+    /// `set` handler holds nowhere else (audit 8b6181, CTRL-08).
     pub fn validate(&self) -> Result<()> {
+        self.validate_structure()?;
+        crate::textcheck::check_appliance(self)?;
+        crate::fieldcheck::validate(self)
+    }
+
+    /// The coherence checks of [`Self::validate`].
+    fn validate_structure(&self) -> Result<()> {
         crate::ha::validate(self)?;
         self.validate_ha_dhcp()?;
         validate_hostname(&self.system.hostname)?;

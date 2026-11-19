@@ -1099,7 +1099,7 @@ mod tests {
         let commands = crate::session::flatten_config(&crate::session::render_appliance(&a));
         let mut session = crate::session::Session::load(&path).unwrap();
         for command in commands {
-            let words = crate::repl::split_line(&command);
+            let words = crate::repl::split_line(&command).unwrap();
             let refs: Vec<_> = words.iter().skip(1).map(String::as_str).collect();
             session.set(&refs).unwrap();
         }

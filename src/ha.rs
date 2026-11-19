@@ -3334,7 +3334,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let mut session = crate::session::Session::load(&directory.join("empty.toml")).unwrap();
         for command in crate::session::flatten_config(&crate::session::render_appliance(&a)) {
-            let args = crate::repl::split_line(&command);
+            let args = crate::repl::split_line(&command).unwrap();
             let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
             session
                 .set(&words)

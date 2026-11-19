@@ -15,7 +15,7 @@ fn sample_network_and_cli_converge_without_deleting_the_installer_identity() {
     crate::session::persist_appliance(&original, &path, false).unwrap();
     let mut session = Session::load(&path).unwrap();
     for line in include_str!("../examples/quickstart.cli").lines() {
-        let words = crate::repl::split_line(line);
+        let words = crate::repl::split_line(line).unwrap();
         if words.first().is_some_and(|s| s == "set") {
             let args: Vec<_> = words.iter().skip(1).map(String::as_str).collect();
             session.set(&args).unwrap();

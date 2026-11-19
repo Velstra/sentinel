@@ -26,6 +26,7 @@ mod confirm;
 mod diff;
 mod domain;
 mod feed;
+mod fieldcheck;
 mod fleet;
 mod grammar_walk;
 mod ha;
@@ -34,6 +35,8 @@ mod held_links;
 mod identity;
 mod ids;
 mod image;
+#[cfg(test)]
+mod injection_regress;
 mod install;
 mod installer_tui;
 mod ipsec;
@@ -64,6 +67,7 @@ mod safe_apply;
 mod session;
 mod system;
 mod telemetry;
+mod textcheck;
 mod trace;
 mod ui;
 mod unlock;
@@ -2220,7 +2224,9 @@ fn wizard_config(lines: &[String]) -> Result<String> {
     // and returns only an exit flag: it is not a transactional parser result.
     let mut session = session::Session::empty();
     for (index, line) in lines.iter().enumerate() {
-        let words = repl::split_line(line);
+        // Never include the generated line in an error: it may carry a password.
+        let words = repl::split_line(line)
+            .with_context(|| format!("invalid installer command at step {}", index + 1))?;
         let args: Vec<&str> = words.iter().map(String::as_str).collect();
         anyhow::ensure!(
             args.first() == Some(&"set"),
@@ -4204,10 +4210,16 @@ mod tests {
             "#comment",
             "a\\b",
             "\"quoted\"",
-            "tab\t文字",
+            "wide 文字",
         ] {
-            assert_eq!(super::repl::split_line(&super::wizard_word(word)), [word]);
+            assert_eq!(
+                super::repl::split_line(&super::wizard_word(word)).unwrap(),
+                [word]
+            );
         }
+        // No value may hold a control character (audit 8b6181, CTRL-08), so a
+        // tab collected by the installer is refused rather than smuggled.
+        assert!(super::repl::split_line(&super::wizard_word("tab\t")).is_err());
     }
 
     #[test]
