@@ -38,6 +38,26 @@ extern "C" fn defer(signal: libc::c_int) {
     DEFERRED_SIGNAL.store(signal, Ordering::Relaxed);
 }
 
+/// Install the recording handler for `signals`, returning what it replaced.
+fn defer_signals(signals: &[libc::c_int]) -> Vec<(libc::c_int, libc::sigaction)> {
+    let mut previous = Vec::new();
+    for &signal in signals {
+        // SAFETY: a zeroed sigaction is a valid starting value; the handler
+        // only performs an atomic store.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = defer as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, &action, &mut old) == 0 {
+                previous.push((signal, old));
+            }
+        }
+    }
+    previous
+}
+
 /// Holds the deferred signals and the output relays; dropping it restores both.
 pub(crate) struct Guard {
     previous: Vec<(libc::c_int, libc::sigaction)>,
@@ -49,21 +69,7 @@ impl Guard {
     /// relay that cannot be set up leaves that stream as it was.
     pub(crate) fn enter() -> Self {
         DEFERRED_SIGNAL.store(0, Ordering::Relaxed);
-        let mut previous = Vec::new();
-        for signal in DEFERRED {
-            // SAFETY: a zeroed sigaction is a valid starting value; the handler
-            // only performs an atomic store.
-            unsafe {
-                let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = defer as extern "C" fn(libc::c_int) as usize;
-                action.sa_flags = libc::SA_RESTART;
-                libc::sigemptyset(&mut action.sa_mask);
-                let mut old: libc::sigaction = std::mem::zeroed();
-                if libc::sigaction(signal, &action, &mut old) == 0 {
-                    previous.push((signal, old));
-                }
-            }
-        }
+        let previous = defer_signals(&DEFERRED);
         let relays = [libc::STDOUT_FILENO, libc::STDERR_FILENO]
             .into_iter()
             .filter_map(|fd| Relay::install(fd).ok())
@@ -250,17 +256,8 @@ mod tests {
             relays: Vec::new(),
         };
         // Install only the handlers, without touching the test harness's output.
-        let mut installed = Vec::new();
-        for signal in [libc::SIGHUP] {
-            unsafe {
-                let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = defer as extern "C" fn(libc::c_int) as usize;
-                action.sa_flags = libc::SA_RESTART;
-                let mut old: libc::sigaction = std::mem::zeroed();
-                assert_eq!(libc::sigaction(signal, &action, &mut old), 0);
-                installed.push((signal, old));
-            }
-        }
+        let installed = defer_signals(&[libc::SIGHUP]);
+        assert_eq!(installed.len(), 1);
         DEFERRED_SIGNAL.store(0, Ordering::Relaxed);
         assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
         assert_eq!(guard.deferred(), Some(libc::SIGHUP));
