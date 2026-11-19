@@ -160,7 +160,7 @@ in pkgs.testers.runNixOSTest {
             node.succeed("systemctl stop ha-packets")
             print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -tt -n -e -S -r /tmp/ha-packets.pcap 2>/dev/null | tail -n 55"))
         raise AssertionError(f"established TCP stream stalled after {label}")
-    def wait_forwarding(label, started, bound):
+    def wait_forwarding(label, started, bound, paused=None):
         # Forwarding has resumed once the established stream advances again.
         before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
         while True:
@@ -170,6 +170,10 @@ in pkgs.testers.runNixOSTest {
                 print(f"{label}: forwarding resumed {elapsed:.2f}s after the fault")
                 return elapsed
             if time.monotonic()-started>bound:
+                # Diagnostics run commands on every member: a paused VM would
+                # hang them, so resume it first.
+                if paused is not None:
+                    paused.send_monitor_command("cont")
                 check_stream(label+f" (forwarding not resumed within {bound}s)")
                 raise AssertionError(f"{label}: forwarding did not resume within {bound}s")
             time.sleep(0.05)
@@ -356,9 +360,11 @@ in pkgs.testers.runNixOSTest {
         node.send_monitor_command("cont")
     # (1) The owner pauses: the standby takes over; the owner returns, catches
     # up from its successor and (preempt) takes ownership back.
+    # The stream must be alive going in, or a pause could not be judged.
+    check_stream("before the VM pause scenarios")
     started=time.monotonic()
     master.send_monitor_command("stop")
-    wait_forwarding("owner VM paused",started,5.0)
+    wait_forwarding("owner VM paused",started,5.0,paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(8)
     master.send_monitor_command("cont")
@@ -371,7 +377,7 @@ in pkgs.testers.runNixOSTest {
     # (3) The next failure: the resumed standby takes over.
     started=time.monotonic()
     master.send_monitor_command("stop")
-    wait_forwarding("second consecutive pause failover",started,5.0)
+    wait_forwarding("second consecutive pause failover",started,5.0,paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(3)
     master.send_monitor_command("cont")
