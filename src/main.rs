@@ -171,17 +171,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum HaCommand {
-    /// Pair this primary with a secondary using its bootstrap machine token.
+    /// Pair this primary with a secondary using its enrollment credential.
     ///
-    /// The token is read from standard input (`--secret-stdin`), or prompted
-    /// for without echo on a terminal. It is the secondary's API machine token:
-    /// on a command line it would sit in the process list and shell history.
+    /// The credential is the secondary's `system config-sync secret` (generate
+    /// one with `sentinel ha secret generate`). It is read from standard input
+    /// (`--secret-stdin`), or prompted for without echo on a terminal: on a
+    /// command line it would sit in the process list and shell history.
     Pair {
         peer: String,
         /// Refused: a token in argv is visible to every local user.
         #[arg(long, hide = true, conflicts_with = "secret_stdin")]
         secret: Option<String>,
-        /// Read the machine token from standard input.
+        /// Read the enrollment credential from standard input.
         #[arg(long)]
         secret_stdin: bool,
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -203,7 +204,7 @@ enum HaCommand {
         /// The pair's cluster identifier, when one was set explicitly.
         #[arg(long)]
         cluster: Option<String>,
-        /// Read the machine token from standard input.
+        /// Read the enrollment credential from standard input.
         #[arg(long)]
         secret_stdin: bool,
     },
@@ -237,7 +238,7 @@ fn read_pair_token(from_stdin: bool, argv: Option<String>) -> Result<String> {
     use std::io::{IsTerminal, Read};
     anyhow::ensure!(
         argv.is_none(),
-        "--secret puts the machine token in the process list and shell history; \
+        "--secret puts the enrollment credential in the process list and shell history; \
          pipe it with --secret-stdin, or omit both to be prompted"
     );
     let mut value = if !from_stdin && std::io::stdin().is_terminal() {

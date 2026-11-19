@@ -34,7 +34,10 @@ release acceptance and open HA failure cases remain unresolved.
 5. On **each member**, explicitly bind `services web listen-address` to that
    member's static control address (`10.3.0.1` / `10.3.0.2` here), and keep TLS
    enabled. Set the secondary's `system config-sync secret` to a private, random
-   enrollment credential of 32–1024 non-control bytes. The credential starts its
+   enrollment credential: generate one with `sentinel ha secret generate` (32
+   random bytes as 64 hex digits). A short or patterned secret is refused at
+   commit, because the enrollment proof lets anybody who can reach the
+   management port test guesses against it offline. The credential starts its
    HTTPS machine API even with the web console disabled, but never widens its
    listener: an unset address remains `127.0.0.1`, including when web and sync
    are both enabled. Save both configurations and verify the actual endpoints
@@ -121,6 +124,56 @@ lease and an 80 ms exchange budget; the lease must cover
 `2 × io-timeout-ms + 45 ms`. Measure under load and test loss/recovery before
 changing them. A larger lease also lengthens the time an old owner can retain
 authority. Do not tune away a failure by making the guard less conservative.
+
+## What a member trusts its peer with
+
+The shared secret is the **peer credential**, not an administrator login and
+not the member's machine token. A peer holding it can:
+
+- read what a read-only account reads (the stack view, enrollment);
+- push the shared configuration (`PUT /api/v1/config-sync`) and complete a
+  pairing (`POST /api/v1/ha/pair`).
+
+It cannot replace a member's whole configuration through the ordinary API,
+post `configure` lines, stage updates or confirm or revert a commit-confirm
+window. Neither a push nor a pairing changes who manages the receiver: its
+accounts (with their SSH keys, password hashes and TOTP secrets), groups, AAA
+servers, update channels and keys, SSH server and serial console stay its own,
+so configure them on **each** member.
+
+What the peer *can* change is the shared policy — firewall, NAT, routing, VPN,
+services — and, through pairing, the HA identity. That is the point of
+synchronization, and it means the secret is the authority to change the
+traffic policy of both members: anybody who obtains it, or controls a member,
+controls what both members forward. Keep the secret to the two members,
+rotate it if either is suspect (set a new generated value on both; the outbox
+delivers the rotation with the old credential), and treat a compromised
+member as a compromised pair. Enrollment also hands the peer the receiver's
+full configuration, including its local password hashes; prefer key-only SSH
+and strong, unique passwords on HA members.
+
+Each source address may request ten enrollment proofs per ten minutes, thirty
+invalid bearers lock a source out of the API for five minutes, and every
+non-read use of the peer credential or the machine token is logged with its
+source address (`journalctl -u sentinel-api`).
+
+### Upgrading a pair with a weak secret
+
+An appliance upgraded with a secret that is now considered weak still boots,
+keeps its pairing and serves its API, prints a warning at every apply, and
+refuses every configuration change until the secret is rotated. Rotate it on
+both members, one commit each. The first boot of the new image also replaces
+`/var/lib/sentinel/api-token` when an earlier release had written the secret
+into it; read the new machine token from that file.
+
+### Mixed versions during an upgrade
+
+Pairing and config-sync keep working between a member that has been updated
+and one that has not: the proof, the bearer and the base revisions a push
+names are understood by both. While the members run different versions, do
+not change accounts, AAA, update, SSH or console settings on the older member —
+the updated one keeps its own and the older one's next push is then held as a
+conflict. Finish the upgrade promptly.
 
 ## Configuration writes on either member
 
