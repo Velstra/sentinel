@@ -15,6 +15,7 @@ mod admission;
 mod alert;
 mod api;
 mod api_listener;
+mod api_throttle;
 mod api_session;
 mod archive;
 mod boot_entry;

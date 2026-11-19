@@ -820,51 +820,43 @@ async fn get_metrics(
 /// ungrouped accounts get no API grant; the explicitly configured, ungrouped
 /// bootstrap `admin` retains its recovery administrator grant.
 ///
-/// Attempts are budgeted two ways: 30 per account in ten minutes, across all
-/// origins, and ten per origin before a fifteen-minute origin lockout. Both
-/// refuse even correct credentials while exhausted. The cross-origin account
-/// limit bounds distributed guessing but permits targeted account denial of
-/// service; it does not promise that another source bypasses the account limit.
-/// Successful sign-in clears both budgets. They are in memory, so an API
-/// restart clears them too.
+/// Attempts are budgeted three ways (see [`crate::api_throttle`]): ten per
+/// origin over all accounts, ten per (account, origin), and a hundred per
+/// account from origins that never signed it in. Each refuses even correct
+/// credentials while exhausted. Guessing `admin` from one place therefore
+/// locks that place, not the account: the administrator's own workstation —
+/// an origin that signed `admin` in before — keeps its own budget even while a
+/// distributed guess has exhausted the new-origins one. A good sign-in clears
+/// the origin's and the pair's counts. All of it is in memory, so an API
+/// restart clears it too.
 ///
-/// The address's attempt is counted when it is *let through*, not when it has
+/// Attempts are counted when they are *let through*, not when they have
 /// failed. Counting afterwards let a burst of parallel guesses all pass the
 /// check before the first of them had finished hashing; counting first means
 /// the threshold bounds the password checks one address can cause, however
-/// many it sends at once. A good sign-in then clears the count.
+/// many it sends at once.
 ///
 /// The peer address comes from `ConnectInfo`, which the server wires in via
-/// `into_make_service_with_connect_info`. When it is absent (an in-process test,
-/// or a transport with no peer address) the per-IP limiter is simply skipped and
-/// the per-account throttle still applies.
+/// `into_make_service_with_connect_info`. When it is absent (an in-process
+/// test, or a transport with no peer address) the per-origin limiter is
+/// skipped and the account is counted against one unknown origin.
 async fn post_login(
     State(state): State<Arc<ApiState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let peer_ip = connect_info.map(|ci| ci.0.ip());
+    let tables = crate::api_throttle::tables();
+    let peer_ip = connect_info.map(|ci| crate::api_throttle::source(ci.0.ip()));
     // A locked address is refused up front — cheaply, before the password hash
     // that a guesser is really trying to spend the box's CPU on — and an
     // address that is let through has already spent one of its attempts.
     if let Some(ip) = peer_ip {
-        match ip_throttle().reserve(ip) {
-            Ok(()) => {}
-            Err(IpRefusal::Locked(remaining)) => {
-                return Err(ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    anyhow!(
-                        "too many failed sign-ins from your address; locked for another {remaining}s"
-                    ),
-                ));
-            }
-            Err(IpRefusal::Full) => {
-                return Err(ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    anyhow!("too many sign-in attempts from too many addresses; try again later"),
-                ));
-            }
-        }
+        tables.sign_in_sources.count(&ip).map_err(|refusal| {
+            too_many(
+                &refusal,
+                "too many sign-in attempts from your address; try again later".into(),
+            )
+        })?;
     }
     let username = body
         .get("username")
@@ -891,23 +883,32 @@ async fn post_login(
             "use a valid username (at most 32 characters), a password of at most 4096 bytes and a valid one-time code"
         )));
     }
+    let origin = peer_ip.unwrap_or(crate::api_throttle::UNKNOWN_SOURCE);
+    let attempts = tables
+        .sign_in
+        .begin(&username, origin)
+        .map_err(|refusal| match refusal {
+            crate::api_throttle::SignInRefusal::Origin(r) => too_many(
+                &r,
+                "too many sign-in attempts for this account from your address; try again later"
+                    .into(),
+            ),
+            crate::api_throttle::SignInRefusal::NewOrigins(r) => too_many(
+                &r,
+                "too many sign-in attempts for this account from new addresses; sign in from an \
+                 address that signed this account in before, or try again later"
+                    .into(),
+            ),
+        })?;
     // Guessing costs time whether or not the account exists, so a wrong username
     // and a wrong password look the same from outside. The delay is AWAITED, not
     // slept on a thread: earlier it was a blocking sleep inside `spawn_blocking`,
     // so a couple of hundred concurrent guesses pinned every blocking thread (up
     // to 2 s each) and the API — and the console behind it — went dark.
-    let attempts = note_attempt(&username);
-    if attempts > MAX_ACCOUNT_ATTEMPTS {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            anyhow!(
-                "too many sign-in attempts for this account; try again after the ten-minute window"
-            ),
-        ));
-    }
     tokio::time::sleep(attempt_delay(attempts)).await;
 
     let state = state.clone();
+    let account = username.clone();
     // Off the runtime: hashing is deliberately slow, and a login must not stall
     // the executor that is serving everybody else.
     let outcome = tokio::task::spawn_blocking(move || sign_in(&state, &username, &password, &code))
@@ -915,11 +916,13 @@ async fn post_login(
         .map_err(|e| ApiError::internal(anyhow!("login task: {e}")))?;
     match outcome {
         Ok(session) => {
-            // A good sign-in clears the address: an operator who mistyped twice
-            // and then got it right is not one attempt away from a lockout.
+            // A good sign-in clears the address and the pair, and trusts the
+            // origin for this account: an operator who mistyped twice and then
+            // got it right is not one attempt away from a lockout.
             if let Some(ip) = peer_ip {
-                ip_throttle().forget(ip);
+                tables.sign_in_sources.forget(&ip);
             }
+            tables.sign_in.succeeded(&account, origin);
             Ok(Json(session))
         }
         // The failure was already counted when the attempt was let through.
@@ -1230,7 +1233,6 @@ fn sign_in(
         crate::aaa::unix_now(),
     )
     .map_err(|e| ApiError::internal(anyhow!("opening a session: {e:#}")))?;
-    forget_attempts(username);
     Ok(json!({
         "token": token,
         "user": username,
@@ -1241,213 +1243,18 @@ fn sign_in(
     }))
 }
 
-/// Failed sign-ins per account, and when they started.
-///
-/// In memory on purpose: a restart clears it, and an operator who has locked
-/// themselves out by fat-fingering a password should not have to find a file to
-/// get back in.
-fn attempts() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>> {
-    static ATTEMPTS: OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>> =
-        OnceLock::new();
-    ATTEMPTS.get_or_init(Default::default)
-}
-
-/// The most accounts whose failed attempts we track at once. A cap, not a tuning
-/// knob: the map is a throttle, and an attacker spraying distinct usernames must
-/// not be able to grow it without bound. When it is full and a new account
-/// appears, quiet entries are forgotten first and, if that is not enough, the
-/// least-recently-active entry is dropped.
-const MAX_TRACKED_ACCOUNTS: usize = 4096;
-
-/// How long the ten-minute forgiveness window lasts.
-const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
-const MAX_ACCOUNT_ATTEMPTS: u32 = 30;
-
-/// How long to slow a failed sign-in: 250 ms per attempt in the current window,
-/// capped at 2 s. Awaited asynchronously by [`post_login`], never slept on a
-/// thread, so it costs a guesser time without costing the server a worker.
+/// How long to slow a failed sign-in: 250 ms per attempt this (account,
+/// origin) made in its window, capped at 2 s. Awaited asynchronously by
+/// [`post_login`], never slept on a thread, so it costs a guesser time without
+/// costing the server a worker.
 fn attempt_delay(attempts: u32) -> std::time::Duration {
     std::time::Duration::from_millis(250 * attempts.min(8) as u64)
 }
 
-fn note_attempt(username: &str) -> u32 {
-    let mut map = attempts().lock().unwrap();
-    // Keep the map bounded before inserting a not-yet-seen account: forget the
-    // quiet entries, then, if still at the cap, evict the least-recently-active
-    // one. An account mid-attack has a recent entry and is never the victim.
-    if map.len() >= MAX_TRACKED_ACCOUNTS && !map.contains_key(username) {
-        map.retain(|_, (started, _)| started.elapsed() <= ATTEMPT_WINDOW);
-        if map.len() >= MAX_TRACKED_ACCOUNTS
-            && let Some(oldest) = map
-                .iter()
-                .max_by_key(|(_, (started, _))| started.elapsed())
-                .map(|(k, _)| k.clone())
-        {
-            map.remove(&oldest);
-        }
-    }
-    let entry = map
-        .entry(username.to_string())
-        .or_insert((std::time::Instant::now(), 0));
-    // A quiet ten minutes forgives everything: the delay is meant to stop a
-    // machine grinding through a wordlist, not to punish a person.
-    if entry.0.elapsed() > ATTEMPT_WINDOW {
-        *entry = (std::time::Instant::now(), 0);
-    }
-    entry.1 = entry.1.saturating_add(1);
-    entry.1
-}
-
-fn forget_attempts(username: &str) {
-    attempts().lock().unwrap().remove(username);
-}
-
-// ---- per-IP lockout -------------------------------------------------------
-//
-// The per-account budget is cross-origin; this separate peer-address budget
-// also stops a single source spraying many accounts. An exhausted source is
-// refused before expensive password hashing. Another source is still subject
-// to the shared account budget, not guaranteed independent access.
-
-/// One address's recent attempts: when the current window opened, how many
-/// attempts not yet followed by a good sign-in have landed in it, and, once
-/// tripped, until when the address is locked out.
-#[derive(Clone, Copy)]
-struct IpRecord {
-    window_started: std::time::Instant,
-    failures: u32,
-    locked_until: Option<std::time::Instant>,
-}
-
-/// Sign-in attempts per source address, in memory (a restart clears it, like the
-/// per-account map), bounded by `capacity`. A value rather than bare functions
-/// over one global so a test can fill a small one to its cap without starving
-/// every other test in the process of sign-in attempts.
-struct IpThrottle {
-    records: std::sync::Mutex<HashMap<std::net::IpAddr, IpRecord>>,
-    capacity: usize,
-}
-
-/// Why an address may not try now.
-#[derive(Debug, PartialEq, Eq)]
-enum IpRefusal {
-    /// Locked out, for this many more seconds.
-    Locked(u64),
-    /// The table is full of locked addresses and this one is new. Refusing it
-    /// is the fail-closed answer; making room would release a lock.
-    Full,
-}
-
-/// The throttle the server uses.
-fn ip_throttle() -> &'static IpThrottle {
-    static IPS: OnceLock<IpThrottle> = OnceLock::new();
-    IPS.get_or_init(|| IpThrottle::new(MAX_TRACKED_IPS))
-}
-
-/// The most source addresses whose failures we track at once. A cap, not a
-/// tuning knob: a spray from many spoofable-looking addresses must not grow the
-/// map without bound. Quiet entries are forgotten first, then the
-/// least-recently-active unlocked one; a lock is never forgotten early.
-const MAX_TRACKED_IPS: usize = 4096;
-
-/// Attempts within one window — counted as they start, cleared by a good
-/// sign-in — before an address is locked out.
-const IP_MAX_FAILURES: u32 = 10;
-
-/// How long an address stays locked once it trips the threshold.
-const IP_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(900);
-
-/// How long a quiet address is forgiven — the counting window. A stray failure an
-/// hour ago is not evidence of an attack now.
-const IP_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
-
-impl IpThrottle {
-    fn new(capacity: usize) -> Self {
-        Self {
-            records: Default::default(),
-            capacity,
-        }
-    }
-
-    /// Let one sign-in attempt from `ip` through, counting it now — or refuse
-    /// it. Counted *before* the password is checked, under the same lock as the
-    /// check, so parallel guesses cannot all slip past a count that has not
-    /// caught up yet: the threshold is the most password checks one address can
-    /// cause per window, however many requests it has in flight.
-    fn reserve(&self, ip: std::net::IpAddr) -> Result<(), IpRefusal> {
-        let ip = throttle_source(ip);
-        let mut map = self.records.lock().unwrap();
-        let now = std::time::Instant::now();
-        if let Some(until) = map.get(&ip).and_then(|r| r.locked_until) {
-            if until > now {
-                return Err(IpRefusal::Locked((until - now).as_secs().max(1)));
-            }
-            // The lock has run out: forgive, and start this address afresh.
-            map.remove(&ip);
-        }
-        // Bound the map before inserting a not-yet-seen address: forget lapsed
-        // windows and expired locks, then, if still full, the least-recently-
-        // active address that is NOT locked. A lock is never evicted — that
-        // was a way to unlock yourself by spraying from other addresses — so
-        // a table full of locks refuses newcomers rather than forgetting one.
-        if map.len() >= self.capacity && !map.contains_key(&ip) {
-            map.retain(|_, r| match r.locked_until {
-                Some(until) => until > now,
-                None => r.window_started.elapsed() <= IP_WINDOW,
-            });
-            if map.len() >= self.capacity {
-                let oldest = map
-                    .iter()
-                    .filter(|(_, r)| r.locked_until.is_none())
-                    .max_by_key(|(_, r)| r.window_started.elapsed())
-                    .map(|(k, _)| *k);
-                match oldest {
-                    Some(oldest) => {
-                        map.remove(&oldest);
-                    }
-                    None => return Err(IpRefusal::Full),
-                }
-            }
-        }
-        let rec = map.entry(ip).or_insert(IpRecord {
-            window_started: now,
-            failures: 0,
-            locked_until: None,
-        });
-        // A quiet window forgives: reopen it rather than carrying an old count.
-        if rec.window_started.elapsed() > IP_WINDOW {
-            rec.window_started = now;
-            rec.failures = 0;
-        }
-        rec.failures += 1;
-        if rec.failures >= IP_MAX_FAILURES {
-            rec.locked_until = Some(now + IP_LOCKOUT);
-        }
-        Ok(())
-    }
-
-    /// Clear an address after a good sign-in from it.
-    fn forget(&self, ip: std::net::IpAddr) {
-        self.records.lock().unwrap().remove(&throttle_source(ip));
-    }
-}
-
-/// Privacy addresses within one IPv6 /64 are one source for brute-force
-/// protection. Canonicalize mapped IPv4 too, so ::ffff:x cannot get a second
-/// budget. This never trusts forwarding headers supplied by the caller.
-fn throttle_source(ip: std::net::IpAddr) -> std::net::IpAddr {
-    use std::net::{IpAddr, Ipv6Addr};
-    match ip {
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return IpAddr::V4(v4);
-            }
-            let mut bytes = v6.octets();
-            bytes[8..].fill(0);
-            IpAddr::V6(Ipv6Addr::from(bytes))
-        }
-        v4 => v4,
-    }
+/// A 429 that says when to come back.
+fn too_many(refusal: &crate::api_throttle::Refusal, message: String) -> ApiError {
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, anyhow!(message))
+        .with_retry_after(refusal.retry_after())
 }
 
 /// `GET /api/v1/health` — liveness, no auth.
@@ -2990,6 +2797,7 @@ fn update_error(error: crate::update_jobs::Error) -> ApiError {
     ApiError {
         status,
         message: error.0.message().into(),
+        retry_after: None,
     }
 }
 
@@ -3241,6 +3049,8 @@ async fn post_update(
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// Seconds a throttled client should wait (`Retry-After`).
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -3248,6 +3058,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: format!("{e:#}"),
+            retry_after: None,
         }
     }
 
@@ -3255,6 +3066,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("{e:#}"),
+            retry_after: None,
         }
     }
 
@@ -3266,13 +3078,25 @@ impl ApiError {
         Self {
             status,
             message: format!("{e:#}"),
+            retry_after: None,
         }
+    }
+
+    fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds);
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -4231,66 +4055,14 @@ virtual-address = ["10.43.0.253"]
         }
     }
 
-    /// The per-IP limiter counts within a window, trips a lockout at the
-    /// threshold, and forgets an address on demand. A throttle of the test's
-    /// own, so no other test sharing the process-global one is disturbed.
-    #[test]
-    fn the_per_ip_lockout_trips_at_the_threshold() {
-        let throttle = IpThrottle::new(MAX_TRACKED_IPS);
-        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
-        // Up to the threshold, every attempt is let through — the one that
-        // reaches it included, which is what locks the address.
-        for n in 0..IP_MAX_FAILURES {
-            assert_eq!(
-                throttle.reserve(ip),
-                Ok(()),
-                "attempt {} was refused",
-                n + 1
-            );
-        }
-        let Err(IpRefusal::Locked(remaining)) = throttle.reserve(ip) else {
-            panic!("the threshold must lock the address");
-        };
-        assert!(
-            remaining > 0 && remaining <= IP_LOCKOUT.as_secs(),
-            "a fresh lock counts down from the full window, got {remaining}"
-        );
-        // A neighbouring address is untouched — the lockout is per address.
-        let other: std::net::IpAddr = "203.0.113.99".parse().unwrap();
-        assert_eq!(throttle.reserve(other), Ok(()));
-        // Forgetting clears it.
-        throttle.forget(ip);
-        assert_eq!(throttle.reserve(ip), Ok(()));
-    }
-
-    #[test]
-    fn ipv6_privacy_addresses_and_ipv4_mapped_addresses_share_a_budget() {
-        let throttle = IpThrottle::new(16);
-        let first = "2001:db8:1:2::1".parse().unwrap();
-        let rotated = "2001:db8:1:2:abcd:1234:ffff:abcd".parse().unwrap();
-        for _ in 0..IP_MAX_FAILURES {
-            throttle.reserve(first).unwrap();
-        }
-        assert!(matches!(
-            throttle.reserve(rotated),
-            Err(IpRefusal::Locked(_))
-        ));
-        assert_eq!(throttle.reserve("2001:db8:1:3::1".parse().unwrap()), Ok(()));
-        throttle.forget(rotated);
-        assert_eq!(throttle.reserve(first), Ok(()));
-        assert_eq!(
-            throttle_source("::ffff:192.0.2.1".parse().unwrap()),
-            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
-        );
-    }
-
     #[tokio::test]
     async fn login_bounds_and_account_budget_are_enforced_before_password_work() {
         let app = router(state(seed("login-boundary")));
         let username = "audit-budget-user";
-        forget_attempts(username);
-        for _ in 0..MAX_ACCOUNT_ATTEMPTS {
-            note_attempt(username);
+        let unknown = crate::api_throttle::UNKNOWN_SOURCE;
+        let tables = crate::api_throttle::tables();
+        for _ in 0..crate::api_throttle::SIGN_IN_PER_ACCOUNT_ORIGIN.max {
+            tables.sign_in.begin(username, unknown).unwrap();
         }
         for (name, password, code, expected) in [
             (
@@ -4334,7 +4106,6 @@ virtual-address = ["10.43.0.253"]
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
-        forget_attempts(username);
     }
 
     /// The handler reads `ConnectInfo` and refuses a locked address up front — the
@@ -4344,9 +4115,10 @@ virtual-address = ["10.43.0.253"]
     #[tokio::test]
     async fn a_locked_address_is_refused_with_429() {
         let ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
-        ip_throttle().forget(ip);
-        for _ in 0..IP_MAX_FAILURES {
-            ip_throttle().reserve(ip).unwrap();
+        let sources = &crate::api_throttle::tables().sign_in_sources;
+        sources.forget(&ip);
+        for _ in 0..crate::api_throttle::SIGN_IN_PER_SOURCE.max {
+            sources.count(&ip).unwrap();
         }
 
         let mut req = Request::builder()
@@ -4364,7 +4136,8 @@ virtual-address = ["10.43.0.253"]
             StatusCode::TOO_MANY_REQUESTS,
             "a locked address must be refused before anything else"
         );
-        ip_throttle().forget(ip);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        sources.forget(&ip);
     }
 
     /// With no `ConnectInfo` at all — an in-process oneshot, a peer-less transport
