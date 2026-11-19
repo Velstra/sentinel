@@ -1719,6 +1719,7 @@
         observe-readonly = import ./nix/observe-readonly-test.nix { inherit pkgs self; };
         wren-static-reload = import ./nix/sentinel-wren-adapter-test.nix { inherit pkgs self; };
         apply-ordering = import ./nix/apply-ordering-test.nix { inherit pkgs self; };
+        config-fallback = import ./nix/config-fallback-test.nix { inherit pkgs self; };
         data-status-readonly = import ./nix/data-status-readonly-test.nix { inherit pkgs self; };
         # Known failures remain hard release gates, never expected-pass smoke tests.
         dataplane-conformance = import ./nix/dataplane-conformance.nix { inherit pkgs self; };
