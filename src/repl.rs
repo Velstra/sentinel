@@ -578,6 +578,12 @@ fn commit_admitted(
     saved_before: Option<crate::config::Appliance>,
     running_before: Option<crate::config::Appliance>,
 ) -> bool {
+    // T4.8-bkcommit: which HA role this commit is made under, read before it
+    // applies (the apply itself may restart the agent).
+    let ha_role = act
+        .enabled
+        .then(|| crate::ha::role_before_commit(running_before.as_ref().or(saved_before.as_ref())))
+        .flatten();
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -674,6 +680,14 @@ fn commit_admitted(
         ui::green("✔"),
         ui::dim("(not persisted — `save` to keep across reboot)")
     );
+    if let Some(status) = ha_role
+        && let Some(w) = crate::ha::commit_role_warning(
+            appliance.system.ha.as_ref().is_some_and(|h| h.enabled),
+            status.as_ref(),
+        )
+    {
+        eprintln!("{} {w}", ui::yellow("warning:"));
+    }
     // Last, and only when this commit really changed the way in: the line above
     // says "not persisted" about every commit, which is exactly why it stops
     // being read. `commit-confirm` deliberately does not do this — its whole

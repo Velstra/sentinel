@@ -21,7 +21,16 @@ let
       {name=physicalControl node;hw-id=controlMac;zone="control";}
       {name=logicalControl node;parent=physicalControl node;vlan=43;address="10.3.0.${toString node}/24";zone="control";}
     ];
-    firewall.default_action="accept";
+    # Realistic policy (HA-02): default drop, and rules `to firewall` that
+    # compile to each member's OWN addresses. A default-accept fixture with no
+    # such rule hid a readiness digest that differed on every real pair.
+    firewall.default_action="drop";
+    zone = {wan.default_action="drop";control.default_action="accept";firewall.local=true;};
+    rule = [
+      {name="vrrp";from="wan";proto="vrrp";action="accept";}
+      {name="mgmt-ssh";from="wan";to="firewall";proto="tcp";port=22;action="accept";}
+      {name="mgmt-icmp";from="wan";to="firewall";proto="icmp";action="accept";}
+    ];
     services = {
       # Enrollment must not widen the default loopback listener. Give each
       # member an explicit, node-local control address before pairing.
@@ -207,6 +216,16 @@ in pkgs.testers.runNixOSTest {
     wait_role(primary,"Master")
     primary.wait_until_succeeds("ip -o addr show eth1 | grep -q 10.1.0.100",timeout=20)
     wait_ready(secondary)
+    # The fixture must carry `to firewall` rules or it proves nothing about
+    # HA-02. They compile symbolically (`dst-local`, no address; each agent
+    # expands them to its own member's addresses, DP-16), and the two agents
+    # still report one policy digest.
+    local_script='import tomllib,json; d=tomllib.load(open("/run/sentinel/velstra.toml","rb")); print(json.dumps(sorted([r.get("name",""),r.get("proto",""),r.get("port",0),"dst" in r or "src" in r] for p in d["policy"] for r in p.get("port_rule",[]) if r.get("dst-local"))))'
+    local_rules={number:json.loads(node.succeed(python_command(local_script))) for node,number in ((primary,1),(secondary,2))}
+    assert local_rules[1] and local_rules[1]==local_rules[2] and not any(r[3] for r in local_rules[1]),local_rules
+    digests={number:json.loads(node.succeed("cat /run/velstra/ha/agent.json"))["policy"] for node,number in ((primary,1),(secondary,2))}
+    assert digests[1]==digests[2],digests
+    secondary.wait_until_succeeds("sentinel show ha | grep -qx 'HA Backup'",timeout=10)
     primary.succeed("test ! -e /var/lib/sentinel/ha-pair.json")
     # Repeating a completed enrollment must retain the same member identities.
     primary.succeed("echo '${secret}' | sentinel ha pair 10.3.0.2:8080 ${pairArguments} --secret-stdin")

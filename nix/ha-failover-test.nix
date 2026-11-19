@@ -20,8 +20,13 @@ let
     vpn.wireguard=pkgs.lib.optionals wireguard [{name="wg0";private-key="ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=";listen-port=51820;peer=[{public-key="pOCSkrZRwni5dyxWn1+puxPZBrRqtoyd+dwrRAn4ogk=";allowed-ips=["10.9.0.2/32"];}];}];
     firewall = { default_action = "drop"; stateful = true; fail_closed = true; } //
       pkgs.lib.optionalAttrs synproxy { syn-protect = [{ port = 8443; }]; };
-    zone = { wan.default_action = "drop"; lan.default_action = "drop"; sync.default_action = "accept"; };
-    rule = [{ name = "echo"; from = if wireguard then "vpn" else "lan"; proto = "tcp"; port = 8443; action = "accept"; }]
+    # A realistic pair: rules `to firewall` compile to each member's OWN
+    # addresses (HA-02). A fixture without them hid a readiness digest that
+    # differed between members on every real deployment.
+    zone = { wan.default_action = "drop"; lan.default_action = "drop"; sync.default_action = "accept"; firewall.local = true; };
+    rule = [{ name = "echo"; from = if wireguard then "vpn" else "lan"; proto = "tcp"; port = 8443; action = "accept"; }
+      { name = "mgmt-ssh"; from = "lan"; to = "firewall"; proto = "tcp"; port = 22; action = "accept"; }
+      { name = "mgmt-api"; from = "wan"; to = "firewall"; proto = "tcp"; port = 8443; action = "accept"; }]
       ++ pkgs.lib.optionals leased [{name="v6-neighbors";from="lan";proto="icmpv6";action="accept";}]
       ++ pkgs.lib.optionals wireguard [{name="vpn-handshake";from="wan";proto="udp";port=51820;action="accept";}];
     nat.source = pkgs.lib.optionals (!synproxy) [({ name = "shared-snat"; zone = "wan"; } // pkgs.lib.optionalAttrs (!masquerade) {to="10.1.0.100";})];
@@ -155,6 +160,27 @@ in pkgs.testers.runNixOSTest {
             node.succeed("systemctl stop ha-packets")
             print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -tt -n -e -S -r /tmp/ha-packets.pcap 2>/dev/null | tail -n 55"))
         raise AssertionError(f"established TCP stream stalled after {label}")
+    def wait_forwarding(label, started, bound, paused=None):
+        # Forwarding has resumed once the established stream advances again.
+        before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
+        while True:
+            current=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
+            if current>before+3:
+                elapsed=time.monotonic()-started
+                print(f"{label}: forwarding resumed {elapsed:.2f}s after the fault")
+                return elapsed
+            if time.monotonic()-started>bound:
+                # Diagnostics run commands on every member: a paused VM would
+                # hang them, so resume it first.
+                if paused is not None:
+                    paused.send_monitor_command("cont")
+                check_stream(label+f" (forwarding not resumed within {bound}s)")
+                raise AssertionError(f"{label}: forwarding did not resume within {bound}s")
+            time.sleep(0.05)
+    def agent_caught_up(node):
+        # Eligible again, holding the cluster's current generation: what the
+        # witness needs to hand this member authority at the next failure.
+        return python_command('import json; a=json.load(open("/run/velstra/ha/agent.json")); r=json.load(open("/run/velstra/ha/role.json")); assert a["eligible"] and a["ready_term"]==r["authority"]["term"]>0 and a["policy"]==r["authority"]["policy"], (a,r["authority"])')
     start_all()
     ${pkgs.lib.optionalString leased ''
     witness.wait_for_unit("sentinel-witness.service")
@@ -167,6 +193,14 @@ in pkgs.testers.runNixOSTest {
         node.wait_until_succeeds("journalctl -u velstra --no-pager | grep -q 'authenticated TCP listening'",timeout=60)
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
     backup.succeed("! ip -o address show eth2 | grep -q 10.2.0.100")
+    # The fixture must carry `to firewall` rules, or it proves nothing about
+    # HA-02. They compile symbolically (`dst-local`, no address; each agent
+    # expands them to its own member's addresses, DP-16), so both members
+    # compile the same local rules.
+    local_script='import tomllib,json; d=tomllib.load(open("/run/sentinel/velstra.toml","rb")); print(json.dumps(sorted([r.get("name",""),r.get("proto",""),r.get("port",0),"dst" in r or "src" in r] for p in d["policy"] for r in p.get("port_rule",[]) if r.get("dst-local"))))'
+    local_rules={n.name:json.loads(n.succeed(python_command(local_script))) for n in (master,backup)}
+    assert local_rules["master"] and local_rules["master"]==local_rules["backup"],local_rules
+    assert not any(r[3] for r in local_rules["master"]),local_rules
     ${pkgs.lib.optionalString leased ''
     # Keep live management telemetry active throughout the HA fault matrix.
     # Querying state must not interfere with lease refresh or TCP continuity.
@@ -287,8 +321,13 @@ in pkgs.testers.runNixOSTest {
     check_stream("control partition healed and preempted")
     # Abrupt process exits retain the independent pinned guard. A fresh agent
     # must import complete successor state before its higher priority can win.
+    # HA-04: SIGKILL every process of the owner's unit, as an OOM kill or a
+    # crash does. The warm standby must be forwarding within a bound, and the
+    # restarted member must rejoin by itself (no reboot, no manual restart).
     for service in ("velstra.service","wren.service"):
-        master.succeed(f"systemctl kill --kill-who=main --signal=SIGKILL {service}")
+        started=time.monotonic()
+        master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
+        wait_forwarding(service+" SIGKILL on the owner",started,3.0)
         backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
         check_stream(service+" abrupt exit")
         master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=25)
@@ -312,11 +351,66 @@ in pkgs.testers.runNixOSTest {
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     master.succeed("systemctl kill --kill-who=main --signal=SIGCONT velstra.service")
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
+    # HA-03: pause a whole member VM (hypervisor stall, live migration, suspend).
+    # Its clock stops with it. A resumed member must become an eligible, caught
+    # up standby again by itself, and the pair must survive the NEXT failure
+    # too, without restarting velstra anywhere.
+    def pause(node, seconds):
+        node.send_monitor_command("stop")
+        time.sleep(seconds)
+        node.send_monitor_command("cont")
+    # (1) The owner pauses: the standby takes over; the owner returns, catches
+    # up from its successor and (preempt) takes ownership back.
+    # The stream must be alive going in, or a pause could not be judged.
+    check_stream("before the VM pause scenarios")
+    started=time.monotonic()
+    master.send_monitor_command("stop")
+    wait_forwarding("owner VM paused",started,5.0,paused=master)
+    backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
+    time.sleep(8)
+    master.send_monitor_command("cont")
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
+    master.wait_until_succeeds(agent_caught_up(master),timeout=20)
+    check_stream("paused owner resumed and preempted")
+    # (2) The standby pauses and resumes: it must catch up again by itself.
+    pause(backup,8)
+    backup.wait_until_succeeds(agent_caught_up(backup),timeout=20)
+    # (3) The next failure: the resumed standby takes over.
+    started=time.monotonic()
+    master.send_monitor_command("stop")
+    wait_forwarding("second consecutive pause failover",started,5.0,paused=master)
+    backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
+    time.sleep(3)
+    master.send_monitor_command("cont")
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
+    check_stream("both members recovered from VM pauses")
     ''}
     check_stream("all fault and recovery scenarios")
     client.succeed("touch /tmp/stream-stop")
     client.wait_until_succeeds("test $(systemctl show ha-stream -p ExecMainStatus --value) = 0 && ! systemctl is-active --quiet ha-stream",timeout=10)
     server.succeed("test $(wc -l </tmp/accepted) = 1; grep -q '^${if synproxy then "10.2.0.10" else "10.1.0.100"}:' /tmp/accepted")
+    ${pkgs.lib.optionalString leased ''
+    # HA-04, double fault: the owner's agent dies while the witness is away.
+    # The restarted owner is cold and the standby's snapshot goes stale, so
+    # neither can be granted on its own state. Once the witness is back, the
+    # pair must open a new epoch by itself, with no agent restarted by hand.
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=25)
+    backup.wait_until_succeeds(python_command('import json; assert json.load(open("/run/velstra/ha/agent.json"))["ready_term"] > 0'),timeout=20)
+    witness.succeed("systemctl stop sentinel-witness")
+    master.succeed("systemctl kill --kill-who=all --signal=SIGKILL velstra.service")
+    master.wait_until_succeeds("systemctl is-active velstra.service",timeout=20)
+    time.sleep(3)
+    started=time.monotonic()
+    witness.succeed("systemctl start sentinel-witness")
+    try:
+        client.wait_until_succeeds(python_command('import socket; s=socket.create_connection(("10.1.0.10",8443),2); data=b"double-fault"+bytes([10]); s.sendall(data); assert s.recv(100)==data'),timeout=30)
+    except Exception:
+        for node in (master,backup):
+            print(node.execute("sentinel show ha; cat /run/velstra/ha/role.json /run/velstra/ha/agent.json; journalctl -u velstra -u wren --no-pager -n 40")[1])
+        raise
+    print(f"double fault (owner agent crash during witness outage) recovered {time.monotonic()-started:.1f}s after the witness returned")
+    print(backup.succeed("sentinel show ha; journalctl -u velstra --no-pager | grep -E 'discarded replicated state' || true"))
+    ''}
     ${pkgs.lib.optionalString leased ''
     # Both agents cold: the old terms cannot authorize empty new map instances.
     # Fresh cold votes from both members permit a new node-1 bootstrap epoch.
