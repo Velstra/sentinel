@@ -272,6 +272,13 @@ pub(crate) fn verify(config: &Path, act: &crate::repl::Apply) -> Result<()> {
         // where somebody standing at a dark box looks first.
         eprintln!("{}", status.describe());
     }
+    if !dataplane_selected(Path::new(crate::repl::DEFAULT_VELSTRA_OUT)) {
+        // No interface is zoned: nothing is held down, so nothing can be dark,
+        // and an unprovisioned agent's state is not a readiness signal. Such a
+        // configuration is never recorded as last-known-good either: falling
+        // back to it would trade a refused firewall for no firewall at all.
+        return Ok(());
+    }
     let ready = wait_for_dataplane(READY_DEADLINE);
     match (ready, read_status()) {
         (Ok(()), None) => record_last_good(config),
@@ -280,6 +287,15 @@ pub(crate) fn verify(config: &Path, act: &crate::repl::Apply) -> Result<()> {
             Err(error.context("the data plane is not ready on the fallback configuration either"))
         }
         (Err(error), _) => fall_back_live(config, act, &error),
+    }
+}
+
+/// Whether the compiled data-plane config binds any interface. An unreadable
+/// or malformed one counts as selected, so it is judged rather than skipped.
+fn dataplane_selected(compiled: &Path) -> bool {
+    match std::fs::read(compiled) {
+        Ok(bytes) => crate::system::compiled_dataplane_enabled(&bytes).unwrap_or(true),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -504,6 +520,30 @@ to = "192.0.2.10:80"
         assert_eq!(chosen.system.hostname, "fw");
         assert_eq!(status.unwrap().applied, Applied::Nothing);
         assert!(select_seed(Err(anyhow!("unreadable")), None, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn an_unprovisioned_data_plane_is_not_judged() {
+        // checks.commit: a box with no zoned interface was judged "not ready",
+        // fell back after 90s and stopped the agent the test expected running.
+        let dir = std::env::temp_dir().join(format!("sentinel-selected-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let compiled = dir.join("velstra.toml");
+        assert!(
+            !dataplane_selected(&compiled),
+            "a missing file selects nothing"
+        );
+        std::fs::write(&compiled, "interface = []\n").unwrap();
+        assert!(!dataplane_selected(&compiled));
+        std::fs::write(&compiled, "[[interface]]\nname = \"eth1\"\npolicy = 1\n").unwrap();
+        assert!(dataplane_selected(&compiled));
+        std::fs::write(&compiled, "not toml [").unwrap();
+        assert!(
+            dataplane_selected(&compiled),
+            "malformed must be judged, not skipped"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
