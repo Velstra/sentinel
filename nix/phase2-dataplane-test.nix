@@ -105,21 +105,24 @@ in pkgs.testers.runNixOSTest {
                        "'tcp dst port 9092 or udp dst port 9093' "
                        ">/dev/null 2>/tmp/inbound.err & echo $! >/tmp/inbound.pid")
         client.wait_until_succeeds("grep -q 'listening on eth1' /tmp/inbound.err", timeout=30)
-        fw.succeed("rm -f /tmp/fwprobe.pcap /tmp/fwprobe.err; ${pkgs.tcpdump}/bin/tcpdump -n -U -i any -w /tmp/fwprobe.pcap "
-                   "'port 9092 or port 9093' >/dev/null 2>/tmp/fwprobe.err & echo $! >/tmp/fwprobe.pid")
-        fw.wait_until_succeeds("grep -q 'listening on any' /tmp/fwprobe.err", timeout=30)
+        # The sender's view (not the firewall's: a capture there changed the
+        # timing enough to hide the failure): who answers the probes, with
+        # which TTL and MAC.
+        server.succeed("rm -f /tmp/sent.pcap /tmp/sent.err; tcpdump -n -U -i eth1 -w /tmp/sent.pcap "
+                       "'port 9092 or port 9093 or icmp or icmp6' >/dev/null 2>/tmp/sent.err & echo $! >/tmp/sent.pid")
+        server.wait_until_succeeds("grep -q 'listening on eth1' /tmp/sent.err", timeout=30)
         sent = []
         for address in ("10.1.1.2", "2001:db8:101::2"):
             sent.append(server.execute(f"nc -v -z -w 2 {address} 9092 2>&1"))
             sent.append(server.execute(f"echo probe | nc -v -u -w 1 {address} 9093 2>&1"))
         client.succeed("pid=$(cat /tmp/inbound.pid); kill -INT $pid; "
                        "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
-        fw.succeed("pid=$(cat /tmp/fwprobe.pid); kill -INT $pid; "
-                   "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
+        server.succeed("pid=$(cat /tmp/sent.pid); kill -INT $pid; "
+                       "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
         global inbound_seen
         inbound_seen = (client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null")
-                        + "probes: " + repr(sent) + "\nfirewall saw:\n"
-                        + fw.succeed("${pkgs.tcpdump}/bin/tcpdump -n -e -r /tmp/fwprobe.pcap 2>/dev/null"))
+                        + "probes: " + repr(sent) + "\nthe sender saw:\n"
+                        + server.succeed("tcpdump -n -e -v -r /tmp/sent.pcap 2>/dev/null"))
         return sum(1 for line in inbound_seen.splitlines()
                    if " 10.2.2.2." in line or " 2001:db8:102::2." in line)
     lines = [
