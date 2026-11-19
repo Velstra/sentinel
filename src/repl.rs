@@ -2744,18 +2744,12 @@ const SERVICES_NODES: &[Cand] = &[
         "syslog",
         "ship the journal to remote collectors (rsyslog, RFC 5424)",
     ),
-    (
-        "alerts",
-        "notify on a failed unit: webhook and/or mail (roadmap C23)",
-    ),
+    ("alerts", "notify on a failed unit: webhook and/or mail"),
     (
         "flow-export",
         "ship flow records to an IPFIX collector (RFC 7011)",
     ),
-    (
-        "ids",
-        "intrusion detection: watch links with suricata (roadmap C11)",
-    ),
+    ("ids", "intrusion detection: watch links with suricata"),
 ];
 // `services portal <Tab>`: which zone is gated, and what a visitor has to do.
 const PORTAL_FIELDS: &[Cand] = &[
