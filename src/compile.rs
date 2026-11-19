@@ -476,6 +476,12 @@ pub(crate) struct PortRule {
     /// together with `src` — the data plane ranks one end per rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) dst: Option<String>,
+    /// `dst` is one of this member's own addresses, from a rule `to` the local
+    /// zone. The data plane ignores it; its HA policy digest hashes the mark
+    /// instead of the address, so two paired members holding the same rule —
+    /// each toward its own addresses — agree on the policy (HA-02).
+    #[serde(rename = "dst-local", skip_serializing_if = "is_false")]
+    pub(crate) dst_local: bool,
     /// New-flow rate limit in packets/s. Omitted when the rule is unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) limit: Option<u32>,
@@ -702,6 +708,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                             log: false,
                             src: None,
                             dst: None,
+                            dst_local: false,
                             limit: None,
                             burst: None,
                             icmp_type: None,
@@ -759,6 +766,12 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                             .collect(),
                         _ => Vec::new(),
                     };
+                    // Rules `to` the local zone were expanded to this member's
+                    // own addresses just above; mark them so (HA-02).
+                    let dst_local = !zoned.is_empty()
+                        && r.to
+                            .as_deref()
+                            .is_some_and(|to| appliance.zones.get(to).is_some_and(|z| z.local));
                     let destinations = if zoned.is_empty() {
                         r.resolved_destinations(groups)
                     } else {
@@ -810,6 +823,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                                             log,
                                             src: src.clone(),
                                             dst: dst.clone(),
+                                            dst_local: dst_local && dst.is_some(),
                                             limit: r.limit,
                                             burst: r.burst,
                                             icmp_type,
@@ -853,6 +867,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     log: false,
                     src: None,
                     dst: None,
+                    dst_local: false,
                     limit: None,
                     burst: None,
                     icmp_type: None,
@@ -1684,6 +1699,60 @@ port = 22
             .collect();
         assert!(dsts.contains(&"10.0.0.1/32"), "{dsts:?}");
         assert!(dsts.contains(&"2001:db8:1::1/128"), "{dsts:?}");
+    }
+
+    /// HA-02: a rule `to` the local zone expands to this member's own
+    /// addresses, and the data plane's HA digest must know which destinations
+    /// those are. The mark rides on exactly those rules — not on an explicit
+    /// destination that happens to be the same address, which both members
+    /// hold verbatim.
+    #[test]
+    fn rules_to_the_local_zone_carry_the_member_local_mark() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+address6 = "2001:db8:1::1/64"
+[zone.firewall]
+local = true
+[[rule]]
+name = "ssh-in"
+from = "lan"
+to = "firewall"
+action = "accept"
+proto = "tcp"
+port = 22
+[[rule]]
+name = "explicit"
+from = "lan"
+destination = "10.0.0.1"
+action = "accept"
+proto = "tcp"
+port = 443
+"#;
+        let appliance = Appliance::from_toml(toml).expect("parses");
+        let cfg = compile(&appliance);
+        let rules: Vec<&PortRule> = cfg
+            .policies
+            .iter()
+            .flat_map(|p| p.port_rules.iter())
+            .collect();
+        let local: Vec<_> = rules.iter().filter(|r| r.name == "ssh-in").collect();
+        assert_eq!(local.len(), 2, "{rules:?}");
+        assert!(
+            local.iter().all(|r| r.dst_local && r.dst.is_some()),
+            "{rules:?}"
+        );
+        let explicit = rules
+            .iter()
+            .find(|r| r.name == "explicit")
+            .expect("explicit rule");
+        assert!(!explicit.dst_local, "{explicit:?}");
+        let text = cfg.to_toml().unwrap();
+        assert_eq!(text.matches("dst-local = true").count(), 2, "{text}");
     }
 
     /// `tcp_udp` is one rule to an operator and two to the data plane, which
