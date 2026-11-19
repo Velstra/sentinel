@@ -55,10 +55,10 @@ let
         ("udp-ip-options", ip(17, udp(41003), 0x5103, NOP4), "translated"),
         ("tcp-syn-ip-options", ip(6, tcp(41004, 0x02), 0x5104, NOP4), "translated"),
         ("icmp-echo-ip-options", ip(1, icmp(8, 0x5105), 0x5105, NOP4), "refused"),
-        ("gre", ip(47, b"\0\0\x08\0" + b"x" * 28, 0x5201), "refused"),
-        ("esp", ip(50, b"\0\0\x10\0" + b"\0" * 28, 0x5202), "refused"),
-        ("sctp", ip(132, b"\x9c\x40\x46\x50" + b"\0" * 28, 0x5203), "refused"),
-        ("6in4", ip(41, b"\x60" + b"\0" * 39, 0x5204), "refused"),
+        ("gre", ip(47, b"\0\0\x08\0" + b"x" * 28, 0x5201), "translated"),
+        ("esp", ip(50, b"\0\0\x10\0" + b"\0" * 28, 0x5202), "translated"),
+        ("sctp", ip(132, b"\x9c\x40\x46\x50" + b"\0" * 28, 0x5203), "translated"),
+        ("6in4", ip(41, b"\x60" + b"\0" * 39, 0x5204), "translated"),
         ("icmp-timestamp", ip(1, icmp(13, 0x5205), 0x5205), "refused"),
         ("tcp-bare-ack", ip(6, tcp(41006, 0x10), 0x5301), "refused"),
         ("tcp-xmas", ip(6, tcp(41007, 0x29), 0x5302), "refused"),
@@ -71,6 +71,21 @@ let
                 raw.sendto(packet, (DST, 0))
     print(json.dumps([{"case": name, "id": struct.unpack("!H", packet[4:6])[0],
                        "expect": expect} for name, packet, expect in cases]))
+  '';
+  greReply = pkgs.writeText "gre-reply.py" ''
+    import socket, struct
+    def checksum(data):
+        total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+        while total >> 16:
+            total = (total & 0xffff) + (total >> 16)
+        return ~total & 0xffff
+    payload = b"\0\0\x08\0" + b"r" * 28
+    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 0x5401, 0, 64, 47, 0,
+                         socket.inet_aton("198.18.10.254"), socket.inet_aton("198.18.10.100"))
+    header = header[:10] + struct.pack("!H", checksum(header)) + header[12:]
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw:
+        for _ in range(3):
+            raw.sendto(header + payload, ("198.18.10.100", 0))
   '';
   appliance = pkgs.writeText "leak-appliance.toml" ''
     [system]
@@ -108,7 +123,7 @@ in pkgs.testers.runNixOSTest {
         interfaces.eth1.ipv4.addresses = [{ address = "198.18.20.50"; prefixLength = 24; }];
         defaultGateway = { interface = "eth1"; address = "198.18.20.1"; };
       };
-      environment.systemPackages = [ pkgs.python3 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.tcpdump ];
     };
     wan = {
       boot = { inherit kernelPackages; };
@@ -184,8 +199,18 @@ in pkgs.testers.runNixOSTest {
     assert not leaked, "private source left the masquerade uplink: " + repr(leaked)
     assert not failures, "unexpected delivery: " + repr(failures)
     # The refusals are the datapath's, not an absent program: counters move.
-    assert delta.get("egress_nat_unsupported_dropped", 0) >= 18, delta
+    assert delta.get("egress_nat_unsupported_dropped", 0) >= 6, delta
     assert delta.get("nat_opener_required", 0) + delta.get("tcp_invalid_flags", 0) >= 12, delta
-    assert delta.get("egress_masqueraded", 0) >= 12, delta
+    assert delta.get("egress_masqueraded", 0) >= 24, delta
+    # The portless reply returns: GRE from the WAN host to the uplink address
+    # is un-NATed to the LAN host that owns the binding (address-only NAT).
+    lan.succeed("systemd-run --unit=gre-capture ${pkgs.tcpdump}/bin/tcpdump -U -n -i eth1 -w /tmp/lan.pcap ip proto 47")
+    lan.wait_until_succeeds("test -s /tmp/lan.pcap", timeout=10)
+    wan.succeed("${pkgs.python3}/bin/python3 ${greReply}")
+    lan.sleep(2)
+    lan.succeed("systemctl stop gre-capture.service")
+    replies = lan.succeed("${pkgs.tcpdump}/bin/tcpdump -n -r /tmp/lan.pcap 2>/dev/null")
+    print("GRE_REPLY " + replies)
+    assert "198.18.10.254 > 198.18.20.50" in replies, replies
   '';
 }
