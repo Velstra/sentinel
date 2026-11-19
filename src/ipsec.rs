@@ -366,6 +366,24 @@ fn swanctl_conf_body(conns: &[IpsecConnection], ifaces: &[Interface]) -> String 
     s
 }
 
+/// The body of a double-quoted swanctl string. The settings lexer takes a
+/// backslash as an escape, so a PSK ending in `\` used to escape its own closing
+/// quote and swallow the rest of the file (audit 8b6181, CTRL-29); one in the
+/// middle silently dropped itself from the key. Escaping both metacharacters
+/// makes the key charon loads exactly the key that was configured.
+fn swanctl_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Render-time guard: a line break in a PSK is a line of the secrets file,
+/// escaping or not (validation refuses it; this refuses to write it).
+fn swanctl_secrets_safe(conns: &[IpsecConnection]) -> Result<()> {
+    for c in conns {
+        crate::textcheck::reject_unsafe(&format!("vpn ipsec {} psk", c.name), &c.psk, &[])?;
+    }
+    Ok(())
+}
+
 /// Render the swanctl `secrets { … }` block (the PSKs). Written 0600 — never
 /// world-readable. Each connection contributes one `ike-<name>` entry listing the
 /// two acceptable identities and the shared key.
@@ -376,7 +394,10 @@ fn swanctl_secrets_body(conns: &[IpsecConnection]) -> String {
         s.push_str(&format!("    ike-{} {{\n", c.name));
         s.push_str(&format!("        id-local = {}\n", local_id(c)));
         s.push_str(&format!("        id-remote = {}\n", remote_id(c)));
-        s.push_str(&format!("        secret = \"{}\"\n", c.psk));
+        s.push_str(&format!(
+            "        secret = \"{}\"\n",
+            swanctl_quoted(&c.psk)
+        ));
         s.push_str("    }\n");
     }
     s.push_str("}\n");
@@ -396,6 +417,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     let conf_path = Path::new(SWANCTL_CONF);
     let secrets_path = Path::new(SWANCTL_SECRETS);
     let conf = swanctl_conf_body(conns, &appliance.interfaces);
+    swanctl_secrets_safe(conns)?;
     let secrets = swanctl_secrets_body(conns);
     // The CLI runs as admin and cannot traverse this root-only directory.
     // Permission denied must never masquerade as an absent previous config.
@@ -689,6 +711,22 @@ mod tests {
         // Identities default to the endpoint addresses.
         assert!(body.contains("id = 203.0.113.1"), "{body}");
         assert!(body.contains("id = 198.51.100.1"), "{body}");
+    }
+
+    #[test]
+    fn a_psk_backslash_or_quote_cannot_escape_its_string() {
+        let mut c = conn();
+        c.psk = r#"ends-in-a-backslash\"#.into();
+        let body = swanctl_secrets_body(&[c.clone()]);
+        assert!(
+            body.contains(r#"secret = "ends-in-a-backslash\\""#),
+            "{body}"
+        );
+        c.psk = r#"a"b"#.into();
+        let body = swanctl_secrets_body(&[c.clone()]);
+        assert!(body.contains(r#"secret = "a\"b""#), "{body}");
+        c.psk = "two\nlines".into();
+        assert!(swanctl_secrets_safe(&[c]).is_err());
     }
 
     #[test]

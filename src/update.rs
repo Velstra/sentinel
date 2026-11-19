@@ -404,8 +404,12 @@ fn auth_header(chan: &UpdateChannel, scratch: &Scratch) -> Result<Option<PathBuf
     Ok(match &chan.subscription_key {
         Some(key) => {
             use std::io::Write;
+            // A curl header file is one header per line: a line break in the
+            // key would add a header of the configuration's choosing (CTRL-29).
+            crate::fieldcheck::subscription_key(key)?;
             let machine_id =
                 update_machine_id_at(Path::new("/var/lib/sentinel/update-machine-id"))?;
+            crate::textcheck::reject_unsafe("update machine id", &machine_id, &[' ', ':'])?;
             scratch
                 .create_private("auth-header")?
                 .write_all(

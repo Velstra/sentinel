@@ -291,6 +291,18 @@ pub(crate) fn reject_unsafe(field: &str, value: &str, extra: &[char]) -> Result<
     Ok(())
 }
 
+/// Render-time guard over a whole configuration object: refuse when any string
+/// in `value` (at any depth, keys included) holds a forbidden character. The
+/// generic counterpart of [`reject_unsafe`], for a generator that interpolates
+/// many fields of one object (an interface into its networkd units).
+pub(crate) fn reject_unsafe_in<T: serde::Serialize>(what: &str, value: &T) -> Result<()> {
+    let value = serde_json::to_value(value)?;
+    match scan(&value).first() {
+        Some(finding) => bail!("refusing to render {what}: {finding}"),
+        None => Ok(()),
+    }
+}
+
 /// Render-time guard for a whole generated text whose lines are separated by
 /// `\n` and nothing else: refuse any other control character (a CR that systemd
 /// would read as a second line, a NUL that truncates it) and the Unicode line

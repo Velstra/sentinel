@@ -105,17 +105,28 @@ pub(crate) fn hostapd_conf(iface: &str, w: &Wireless) -> String {
         let mode = wpa.mode.as_deref().unwrap_or("wpa2");
         s.push_str("wpa=2\n");
         s.push_str("rsn_pairwise=CCMP\n");
+        // hostapd reads `sae_password=` as `<password>[|mac=…][|vlanid=…][|pk=…]
+        // [|id=…]`, so a passphrase holding a `|` would be split into a shorter
+        // password plus attributes. SAE falls back to `wpa_passphrase=`, which
+        // hostapd takes verbatim, so that is what such a passphrase is given.
+        let sae_line = if wpa.passphrase.contains('|') {
+            "wpa_passphrase"
+        } else {
+            "sae_password"
+        };
         match mode {
             "wpa3" => {
                 s.push_str("wpa_key_mgmt=SAE\n");
                 s.push_str("ieee80211w=2\n");
-                s.push_str(&format!("sae_password={}\n", wpa.passphrase));
+                s.push_str(&format!("{sae_line}={}\n", wpa.passphrase));
             }
             "wpa2+wpa3" => {
                 s.push_str("wpa_key_mgmt=WPA-PSK SAE\n");
                 s.push_str("ieee80211w=1\n");
                 s.push_str(&format!("wpa_passphrase={}\n", wpa.passphrase));
-                s.push_str(&format!("sae_password={}\n", wpa.passphrase));
+                if sae_line == "sae_password" {
+                    s.push_str(&format!("sae_password={}\n", wpa.passphrase));
+                }
             }
             _ => {
                 s.push_str("wpa_key_mgmt=WPA-PSK\n");
@@ -162,6 +173,15 @@ pub(crate) fn supplicant_conf(w: &Wireless) -> String {
     s
 }
 
+/// Render-time guard (audit 8b6181, CTRL-12): hostapd takes the rest of a line
+/// as the value and wpa_supplicant a quoted string up to the line's last quote,
+/// so the one thing that turns an SSID or a passphrase into a directive — a
+/// rogue open network, an exposed control socket, a `pkcs11_engine_path` that
+/// dlopens a file — is a line break. Independent of `Appliance::validate`.
+pub(crate) fn radio_inputs_safe(iface: &str, w: &Wireless) -> Result<()> {
+    crate::textcheck::reject_unsafe_in(&format!("interface {iface} wireless"), w)
+}
+
 /// The radios this box configures.
 fn radios(appliance: &Appliance) -> Vec<(&Interface, &Wireless)> {
     appliance
@@ -186,6 +206,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 
     let mut desired: HashSet<String> = HashSet::new();
     for (i, w) in &radios {
+        radio_inputs_safe(&i.name, w)?;
         let ap = w.is_access_point();
         let body = if ap {
             hostapd_conf(&i.name, w)
@@ -327,6 +348,40 @@ mod tests {
         assert!(s.contains("scan_ssid=1"), "{s}");
         assert!(s.contains("key_mgmt=WPA-PSK"), "{s}");
         assert!(s.contains("psk=\"correcthorsebattery\""), "{s}");
+    }
+
+    /// CTRL-12: a line break in the SSID or passphrase would be a directive of
+    /// its own in a root daemon's config; the guard refuses to render it.
+    #[test]
+    fn a_line_break_in_the_ssid_or_passphrase_is_never_rendered() {
+        let mut w = ap();
+        w.ssid = "velstra\nctrl_interface=/tmp/x".into();
+        assert!(radio_inputs_safe("wlan0", &w).is_err());
+        let mut w = ap();
+        w.wpa.as_mut().unwrap().passphrase =
+            "12345678\"\n}\npkcs11_engine_path=/e\nnetwork={\nssid=\"y".into();
+        assert!(radio_inputs_safe("wlan0", &w).is_err());
+        let mut w = ap();
+        w.wpa.as_mut().unwrap().passphrase = "quotes \" and # are fine".into();
+        assert!(radio_inputs_safe("wlan0", &w).is_ok());
+    }
+
+    /// hostapd splits `sae_password=` at `|`: a passphrase holding one goes
+    /// through `wpa_passphrase=`, which it takes verbatim.
+    #[test]
+    fn an_sae_passphrase_with_a_bar_is_not_split_into_attributes() {
+        for mode in ["wpa3", "wpa2+wpa3"] {
+            let mut w = ap();
+            let wpa = w.wpa.as_mut().unwrap();
+            wpa.mode = Some(mode.into());
+            wpa.passphrase = "secret|vlanid=5".into();
+            let s = hostapd_conf("wlan0", &w);
+            assert!(!s.contains("sae_password="), "{mode}: {s}");
+            assert!(
+                s.contains("wpa_passphrase=secret|vlanid=5\n"),
+                "{mode}: {s}"
+            );
+        }
     }
 
     /// A station may join an open network: it is somebody else's, and refusing

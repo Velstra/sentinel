@@ -280,3 +280,26 @@ fn ctrl08_a_saved_config_from_before_the_rules_boots_with_only_the_offenders_off
     assert_eq!(booted.services.ssh.loglevel, None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The in-memory half of the rule: a candidate built without a parse (a CLI
+/// draft, a merged sync document) is walked by `validate()` itself. The
+/// vendor class has no per-field check, so only the generic walk can refuse it.
+#[test]
+fn ctrl08_validate_walks_an_in_memory_candidate() {
+    let mut a = Appliance::from_toml(&format!(
+        "{BASE}[[interface]]\nname = \"wan0\"\nzone = \"wan\"\naddress = \"dhcp\"\n"
+    ))
+    .unwrap();
+    a.interfaces[0].dhcp.vendor_class_id = Some("MSFT 5.0".into());
+    a.validate().expect("the clean twin validates");
+    a.interfaces[0].dhcp.vendor_class_id = Some("x\n[Match]\nName=*".into());
+    let error = a
+        .validate()
+        .expect_err("an injected vendor class validated");
+    assert!(
+        error
+            .to_string()
+            .contains("interface[0] dhcp vendor-class-id"),
+        "{error}"
+    );
+}
