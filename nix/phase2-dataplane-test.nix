@@ -119,11 +119,12 @@ in pkgs.testers.runNixOSTest {
                        "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
         server.succeed("pid=$(cat /tmp/sent.pid); kill -INT $pid; "
                        "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
+        arrived = client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null")
         global inbound_seen
-        inbound_seen = (client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null")
-                        + "probes: " + repr(sent) + "\nthe sender saw:\n"
+        inbound_seen = (arrived + "probes: " + repr(sent) + "\nthe sender saw:\n"
                         + server.succeed("tcpdump -n -e -v -r /tmp/sent.pcap 2>/dev/null"))
-        return sum(1 for line in inbound_seen.splitlines()
+        # Counted on the LAN host's capture only.
+        return sum(1 for line in arrived.splitlines()
                    if " 10.2.2.2." in line or " 2001:db8:102::2." in line)
     lines = [
         "set interface eth1 zone lan", "set interface eth1 address 10.1.1.1/24",
