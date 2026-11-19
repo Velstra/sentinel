@@ -237,12 +237,18 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                 session.ensure_current()?;
             }
             let to = rest.first().map(Path::new);
+            // On the appliance `save` writes what is running (CTRL-14); off-box
+            // there is no running system and the file being edited is the
+            // whole point, so the candidate is written.
             let saved = if act.enabled {
-                session.save(to)
+                session.save_running(to)
             } else {
                 session.save_offline(to)
             };
             saved.map(|p| {
+                if act.enabled && to.is_none() {
+                    crate::boot_fallback::clear_status();
+                }
                 eprintln!(
                     "{} saved {} (persists across reboot)",
                     ui::green("✔"),
@@ -579,6 +585,15 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             .flatten(),
         );
         eprintln!("{} applying config: {message}", ui::red("error:"));
+        // The refusal was only ever on this terminal (PERF-06); the next person
+        // to look at the box must be able to find it.
+        crate::journal::note(
+            crate::journal::Severity::Error,
+            "sentinel-commit",
+            &format!("commit refused while applying: {message}"),
+        );
+        // Admitted but not applied: the candidate is not what runs.
+        session.mark_uncommitted();
         note_refusal();
         return false;
     }
@@ -1033,6 +1048,13 @@ fn service_ready(unit: &str) -> Result<()> {
         b"failed\n" => anyhow::bail!("{} readiness probe failed", service.unit()),
         _ => anyhow::bail!("invalid privileged readiness response"),
     }
+}
+
+/// The data plane's readiness, judged exactly as a commit judges it: the unit
+/// is active and the agent answers `Ready` (or, with no interface selected,
+/// the unit is deliberately inactive). Used by the boot verifier.
+pub(crate) fn dataplane_ready() -> Result<()> {
+    service_ready(DEFAULT_UNIT)
 }
 
 /// Fixed read-only privilege boundary, with no caller-supplied socket or verb.
@@ -1504,7 +1526,7 @@ fn diagnostic_chain(error: &anyhow::Error, configurations: &[&crate::config::App
 
 /// Diagnostics are not a credential export. Reuse the configuration secret
 /// inventory for both new and old credentials, including quoted spellings.
-fn apply_error_message<'a>(
+pub(crate) fn apply_error_message<'a>(
     error: &anyhow::Error,
     configurations: impl IntoIterator<Item = &'a crate::config::Appliance>,
 ) -> String {
@@ -1749,6 +1771,14 @@ fn apply_live_as(
     let rendered = compile::compile(appliance)
         .to_toml()
         .context("compiling firewall config")?;
+    // Ask the agent's own parser before anything live moves (DP-01 class). A
+    // refusal here costs nothing; a refusal by the running agent closes the
+    // packet gate for the failed reload and again for its rollback. A restore
+    // puts back a configuration the agent was running, and must not be
+    // blocked by a check of it.
+    if act.enabled && verify == crate::net::Verify::Forward {
+        crate::agent_contract::check_rendered(&rendered, &[appliance])?;
+    }
     let wren_rendered = crate::wren::compile_wren(appliance)
         .to_toml()
         .context("compiling routing config")?;
@@ -2021,8 +2051,10 @@ const CMD_HELP: &[CmdHelp] = &[
         name: "save",
         usage: "save [path]",
         summary: "persist the configuration across reboot",
-        detail: "Writes the committed config to the boot location (or to <path> for a \
-                 backup copy).",
+        detail: "Writes the committed (running) config to the boot location (or to <path> \
+                 for a backup copy). Refused while the candidate has uncommitted edits: \
+                 `commit` them first, or `discard` them. Off-box (--no-apply) it writes \
+                 the file being edited.",
         examples: &[],
     },
     CmdHelp {

@@ -12,11 +12,13 @@
 mod aaa;
 mod acme;
 mod admission;
+mod agent_contract;
 mod alert;
 mod api;
 mod api_session;
 mod archive;
 mod boot_entry;
+mod boot_fallback;
 mod capture;
 mod clock;
 mod compile;
@@ -38,6 +40,7 @@ mod install;
 mod installer_tui;
 mod ipsec;
 mod ipsec_guards;
+mod journal;
 mod lockout;
 mod lookup;
 mod metrics;
@@ -549,6 +552,15 @@ enum Command {
         #[arg(long)]
         id: String,
     },
+    /// After the data plane has started at boot: if it never becomes ready on
+    /// the configuration it was given, fall back to one it accepts; if it does,
+    /// remember that configuration as the last-known-good. Run by
+    /// `sentinel-boot-verify.service`, not by hand.
+    #[command(hide = true)]
+    BootVerify {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Recover an expired management transaction (independent systemd watchdog).
     ApplyRecovery {
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -909,6 +921,7 @@ async fn main() -> Result<()> {
         Command::ApplyPending { config, id } => {
             safe_apply::apply_pending(&config, &id, &live_apply(true))
         }
+        Command::BootVerify { config } => boot_fallback::verify(&config, &live_apply(true)),
         Command::ApplyRecovery { config } => {
             match safe_apply::recover(&config, &live_apply(true), false, false) {
                 // One failed attempt on the way to the bound is logged, not a
@@ -1113,6 +1126,11 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
     // Apply on commit unless told not to (off-box editing). The live apply uses
     // hostnamectl/systemctl, which only work on the box.
     let act = live_apply(!no_apply);
+    if act.enabled
+        && let Some(status) = boot_fallback::read_status()
+    {
+        eprintln!("{}", ui::red(&status.describe()));
+    }
 
     if std::io::stdin().is_terminal() {
         eprintln!("{}", ui::bold("Sentinel configuration mode"));
@@ -1341,9 +1359,26 @@ fn apply_boot(
     // rollback to an older image whose saved config carries a newer field would
     // otherwise boot unconfigured. `config check` and every interactive path
     // stay strict — see Appliance::load_lenient.
-    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
-        &Appliance::load_lenient(config)?,
-    )));
+    //
+    // Before anything is rendered, ask the data plane whether it will load the
+    // result (DP-01 class): a saved configuration it refuses would otherwise
+    // crash-loop the agent and keep every zoned link, management included,
+    // held down. A refusal boots the last-known-good or a management-only
+    // policy instead, and says so (see boot_fallback).
+    let resolve = |candidate: &Appliance| {
+        identity::with_resolved(&feed::with_fetched(&domain::with_resolved(candidate)))
+    };
+    let (selected, fallback) = boot_fallback::select_seed(
+        Appliance::load_lenient(config),
+        boot_fallback::read_last_good(config),
+        |candidate| {
+            let rendered = compile::compile(&resolve(candidate))
+                .to_toml()
+                .context("compiling firewall config")?;
+            agent_contract::check_rendered(&rendered, &[candidate]).map(drop)
+        },
+    )?;
+    let appliance = resolve(&selected);
 
     // Compile BOTH configs before writing either, so a compile error can't leave
     // a half-seeded system (velstra written, wren missing). Rendering is pure and
@@ -1380,6 +1415,10 @@ fn apply_boot(
     // SAs) — which a file can't express — is deferred to `apply-boot-late`, run
     // after networkd has brought the links up.
     net::apply_persistent(&appliance, net::ApplyMode::Boot)?;
+    if let Some(status) = fallback {
+        let running = (status.applied != boot_fallback::Applied::Nothing).then_some(&selected);
+        boot_fallback::publish(running, &status)?;
+    }
     Ok(())
 }
 
@@ -2687,6 +2726,9 @@ fn show_op(args: &[String]) -> Result<()> {
         // System status (the bare default).
         [] | ["system"] | ["status"] => {
             println!("hostname:   {}", system::current_hostname());
+            if let Some(status) = boot_fallback::read_status() {
+                println!("config:     {}", ui::red(&status.describe()));
+            }
             print!("firewall:   ");
             run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
             print!("routing:    ");
@@ -3886,6 +3928,16 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
         }
         ConfigAction::Check { file, live } => {
             let appliance = Appliance::load(&file)?;
+            // The same verdict commit, save and the boot seed ask for.
+            match agent_contract::check(&appliance)? {
+                agent_contract::Verdict::Accepted => {
+                    println!("{}: the data plane's validator accepts it", file.display())
+                }
+                agent_contract::Verdict::Unavailable => println!(
+                    "{}: data-plane contract not checked (no agent on this host)",
+                    file.display()
+                ),
+            }
             if live {
                 net::validate_present_interfaces(&appliance, &system::discover_interfaces())?;
                 println!("{} is valid for this host", file.display());

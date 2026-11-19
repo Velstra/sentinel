@@ -288,6 +288,22 @@ pub fn read_revision(config_path: &Path, n: usize) -> Result<String> {
 /// revision), and reset the session's candidate to it. Idempotent — the revision
 /// is a full, already-validated config.
 pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
+    rollback_with(session, act, n, Path::new(Session::RUNNING), |appliance| {
+        // A revert to an archived revision: `None`, so a partial broad-apply
+        // failure reports mixed-state rather than reconciling back to the
+        // config the operator explicitly asked to leave.
+        crate::repl::apply_live(appliance, act, None)
+    })
+}
+
+/// [`rollback`] with the activation and the running-snapshot path injected.
+fn rollback_with(
+    session: &mut Session,
+    act: &Apply,
+    n: usize,
+    running: &Path,
+    activate: impl FnOnce(&Appliance) -> Result<()>,
+) -> Result<()> {
     let _lock = crate::system::apply_lock()?;
     let cfg = session.config_path().to_path_buf();
     let content = read_revision(&cfg, n)?;
@@ -298,10 +314,16 @@ pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
     crate::admission::check_saved(&cfg, act.enabled, &appliance)?;
 
     if act.enabled {
-        // A revert to an archived revision: `None`, so a partial broad-apply
-        // failure reports mixed-state rather than reconciling back to the
-        // config the operator explicitly asked to leave.
-        crate::repl::apply_live(&appliance, act, None).context("applying the revision")?;
+        activate(&appliance).context("applying the revision")?;
+        // The box now runs the revision; say so where every later reader looks
+        // (CTRL-04). Without this RUNNING kept the rolled-back-from config: the
+        // next configure session, commit-confirm snapshot, API revert and the
+        // schedule/feed timers all started from it and silently put it back.
+        // Published before persistence, through the helper commit uses, so a
+        // failed save below cannot leave RUNNING describing the old config.
+        session
+            .note_committed_at(running, &appliance.to_toml()?)
+            .context("recording the rolled-back revision as the running configuration")?;
     }
 
     // Persist it as the current saved config and archive the rollback as a new
@@ -581,5 +603,68 @@ port = 443
         assert_eq!(read_revision(&cfg, 0).unwrap(), "newest");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rollback_becomes_the_running_configuration_a_new_session_starts_from() {
+        // CTRL-04: commit X, `rollback 1` to R, then open a new session. It must
+        // start from R; RUNNING still saying X let the next edit+commit, the
+        // commit-confirm snapshot and the refresh timers resurrect X.
+        let dir = Directory::new("running");
+        let cfg = dir.config();
+        let running = dir.0.join("running.toml");
+        let revision = "[system]\nhostname = \"rolled-back\"\n";
+        archive_config(&cfg, revision, 10).unwrap();
+        let committed = Appliance::from_toml("[system]\nhostname = \"committed\"\n").unwrap();
+        std::fs::write(&cfg, committed.to_toml().unwrap()).unwrap();
+        std::fs::write(&running, committed.to_toml().unwrap()).unwrap();
+        let mut session = Session::load_live_at(&cfg, &running).unwrap();
+        let act = Apply {
+            enabled: true,
+            ..Apply::off()
+        };
+        let mut activated = Vec::new();
+        rollback_with(&mut session, &act, 0, &running, |appliance| {
+            activated.push(appliance.system.hostname.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(activated, ["rolled-back"]);
+        let published = Appliance::from_toml(&std::fs::read_to_string(&running).unwrap()).unwrap();
+        assert_eq!(published.system.hostname, "rolled-back");
+        let next = Session::load_live_at(&cfg, &running).unwrap();
+        assert!(
+            next.show().contains("hostname rolled-back"),
+            "{}",
+            next.show()
+        );
+        assert!(!next.show().contains("hostname committed"));
+    }
+
+    #[test]
+    fn a_failed_rollback_activation_leaves_running_untouched() {
+        let dir = Directory::new("running-failed");
+        let cfg = dir.config();
+        let running = dir.0.join("running.toml");
+        archive_config(&cfg, "[system]\nhostname = \"rolled-back\"\n", 10).unwrap();
+        let committed = Appliance::from_toml("[system]\nhostname = \"committed\"\n")
+            .unwrap()
+            .to_toml()
+            .unwrap();
+        std::fs::write(&cfg, &committed).unwrap();
+        std::fs::write(&running, &committed).unwrap();
+        let mut session = Session::load_live_at(&cfg, &running).unwrap();
+        let act = Apply {
+            enabled: true,
+            ..Apply::off()
+        };
+        assert!(
+            rollback_with(&mut session, &act, 0, &running, |_| anyhow::bail!(
+                "agent refused"
+            ))
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&running).unwrap(), committed);
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), committed);
     }
 }
