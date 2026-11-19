@@ -1993,6 +1993,15 @@
           python3 ${./tests/management_tls.py} -v
           touch $out
         '';
+        # The mixed-version HA fixture's rewrite of velstra.toml for an older
+        # agent (nix/ha-two-node-flow-test.nix): never widens a dst-local rule.
+        legacy-filter-unit = pkgs.runCommand "sentinel-legacy-filter-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p test
+          cp ${./nix/legacy-velstra-filter.py} test/legacy-velstra-filter.py
+          cp ${./nix/test_legacy_velstra_filter.py} test/test_legacy_velstra_filter.py
+          python3 -B -m unittest discover -s test -v
+          touch $out
+        '';
         boothealth-unit = pkgs.runCommand "sentinel-boot-health-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
           mkdir -p test
           cp ${./nix/boot-health.py} test/boot-health.py

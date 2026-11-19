@@ -1,6 +1,35 @@
 { pkgs, self, legacyPackage ? null }:
 let
-  legacyPath = if legacyPackage == null then "" else toString legacyPackage;
+  # Test-only. On a real box Sentinel and the agent ship in one image (and an
+  # A/B rollback boots both old); only this fixture pairs the CURRENT compiler
+  # with an OLDER agent. The legacy agent refuses unknown keys, so it is handed
+  # velstra.toml minus exactly the top-level tables named here, each introduced
+  # after the legacy revision, and with every `dst-local` rule (DP-16) rewritten
+  # into the per-address form the old agent understood — never just the key
+  # removed, which would widen the rule to any destination. The list is
+  # explicit on purpose: anything else the legacy agent rejects still
+  # crash-loops it and fails this check. See nix/legacy-velstra-filter.py.
+  legacyUnknownTables = [
+    "state" # [state] persist/connections (agent stream, DP-12/DP-27)
+  ];
+  legacyFilter = ./legacy-velstra-filter.py;
+  legacyAgent = if legacyPackage == null then null else pkgs.writeShellScriptBin "velstra" ''
+    set -euo pipefail
+    args=()
+    while [ $# -gt 0 ]; do
+      if [ "$1" = --config ]; then
+        ${pkgs.iproute2}/bin/ip -j address show > /run/velstra/legacy-addresses.json
+        ${pkgs.python3}/bin/python3 -I ${legacyFilter} "$2" /run/velstra/legacy-velstra.toml /run/velstra/legacy-addresses.json ${pkgs.lib.escapeShellArgs legacyUnknownTables}
+        args+=(--config /run/velstra/legacy-velstra.toml)
+        shift 2
+      else
+        args+=("$1")
+        shift
+      fi
+    done
+    exec ${legacyPackage}/bin/velstra "''${args[@]}"
+  '';
+  legacyPath = if legacyPackage == null then "" else toString legacyAgent;
   secret = "3fc09889bc23d47751124c1e3841bd6140e4a4759d174eb8922ae47746b67f1a";
   cluster = "two-node-flow-cluster-0123456789";
   appliance = node: (pkgs.formats.toml {}).generate "two-node-flow-member.toml" {
@@ -60,7 +89,7 @@ let
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance node);
     services.velstra.package = lib.mkIf (node == 1 && legacyPackage != null)
-      (lib.mkForce legacyPackage);
+      (lib.mkForce legacyAgent);
     environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.tcpdump ];
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
     systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
