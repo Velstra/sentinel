@@ -204,7 +204,9 @@ in pkgs.testers.runNixOSTest {
     # The refusals are the datapath's, not an absent program: counters move.
     assert delta.get("egress_nat_unsupported_dropped", 0) >= 6, delta
     assert delta.get("nat_opener_required", 0) + delta.get("tcp_invalid_flags", 0) >= 12, delta
-    assert delta.get("egress_masqueraded", 0) >= 24, delta
+    # Six translated cases, three packets each; the two options cases are
+    # refused at the stateful ingress (DP-34) and never reach masquerade.
+    assert delta.get("egress_masqueraded", 0) >= 18, delta
     # The portless reply returns: GRE from the WAN host to the uplink address
     # is un-NATed to the LAN host that owns the binding (address-only NAT).
     lan.succeed("systemd-run --unit=gre-capture ${pkgs.tcpdump}/bin/tcpdump -U -n -i eth1 -w /tmp/lan.pcap ip proto 47")
