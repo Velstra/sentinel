@@ -38,6 +38,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # pulling a second crypto provider; the ring default provider is installed at
 # startup in `api::serve`.
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+# Named directly only for the timer hyper needs before it enforces a request
+# header-read deadline (axum-server configures none). Already in the tree.
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server-auto"] }
 # Direct handle on rustls only to install the ring crypto provider as the process
 # default before a TLS listener is built. Version tracks what is already resolved.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

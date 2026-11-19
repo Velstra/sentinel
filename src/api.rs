@@ -196,13 +196,16 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
                         key.display()
                     )
                 })?;
-            // `into_make_service_with_connect_info::<SocketAddr>` so the login
-            // handler can see the peer address and apply a per-IP lockout —
-            // without it every request would look like it came from nowhere.
-            axum_server::bind_rustls(addr, tls)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .context("serving the management API over HTTPS")?;
+            // The connection budget (CTRL-05) and the peer address the sign-in
+            // and bearer budgets count both come from the limited listener.
+            crate::api_listener::serve(
+                crate::api_listener::Listen::Bind(addr),
+                app,
+                Some(tls),
+                crate::api_listener::LIMITS,
+            )
+            .await
+            .context("serving the management API over HTTPS")?;
         }
         // Opt-in plaintext (`[services.web] tls = false`): loopback/dev, or behind
         // an external TLS terminator. Say plainly that it is unencrypted.
@@ -212,15 +215,14 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
                  PLAINTEXT: tls is disabled, so use this only on a trusted or loopback network",
                 token_file.display()
             );
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("binding {addr}"))?;
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
+            crate::api_listener::serve(
+                crate::api_listener::Listen::Bind(addr),
+                app,
+                None,
+                crate::api_listener::LIMITS,
             )
             .await
-            .context("serving the REST API")?;
+            .with_context(|| format!("serving the REST API on {addr}"))?;
         }
     }
     Ok(())

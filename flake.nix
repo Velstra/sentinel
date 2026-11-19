@@ -886,6 +886,11 @@
               ExecStart = "${sentinel}/bin/sentinel api --listen $SENTINEL_API_LISTEN --config /var/lib/sentinel/appliance.toml --token-file /var/lib/sentinel/api-token";
               Restart = "on-failure";
               RestartSec = "5s";
+              # CTRL-05: the listener caps itself at 512 connections; the
+              # default soft limit of 1024 descriptors left too little room
+              # beside them for session files, child processes and the
+              # outbound peer and update requests the API makes.
+              LimitNOFILE = 65536;
             };
           };
 
