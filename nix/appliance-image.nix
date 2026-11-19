@@ -67,7 +67,9 @@ let
   # (`system.build.image`) and its usrhash, which do not depend on these keys.
   #
   # Every signature is made at one fixed time, so the same keys give the same
-  # bytes: sbsign embeds the signing time and nothing else varies.
+  # signatures (sbsign embeds the signing time). mtools still stamps the FAT
+  # directory entries it rewrites with build-time values, so a rebuild of the
+  # signed image differs in a few ESP timestamp bytes: attest the unsigned one.
   signingTime = "2025-01-01 00:00:00";
   faketime = "TZ=UTC ${pkgs.libfaketime}/bin/faketime '${signingTime}'";
   sbKeys = pkgs.runCommand "${cfg.slotPrefix}-sb-keys" { nativeBuildInputs = [ pkgs.openssl ]; } ''
