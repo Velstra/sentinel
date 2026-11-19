@@ -1764,6 +1764,12 @@
         modules = [
           self.nixosModules.sentinel
           ./nix/image.nix
+          # The shipped closure's security backports (IMG-04, IMG-02). Applied
+          # to the image (and to the checks that verify them), not to the
+          # shared module: the closure rewrite changes the store paths of
+          # everything above libcap/libxcrypt, and image-booting checks that
+          # run host store paths inside the guest would no longer find them.
+          ./nix/security-backports.nix
           # The verity image build reads `config.nixpkgs.hostPlatform` (efiArch);
           # define it explicitly (this nixpkgs' `nixosSystem` doesn't set it from
           # the `system` arg).
