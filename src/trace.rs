@@ -1253,7 +1253,7 @@ to = "10.9.0.10:80"
         ] {
             let t = trace(&appliance, &q(src, kind)).unwrap();
             assert_eq!(
-                (t.verdict.as_str(), t.decided_by.as_str()),
+                (t.verdict, t.decided_by.as_str()),
                 ("pass", "ICMPv6 link control"),
                 "{src} type {kind}: {t:?}"
             );
