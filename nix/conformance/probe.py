@@ -118,6 +118,69 @@ def pmtu():
         return {"error": "missing-pmtu-error"}
 
 
+PMTU6_CLIENT_PORT = 18300
+PMTU6_SERVER = "2001:db8:10::fe"
+
+
+def pmtu6_client(result_path, ready_path, wait=10.0):
+    """Hold a connected UDP flow open, then report the path MTU the kernel learnt.
+
+    The flow is real traffic (one echoed datagram), so both firewalls track it
+    before a Packet Too Big quoting it is injected from the WAN side. The PMTU is
+    only updated for a live socket, so this stays connected until it sees the
+    change or gives up.
+    """
+    import os
+    import time
+    def signal_ready():
+        with open(ready_path, "w") as ready:
+            ready.write("ready\n")
+
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as connection:
+        connection.settimeout(TIMEOUT)
+        try:
+            connection.bind(("2001:db8:20::50", PMTU6_CLIENT_PORT))
+            connection.connect((PMTU6_SERVER, UDP_PORT))
+            connection.send(payload(64))
+            connection.recv(4096)
+        except OSError as error:
+            # No tracked flow, so no PMTU case to run: report it as the case's
+            # result instead of leaving the harness waiting.
+            observed = error_result(error)
+            signal_ready()
+        else:
+            signal_ready()
+            deadline = time.monotonic() + wait
+            mtu = connection.getsockopt(socket.IPPROTO_IPV6, 24)  # IPV6_MTU
+            while mtu != 1280 and time.monotonic() < deadline:
+                time.sleep(0.1)
+                mtu = connection.getsockopt(socket.IPPROTO_IPV6, 24)
+            observed = {"mtu": mtu}
+    tmp = result_path + ".tmp"
+    with open(tmp, "w") as result:
+        json.dump(observed, result)
+    os.rename(tmp, result_path)
+
+
+def ptb6(client, client_port, server, server_port, mtu):
+    """Send a Packet Too Big to `client`, quoting its UDP datagram to `server`.
+
+    The WAN-side host plays the narrower router a real path would have. The
+    kernel fills in the ICMPv6 checksum of a raw ICMPv6 socket.
+    """
+    datagram = struct.pack("!HHHH", client_port, server_port, 8 + 1352, 0) + payload(1352)
+    quoted = struct.pack("!IHBB", 0x60000000, len(datagram), 17, 64)
+    quoted += socket.inet_pton(socket.AF_INET6, client) + socket.inet_pton(socket.AF_INET6, server)
+    message = struct.pack("!BBHI", 2, 0, 0, mtu) + (quoted + datagram)[:1280 - 48]
+    with socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6) as raw:
+        raw.sendto(message, (client, 0))
+
+
+def pmtu6_result(result_path="/tmp/pmtu6.json"):
+    with open(result_path) as result:
+        return json.load(result)
+
+
 def ping(address, size):
     result = subprocess.run(
         ["ping", "-n", "-c", "1", "-W", "2", "-s", str(size), address],
@@ -165,6 +228,40 @@ def cases(side):
         ]
     if side == "pmtu":
         return [("ipv4-pmtu-feedback", pmtu, {"error": "message-too-large", "mtu": 1280})]
+    # Firewall-policy sides (checks.firewall-policy-conformance): a WAN zone
+    # that denies by default AND sets block-icmp, with no ICMPv6 rule of any kind,
+    # an IPv4 bogon rule and an MSS clamp. Each case names the audit finding it
+    # pins.
+    if side == "policy-lan":
+        return [
+            # DP-09: forwarded SYN, full checksum from the sender, clamped.
+            ("ipv4-tcp-mss-clamped-forward", lambda: tcp("198.18.10.254", TCP_PORT), expected(1024, "198.18.10.100", True)),
+            # DP-C07: block-icmp neither stops the ping leaving nor its answer.
+            ("ipv4-icmp-echo-under-block-icmp", lambda: ping("198.18.10.254", 56), {"delivered": True}),
+            ("ipv4-related-unreachable-under-block-icmp", lambda: udp("198.18.10.254", 18199, 64), {"error": "refused"}),
+            # DP-10: neighbour discovery on a default-drop, block-icmp WAN.
+            ("ipv6-tcp-forward-default-drop-wan", lambda: tcp("2001:db8:10::fe", TCP_PORT), expected(1024, "2001:db8:20::50", True)),
+            ("ipv6-icmp-echo-under-block-icmp", lambda: ping("2001:db8:10::fe", 56), {"delivered": True}),
+            # DP-21: an ICMPv6 error about a tracked flow is RELATED.
+            ("ipv6-related-unreachable-under-block-icmp", lambda: udp("2001:db8:10::fe", 18199, 64), {"error": "refused"}),
+        ]
+    if side == "policy-wan":
+        return [
+            # EDGE-02: the RST must be one the receiver accepts.
+            ("ipv4-tcp-reject-valid-rst", lambda: tcp("198.18.10.100", 18082), {"error": "refused"}),
+            # DP-11: a v4 0.0.0.0/8 drop on the same port must not touch IPv6...
+            ("ipv6-tcp-reject-despite-v4-bogon-rule", lambda: tcp("2001:db8:10::100", 18082), {"error": "refused"}),
+            # ...and a v4 0.0.0.0/1 accept must not open IPv6.
+            ("ipv6-v4-prefix-rule-does-not-open", lambda: tcp("2001:db8:20::50", 18083), {"error": "timeout"}),
+            # DP-35: a UDP reject answers with port-unreachable in both families.
+            ("ipv4-udp-reject", lambda: udp("198.18.10.100", 18082, 64), {"error": "refused"}),
+            ("ipv6-udp-reject", lambda: udp("2001:db8:10::100", 18082, 64), {"error": "refused"}),
+            # block-icmp still refuses a new ping, over an explicit ICMP accept.
+            ("ipv4-wan-ping-box-blocked", lambda: ping("198.18.10.100", 56), {"delivered": False}),
+            ("ipv6-wan-ping-box-blocked", lambda: ping("2001:db8:10::100", 56), {"delivered": False}),
+        ]
+    if side == "pmtu6":
+        return [("ipv6-pmtu-feedback-related", pmtu6_result, {"mtu": 1280})]
     raise ValueError("unknown traffic side: " + str(side))
 
 
@@ -179,7 +276,7 @@ def run(side):
     return results
 
 
-def compare(oracle, subject):
+def compare(oracle, subject, sides=("lan", "wan", "pmtu")):
     """No xfail/ignore list: even a known mismatch fails qualification."""
     for records in (oracle, subject):
         if not isinstance(records, list) or any(
@@ -197,7 +294,7 @@ def compare(oracle, subject):
         raise ValueError("duplicate case identifier")
     if oracle_by_id.keys() != subject_by_id.keys():
         raise ValueError("different traffic inventories")
-    required = {name: expected for side in ("lan", "wan", "pmtu")
+    required = {name: expected for side in sides
                 for name, _, expected in cases(side)}
     if oracle_by_id.keys() != required.keys():
         raise ValueError("incomplete or unknown traffic inventory")
@@ -227,9 +324,22 @@ if __name__ == "__main__":
     server = commands.add_parser("server")
     server.add_argument("address", nargs="+")
     client = commands.add_parser("client")
-    client.add_argument("side", choices=("lan", "wan", "pmtu"))
+    client.add_argument("side", choices=("lan", "wan", "pmtu", "policy-lan", "policy-wan", "pmtu6"))
+    hold = commands.add_parser("pmtu6-client")
+    hold.add_argument("result")
+    hold.add_argument("ready")
+    inject = commands.add_parser("ptb6")
+    inject.add_argument("client")
+    inject.add_argument("client_port", type=int)
+    inject.add_argument("server")
+    inject.add_argument("server_port", type=int)
+    inject.add_argument("mtu", type=int)
     args = parser.parse_args()
     if args.command == "server":
         asyncio.run(serve(args.address))
+    elif args.command == "pmtu6-client":
+        pmtu6_client(args.result, args.ready)
+    elif args.command == "ptb6":
+        ptb6(args.client, args.client_port, args.server, args.server_port, args.mtu)
     else:
         print(json.dumps(run(args.side)))

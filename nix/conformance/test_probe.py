@@ -66,6 +66,19 @@ class DifferentialContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "malformed"):
                     compare(self.baseline(), bad)
 
+    def test_policy_sides_are_their_own_complete_inventory(self):
+        sides = ("policy-lan", "policy-wan", "pmtu6")
+        records = [{"case": name, "expected": expected, "observed": expected}
+                   for side in sides for name, _, expected in cases(side)]
+        self.assertEqual(len(records), 14)
+        self.assertEqual(len({r["case"] for r in records}), 14)
+        self.assertTrue(all(r["passed"] for r in compare(records, records, sides)))
+        # Neither inventory is accepted in place of the other.
+        with self.assertRaises(ValueError):
+            compare(records, records)
+        with self.assertRaises(ValueError):
+            compare(self.baseline(), self.baseline(), sides)
+
     def test_unknown_side_never_silently_selects_pmtu(self):
         with self.assertRaisesRegex(ValueError, "unknown traffic side"):
             cases("typo")
