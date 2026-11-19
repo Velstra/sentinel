@@ -88,6 +88,8 @@ in pkgs.testers.runNixOSTest {
         script = "printf '%s\\n' " + " ".join(shlex.quote(c) for c in list(commands) + tail) + " | sentinel configure"
         output = fw.succeed("su admin -c " + shlex.quote(script))
         assert "error:" not in output.lower() and "commit failed" not in output.lower(), output
+    inbound_seen = ""
+
     def unsolicited_from_wan():
         # Counted where it would land, on the LAN host's wire, so the answer
         # does not depend on whether anything there would have replied. Both
