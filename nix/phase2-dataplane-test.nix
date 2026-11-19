@@ -94,21 +94,26 @@ in pkgs.testers.runNixOSTest {
         # Counted where it would land, on the LAN host's wire, so the answer
         # does not depend on whether anything there would have replied. Both
         # families, TCP and UDP, to ports no rule mentions.
-        # The capture must be running before the first probe and finished
-        # before it is read: a fixed sleep raced a slow tcpdump start-up and
-        # read an empty file while the probes had in fact crossed (the client
-        # had answered them with resets).
+        # The capture must be running before the first probe and must hand
+        # over every packet before it stops. libpcap batches packets into
+        # ring blocks it retires only on a timeout (1 s by default), and a
+        # capture stopped sooner loses the unretired block: once the
+        # firewall delivered RELATED ICMP errors (DP-10), the UDP probes got
+        # their port-unreachable at once instead of waiting out `nc -w 1`,
+        # the capture stopped within that second and the step read "0
+        # admitted probes" although the client had answered every one.
+        # Hence --immediate-mode, and a wait for 'listening' before probing.
         # Captured by port only and counted by source below, so a probe that
         # arrives with a rewritten source shows up in the failure message
         # instead of as an empty capture.
-        client.succeed("rm -f /tmp/inbound.pcap /tmp/inbound.err; tcpdump -n -U -i eth1 -w /tmp/inbound.pcap "
+        client.succeed("rm -f /tmp/inbound.pcap /tmp/inbound.err; tcpdump --immediate-mode -n -U -i eth1 -w /tmp/inbound.pcap "
                        "'tcp dst port 9092 or udp dst port 9093' "
                        ">/dev/null 2>/tmp/inbound.err & echo $! >/tmp/inbound.pid")
         client.wait_until_succeeds("grep -q 'listening on eth1' /tmp/inbound.err", timeout=30)
         # The sender's view (not the firewall's: a capture there changed the
         # timing enough to hide the failure): who answers the probes, with
         # which TTL and MAC.
-        server.succeed("rm -f /tmp/sent.pcap /tmp/sent.err; tcpdump -n -U -i eth1 -w /tmp/sent.pcap "
+        server.succeed("rm -f /tmp/sent.pcap /tmp/sent.err; tcpdump --immediate-mode -n -U -i eth1 -w /tmp/sent.pcap "
                        "'port 9092 or port 9093 or icmp or icmp6' >/dev/null 2>/tmp/sent.err & echo $! >/tmp/sent.pid")
         server.wait_until_succeeds("grep -q 'listening on eth1' /tmp/sent.err", timeout=30)
         sent = []
