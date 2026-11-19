@@ -8,7 +8,7 @@ HA qualification or a rolling-upgrade guarantee.
 
 | Mode | Authority | Important limitation |
 | --- | --- | --- |
-| `witness` | An independent witness grants short forwarding leases to one member. | Loss of witness authority can stop forwarding even when both appliances are healthy. An authenticated witness preflight and outage-continuity qualification remain open. |
+| `witness` | An independent witness grants short forwarding leases to one member. | The witness is a single point of failure for forwarding: losing it stops forwarding on both members within one lease, even when both appliances are healthy (see [Witness loss](#witness-loss-is-a-single-point-of-failure)). |
 | `two-node` | Two appliances exchange authenticated heartbeats without a witness. | A total partition can promote both members. Independent heartbeat paths reduce, but do not remove, that risk. |
 | Legacy VRRP and sync | VRRP election and separately configured synchronization. | Not equivalent to fenced pairing; do not infer split-brain protection from a shared VIP. |
 
@@ -85,6 +85,12 @@ Then pair on the primary:
 sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440
 ```
 
+Members that compute the shared policy differently — an image whose compiler
+numbers zones or encodes rules differently — never agree on the readiness
+digest. During a rolling upgrade across such a change the standby stays not
+ready and no state crosses; the switch-over to the upgraded member is an outage
+with connection loss, not a warm failover.
+
 A reachable TCP port does not prove that the witness will authorize the correct
 cluster/key/member pair. Verify authority, standby readiness and actual traffic
 before considering the lab operational. Do not deploy witness or member upgrades
@@ -122,6 +128,70 @@ lease and an 80 ms exchange budget; the lease must cover
 changing them. A larger lease also lengthens the time an old owner can retain
 authority. Do not tune away a failure by making the guard less conservative.
 
+## Standby readiness
+
+`sentinel show ha` on the standby must read plain `HA Backup`. A reason in
+parentheses means the witness would refuse it authority right now, and a
+failure of the active member would not fail over. The readiness digest covers
+the shared policy only: rules `to firewall` and a captive-portal gate name each
+member's own addresses, and those are deliberately left out of it, so two
+members with the same shared configuration agree. A standby that stays
+"policy differs from the owner's" after configuration sync has delivered means
+the shared policy really differs; inspect both members' configurations. A
+state-sync refusal for that reason is logged as a warning (once a minute).
+
+| Reason | Meaning |
+| --- | --- |
+| `policy differs from the owner's; awaiting configuration sync` | A commit has not reached this member, or the shared policy differs. |
+| `fresh agent has no state snapshot yet` | The agent just started. It imports the owner's state within a second. |
+| `no complete state snapshot from the owner` / `state snapshot is stale` | State sync from the owner is not arriving. |
+| `stale state discarded; awaiting a state snapshot` | State stayed unusable for 5 s and was dropped, see below. |
+
+A standby whose replicated state stays unusable for 5 s (stale, or imported
+under a policy it no longer holds) discards it and votes as an empty member.
+This removes a deadlock: if the active member's agent crashed meanwhile, it
+restarts empty too, and two empty members let the witness open a new epoch.
+Established connections do not survive that path; new ones do.
+
+## Failure behaviour (witness mode)
+
+These cases are exercised by `checks.ha-witness-failover`:
+
+- **Data-plane agent crash on the active member** (`velstra` killed, OOM): the
+  kernel fence closes the old member at once; the ready standby takes over and
+  established flows continue (the check bounds the gap at 3 s; about 1 s was
+  measured in the VM check). The crashed
+  member restarts empty, imports the new owner's state and rejoins.
+- **Routing daemon crash** (`wren` killed): the lease lapses and the standby
+  takes over the same way.
+- **VM pause, suspend or live migration**: a resumed member catches up from the
+  current owner by itself and is eligible again; the next failure still fails
+  over. A paused VM's clock stops with it, so for up to one lease (250 ms by
+  default) after it resumes, its data plane can still consider its old lease
+  valid while the witness has already granted the peer. Drain or demote an
+  active member before migrating or suspending it.
+- **Agent crash while the witness is away**: both members end up unable to use
+  their state; once the witness returns, the pair opens a new epoch on its own
+  (see Standby readiness). Expect a short outage and new connections.
+
+### Witness loss is a single point of failure
+
+Losing the witness stops forwarding on both members within one lease. This is
+the price of split-brain protection, not a defect that a setting can tune away:
+the active member cannot tell "the witness is down" from "I am cut off from the
+witness and the peer is not". In the second case the witness grants the peer
+when the lease runs out, so a member that kept forwarding on its own would
+forward alongside its successor. When the witness returns, the previous owner
+is granted again from its retained state and forwarding resumes.
+
+Continuing through a witness outage would be safe only with the peer as a
+second vote: the active member keeps forwarding only on the peer's fresh,
+authenticated promise not to seek authority itself, and a returning witness
+waits out every such promise. Sentinel does not implement that protocol. Until
+it does, run the witness on independent power and network, monitor it, and
+prefer `two-node` mode only if availability through a witness outage matters
+more than exclusive ownership through a partition.
+
 ## Configuration writes on either member
 
 Master/Backup describes forwarding ownership, not configuration permissions.
@@ -142,6 +212,8 @@ pending synchronization state before changing policy.
 nix build .#checks.x86_64-linux.ha-pair -L
 nix build .#checks.x86_64-linux.ha-two-node -L
 nix build .#checks.x86_64-linux.ha-two-node-flow -L
+nix build .#checks.x86_64-linux.ha-witness-failover -L
+nix build .#checks.x86_64-linux.ha-napt-mixed-version -L
 nix build .#checks.x86_64-linux.configsync -L
 ```
 
