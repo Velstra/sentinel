@@ -222,7 +222,10 @@ pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Resu
         // An unprovisioned appliance has no selected interfaces. Stop an old
         // attachment too when the last binding is removed; do not restart the
         // agent onto its fallback NIC or treat a skipped ExecCondition as Ready.
-        return service_stop(unit);
+        service_stop(unit)?;
+        return release_pinned_dataplane(Path::new(PINNED_DATAPATH), |args| {
+            run_priv("velstra", args)
+        });
     }
     if unit == "wren.service" {
         // Wren's SIGHUP handles static routes without disturbing adjacencies.
@@ -243,6 +246,26 @@ pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Resu
         "reload"
     };
     reload_agent(unit, command)
+}
+
+/// Where a persisting agent (`[state] persist = true`) pins its hooks, maps
+/// and connection state so a restart adopts them.
+const PINNED_DATAPATH: &str = "/sys/fs/bpf/velstra";
+
+/// Release the stopped agent's pinned data plane once no interface is bound.
+/// A persisting agent leaves its hooks attached when it stops, for the next
+/// agent to adopt. With the last binding removed no agent starts again, so
+/// the hooks would keep filtering the formerly zoned link with the last
+/// policy, and nothing would be left to change or remove them (DP-12).
+/// `release-datapath` must run with the agent stopped, which the caller does.
+fn release_pinned_dataplane(
+    root: &Path,
+    release: impl FnOnce(&[&str]) -> Result<()>,
+) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    release(&["release-datapath"]).context("releasing the stopped agent's pinned data plane")
 }
 
 /// The compiler always emits an explicit interface array, including `[]` for
@@ -2837,6 +2860,30 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// boothealth: removing the last zone binding stops a persisting agent;
+    /// its pinned hooks are released then, and only when there are pins.
+    #[test]
+    fn the_last_binding_removed_releases_a_pinned_dataplane() {
+        let dir = std::env::temp_dir().join(format!("sentinel-pinned-{}", std::process::id()));
+        let mut calls = Vec::new();
+        release_pinned_dataplane(&dir, |args| {
+            calls.push(args.join(" "));
+            Ok(())
+        })
+        .unwrap();
+        assert!(calls.is_empty(), "no pins, nothing to release");
+        std::fs::create_dir_all(&dir).unwrap();
+        release_pinned_dataplane(&dir, |args| {
+            calls.push(args.join(" "));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, ["release-datapath"]);
+        let failed = release_pinned_dataplane(&dir, |_| anyhow::bail!("busy"));
+        assert!(failed.is_err(), "a failed release is reported, not ignored");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// CTRL-21: a transient unit's `--setenv` lands in `/proc/*/cmdline` of
     /// `systemd-run` and in the unit's `Environment=`, which any local user can
