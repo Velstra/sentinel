@@ -200,6 +200,104 @@ fn link_up(name: &str) -> bool {
     std::path::Path::new(&format!("/sys/class/net/{name}")).exists() && !link_down(name)
 }
 
+/// Where a persisting agent pins its interface hooks (fabric `persist.rs`).
+const PINNED_LINKS: &str = "/sys/fs/bpf/velstra/links";
+
+/// Whether `link` is still filtered by hooks a persisting agent pinned: an XDP
+/// pin for it exists and is attached to the link's *current* incarnation, and
+/// so is its egress pin if it has one. A pin whose interface was recreated
+/// reports another (or no) ifindex, so that link is held as before.
+fn pinned_hooks_enforce(
+    link: &str,
+    dir: &str,
+    index: impl Fn(&str) -> Option<u32>,
+    pinned: impl Fn(&Path) -> Option<u32>,
+) -> bool {
+    let Some(current) = index(link) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut xdp = false;
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        let is_xdp = ["xdp-drv-", "xdp-skb-", "xdp-hw-"]
+            .iter()
+            .any(|prefix| file.strip_prefix(prefix) == Some(link));
+        let is_egress = file.strip_prefix("egress-") == Some(link);
+        if !is_xdp && !is_egress {
+            continue;
+        }
+        if pinned(&entry.path()) != Some(current) {
+            return false;
+        }
+        xdp |= is_xdp;
+    }
+    xdp
+}
+
+fn link_index(name: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The ifindex a pinned XDP or TCX bpf_link is attached to; `None` when it
+/// cannot be read and `Some(0)` when its interface is gone.
+fn pinned_link_ifindex(path: &Path) -> Option<u32> {
+    use std::os::unix::ffi::OsStrExt as _;
+    const BPF_OBJ_GET: libc::c_long = 7;
+    const BPF_OBJ_GET_INFO_BY_FD: libc::c_long = 15;
+    const LINK_XDP: u32 = 6;
+    const LINK_TCX: u32 = 11;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // union bpf_attr for BPF_OBJ_GET: pathname (u64), bpf_fd, file_flags.
+    let mut get = [0u64; 2];
+    get[0] = name.as_ptr() as u64;
+    // SAFETY: the attr buffer and the path outlive the call.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET,
+            get.as_mut_ptr(),
+            size_of_val(&get),
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // struct bpf_link_info: type, id, prog_id, then the per-type union at 16,
+    // whose first field for XDP and TCX is the ifindex.
+    let mut info = [0u8; 64];
+    // info attr: bpf_fd (u32), info_len (u32), info (u64).
+    let mut attr = [0u64; 2];
+    attr[0] = (fd as u64) | ((info.len() as u64) << 32);
+    attr[1] = info.as_mut_ptr() as u64;
+    // SAFETY: `info` is writable for the length the kernel is told.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET_INFO_BY_FD,
+            attr.as_mut_ptr(),
+            size_of_val(&attr),
+        )
+    };
+    // SAFETY: fd was returned by BPF_OBJ_GET above and is closed once.
+    unsafe { libc::close(fd as i32) };
+    if rc < 0 {
+        return None;
+    }
+    let kind = u32::from_ne_bytes(info[0..4].try_into().ok()?);
+    if kind != LINK_XDP && kind != LINK_TCX {
+        return None;
+    }
+    Some(u32::from_ne_bytes(info[16..20].try_into().ok()?))
+}
+
 /// `sentinel hold-links-down`, run as the agent unit's `ExecStopPost=`: put
 /// every zoned link back into the hold. Each link is tried even if one fails,
 /// and a failure fails the command, so the unit's `OnFailure=` alert names it.
@@ -209,6 +307,17 @@ pub fn hold_down(config: &Path) -> Result<()> {
         .unwrap_or_else(|| Appliance::load(config))?;
     let mut failed = Vec::new();
     for link in to_hold_down(&appliance, link_up) {
+        // A persisting agent (`[state] persist`) leaves its pinned hooks
+        // attached and enforcing the last policy when it stops, and the next
+        // agent swaps its programs into them atomically. Downing such a link
+        // would only add an outage — and flush its addresses — across a
+        // restart that keeps every connection (DP-12/DP-27).
+        if pinned_hooks_enforce(&link, PINNED_LINKS, link_index, pinned_link_ifindex) {
+            eprintln!(
+                "hold-links-down: {link} kept up: its pinned datapath hooks are still attached"
+            );
+            continue;
+        }
         match crate::system::ip_link(&["set", "dev", &link, "down"]) {
             Ok(()) => eprintln!("hold-links-down: {link} held until the data plane hooks it again"),
             Err(error) => {
@@ -228,6 +337,45 @@ pub fn hold_down(config: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_whose_pinned_hooks_are_attached_is_not_held_down() {
+        let dir = std::env::temp_dir().join(format!("sentinel-pins-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["xdp-skb-wan0", "egress-wan0", "xdp-drv-lan0"] {
+            std::fs::write(dir.join(file), b"").unwrap();
+        }
+        let dir_text = dir.to_str().unwrap();
+        let index = |name: &str| match name {
+            "wan0" => Some(7),
+            "lan0" => Some(8),
+            "dmz0" => Some(9),
+            _ => None,
+        };
+        // Both of wan0's pins on its current ifindex: still enforcing.
+        assert!(pinned_hooks_enforce("wan0", dir_text, index, |_| Some(7)));
+        // lan0's pin belongs to an earlier incarnation: hold it.
+        assert!(!pinned_hooks_enforce("lan0", dir_text, index, |_| Some(3)));
+        // An egress pin that is detached spoils an attached XDP pin.
+        let detached_egress = |p: &Path| Some(if p.ends_with("egress-wan0") { 0 } else { 7 });
+        assert!(!pinned_hooks_enforce(
+            "wan0",
+            dir_text,
+            index,
+            detached_egress
+        ));
+        // No pin, an unreadable pin, a missing link or a missing directory: hold.
+        assert!(!pinned_hooks_enforce("dmz0", dir_text, index, |_| Some(9)));
+        assert!(!pinned_hooks_enforce("wan0", dir_text, index, |_| None));
+        assert!(!pinned_hooks_enforce("gone0", dir_text, index, |_| Some(7)));
+        assert!(!pinned_hooks_enforce(
+            "wan0",
+            "/nonexistent/velstra/links",
+            index,
+            |_| Some(7)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

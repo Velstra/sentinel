@@ -33,10 +33,56 @@ let
     port = 9000
     action = "pass"
     direction = "in"
+    [[policy.port_rule]]
+    proto = "tcp"
+    port = 9001
+    action = "pass"
+    direction = "in"
     [[interface]]
     name = "eth1"
     policy = 2
+    activate = true
   '');
+  # The appliance's own link hold, exactly as the Sentinel unit runs it: the
+  # agent's ExecStopPost/ExecStartPre put zoned links down unless a pinned
+  # datapath still enforces on them.
+  appliance = pkgs.writeText "persist-appliance.toml" ''
+    [system]
+    hostname = "fw"
+    [zone.lan]
+    [[interface]]
+    name = "eth1"
+    zone = "lan"
+  '';
+  hold = "${self.packages.x86_64-linux.sentinel}/bin/sentinel hold-links-down --config ${appliance}";
+  # Client -> fw:9000 every 5 ms; the server writes the largest delivery gap.
+  stream = pkgs.writeText "persist-stream.py" ''
+    import json, socket, sys, time
+    from pathlib import Path
+    if sys.argv[1] == "server":
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", 9001))
+        s.listen(1)
+        Path("/run/stream-ready").touch()
+        c, _ = s.accept()
+        last, gaps = time.monotonic(), []
+        while data := c.recv(65536):
+            now = time.monotonic()
+            # (gap, CLOCK_MONOTONIC at its end) — comparable with the console's [uptime].
+            gaps = sorted(gaps + [(round(now - last, 3), round(now, 3))])[-5:]
+            last = now
+            # Atomic: the driver reads this while it is being updated.
+            Path("/run/stream-worst.tmp").write_text(json.dumps(gaps))
+            Path("/run/stream-worst.tmp").replace("/run/stream-worst")
+    else:
+        c = socket.create_connection(("198.18.10.100", 9001), 10)
+        c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        end = time.monotonic() + float(sys.argv[2])
+        while time.monotonic() < end:
+            c.sendall(b"x")
+            time.sleep(0.005)
+  '';
   echo = pkgs.writeText "persist-echo.py" ''
     import socket, sys, threading
     def serve(port):
@@ -116,6 +162,8 @@ in pkgs.testers.runNixOSTest {
         environment.RUST_LOG = "info";
         serviceConfig = {
           ExecStart = "${agent}/bin/velstra run --iface eth1 --xdp-mode skb --config ${config} --query-socket /run/velstra/query.sock";
+          ExecStopPost = "+${hold}";
+          ExecStartPre = "-+${hold}";
           Restart = "no";
         };
       };
@@ -148,6 +196,11 @@ in pkgs.testers.runNixOSTest {
     save()
     assert receipt["before"] == {"rule_port": True, "closed_port": False, "held": "ok"}, receipt
 
+    fw.succeed("systemd-run --unit stream-server ${python} ${stream} server")
+    fw.wait_until_succeeds("test -e /run/stream-ready")
+    client.succeed("systemd-run --unit stream-client ${python} ${stream} client 90")
+    fw.wait_until_succeeds("test -e /run/stream-worst")
+    receipt["kill_at"] = float(fw.succeed("cut -d' ' -f1 /proc/uptime"))
     fw.succeed("systemctl kill -s KILL --kill-whom=all agent")
     fw.wait_until_succeeds("! systemctl is-active agent")
     receipt["dead"] = {
@@ -160,6 +213,7 @@ in pkgs.testers.runNixOSTest {
     assert not receipt["dead"]["closed_port"], f"agent death left the link unfiltered: {receipt}"
     assert receipt["dead"]["held"] == "ok", f"agent death dropped connection state: {receipt}"
 
+    receipt["restart_at"] = float(fw.succeed("cut -d' ' -f1 /proc/uptime"))
     fw.succeed("systemctl start agent")
     fw.wait_until_succeeds("journalctl -u agent --no-pager | grep -c 'Velstra is live.' | grep -qx 2")
     journal = fw.succeed("journalctl -u agent --no-pager")
@@ -171,12 +225,21 @@ in pkgs.testers.runNixOSTest {
         "adopted_egress": "adopted the pinned egress firewall on eth1" in journal,
         "capacity": json.loads(fw.succeed("${python} ${query} capacity")),
     }
+    restarted["stream_gaps"] = json.loads(fw.succeed("cat /run/stream-worst"))
+    restarted["stream_worst_gap_s"] = max(g for g, _ in restarted["stream_gaps"])
+    # The first start holds the link (no pins yet); a restart must not.
+    restarted["link_downed"] = journal.count("held until the data plane hooks it again") > 1
+    restarted["link_kept"] = "kept up: its pinned datapath hooks are still attached" in journal
     receipt["restarted"] = restarted
     save()
     r = restarted
     assert not r["closed_port"] and r["held"] == "ok", receipt
     assert r["adopted_state"] and r["adopted_xdp"] and r["adopted_egress"], receipt
     assert r["capacity"]["state_adopted_from_previous_agent"] is True, receipt
+    # Forwarding never stops: the hold left the link up and the stream through
+    # the datapath saw no gap beyond scheduling across SIGKILL and restart.
+    assert r["link_kept"] and not r["link_downed"], receipt
+    assert r["stream_worst_gap_s"] < 1.0, receipt
 
     fw.succeed("systemctl stop agent")
     receipt["stopped"] = {"closed_port": reachable(8080), "held": held("stopped")}
