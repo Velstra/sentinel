@@ -315,10 +315,11 @@ in
           "rw"
           "nofail"
           # Direct RAW/QCOW2 imports skip the installer. Grow the verified
-          # existing partition BEFORE mounting, then grow ext4 online without
-          # formatting it. Installer-managed LUKS/RAID members are not resized.
+          # existing partition and then its ext4, both BEFORE mounting and
+          # without formatting it. Installer-managed LUKS/RAID members are not
+          # resized. No x-systemd.growfs: an online resize raced the first
+          # writers on the freshly mounted filesystem (PROV-02).
           "x-systemd.requires=${cfg.slotPrefix}-state-grow.service"
-          "x-systemd.growfs"
           # On an ENCRYPTED install the LABEL=data ext4 lives inside a LUKS volume,
           # so it does not exist until the unlock unit has opened it.
           # `x-systemd.requires=` makes this mount Require + After that service. On a
@@ -409,6 +410,9 @@ in
         before = [
           "local-fs.target"
           "${utils.escapeSystemdPath cfg.stateDir}.mount"
+          # The mount's own check must not read the filesystem while the
+          # partition under it is being resized and the filesystem grown.
+          "systemd-fsck@${utils.escapeSystemdPath "/dev/disk/by-label/data"}.service"
           cfg.unlockUnit
         ];
         unitConfig = {
@@ -418,7 +422,8 @@ in
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          TimeoutStartSec = "90s";
+          # Covers the offline e2fsck + resize2fs of a large first-boot disk.
+          TimeoutStartSec = "300s";
           UMask = "0077";
           NoNewPrivileges = true;
           ProtectHome = true;
@@ -430,7 +435,9 @@ in
             + " --sfdisk ${pkgs.util-linux}/bin/sfdisk"
             + " --blkid ${pkgs.util-linux}/bin/blkid"
             + " --repart ${pkgs.systemd}/bin/systemd-repart"
-            + " --udevadm ${pkgs.systemd}/bin/udevadm";
+            + " --udevadm ${pkgs.systemd}/bin/udevadm"
+            + " --e2fsck ${pkgs.e2fsprogs}/bin/e2fsck"
+            + " --resize2fs ${pkgs.e2fsprogs}/bin/resize2fs";
         };
       };
     };
