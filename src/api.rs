@@ -1577,6 +1577,7 @@ fn receive_pairing(state: &ApiState, mut request: PairRequest) -> Result<Json<Va
     // Applied before the revision comparison, so a retried pairing whose
     // acknowledgement was lost is still recognised as already applied.
     crate::configsync::keep_member_trust(&mut request.appliance, &local);
+    crate::configsync::keep_member_session_sources(&mut request.appliance, &local);
     request
         .appliance
         .validate()
@@ -2183,8 +2184,10 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
                 .entry(name.clone())
                 .or_insert_with(|| facts.clone());
         }
-        // Who manages this member, and how, is this member's (CTRL-09).
+        // Who manages this member, and how, is this member's (CTRL-09), and
+        // so are the addresses it sources its own sessions from (CTRL-10).
         crate::configsync::keep_member_trust(&mut adjusted, local);
+        crate::configsync::keep_member_session_sources(&mut adjusted, local);
         adjusted.validate()?;
         return Ok(adjusted);
     }
@@ -2196,7 +2199,7 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
     // keys, the SSH server (its listen address included, CTRL-10) and the
     // console — is this member's, never the sender's (CTRL-09).
     crate::configsync::keep_member_trust(&mut incoming, local);
-    keep_member_session_sources(&mut incoming, local);
+    crate::configsync::keep_member_session_sources(&mut incoming, local);
     incoming.system.hostname = local.system.hostname.clone();
     incoming.system.config_sync = local.system.config_sync.clone();
     incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
@@ -2236,30 +2239,6 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
     }
     incoming.validate()?;
     Ok(incoming)
-}
-
-/// Addresses a legacy push carries that name the *sender's* own end of a
-/// session (CTRL-10): a BGP neighbour's `update-source` and the PPPoE server's
-/// `local-address`. Importing them left the receiver binding an address it
-/// does not have. For a neighbour, or a PPPoE server, the receiver already
-/// has, the receiver's own value is kept; a new one arrives as sent (it may
-/// be a shared VRRP address), and the receiver's validation decides.
-fn keep_member_session_sources(incoming: &mut Appliance, local: &Appliance) {
-    if let (Some(theirs), Some(ours)) = (&mut incoming.protocols.bgp, &local.protocols.bgp) {
-        for neighbor in &mut theirs.neighbors {
-            if let Some(own) = ours
-                .neighbors
-                .iter()
-                .find(|n| n.address == neighbor.address)
-            {
-                neighbor.update_source = own.update_source.clone();
-            }
-        }
-    }
-    if local.services.pppoe_server.local_address.is_some() {
-        incoming.services.pppoe_server.local_address =
-            local.services.pppoe_server.local_address.clone();
-    }
 }
 
 /// Caller holds apply.lock; ordinary writes never accept a CLI trial implicitly.
@@ -6721,6 +6700,69 @@ action="reject"
         );
         assert_eq!(
             merged.protocols.bgp.unwrap().neighbors[0]
+                .update_source
+                .as_deref(),
+            Some("10.43.0.41")
+        );
+    }
+
+    /// What the receiver keeps of its own (CTRL-09, CTRL-10) must not count as
+    /// a difference: members whose accounts, SSH settings or BGP source
+    /// addresses differ keep synchronizing push after push, not only once —
+    /// a kept field that still entered the shared revision turned every
+    /// following push into a conflict.
+    #[tokio::test]
+    async fn members_that_keep_their_own_settings_keep_synchronizing() {
+        let (a, b) = legacy_pair();
+        let bgp = |own: &str| {
+            Appliance::from_toml(&format!(
+                "[system]\nhostname = \"x\"\n[protocols.bgp]\nlocal-as = 65001\n\
+                 [[protocols.bgp.neighbor]]\naddress = \"10.43.0.1\"\nremote-as = 65000\n\
+                 update-source = \"{own}\"\n"
+            ))
+            .unwrap()
+            .protocols
+            .bgp
+        };
+        let mut a = a;
+        a.protocols.bgp = bgp("10.43.0.40");
+        a.services.ssh.port = Some(2222);
+        let mut b = b;
+        b.protocols.bgp = bgp("10.43.0.41");
+        b.services.ssh.port = Some(22);
+        b.system.logins[0].ssh_keys = vec![
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl vera-on-b"
+                .into(),
+        ];
+        assert_eq!(
+            crate::configsync::shared_revision(&a).unwrap(),
+            crate::configsync::shared_revision(&b).unwrap()
+        );
+        let st = sync_state(&b);
+        let app = router(st.clone());
+        let mut previous = a.clone();
+        for step in 0..3 {
+            let mut next = previous.clone();
+            next.interfaces[0].mtu = Some(1400 + step);
+            let base = crate::configsync::shared_revision(&previous).unwrap();
+            let resp = app
+                .clone()
+                .oneshot(push(Some(&base), PEER_SECRET, &next))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "push {step}: {}",
+                body_string(resp).await
+            );
+            previous = next;
+        }
+        let saved = Appliance::load(&st.config_path).unwrap();
+        assert_eq!(saved.interfaces[0].mtu, Some(1402));
+        assert_eq!(saved.services.ssh.port, Some(22));
+        assert_eq!(
+            saved.protocols.bgp.unwrap().neighbors[0]
                 .update_source
                 .as_deref(),
             Some("10.43.0.41")

@@ -79,6 +79,32 @@ pub(crate) fn keep_member_trust(incoming: &mut Appliance, local: &Appliance) {
     incoming.system.console = local.system.console.clone();
 }
 
+/// Addresses a push carries that name the *sender's* own end of a session
+/// (CTRL-10): a BGP neighbour's `update-source` and the PPPoE server's
+/// `local-address`. Importing them left the receiver binding an address it
+/// does not have. For a neighbour, or a PPPoE server, the receiver already
+/// has, the receiver's own value is kept; a new one arrives as sent (it may be
+/// a shared VRRP address) and the receiver's validation decides. Like the
+/// management trust, these are left out of [`shared_revision`], so members
+/// whose values differ stay in sync.
+pub(crate) fn keep_member_session_sources(incoming: &mut Appliance, local: &Appliance) {
+    if let (Some(theirs), Some(ours)) = (&mut incoming.protocols.bgp, &local.protocols.bgp) {
+        for neighbor in &mut theirs.neighbors {
+            if let Some(own) = ours
+                .neighbors
+                .iter()
+                .find(|n| n.address == neighbor.address)
+            {
+                neighbor.update_source = own.update_source.clone();
+            }
+        }
+    }
+    if local.services.pppoe_server.local_address.is_some() {
+        incoming.services.pppoe_server.local_address =
+            local.services.pppoe_server.local_address.clone();
+    }
+}
+
 /// The names of the sections [`keep_member_trust`] keeps, as the fleet fence
 /// names them.
 #[cfg(test)]
@@ -91,13 +117,21 @@ pub(crate) const MEMBER_TRUST_SECTIONS: [&str; 6] = [
     "system.console",
 ];
 
-fn blank_member_trust(a: &mut Appliance) {
+/// Blank everything [`keep_member_trust`] and [`keep_member_session_sources`]
+/// keep on the receiver, so it does not count as a difference.
+fn blank_member_local(a: &mut Appliance) {
     a.system.logins = Vec::new();
     a.system.groups = Vec::new();
     a.system.aaa = Default::default();
     a.update = None;
     a.services.ssh = Default::default();
     a.system.console = Default::default();
+    if let Some(bgp) = &mut a.protocols.bgp {
+        for neighbor in &mut bgp.neighbors {
+            neighbor.update_source = None;
+        }
+    }
+    a.services.pppoe_server.local_address = None;
 }
 
 /// The revision of the part of `a` that config-sync converges: the same on
@@ -105,11 +139,12 @@ fn blank_member_trust(a: &mut Appliance) {
 ///
 /// Member-local facts differ by design and are taken out first — the exact
 /// set the receiver keeps when it merges a push (`api::merge_synced_config`),
-/// including the management trust [`keep_member_trust`] fences: two members
-/// whose accounts differ are still in sync.
+/// including the management trust [`keep_member_trust`] fences and the session
+/// sources [`keep_member_session_sources`] keeps: two members whose accounts or
+/// BGP source addresses differ are still in sync.
 pub fn shared_revision(a: &Appliance) -> Result<String> {
     let mut view = shared_view(a)?;
-    blank_member_trust(&mut view);
+    blank_member_local(&mut view);
     crate::ha::revision(&view)
 }
 
