@@ -1837,6 +1837,7 @@
           inherit pkgs self;
           persist = false;
         };
+        masquerade-leak = import ./nix/masquerade-leak-test.nix { inherit pkgs self; };
         nat-capacity-pressure = import ./nix/nat-capacity-pressure-test.nix {
           inherit pkgs self;
           counts = [ 1 64 12000 15000 16000 17000 20000 ];
@@ -8507,7 +8508,28 @@
         # to the client with the server's real address. Proven end to end: the
         # client curls the WAN ip and gets the server's payload, all in XDP.
         #   nix build .#checks.x86_64-linux.hairpin -L
-        hairpin = pkgs.testers.runNixOSTest {
+        hairpin = let
+          holdClient = pkgs.writeText "hold-client.py" ''
+            import socket, sys, time
+            tag = sys.argv[1].encode()
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", 40000))
+            s.settimeout(10)
+            s.connect(("198.51.100.1", 8081))
+            f = s.makefile("rwb")
+            f.write(tag + b"-1\n"); f.flush()
+            first = f.readline()
+            assert first == tag + b"-1\n", first
+            open("/tmp/hold-ready", "w").close()
+            time.sleep(6)
+            f.write(tag + b"-2\n"); f.flush()
+            second = f.readline()
+            assert second == tag + b"-2\n", second
+            open("/tmp/hold-" + tag.decode() + ".ok", "w").close()
+            print("ok", tag.decode())
+          '';
+        in pkgs.testers.runNixOSTest {
           name = "sentinel-hairpin";
           nodes = {
             # Internal server on the LAN segment, serving :8443.
@@ -8529,6 +8551,22 @@
                     address = "10.1.0.1";
                     interface = "eth1";
                   };
+                };
+                # A line echo server that holds its connections open, so two
+                # hairpin clients can be connected at the same time (DP-23).
+                systemd.services.echo = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = "exec ${pkgs.python3}/bin/python3 ${pkgs.writeText "hold-echo.py" ''
+                    import socketserver
+                    class Echo(socketserver.StreamRequestHandler):
+                        def handle(self):
+                            for line in self.rfile:
+                                self.wfile.write(line)
+                                self.wfile.flush()
+                    socketserver.ThreadingTCPServer.allow_reuse_address = True
+                    socketserver.ThreadingTCPServer(("0.0.0.0", 9000), Echo).serve_forever()
+                  ''}";
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
@@ -8560,6 +8598,28 @@
                   };
                 };
                 environment.systemPackages = [ pkgs.curl ];
+              };
+            # A second internal client, to prove two hairpin clients that pick the
+            # SAME source port toward the same reflected service do not collide.
+            client2 =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.4";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.1.0.1";
+                    interface = "eth1";
+                  };
+                };
               };
             # The appliance: LAN = eth1 (vlan 1), WAN = eth2 (vlan 2). Sentinel owns
             # both addresses so the compiler knows the public IP for the reflection.
@@ -8606,6 +8666,9 @@
                 "'set nat destination web zone wan' 'set nat destination web proto tcp' "
                 "'set nat destination web port 8080' 'set nat destination web to 10.1.0.2:8443' "
                 "'set nat destination web hairpin true' "
+                "'set nat destination echo zone wan' 'set nat destination echo proto tcp' "
+                "'set nat destination echo port 8081' 'set nat destination echo to 10.1.0.2:9000' "
+                "'set nat destination echo hairpin true' "
                 "commit save exit "
                 "| sentinel configure\""
             )
@@ -8627,6 +8690,19 @@
                 "curl -s --max-time 5 http://198.51.100.1:8080/ | grep -q hello-from-server",
                 timeout=60,
             )
+
+            # DP-23: two LAN clients, both from source port 40000, to the same
+            # reflected service, connected at once. With the client port kept
+            # they share one server-side tuple and the second steals the first's
+            # replies; each must still receive exactly its own echo.
+            server.wait_for_unit("echo.service")
+            client.succeed("systemd-run --unit=hold-a ${pkgs.python3}/bin/python3 ${holdClient} A")
+            client.wait_until_succeeds("test -e /tmp/hold-ready", timeout=30)
+            client2.succeed("${pkgs.python3}/bin/python3 ${holdClient} B")
+            client2.succeed("test -e /tmp/hold-B.ok")
+            # The first client's SECOND echo, after the second client connected,
+            # must still be its own: a marker only a correct reply writes.
+            client.wait_until_succeeds("test -e /tmp/hold-A.ok", timeout=30)
           '';
         };
 

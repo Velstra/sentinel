@@ -26,10 +26,10 @@ import time
 
 FLOW_KEY = struct.Struct("<I4s4sHHB3x")
 FIREWALL_KEY = struct.Struct("<I16s16sHHBB2x")
-FIREWALL_VALUE = struct.Struct("<QQII")
+FIREWALL_VALUE = struct.Struct("<QQII16x")  # + node-local TCP tracking
 NAT_VALUE = struct.Struct("<4s4sHHHHQQQQ")
 MAP_LAYOUTS = {"CONNTRACK": (20, 48, "lru_hash"),
-               "FW_FLOWS": (44, 24, "lru_hash"),
+               "FW_FLOWS": (44, 40, "lru_hash"),
                "SYN_FLOWS": (20, 16, "lru_hash"),
                "IFACE_POLICY": (4, 4, "hash")}
 SOCKET = "/run/qa-nat-capacity.sock"
