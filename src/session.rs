@@ -7434,6 +7434,7 @@ impl Session {
                     "enable" => s.enable = true,
                     "port" => s.port = None,
                     "listen-address" => s.listen_address = None,
+                    "loglevel" => s.loglevel = None,
                     "password-authentication" => s.password_authentication = false,
                     other => bail!("services ssh has no field {other:?}"),
                 }
