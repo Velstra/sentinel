@@ -12,17 +12,20 @@
 //! * every **port rule** as one data-plane rule per `(proto, port, one address
 //!   end[, interface])`: ranges and `port-group`s fan out, `tcp_udp` becomes
 //!   two rules, `source`/`destination` and their groups become the CIDR the
-//!   trie is keyed on, `interface-group` scopes a rule to a link, `family` and
-//!   `direction` narrow it, and a MAC-group rule becomes one verdict per member;
+//!   trie is keyed on, `interface-group` scopes a rule to a link, `family`
+//!   narrows it, `direction` defaults to `in` (a `from <zone>` rule is about
+//!   traffic arriving from that zone, never about traffic leaving through it),
+//!   and a MAC-group rule becomes one verdict per member. Two rules on the same
+//!   data-plane key are resolved here, stricter first (`conflicts`);
 //! * a **destination zone** (`to = <zone>`) as a match on that zone's own
 //!   subnets — or, for a zone marked `local` (whatever it is called: the flag
-//!   is per zone, not a reserved name), on this box's own addresses as host
-//!   routes. The data plane has no notion of an egress zone; it ranks one
-//!   address end per rule by longest prefix, so "to lan" is enforced as "to the
-//!   networks lan is made of". A zone with no static subnet yields nothing to
-//!   match on, and the rule then **widens to any destination** rather than
-//!   matching none — `warnings()` says so at every commit, and that warning is
-//!   the only thing between a rule that reads narrow and one that is not;
+//!   is per zone, not a reserved name), as `dst-local`: the agent matches the
+//!   addresses this box holds at run time, DHCP and VRRP included. The data
+//!   plane has no notion of an egress zone; it ranks one address end per rule
+//!   by longest prefix, so "to lan" is enforced as "to the networks lan is
+//!   made of". A non-local zone with no static subnet yields nothing to match
+//!   on, and the rule then **widens to any destination** rather than matching
+//!   none — `warnings()` says so at every commit;
 //! * port-forwards, hairpin reflections, load-balanced services (each with the
 //!   `pass` that opens its port), masquerade and CGNAT layout per interface,
 //!   NPTv6, SYN proxy, flow export, conntrack sync, the EVPN overlay and SRv6.
@@ -42,6 +45,21 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::config::{Action, Appliance, Proto};
+
+mod capacity;
+mod conflicts;
+
+pub(crate) use capacity::capacity_errors;
+
+/// Refuse a configuration whose compiled policy would overflow a data-plane
+/// map, naming every map that does (see [`capacity_errors`]).
+pub(crate) fn check_capacity(appliance: &Appliance) -> anyhow::Result<()> {
+    let errors = capacity_errors(appliance);
+    if errors.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!("{}", errors.join("\n"))
+}
 
 /// The MSS a departing SYN may advertise on this link, if it needs a ceiling.
 ///
@@ -132,6 +150,40 @@ pub struct VelstraConfig {
     /// encapsulation. Omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     srv6: Option<Srv6Out>,
+    /// The box addresses the configuration itself names (static interface
+    /// addresses and VRRP virtual addresses). Not emitted: the agent resolves
+    /// `dst-local` from what the box actually holds. Kept for the offline
+    /// views (`trace`, `attribute`), which have no live inventory and must
+    /// say so rather than guess.
+    #[serde(skip)]
+    pub(crate) local_hint: Vec<std::net::IpAddr>,
+}
+
+/// The addresses the configuration says this box holds: every enabled
+/// interface's static v4/v6 address and every VRRP virtual address. A subset
+/// of what the agent matches for `dst-local` — DHCP, SLAAC and DHCPv6
+/// addresses are only known at run time.
+pub(crate) fn configured_local_addresses(appliance: &Appliance) -> Vec<std::net::IpAddr> {
+    let host = |cidr: &str| cidr.split('/').next()?.parse::<std::net::IpAddr>().ok();
+    let mut out: Vec<std::net::IpAddr> = appliance
+        .interfaces
+        .iter()
+        .filter(|i| !i.disabled)
+        .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
+        .flatten()
+        .filter_map(host)
+        .chain(
+            appliance
+                .protocols
+                .vrrp
+                .iter()
+                .flat_map(|v| v.virtual_address.iter())
+                .filter_map(|a| host(a)),
+        )
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// `[srv6]` in the emitted data-plane config: this box's SRv6 identity and the
@@ -189,7 +241,7 @@ struct ServiceOut {
 }
 
 /// One backend behind a [`ServiceOut`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct BackendOut {
     ip: String,
     /// Absent ⇒ keep the client's original destination port.
@@ -270,13 +322,37 @@ pub(crate) struct Policy {
     pub(crate) port_rules: Vec<PortRule>,
 }
 
+/// The largest policy id the compiler hands out. An interface outside every
+/// EVPN instance defaults its overlay segment to its policy id, and a segment
+/// id (VNI) is 24 bits, so a policy id must fit in 24 bits too.
+const POLICY_ID_MAX: u32 = 0x00FF_FFFF;
+
+/// FNV-1a over the zone name: small, dependency-free and fixed forever, which
+/// is the property that matters — the same name must map to the same id on
+/// every release and on both members of an HA pair.
+fn zone_id_hash(name: &str) -> u32 {
+    name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
 /// Which policy id each zone in use compiles to.
 ///
-/// Assigned by sorted zone name so a recompile is deterministic — the map keys
-/// the data plane uses for conntrack and rules must not move because an
-/// interface was added. Exposed because the portal has to name a zone's policy
-/// to the agent, and a second implementation of this rule would eventually
-/// admit devices to the wrong zone.
+/// The id is a function of the zone's **name** (a 24-bit hash, never 0), not of
+/// its rank among the other zones. The data plane keys conntrack, NAT, portal
+/// and counter state by this id, and a changed id makes the commit reset that
+/// state box-wide (`system::reload_compiled`): ranking by sorted name meant
+/// that adding zone `dmz` to `{lan, wan}` renumbered both and dropped every
+/// connection on the box. With a hash, adding, removing or renaming one zone
+/// leaves every other zone's id where it was.
+///
+/// Two names that hash to the same id are resolved in sorted-name order by
+/// probing to the next free id, so the result stays deterministic; only the
+/// colliding zones depend on each other, and only in that (rare) case.
+///
+/// Exposed because the portal has to name a zone's policy to the agent, and a
+/// second implementation of this rule would eventually admit devices to the
+/// wrong zone.
 pub fn zone_policy_ids(appliance: &Appliance) -> BTreeMap<&str, u32> {
     let mut zone_names: Vec<&str> = appliance
         .interfaces
@@ -286,35 +362,34 @@ pub fn zone_policy_ids(appliance: &Appliance) -> BTreeMap<&str, u32> {
         .collect();
     zone_names.sort_unstable();
     zone_names.dedup();
+    let mut taken = std::collections::BTreeSet::new();
     zone_names
         .into_iter()
-        .enumerate()
-        .map(|(i, name)| (name, i as u32 + 1))
+        .map(|name| {
+            let mut id = zone_id_hash(name) % POLICY_ID_MAX + 1;
+            while !taken.insert(id) {
+                id = id % POLICY_ID_MAX + 1;
+            }
+            (name, id)
+        })
         .collect()
 }
 
-/// Static destination prefixes used by `to <zone>` rules. This is deliberately
-/// not the set of destinations routed through that zone: routing can change at
-/// runtime, and an ingress-address trie does not match an egress interface.
+/// Whether `zone` is a **local** zone — this box itself. Its destination is
+/// resolved by the agent from the addresses the box actually holds
+/// ([`PortRule::dst_local`]), never from the configuration.
+pub(crate) fn is_local_zone(appliance: &Appliance, zone: &str) -> bool {
+    appliance.zones.get(zone).is_some_and(|z| z.local)
+}
+
+/// Static destination prefixes used by `to <zone>` rules for an ordinary
+/// (non-local) zone. This is deliberately not the set of destinations routed
+/// through that zone: routing can change at runtime, and an ingress-address
+/// trie does not match an egress interface. A local zone yields nothing here;
+/// see [`is_local_zone`].
 fn zone_destination_prefixes(appliance: &Appliance, zone: &str) -> Vec<String> {
-    if appliance.zones.get(zone).is_some_and(|z| z.local) {
-        return appliance
-            .interfaces
-            .iter()
-            .filter(|i| !i.disabled)
-            .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
-            .flatten()
-            .filter_map(|cidr| {
-                let (addr, _) = cidr.split_once('/')?;
-                if addr.parse::<std::net::Ipv4Addr>().is_ok() {
-                    Some(format!("{addr}/32"))
-                } else if addr.parse::<std::net::Ipv6Addr>().is_ok() {
-                    Some(format!("{addr}/128"))
-                } else {
-                    None
-                }
-            })
-            .collect();
+    if is_local_zone(appliance, zone) {
+        return Vec::new();
     }
     appliance
         .interfaces
@@ -371,7 +446,7 @@ pub(crate) fn destination_zone_warnings(appliance: &Appliance) -> Vec<String> {
         .filter(|r| r.source.is_none() && r.source_group.is_none())
         .filter_map(|r| {
             let to = r.to.as_deref()?;
-            if appliance.zones.get(to).is_some_and(|z| z.local) {
+            if is_local_zone(appliance, to) {
                 return None;
             }
             let prefixes = zone_destination_prefixes(appliance, to);
@@ -476,6 +551,21 @@ pub(crate) struct PortRule {
     /// together with `src` — the data plane ranks one end per rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) dst: Option<String>,
+    /// The destination is **this box**: whatever addresses it holds when the
+    /// packet arrives, not the ones the configuration happens to spell out.
+    /// Emitted as `dst-local = true` with no `dst`; the agent resolves it from
+    /// its live host inventory — DHCP leases, SLAAC/DHCPv6 addresses and a
+    /// VRRP address while this member holds it included — and re-resolves
+    /// when those change. An agent that predates the field refuses it
+    /// (`deny_unknown_fields`) instead of guessing. Never set together with
+    /// `src` or `dst`. Omitted when false.
+    ///
+    /// Resolving it here instead, from static addresses only, left a DHCP
+    /// management port unreachable by its own `to firewall` rules, a VRRP
+    /// address never local, and an all-DHCP box matching *any* destination;
+    /// it also made the compiled policy differ between HA members.
+    #[serde(rename = "dst-local", skip_serializing_if = "is_false")]
+    pub(crate) dst_local: bool,
     /// New-flow rate limit in packets/s. Omitted when the rule is unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) limit: Option<u32>,
@@ -634,16 +724,172 @@ fn action_str(a: Action) -> &'static str {
     }
 }
 
+/// Which scheduled rules a compile emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Schedules {
+    /// Only those whose weekly window is open right now — what is loaded.
+    Now,
+    /// Every one of them — the worst case a capacity check has to fit, since a
+    /// window that opens later re-applies without another `config check`.
+    All,
+}
+
+/// The direction a compiled port rule is enforced in.
+///
+/// `from <zone>` names the zone a packet **arrives** from, so a rule that
+/// does not say otherwise is an ingress rule. The data plane reads an absent
+/// direction as "both", and at its egress hook it consults the policy of the
+/// zone the packet is *leaving* through — so a direction-less
+/// `from wan proto tcp port 25 drop` (meant to keep SMTP out) also dropped
+/// every LAN host's outbound SMTP as it left through WAN. Emitting `in`
+/// unless the operator wrote `out` gives the rule the meaning it was written
+/// with; `direction out` remains the way to speak about traffic leaving a
+/// zone's links, including what this box originates.
+///
+/// `both` is the agent's own default, so it is emitted as no direction at all.
+fn rule_direction(r: &crate::config::Rule) -> Option<String> {
+    match r.direction.as_deref() {
+        None => Some("in".to_string()),
+        Some("both") => None,
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// One operator rule as the data-plane rules it becomes: one per
+/// `(protocol, source, destination, port, interface)`.
+///
+/// `tcp_udp` is one rule to an operator and two to the data plane, which has
+/// no such protocol; ranges and `port-group`s fan out; `source-group`,
+/// `destination-group` and `interface-group` fan out over their members. A
+/// rule constrains one address end — validation refuses both — so at most one
+/// of the source and destination lists is longer than a single `None`.
+fn expand_port_rule(appliance: &Appliance, r: &crate::config::Rule) -> Vec<PortRule> {
+    // `is_port_rule()` already implies a proto; a proto-less rule simply
+    // contributes nothing rather than panicking the compile.
+    let Some(protos) = r.proto.map(|p| p.concrete()) else {
+        return Vec::new();
+    };
+    let groups = &appliance.firewall.group;
+    let sources = r.resolved_sources(groups);
+    // `to <zone>` occupies the destination end — but only when the rule has
+    // not already bound its source: one rule matches one address end, and an
+    // explicit source is the narrower, operator-written constraint
+    // (`warnings()` says so at every commit).
+    //
+    // A **local** zone is this box, and its addresses are the agent's to
+    // know: the rule carries `dst-local` and no address. It never widens to
+    // "any destination", whatever the box's addressing is. An ordinary zone
+    // is matched on its static subnets; one with none yields nothing and
+    // falls back to "any" (with a commit warning).
+    let binds_source = r.source.is_some() || r.source_group.is_some();
+    let to = r.to.as_deref().filter(|_| !binds_source);
+    let dst_local = to.is_some_and(|z| is_local_zone(appliance, z));
+    let zoned: Vec<Option<String>> = to
+        .map(|z| {
+            zone_destination_prefixes(appliance, z)
+                .into_iter()
+                .map(Some)
+                .collect()
+        })
+        .unwrap_or_default();
+    let destinations = if dst_local {
+        vec![None]
+    } else if zoned.is_empty() {
+        r.resolved_destinations(groups)
+    } else {
+        zoned
+    };
+    let ports = r.resolved_ports(groups);
+    // An interface-group expands the way a source-group does: the data plane
+    // keys one interface per rule, so a rule over three links is three rules.
+    let ifaces: Vec<Option<String>> = match &r.interface_group {
+        Some(g) => groups
+            .interface
+            .get(g)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Some)
+            .collect(),
+        None => vec![None],
+    };
+    let direction = rule_direction(r);
+    let mut out =
+        Vec::with_capacity(protos.len() * sources.len() * destinations.len() * ports.len());
+    for &p in protos {
+        let proto = proto_str(p);
+        // Resolved here rather than at parse time because `tcp_udp` expands to
+        // several protocols and a name means a different number in each
+        // family. Validation has already refused a type on a protocol without
+        // any; if a lookup somehow failed, matching every type would be the
+        // wrong way to be wrong, so it becomes a type nothing sends.
+        let icmp_type = r.icmp_type.as_deref().map(|t| {
+            crate::config::resolve_icmp_type(t, matches!(p, crate::config::Proto::Icmpv6))
+                .unwrap_or(u8::MAX)
+        });
+        for src in &sources {
+            for dst in &destinations {
+                for &port in &ports {
+                    for iface in &ifaces {
+                        out.push(PortRule {
+                            name: r.name.clone(),
+                            proto,
+                            port,
+                            action: action_str(r.action),
+                            log: r.log,
+                            src: src.clone(),
+                            dst: dst.clone(),
+                            dst_local,
+                            limit: r.limit,
+                            burst: r.burst,
+                            icmp_type,
+                            src_mac: None,
+                            in_interface: iface.clone(),
+                            family: r.family.clone(),
+                            direction: direction.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Compile a Sentinel appliance config into a Velstra agent config. Each named
 /// zone in use becomes one policy, carrying its resolved posture (zone override
-/// over the global `[firewall]` defaults). Policy ids are assigned by sorted zone
-/// name so recompiles are deterministic (stable conntrack/map keys).
+/// over the global `[firewall]` defaults). Policy ids are a hash of the zone
+/// name (see [`zone_policy_ids`]), so they survive other zones coming and going.
 pub fn compile(appliance: &Appliance) -> VelstraConfig {
+    compile_with(appliance, Schedules::Now)
+}
+
+/// [`compile`], choosing which scheduled rules to emit.
+pub(crate) fn compile_with(appliance: &Appliance, schedules: Schedules) -> VelstraConfig {
+    compile_noted(appliance, schedules, &mut Vec::new())
+}
+
+/// What the compiler had to decide on the operator's behalf, as advisories:
+/// rules that share one data-plane key and lose part of what they said
+/// ([`conflicts::resolve`]). Every scheduled rule is included, so a conflict
+/// that only exists inside a window is reported before the window opens.
+pub(crate) fn rule_key_warnings(appliance: &Appliance) -> Vec<String> {
+    let mut notes = Vec::new();
+    compile_noted(appliance, Schedules::All, &mut notes);
+    notes
+}
+
+fn compile_noted(
+    appliance: &Appliance,
+    schedules: Schedules,
+    notes: &mut Vec<String>,
+) -> VelstraConfig {
     let fw = &appliance.firewall;
 
     // The zones actually in use (a zone with no assigned interface needs no
     // policy; interfaces the system provides but that aren't assigned a zone yet
-    // are simply not firewalled). Sorted + deduped → stable ids starting at 1.
+    // are simply not firewalled). Each gets a name-derived id (see
+    // `zone_policy_ids`).
     // An administratively disabled interface is dropped from the data plane
     // entirely: it contributes no zone and gets no policy binding (so the agent
     // never attaches XDP to it). A disabled rule / NAT entry is likewise skipped
@@ -651,7 +897,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     let ids = zone_policy_ids(appliance);
     let zone_names: Vec<&str> = ids.keys().copied().collect();
 
-    let policies = zone_names
+    let mut policies: Vec<Policy> = zone_names
         .iter()
         .map(|&zone| {
             let posture = appliance.zone_posture(zone);
@@ -702,6 +948,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                             log: false,
                             src: None,
                             dst: None,
+                            dst_local: false,
                             limit: None,
                             burst: None,
                             icmp_type: None,
@@ -712,119 +959,22 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                         })
                 })
                 .collect();
-            let port_rules = appliance
+            let port_rules: Vec<PortRule> = appliance
                 .rules
                 .iter()
                 // A scheduled rule (roadmap C15) is emitted only while its weekly
                 // window is open (local time); a systemd timer re-applies at the
-                // boundaries. An unscheduled rule is always emitted.
+                // boundaries. An unscheduled rule is always emitted. A capacity
+                // count asks for every scheduled rule, open or not, so that a
+                // window opening later cannot overflow a map.
                 .filter(|r| {
                     !r.disabled
                         && r.from == zone
                         && r.is_port_rule()
-                        && r.schedule.as_ref().is_none_or(|s| s.is_active_now())
+                        && (schedules == Schedules::All
+                            || r.schedule.as_ref().is_none_or(|s| s.is_active_now()))
                 })
-                .flat_map(|r| {
-                    // `is_port_rule()` already implies a proto, but guard the unwrap
-                    // so a future change to that predicate can never panic the
-                    // compile: a proto-less rule simply contributes no port rules.
-                    // `tcp_udp` is one rule to an operator and two to the data
-                    // plane, which has no such protocol. Expanding it here means
-                    // nothing downstream has to know the grammar has a word for
-                    // "either".
-                    let Some(protos) = r.proto.map(|p| p.concrete()) else {
-                        return Vec::new();
-                    };
-                    let action = action_str(r.action);
-                    let log = r.log;
-                    // A rule constrains one end or the other — validation refuses
-                    // both — so exactly one of these expands to something other
-                    // than a single `None`, and the product stays one entry per
-                    // (constraint, port).
-                    let sources = r.resolved_sources(groups);
-                    // `to <zone>` is enforced as a destination match on that zone's
-                    // subnets — validation has already refused it alongside an
-                    // explicit source or destination, so exactly one of these three
-                    // ever contributes. A zone with no static subnet yields nothing
-                    // to match and falls back to "any" (with a commit warning).
-                    // …but only when the rule has not already bound its source: one
-                    // rule matches one address end, and an explicit source is the
-                    // narrower, operator-written constraint. `warnings()` says so at
-                    // every commit rather than letting it pass unremarked.
-                    let binds_source = r.source.is_some() || r.source_group.is_some();
-                    let zoned: Vec<Option<String>> = match &r.to {
-                        Some(z) if !binds_source => zone_destination_prefixes(appliance, z)
-                            .into_iter()
-                            .map(Some)
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    let destinations = if zoned.is_empty() {
-                        r.resolved_destinations(groups)
-                    } else {
-                        zoned
-                    };
-                    let ports = r.resolved_ports(groups);
-                    let mut out = Vec::with_capacity(
-                        protos.len() * sources.len() * destinations.len() * ports.len(),
-                    );
-                    // An interface-group expands here, the way a source-group
-                    // does: the data plane keys one interface per rule, so a
-                    // rule over three links is three rules.
-                    let ifaces: Vec<Option<String>> = match &r.interface_group {
-                        Some(g) => groups
-                            .interface
-                            .get(g)
-                            .cloned()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(Some)
-                            .collect(),
-                        None => vec![None],
-                    };
-                    for &p in protos {
-                        let proto = proto_str(p);
-                        // Resolved here rather than at parse time because
-                        // `tcp_udp` expands to several protocols and a name
-                        // means a different number in each family. Validation
-                        // has already refused a type on a protocol without any,
-                        // so a failure here cannot happen — and if it somehow
-                        // did, matching every type would be the wrong way to be
-                        // wrong, so it becomes a type nothing sends.
-                        let icmp_type = r.icmp_type.as_deref().map(|t| {
-                            crate::config::resolve_icmp_type(
-                                t,
-                                matches!(p, crate::config::Proto::Icmpv6),
-                            )
-                            .unwrap_or(u8::MAX)
-                        });
-                        for src in &sources {
-                            for dst in &destinations {
-                                for &port in &ports {
-                                    for iface in &ifaces {
-                                        out.push(PortRule {
-                                            name: r.name.clone(),
-                                            proto,
-                                            port,
-                                            action,
-                                            log,
-                                            src: src.clone(),
-                                            dst: dst.clone(),
-                                            limit: r.limit,
-                                            burst: r.burst,
-                                            icmp_type,
-                                            src_mac: None,
-                                            in_interface: iface.clone(),
-                                            family: r.family.clone(),
-                                            direction: r.direction.clone(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    out
-                })
+                .flat_map(|r| expand_port_rule(appliance, r))
                 .collect();
             // C22: open the firewall for each load-balanced service on this zone.
             //
@@ -837,29 +987,34 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             // *visible*: it shows up in the compiled config an operator inspects.
             let mut port_rules: Vec<PortRule> = port_rules;
             port_rules.extend(mac_rules);
-            for lb in appliance
+            for (lb, &lb_proto) in appliance
                 .load_balancers
                 .iter()
                 .filter(|l| !l.disabled && l.zone == zone)
+                .flat_map(|l| l.proto.concrete().iter().map(move |p| (l, p)))
             {
                 let rule = PortRule {
                     // Not an operator's rule: the compiler opens the VIP's port
                     // itself, and saying so beats attributing a flow to a rule
                     // nobody wrote.
                     name: format!("(load-balancer {})", lb.name),
-                    proto: proto_str(lb.proto),
+                    proto: proto_str(lb_proto),
                     port: lb.port,
                     action: "pass",
                     log: false,
                     src: None,
                     dst: None,
+                    dst_local: false,
                     limit: None,
                     burst: None,
                     icmp_type: None,
                     src_mac: None,
                     in_interface: None,
                     family: None,
-                    direction: None,
+                    // A VIP is reached by arriving traffic; like an operator's
+                    // rule, the opening is not also a verdict on packets
+                    // leaving through this zone.
+                    direction: Some("in".to_string()),
                 };
                 // An explicit rule the operator wrote for the same (proto, port)
                 // wins — including a `drop`, which is how you take a VIP out of
@@ -885,6 +1040,12 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             }
         })
         .collect();
+    // One verdict per data-plane key: resolved here, by strictness, so the
+    // agent, `trace` and `attribute` all see the same single entry.
+    for policy in &mut policies {
+        let rules = std::mem::take(&mut policy.port_rules);
+        policy.port_rules = conflicts::resolve(rules, &policy.name, notes);
+    }
 
     // Zones that have a source-NAT (masquerade) rule — their interfaces get
     // `masquerade = true` so the data plane SNATs traffic leaving them.
@@ -995,39 +1156,44 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         let Ok((ip, port)) = crate::config::parse_host_port(&dst.to) else {
             continue;
         };
-        let proto = proto_str(dst.proto);
         let dst_ip = ip.to_string();
-        // The plain forward on the ingress (public) zone.
-        port_forwards.push(PortForwardOut {
-            policy,
-            proto,
-            port: dst.port,
-            dst_ip: dst_ip.clone(),
-            dst_port: port,
-            match_dst: None,
-            local_destination: true,
-            snat_ip: None,
-        });
-        if !dst.hairpin {
-            continue;
-        }
-        let Some(public_ip) = zone_ipv4(&dst.zone) else {
-            continue; // no static public IP → reflection can't be resolved.
-        };
-        for (&zname, &zpolicy) in ids.iter().filter(|(z, _)| **z != dst.zone.as_str()) {
-            let Some(box_ip) = zone_ipv4(zname) else {
-                continue; // this internal zone has no static box address → skip.
-            };
+        // `tcp_udp` is one forward to an operator and one per protocol to the
+        // data plane, whose port-forward is keyed on a single protocol.
+        // Validation refuses every protocol a forward cannot key a port on.
+        for &p in dst.proto.concrete() {
+            let proto = proto_str(p);
+            // The plain forward on the ingress (public) zone.
             port_forwards.push(PortForwardOut {
-                policy: zpolicy,
+                policy,
                 proto,
                 port: dst.port,
                 dst_ip: dst_ip.clone(),
                 dst_port: port,
-                match_dst: Some(public_ip.to_string()),
-                local_destination: false,
-                snat_ip: Some(box_ip.to_string()),
+                match_dst: None,
+                local_destination: true,
+                snat_ip: None,
             });
+            if !dst.hairpin {
+                continue;
+            }
+            let Some(public_ip) = zone_ipv4(&dst.zone) else {
+                continue; // no static public IP → reflection can't be resolved.
+            };
+            for (&zname, &zpolicy) in ids.iter().filter(|(z, _)| **z != dst.zone.as_str()) {
+                let Some(box_ip) = zone_ipv4(zname) else {
+                    continue; // this internal zone has no static box address → skip.
+                };
+                port_forwards.push(PortForwardOut {
+                    policy: zpolicy,
+                    proto,
+                    port: dst.port,
+                    dst_ip: dst_ip.clone(),
+                    dst_port: port,
+                    match_dst: Some(public_ip.to_string()),
+                    local_destination: false,
+                    snat_ip: Some(box_ip.to_string()),
+                });
+            }
         }
     }
 
@@ -1051,14 +1217,18 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 port: (port != 0).then_some(port),
             });
         }
-        services.push(ServiceOut {
-            policy,
-            vip: lb.vip.clone(),
-            port: lb.port,
-            proto: proto_str(lb.proto),
-            backends,
-            router_nat: true,
-        });
+        // `tcp_udp` is one service to an operator and one per protocol to the
+        // data plane, which keys a service on a single protocol.
+        for &p in lb.proto.concrete() {
+            services.push(ServiceOut {
+                policy,
+                vip: lb.vip.clone(),
+                port: lb.port,
+                proto: proto_str(p),
+                backends: backends.clone(),
+                router_nat: true,
+            });
+        }
     }
 
     // NPTv6 (RFC 6296) — one `[[npt66]]` per rule, bound to its boundary interface.
@@ -1109,6 +1279,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     });
 
     VelstraConfig {
+        local_hint: configured_local_addresses(appliance),
         ha: crate::ha::dataplane(appliance),
         conntrack: ConntrackOut {
             tcp_syn: fw.conntrack.tcp_syn,
@@ -1246,6 +1417,14 @@ pub fn attribute(cfg: &VelstraConfig, flows: &[Flow]) -> BTreeMap<String, Hits> 
                     Some(b) => b,
                     None => continue,
                 },
+                // The agent installs a local rule as one host route per box
+                // address; offline only the configured ones are known.
+                (None, None) if r.dst_local => {
+                    if !cfg.local_hint.contains(&flow.dst) {
+                        continue;
+                    }
+                    if flow.dst.is_ipv4() { 32 } else { 128 }
+                }
                 (None, None) => 0,
             };
             if best.is_none_or(|(_, b)| bits > b) {
@@ -1652,8 +1831,10 @@ port = 443
         );
     }
 
-    /// The local zone is the box, in both families too — otherwise a dual-stacked
-    /// appliance could only bind rules toward half of itself.
+    /// The local zone is the box, in both families too — and it is the box as
+    /// it is at run time. The rule names no address at all; the agent matches
+    /// every address the box holds (DHCP, SLAAC, a held VRRP address), so the
+    /// rule cannot be narrower or wider than "this appliance".
     #[test]
     fn the_local_zone_is_this_box_in_both_families() {
         let toml = r#"
@@ -1676,14 +1857,18 @@ port = 22
 "#;
         let appliance = Appliance::from_toml(toml).expect("parses");
         let cfg = compile(&appliance);
-        let dsts: Vec<&str> = cfg
+        let ssh: Vec<&PortRule> = cfg
             .policies
             .iter()
             .flat_map(|p| p.port_rules.iter())
-            .filter_map(|r| r.dst.as_deref())
+            .filter(|r| r.name == "ssh-in")
             .collect();
-        assert!(dsts.contains(&"10.0.0.1/32"), "{dsts:?}");
-        assert!(dsts.contains(&"2001:db8:1::1/128"), "{dsts:?}");
+        assert_eq!(ssh.len(), 1, "one family-neutral rule");
+        assert!(ssh[0].dst_local && ssh[0].dst.is_none() && ssh[0].family.is_none());
+        // The offline views still know the configured addresses.
+        let ten: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let six: std::net::IpAddr = "2001:db8:1::1".parse().unwrap();
+        assert!(cfg.local_hint.contains(&ten) && cfg.local_hint.contains(&six));
     }
 
     /// `tcp_udp` is one rule to an operator and two to the data plane, which
@@ -1738,10 +1923,13 @@ port = 53
 
         // One interface binding per declared interface.
         assert_eq!(cfg.interfaces.len(), 2);
-        // Policy ids are assigned by sorted zone name: lan=1, wan=2.
+        // Policy ids are a function of the zone name alone (24-bit FNV-1a,
+        // never 0), pinned here so a change to the derivation — which would
+        // reset every connection on the next commit after an upgrade — is a
+        // deliberate one.
         let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
         let lan = cfg.policies.iter().find(|p| p.name == "lan").unwrap();
-        assert_eq!((lan.id, wan.id), (1, 2));
+        assert_eq!((lan.id, wan.id), (6_324_327, 14_869_293));
         let wan_if = cfg.interfaces.iter().find(|i| i.name == "wan0").unwrap();
         assert_eq!(wan_if.policy, wan.id);
 
@@ -2919,7 +3107,9 @@ to = "10.0.0.10:8443"
         let cfg = compile(&Appliance::from_toml(toml).unwrap());
         assert_eq!(cfg.port_forwards.len(), 1);
         let pf = &cfg.port_forwards[0];
-        assert_eq!(pf.policy, 2); // wan sorts after lan → id 2
+        let appliance = Appliance::from_toml(toml).unwrap();
+        let ids = zone_policy_ids(&appliance);
+        assert_eq!(pf.policy, ids["wan"]); // the ingress zone's own policy
         assert_eq!((pf.proto, pf.port), ("tcp", 443));
         assert_eq!((pf.dst_ip.as_str(), pf.dst_port), ("10.0.0.10", 8443));
         assert!(pf.local_destination);
@@ -2949,16 +3139,26 @@ port = 443
 to = "10.0.0.10:8443"
 hairpin = true
 "#;
-        let cfg = compile(&Appliance::from_toml(toml).unwrap());
-        // ids: lan=1, wan=2. A plain WAN forward plus one reflection entry for lan.
+        let appliance = Appliance::from_toml(toml).unwrap();
+        let cfg = compile(&appliance);
+        let ids = zone_policy_ids(&appliance);
+        // A plain WAN forward plus one reflection entry for lan.
         assert_eq!(cfg.port_forwards.len(), 2);
         // The plain forward binds the wan (ingress) policy with no match/snat.
-        let plain = cfg.port_forwards.iter().find(|p| p.policy == 2).unwrap();
+        let plain = cfg
+            .port_forwards
+            .iter()
+            .find(|p| p.policy == ids["wan"])
+            .unwrap();
         assert_eq!((plain.dst_ip.as_str(), plain.dst_port), ("10.0.0.10", 8443));
         assert!(plain.match_dst.is_none() && plain.snat_ip.is_none());
         // The reflection entry binds the lan policy: match the public IP, SNAT the
         // source to the box's lan address so the reply routes back through the box.
-        let refl = cfg.port_forwards.iter().find(|p| p.policy == 1).unwrap();
+        let refl = cfg
+            .port_forwards
+            .iter()
+            .find(|p| p.policy == ids["lan"])
+            .unwrap();
         assert_eq!(refl.match_dst.as_deref(), Some("198.51.100.1"));
         assert_eq!(refl.snat_ip.as_deref(), Some("10.0.0.1"));
         assert_eq!((refl.dst_ip.as_str(), refl.dst_port), ("10.0.0.10", 8443));
@@ -3388,3 +3588,7 @@ password = "p"
         assert!(!crate::net::held_until_attached(&appliance.interfaces[1]));
     }
 }
+
+#[cfg(test)]
+#[path = "compile/contract_tests.rs"]
+mod contract_tests;

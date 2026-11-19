@@ -514,6 +514,9 @@ impl<'a> Walk<'a> {
         if let Some(d) = &r.dst {
             why.push(format!("destination {d}"));
         }
+        if r.dst_local {
+            why.push(format!("destination {} is this box", self.dst));
+        }
         if let Some(m) = &r.src_mac {
             why.push(format!("sender {m}"));
         }
@@ -643,6 +646,15 @@ impl<'a> Walk<'a> {
                     let bits = match (&r.src, &r.dst) {
                         (Some(c), _) => contains(c, self.q.src).unwrap_or(0),
                         (_, Some(c)) => contains(c, self.dst).unwrap_or(0),
+                        // The agent installs a local rule as one host route
+                        // per box address.
+                        _ if r.dst_local => {
+                            if self.dst.is_ipv4() {
+                                32
+                            } else {
+                                128
+                            }
+                        }
                         _ => 0,
                     };
                     let key = (
@@ -708,7 +720,7 @@ impl<'a> Walk<'a> {
             return Some(format!("is for ICMP type {t}"));
         }
         if r.port != 0 && r.port != self.dst_port {
-            return Some(format!("is for port {}", r.port));
+            return Some(format!("is for port {}", self.ports_of(r)));
         }
         if let Some(i) = &r.in_interface
             && *i != self.q.in_interface
@@ -725,7 +737,40 @@ impl<'a> Walk<'a> {
         {
             return Some(format!("destination {} is not in {c}", self.dst));
         }
+        if r.dst_local && !self.is_local(self.dst) {
+            return Some(format!(
+                "destination {} is not one of this box's configured addresses (the data \
+                 plane also matches addresses learned at run time: DHCP, SLAAC, a held VRRP \
+                 address)",
+                self.dst
+            ));
+        }
         None
+    }
+
+    /// Whether `addr` is one of this box's own addresses, as far as the
+    /// configuration says. The agent matches what the box holds live.
+    fn is_local(&self, addr: IpAddr) -> bool {
+        self.cfg.local_hint.contains(&addr)
+    }
+
+    /// The ports the operator wrote for the rule a compiled entry came from —
+    /// `80-90`, not the `80` of whichever expansion was looked at first.
+    fn ports_of(&self, r: &PortRule) -> String {
+        let written = self
+            .appliance
+            .rules
+            .iter()
+            .find(|rule| rule.name == r.name)
+            .map(|rule| {
+                let mut specs: Vec<String> = rule.port.iter().map(ToString::to_string).collect();
+                if let Some(group) = &rule.port_group {
+                    specs.push(format!("port-group {group}"));
+                }
+                specs.join(",")
+            })
+            .filter(|s| !s.is_empty());
+        written.unwrap_or_else(|| r.port.to_string())
     }
 
     // ---- routing ------------------------------------------------------------

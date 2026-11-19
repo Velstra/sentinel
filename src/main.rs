@@ -1288,6 +1288,10 @@ fn apply_candidate(
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(candidate)));
+    // Validation saw feed groups empty. A refresh whose fetched feed no longer
+    // fits the data plane leaves the running policy in force and says why.
+    compile::check_capacity(&appliance)
+        .context("feed, domain and user groups as resolved; the running policy is unchanged")?;
     // This is the path `sentinel-fwsched.service` runs at every window
     // boundary, so it is where a schedule is decided by the clock. Saying so
     // here puts it in the journal beside the re-apply that acted on it, which
