@@ -1648,22 +1648,16 @@ fn update_local(path: &str, flags: &UpdateFlags) -> Result<()> {
     })?;
     let proof = update::verify_local_image(image, flags.signature, &key)?;
     eprintln!("signature verified against the pinned release key");
-    match &proof.version {
-        Some(version) => {
-            eprintln!("signed release {version}");
-            update::refuse_downgrade(version, flags.allow_downgrade)?;
-        }
-        // A digest or raw signature vouches for bytes, not for a release, so
-        // there is no version to hold against the running one. The input here
-        // is chosen by root at the console, not served by a mirror, which is
-        // why this is said rather than refused; a signed manifest closes it.
-        None => eprintln!(
-            "note: this proof states no release version, so it cannot be checked against \
-             the running {} — use the release's signed manifest (--signature \
-             …/manifest.json.sig) for downgrade protection",
-            update::running_version().unwrap_or_else(|_| "unidentified image release".to_string())
-        ),
+    if let Some(version) = &proof.version {
+        eprintln!("signed release {version}");
     }
+    // A digest or raw signature vouches for bytes, not for a release, so it
+    // cannot rule out a downgrade: refused unless --allow-downgrade (CTRL-26).
+    update::refuse_unversioned_or_downgrade(
+        proof.version.as_deref(),
+        &update::running_version()?,
+        flags.allow_downgrade,
+    )?;
     install::update_verified(&proof.source, &proof.sha256, flags.commit)
 }
 

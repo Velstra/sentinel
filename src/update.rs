@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::config::UpdateChannel;
@@ -712,8 +712,7 @@ fn check_offer_using(
     let pubkey = resolve_pubkey(chan, &scratch)?;
     verify_signature(&pubkey, &manifest_path, &sig_path)?;
 
-    let manifest: Manifest =
-        serde_json::from_slice(&bytes).context("parsing the (verified) release manifest")?;
+    let manifest = parse_verified_manifest(&bytes)?;
 
     if !valid_image_name(&manifest.image) {
         bail!(
@@ -721,7 +720,6 @@ fn check_offer_using(
             manifest.image
         );
     }
-    check_manifest_fields(&manifest)?;
     if manifest.product.as_deref() != Some(PRODUCT) {
         bail!("online update metadata must explicitly name {PRODUCT}");
     }
@@ -766,6 +764,19 @@ fn decode_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         bail!("invalid signed release envelope lengths");
     }
     Ok((manifest, signature))
+}
+
+/// Parse the exact bytes a signature verified into the one canonical manifest
+/// every later stage sees (CTRL-25): the field checks run here, and the image
+/// digest is stored in the bare lowercase form the slot writer compares
+/// against, so a `sha256:` spelling cannot pass the checks before a multi-GiB
+/// download and then fail at the writer after it.
+fn parse_verified_manifest(bytes: &[u8]) -> Result<Manifest> {
+    let mut manifest: Manifest =
+        serde_json::from_slice(bytes).context("parsing the (verified) release manifest")?;
+    check_manifest_fields(&manifest)?;
+    manifest.sha256 = norm_digest(&manifest.sha256);
+    Ok(manifest)
 }
 
 /// The checks every verified manifest gets, from a channel or from a medium.
@@ -824,6 +835,44 @@ pub(crate) fn refuse_downgrade_against(
          --allow-downgrade."
     )
 }
+
+/// The local-image gate for a proof's stated release version (CTRL-26).
+///
+/// A signed digest or a raw signature vouches for bytes, not for a release:
+/// every old release's digest stays validly signed forever, so such a proof
+/// cannot exclude a downgrade. That is refused like any other downgrade the
+/// appliance cannot rule out, and the same explicit `--allow-downgrade`
+/// accepts it. A signed release manifest states its version and is checked.
+pub(crate) fn refuse_unversioned_or_downgrade(
+    version: Option<&str>,
+    running: &str,
+    allow_downgrade: bool,
+) -> Result<()> {
+    match version {
+        Some(version) => refuse_downgrade_against(version, running, allow_downgrade),
+        None if allow_downgrade => {
+            eprintln!(
+                "warning: --allow-downgrade: this proof states no release version, so it \
+                 cannot be checked against the running {running}; installing it as asked"
+            );
+            Ok(())
+        }
+        None => bail!(
+            "this proof (a signed digest or raw signature) states no release version, so it \
+             cannot rule out a downgrade from the running {running} — an old release's \
+             digest stays validly signed forever. Use the release's signed manifest \
+             (--signature …/manifest.json.sig), or pass --allow-downgrade to accept an \
+             unversioned proof."
+        ),
+    }
+}
+
+/// The largest image the raw-signature proof form stages privately (CTRL-26).
+///
+/// That form copies the image into the volatile temp directory before
+/// verifying it, and OpenSSL's Ed25519 buffers its whole input; a full
+/// appliance image belongs to the signed-digest form, which streams.
+pub(crate) const RAW_SIGNED_IMAGE_MAX: u64 = 64 * 1024 * 1024;
 
 /// Order two versions the way semantic versioning does: numeric dot-separated
 /// core (a leading `v` and `+build` metadata ignored, missing components read as
@@ -1019,11 +1068,9 @@ pub fn verify_local_image(
     if name.ends_with(".json") {
         let bytes = read_small(&signed, 65536)?;
         verify_bytes(public_key, &bytes, &sig)?;
-        let manifest: Manifest =
-            serde_json::from_slice(&bytes).context("parsing the (verified) release manifest")?;
-        check_manifest_fields(&manifest)?;
+        let manifest = parse_verified_manifest(&bytes)?;
         return Ok(LocalProof {
-            sha256: norm_digest(&manifest.sha256),
+            sha256: manifest.sha256,
             version: Some(manifest.version),
             source: image.to_path_buf(),
             _copy: None,
@@ -1070,14 +1117,31 @@ pub fn verify_local_image(
             sig.display()
         );
     }
-    // Raw form: copy first, verify the copy, install the copy.
+    // Raw form: copy first, verify the copy, install the copy. Bounded both
+    // by the size the file reports and by the bytes actually read, so neither
+    // a large image nor one still growing can fill the temporary filesystem.
+    use std::io::Read;
+    let mut input = std::fs::File::open(image)?;
+    let size = input.metadata()?.len();
+    ensure!(
+        size <= RAW_SIGNED_IMAGE_MAX,
+        "{} ({size} bytes) is too large for a raw signature (limit {RAW_SIGNED_IMAGE_MAX} \
+         bytes); sign its SHA-256 instead (<image>.sha256 + <image>.sha256.sig) or use the \
+         release's signed manifest",
+        image.display()
+    );
     let copy = Scratch::new()?;
     let source = copy.join("image.raw");
-    std::io::copy(
-        &mut std::fs::File::open(image)?,
+    let staged = std::io::copy(
+        &mut (&mut input).take(RAW_SIGNED_IMAGE_MAX + 1),
         &mut copy.create_private("image.raw")?,
     )
     .context("staging the image privately")?;
+    ensure!(
+        staged <= RAW_SIGNED_IMAGE_MAX,
+        "{} grew past the raw-signature limit while it was being staged",
+        image.display()
+    );
     let pubkey = resolve_pubkey_pem(public_key, &copy)?;
     verify_signature(&pubkey, &source, &sig)?;
     let sha256 = sha256_hex(&source)?;
@@ -1290,6 +1354,112 @@ mod tests {
             std::fs::write(dir.join("release.json"), invalid).unwrap();
             assert!(check(&chan).is_err());
         }
+    }
+
+    /// A `file://` channel whose `manifest.json` is `body`, signed by a fresh
+    /// throwaway key.
+    fn signed_channel(dir: &Scratch, body: &[u8]) -> UpdateChannel {
+        let private = dir.join("release.key");
+        let public = dir.join("release.pub");
+        let manifest = dir.join("manifest.json");
+        std::fs::write(&manifest, body).unwrap();
+        for args in [
+            vec![
+                "genpkey",
+                "-algorithm",
+                "ED25519",
+                "-out",
+                s(&private).unwrap(),
+            ],
+            vec![
+                "pkey",
+                "-in",
+                s(&private).unwrap(),
+                "-pubout",
+                "-out",
+                s(&public).unwrap(),
+            ],
+            vec![
+                "pkeyutl",
+                "-sign",
+                "-rawin",
+                "-inkey",
+                s(&private).unwrap(),
+                "-in",
+                s(&manifest).unwrap(),
+                "-out",
+                s(&dir.join("manifest.json.sig")).unwrap(),
+            ],
+        ] {
+            let output = Command::new(openssl_bin()).args(args).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        UpdateChannel {
+            name: None,
+            url: format!("file://{}", dir.0.display()),
+            public_key: format!("file:{}", public.display()),
+            subscription_key: None,
+        }
+    }
+
+    #[test]
+    fn a_prefixed_manifest_digest_reaches_the_slot_writer_in_canonical_form() {
+        // CTRL-25: every check before the download accepted `sha256:<HEX>`;
+        // the slot writer compared the raw string and refused only after the
+        // whole image had been fetched.
+        let dir = Scratch::new().unwrap();
+        let hex = "ab".repeat(32);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "version": "9.1.0", "image": "image.raw",
+            "sha256": format!("  sha256:{}  ", hex.to_ascii_uppercase()),
+            "product": PRODUCT,
+            "freshness": {"schema":1,"channel":"default","arch":std::env::consts::ARCH,
+                "sequence":1,"issued_at":now,"expires_at":now+3600},
+        }))
+        .unwrap();
+        let chan = signed_channel(&dir, &body);
+        let offer = check_offer_using(&chan, |offer| {
+            freshness::observe_test(&chan, offer, &dir.join("trust"))
+        })
+        .unwrap();
+        assert_eq!(offer.manifest.sha256, hex);
+        // The manifest digest still names the exact signed bytes.
+        assert_eq!(offer.manifest_sha256, digest_hex(&body));
+    }
+
+    #[test]
+    fn a_raw_signature_image_is_bounded_before_it_is_staged_in_temporary_storage() {
+        // CTRL-26: the raw-signature form copies the image into the volatile
+        // temp directory before verifying it; an unbounded image filled tmpfs.
+        let dir = Scratch::new().unwrap();
+        let image = dir.join("big.raw");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(RAW_SIGNED_IMAGE_MAX + 1)
+            .unwrap();
+        std::fs::write(dir.join("big.raw.sig"), [0u8; 64]).unwrap();
+        let Err(error) = verify_local_image(&image, None, "file:/nonexistent/release.pem") else {
+            panic!("an oversized raw-signed image must be refused");
+        };
+        assert!(
+            format!("{error:#}").contains("too large for a raw signature"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_proof_without_a_release_version_cannot_install_without_an_explicit_downgrade_opt_in() {
+        // CTRL-26: a signed digest or raw signature vouches for bytes, not a
+        // release, so it cannot exclude a downgrade; that used to be a note.
+        assert!(refuse_unversioned_or_downgrade(None, "2.0.0", false).is_err());
+        refuse_unversioned_or_downgrade(None, "2.0.0", true).unwrap();
+        assert!(refuse_unversioned_or_downgrade(Some("1.9.0"), "2.0.0", false).is_err());
+        refuse_unversioned_or_downgrade(Some("2.0.0"), "2.0.0", false).unwrap();
+        refuse_unversioned_or_downgrade(Some("2.1.0"), "2.0.0", false).unwrap();
     }
 
     // ---- pure tests (no openssl/curl, always run) ----
