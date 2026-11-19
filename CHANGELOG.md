@@ -9,6 +9,8 @@ the audit's blocking findings are closed and requalified.
 
 ### Audit 8b6181 remediation (image, release gates and docs)
 
+- DP-34: IPv4 packets with options are refused on stateful zones (TCP and
+  UDP whose IPv4 header carries options cannot be tracked or translated).
 - IMG-02: imported `$1$`/`$5$`/`$6$` hashes now work over SSH as well as the
   API; the shipped libcrypt also verifies md5crypt and sha256crypt (new
   passwords stay yescrypt). Checked by `checks.legacy-hash-login`.
