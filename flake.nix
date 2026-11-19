@@ -1808,6 +1808,7 @@
         install-wizard-ssh-key = import ./nix/install-wizard-key-test.nix { inherit pkgs self; };
         dhcp-late-client = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; };
         dhcp-late-client-stateless = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; stateful = false; };
+        local-destination = import ./nix/local-destination-test.nix { inherit pkgs self; };
         install-boot-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; };
         install-boot-luks-retry = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; invalidAttempts = 2; };
         install-boot-raid1 = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1"; };
