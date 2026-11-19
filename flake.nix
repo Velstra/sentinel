@@ -414,7 +414,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-otLvkMiV31a7agSVNSIvAYa+2qD71WrpGZkRiar1PEc=";
+      ebpfHash = "sha256-E7y3l4aQWhKKKpePNpqEMsP+sb5oaxk7qYm1ofUw9d4=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
@@ -1826,6 +1826,15 @@
         # Known failures remain hard release gates, never expected-pass smoke tests.
         dataplane-conformance = import ./nix/dataplane-conformance.nix { inherit pkgs self; };
         tcp-reset-validation = import ./nix/tcp-reset-validation-test.nix { inherit pkgs self; };
+        # DP-28/PERF-04: a reload on top of a 120k blocklist must not stall traffic.
+        agent-reconfigure-stall = import ./nix/agent-reconfigure-stall-test.nix { inherit pkgs self; };
+        # DP-12/DP-27: a killed agent leaves its links filtered and its state adopted.
+        agent-restart-persist = import ./nix/agent-restart-persist-test.nix { inherit pkgs self; };
+        # The same scenario without persistence: documents the fail-open baseline.
+        agent-restart-persist-off = import ./nix/agent-restart-persist-test.nix {
+          inherit pkgs self;
+          persist = false;
+        };
         nat-capacity-pressure = import ./nix/nat-capacity-pressure-test.nix {
           inherit pkgs self;
           counts = [ 1 64 12000 15000 16000 17000 20000 ];

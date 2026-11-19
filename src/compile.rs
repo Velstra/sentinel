@@ -79,6 +79,15 @@ fn mss_ceiling(i: &crate::config::Interface) -> Option<u16> {
     }
 }
 
+/// The agent's `[state]` table. `persist` pins the attached hooks and the
+/// connection state in bpffs, so an agent crash or restart neither forwards
+/// unfiltered nor drops every established connection (DP-12, DP-27). The
+/// table size is left to the agent, which derives it from the host's memory.
+#[derive(Debug, Serialize)]
+struct StateOut {
+    persist: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ConntrackOut {
     tcp_syn: u32,
@@ -116,6 +125,7 @@ pub struct VelstraConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) blocklist: Vec<String>,
     conntrack: ConntrackOut,
+    state: StateOut,
     #[serde(skip_serializing_if = "Option::is_none")]
     ha: Option<crate::ha::DataplaneHa>,
     #[serde(rename = "policy")]
@@ -1289,6 +1299,7 @@ fn compile_noted(
             udp_stream: fw.conntrack.udp_stream,
             icmp: fw.conntrack.icmp,
         },
+        state: StateOut { persist: true },
         // Deny by default; interfaces opt into their zone policy.
         default_action: action_str(fw.default_action),
         stateful: fw.stateful,
@@ -1645,6 +1656,17 @@ zone = "lan"
         let appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
         let rendered = compile(&appliance).to_toml().unwrap();
         assert!(!rendered.contains("source_validation"), "{rendered}");
+    }
+
+    /// DP-12/DP-27: the appliance always asks the agent to pin its hooks and
+    /// connection state, so an agent crash neither forwards unfiltered nor
+    /// drops every established connection. The size is the agent's to derive.
+    #[test]
+    fn the_agent_is_told_to_persist_its_datapath() {
+        let appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
+        let rendered = compile(&appliance).to_toml().unwrap();
+        assert!(rendered.contains("[state]\npersist = true\n"), "{rendered}");
+        assert!(!rendered.contains("connections"), "{rendered}");
     }
 
     /// The agent renders a table, not JSON, so this reads one back — including
