@@ -52,8 +52,11 @@ let
     cases = [
         ("udp-control", ip(17, udp(41001), 0x5101), "translated"),
         ("tcp-syn-control", ip(6, tcp(41002, 0x02), 0x5102), "translated"),
-        ("udp-ip-options", ip(17, udp(41003), 0x5103, NOP4), "translated"),
-        ("tcp-syn-ip-options", ip(6, tcp(41004, 0x02), 0x5104, NOP4), "translated"),
+        # TCP/UDP with IPv4 options cannot be tracked, so a stateful zone
+        # refuses them at ingress (DP-34) before masquerade sees them; the
+        # masquerade path would translate them (DP-04). Either way never leaked.
+        ("udp-ip-options", ip(17, udp(41003), 0x5103, NOP4), "refused"),
+        ("tcp-syn-ip-options", ip(6, tcp(41004, 0x02), 0x5104, NOP4), "refused"),
         ("icmp-echo-ip-options", ip(1, icmp(8, 0x5105), 0x5105, NOP4), "refused"),
         ("gre", ip(47, b"\0\0\x08\0" + b"x" * 28, 0x5201), "translated"),
         ("esp", ip(50, b"\0\0\x10\0" + b"\0" * 28, 0x5202), "translated"),
