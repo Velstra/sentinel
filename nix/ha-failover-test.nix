@@ -194,7 +194,8 @@ in pkgs.testers.runNixOSTest {
     local_script='import tomllib,json; d=tomllib.load(open("/run/sentinel/velstra.toml","rb")); print(json.dumps(sorted(r["dst"] for p in d["policy"] for r in p.get("port_rule",[]) if r.get("dst-local"))))'
     local_dst={n.name:set(json.loads(n.succeed(python_command(local_script)))) for n in (master,backup)}
     assert "10.2.0.1/32" in local_dst["master"] and "10.2.0.2/32" in local_dst["backup"],local_dst
-    assert local_dst["master"].isdisjoint(local_dst["backup"]),local_dst
+    # Not disjoint: a tunnel address (wg0) can be the same on both members.
+    assert "10.2.0.2/32" not in local_dst["master"] and "10.2.0.1/32" not in local_dst["backup"],local_dst
     ${pkgs.lib.optionalString leased ''
     # Keep live management telemetry active throughout the HA fault matrix.
     # Querying state must not interfere with lease refresh or TCP continuity.
