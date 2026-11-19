@@ -591,9 +591,12 @@ fn recover_with(
             ensure!(!force, "{RECOVERY_FAILED_HINT}");
             return Ok(false);
         }
-        if !force
-            && ((pending.boot == boot()? && now_ms() < pending.deadline_ms)
-                || now_ms() < pending.retry_at_ms)
+        // Both deadlines are CLOCK_BOOTTIME of the boot that wrote them, so
+        // they mean nothing in a later boot: comparing a prior boot's backoff
+        // against this boot's uptime deferred recovery by up to the old
+        // uptime (CTRL-22).
+        let this_boot = pending.boot == boot()?;
+        if !force && this_boot && (now_ms() < pending.deadline_ms || now_ms() < pending.retry_at_ms)
         {
             return Ok(false);
         }
@@ -1005,6 +1008,30 @@ mod tests {
             ))
             .unwrap()
         );
+        assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_backoff_recorded_in_an_earlier_boot_does_not_defer_recovery() {
+        // CTRL-22: retry_at_ms is CLOCK_BOOTTIME of the boot that wrote it. A
+        // journal left by an earlier boot (sentinel-boot failed before its own
+        // recovery ran) must be recovered at once, not after the old uptime.
+        let path = fixture();
+        begin(&path, &next(), &Apply::off(), 60).unwrap();
+        let mut prior_boot = read(&path).unwrap().unwrap();
+        prior_boot.boot = "00000000-0000-0000-0000-000000000000".into();
+        prior_boot.deadline_ms = u64::MAX;
+        prior_boot.retry_at_ms = u64::MAX;
+        write(&path, &prior_boot).unwrap();
+        let mut calls = 0;
+        let recovered = recover_with(&path, &Apply::off(), false, false, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(recovered, "a prior-boot backoff deferred recovery");
+        assert_eq!(calls, 1);
         assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

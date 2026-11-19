@@ -257,12 +257,18 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                 session.ensure_current()?;
             }
             let to = rest.first().map(Path::new);
+            // On the appliance `save` writes what is running (CTRL-14); off-box
+            // there is no running system and the file being edited is the
+            // whole point, so the candidate is written.
             let saved = if act.enabled {
-                session.save(to)
+                session.save_running(to)
             } else {
                 session.save_offline(to)
             };
             saved.map(|p| {
+                if act.enabled && to.is_none() {
+                    crate::boot_fallback::clear_status();
+                }
                 eprintln!(
                     "{} saved {} (persists across reboot)",
                     ui::green("✔"),
@@ -545,6 +551,33 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             return false;
         }
     };
+    // From here to the recorded RUNNING the commit must finish or roll back,
+    // whatever happens to the terminal (CTRL-15).
+    // Off-box nothing live is touched and there is nothing to protect.
+    let guard = act.enabled.then(crate::commit_guard::Guard::enter);
+    let committed = commit_admitted(session, act, saved_before, running_before);
+    let deferred = guard
+        .as_ref()
+        .and_then(crate::commit_guard::Guard::deferred);
+    drop(guard);
+    if let Some(signal) = deferred {
+        eprintln!(
+            "{}",
+            ui::yellow(&format!(
+                "note: signal {signal} arrived during the commit and was deferred until it finished"
+            ))
+        );
+    }
+    committed
+}
+
+/// The part of `commit` after admission: validate, activate, record.
+fn commit_admitted(
+    session: &mut Session,
+    act: &Apply,
+    saved_before: Option<crate::config::Appliance>,
+    running_before: Option<crate::config::Appliance>,
+) -> bool {
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -599,6 +632,15 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             .flatten(),
         );
         eprintln!("{} applying config: {message}", ui::red("error:"));
+        // The refusal was only ever on this terminal (PERF-06); the next person
+        // to look at the box must be able to find it.
+        crate::journal::note(
+            crate::journal::Severity::Error,
+            "sentinel-commit",
+            &format!("commit refused while applying: {message}"),
+        );
+        // Admitted but not applied: the candidate is not what runs.
+        session.mark_uncommitted();
         note_refusal();
         return false;
     }
@@ -714,6 +756,8 @@ fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
         if act.enabled {
             session.ensure_current()?;
         }
+        // Like commit: finish or roll back whatever happens to the terminal.
+        let _guard = act.enabled.then(crate::commit_guard::Guard::enter);
         crate::archive::rollback(session, act, n)
     })();
     match restored {
@@ -745,17 +789,35 @@ impl Rollback {
         self.steps.push((what, Box::new(undo)));
     }
 
+    /// The apply completed: nothing is left to undo.
+    fn disarm(&mut self) {
+        self.steps.clear();
+    }
+
     /// Run every recorded undo in reverse order. Returns the names of any that
     /// themselves failed, so the operator learns exactly what is left
     /// inconsistent (rather than a bare "commit failed").
-    fn unwind(self) -> Vec<String> {
+    fn unwind(mut self) -> Vec<String> {
         let mut failures = Vec::new();
-        for (what, undo) in self.steps.into_iter().rev() {
+        for (what, undo) in std::mem::take(&mut self.steps).into_iter().rev() {
             if let Err(e) = undo() {
                 failures.push(format!("{what} ({e})"));
             }
         }
         failures
+    }
+}
+
+/// A rollback stack dropped while still armed — the apply was abandoned by a
+/// panic between two stages — undoes what it recorded rather than leaving the
+/// earlier stages live over a later one that never ran (CTRL-15).
+impl Drop for Rollback {
+    fn drop(&mut self) {
+        for (what, undo) in std::mem::take(&mut self.steps).into_iter().rev() {
+            if let Err(error) = undo() {
+                eprintln!("warning: undoing {what} after an abandoned apply: {error:#}");
+            }
+        }
     }
 }
 
@@ -1053,6 +1115,13 @@ fn service_ready(unit: &str) -> Result<()> {
         b"failed\n" => anyhow::bail!("{} readiness probe failed", service.unit()),
         _ => anyhow::bail!("invalid privileged readiness response"),
     }
+}
+
+/// The data plane's readiness, judged exactly as a commit judges it: the unit
+/// is active and the agent answers `Ready` (or, with no interface selected,
+/// the unit is deliberately inactive). Used by the boot verifier.
+pub(crate) fn dataplane_ready() -> Result<()> {
+    service_ready(DEFAULT_UNIT)
 }
 
 /// Fixed read-only privilege boundary, with no caller-supplied socket or verb.
@@ -1524,7 +1593,7 @@ fn diagnostic_chain(error: &anyhow::Error, configurations: &[&crate::config::App
 
 /// Diagnostics are not a credential export. Reuse the configuration secret
 /// inventory for both new and old credentials, including quoted spellings.
-fn apply_error_message<'a>(
+pub(crate) fn apply_error_message<'a>(
     error: &anyhow::Error,
     configurations: impl IntoIterator<Item = &'a crate::config::Appliance>,
 ) -> String {
@@ -1769,6 +1838,14 @@ fn apply_live_as(
     let rendered = compile::compile(appliance)
         .to_toml()
         .context("compiling firewall config")?;
+    // Ask the agent's own parser before anything live moves (DP-01 class). A
+    // refusal here costs nothing; a refusal by the running agent closes the
+    // packet gate for the failed reload and again for its rollback. A restore
+    // puts back a configuration the agent was running, and must not be
+    // blocked by a check of it.
+    if act.enabled && verify == crate::net::Verify::Forward {
+        crate::agent_contract::check_rendered(&rendered, &[appliance])?;
+    }
     let wren_rendered = crate::wren::compile_wren(appliance)
         .to_toml()
         .context("compiling routing config")?;
@@ -1895,6 +1972,7 @@ fn apply_live_as(
             None => unwind_err_mixed(rb, error),
         });
     }
+    rb.disarm();
     Ok(())
 }
 
@@ -2041,8 +2119,10 @@ const CMD_HELP: &[CmdHelp] = &[
         name: "save",
         usage: "save [path]",
         summary: "persist the configuration across reboot",
-        detail: "Writes the committed config to the boot location (or to <path> for a \
-                 backup copy).",
+        detail: "Writes the committed (running) config to the boot location (or to <path> \
+                 for a backup copy). Refused while the candidate has uncommitted edits: \
+                 `commit` them first, or `discard` them. Off-box (--no-apply) it writes \
+                 the file being edited.",
         examples: &[],
     },
     CmdHelp {
@@ -8885,6 +8965,33 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("second"), "{:?}", failures);
         assert!(failures[0].contains("boom"), "{:?}", failures);
+    }
+
+    #[test]
+    fn an_abandoned_apply_undoes_its_stages_and_a_finished_one_does_not() {
+        // CTRL-15: a panic between two stages dropped the stack and left the
+        // earlier stages live. An armed stack now undoes itself on drop.
+        let undone = std::rc::Rc::new(std::cell::Cell::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut rb = Rollback::new();
+            let seen = undone.clone();
+            rb.push("firewall", move || {
+                seen.set(seen.get() + 1);
+                Ok(())
+            });
+            panic!("EIO while reporting progress");
+        }));
+        assert!(result.is_err());
+        assert_eq!(undone.get(), 1, "the abandoned stage was not undone");
+        let mut rb = Rollback::new();
+        let seen = undone.clone();
+        rb.push("firewall", move || {
+            seen.set(seen.get() + 1);
+            Ok(())
+        });
+        rb.disarm();
+        drop(rb);
+        assert_eq!(undone.get(), 1, "a finished apply was undone");
     }
 
     #[test]

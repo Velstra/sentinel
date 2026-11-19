@@ -62,10 +62,16 @@ in
       wantedBy = [ "multi-user.target" ];
       # After the boot service (which compiles /run/sentinel/wren.toml) and after
       # the network is being set up (BGP/OSPF need the interface addresses).
+      # networkd merely being started is not enough (CTRL-19): wren reads the
+      # connected networks when its protocols start, so it waits for
+      # sentinel-boot-late, which itself waits (bounded, 30s) for links to come
+      # online and installs the link-runtime state. Only ordering: a failed
+      # boot-late never keeps routing down.
       after = [
         "network-pre.target"
         "sentinel-boot.service"
         "systemd-networkd.service"
+        "sentinel-boot-late.service"
       ];
       requires = [ "sentinel-boot.service" ];
       wants = [ "network.target" ];

@@ -329,7 +329,7 @@ fn without_management(a: &Appliance, scope: &Scope) -> Appliance {
 
 /// The ports management arrives on: what the administration services are
 /// configured to listen on, defaults applied.
-fn management_ports(a: &Appliance) -> BTreeSet<u16> {
+pub(crate) fn management_ports(a: &Appliance) -> BTreeSet<u16> {
     let mut ports = BTreeSet::new();
     if a.services.ssh.enable {
         ports.insert(a.services.ssh.port.unwrap_or(22));
@@ -355,7 +355,7 @@ fn session_port() -> Option<u16> {
 }
 
 /// Whether a rule's port match covers `port`.
-fn covers(spec: crate::config::PortSpec, port: u16) -> bool {
+pub(crate) fn covers(spec: crate::config::PortSpec, port: u16) -> bool {
     let (lo, hi) = spec.bounds();
     (lo..=hi).contains(&port)
 }

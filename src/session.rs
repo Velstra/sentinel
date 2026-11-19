@@ -2851,7 +2851,7 @@ impl Session {
         Self::load_live_at(path, Path::new(Self::RUNNING))
     }
 
-    fn load_live_at(path: &Path, running: &Path) -> Result<Self> {
+    pub(crate) fn load_live_at(path: &Path, running: &Path) -> Result<Self> {
         let snapshot = Self::read_running_at(running)?;
         let draft = match &snapshot {
             Some(text) => Draft::from_appliance(&Appliance::from_toml(text)?),
@@ -2896,7 +2896,7 @@ impl Session {
         self.note_committed_at(Path::new(Self::RUNNING), toml)
     }
 
-    fn note_committed_at(&mut self, path: &Path, toml: &str) -> Result<()> {
+    pub(crate) fn note_committed_at(&mut self, path: &Path, toml: &str) -> Result<()> {
         crate::system::install_config_file(path, toml)?;
         self.seen_running = Some(toml.to_string());
         Ok(())
@@ -9930,7 +9930,9 @@ impl Session {
     }
 
     /// Persist the (validated) candidate to disk. Writes to `path` or, if given,
-    /// `to`.
+    /// `to`. The appliance's own `save` is [`Self::save_running`]; this form is
+    /// the candidate writer the tests and the grammar walk build fixtures with.
+    #[cfg(test)]
     pub fn save(&mut self, to: Option<&Path>) -> Result<PathBuf> {
         self.save_with_mode(to, false)
     }
@@ -9939,10 +9941,65 @@ impl Session {
         self.save_with_mode(to, true)
     }
 
+    /// A commit admitted this candidate but its activation failed and was rolled
+    /// back, so the candidate is not what runs. Keep it marked as an edit: an
+    /// `exit` must warn about it and an on-box `save` must not mistake it for
+    /// the committed configuration.
+    pub(crate) fn mark_uncommitted(&mut self) {
+        self.dirty = true;
+    }
+
+    /// `save` on the appliance: persist the configuration that is RUNNING — the
+    /// one the last commit applied, or, before any commit since boot, the one
+    /// the box booted — never the candidate (CTRL-14).
+    ///
+    /// Writing the candidate let an edit that was never applied, never
+    /// lockout-checked and never shown to the data plane become what the next
+    /// boot loads; that is how a port-forward the agent refused bricked a box at
+    /// boot (DP-01). With uncommitted edits this refuses rather than silently
+    /// saving the older running configuration under the operator's nose.
+    pub fn save_running(&mut self, to: Option<&Path>) -> Result<PathBuf> {
+        self.save_running_at(to, Path::new(Self::RUNNING))
+    }
+
+    pub(crate) fn save_running_at(&mut self, to: Option<&Path>, running: &Path) -> Result<PathBuf> {
+        let _lock = crate::system::apply_lock()?;
+        if self.dirty {
+            bail!(
+                "the candidate has uncommitted changes; `save` writes the committed (running) \
+                 configuration — `commit` them first, or `discard` them"
+            );
+        }
+        let appliance = match Self::read_running_at(running)? {
+            Some(text) => {
+                Appliance::from_toml(&text).context("reading the running configuration")?
+            }
+            None => match Self::read_saved_at(&self.path)? {
+                // Nothing committed since boot: the box runs what it booted.
+                Some(saved) => saved,
+                None => self.materialize()?,
+            },
+        };
+        self.persist_checked(&appliance, to, false)
+    }
+
     fn save_with_mode(&mut self, to: Option<&Path>, offline: bool) -> Result<PathBuf> {
         let _lock = crate::system::apply_lock()?;
         let appliance = self.materialize()?;
+        self.persist_checked(&appliance, to, offline)
+    }
+
+    /// Admission, the data plane's own verdict, then persistence: a saved file
+    /// is one the next boot's agent will load, by the same check commit makes.
+    fn persist_checked(
+        &mut self,
+        appliance: &Appliance,
+        to: Option<&Path>,
+        offline: bool,
+    ) -> Result<PathBuf> {
+        let appliance = appliance.clone();
         self.admit(&appliance)?;
+        crate::agent_contract::check(&appliance)?;
         let path = to.unwrap_or(&self.path).to_path_buf();
         if path != self.path {
             // A legacy policy at the source is not authority to introduce it
@@ -13522,6 +13579,51 @@ mod tests {
         session.note_committed_at(&running, "new revision").unwrap();
         assert_eq!(session.seen_running.as_deref(), Some("new revision"));
         assert_eq!(std::fs::read_to_string(running).unwrap(), "new revision");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_on_box_save_writes_the_running_configuration_never_the_candidate() {
+        // CTRL-14: `set system hostname never-committed` + `save` wrote the
+        // draft into the boot config. On the appliance save writes RUNNING and
+        // refuses while the candidate has edits that were never applied.
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-save-running-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let saved = directory.join("appliance.toml");
+        let running = directory.join("running.toml");
+        let booted = Appliance::from_toml("[system]\nhostname = 'booted'\n")
+            .unwrap()
+            .to_toml()
+            .unwrap();
+        std::fs::write(&saved, &booted).unwrap();
+
+        let mut session = Session::load_live_at(&saved, &running).unwrap();
+        session
+            .set(&["system", "hostname", "never-committed"])
+            .unwrap();
+        let error = session.save_running_at(None, &running).unwrap_err();
+        assert!(format!("{error:#}").contains("uncommitted"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), booted);
+
+        // A commit that was admitted but whose activation was rolled back is
+        // still not what runs.
+        session.commit().unwrap();
+        session.mark_uncommitted();
+        assert!(session.save_running_at(None, &running).is_err());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), booted);
+
+        // What a successful commit published is what save persists.
+        let committed = Appliance::from_toml("[system]\nhostname = 'committed'\n")
+            .unwrap()
+            .to_toml()
+            .unwrap();
+        std::fs::write(&running, &committed).unwrap();
+        let mut session = Session::load_live_at(&saved, &running).unwrap();
+        session.save_running_at(None, &running).unwrap();
+        let persisted = Appliance::load(&saved).unwrap();
+        assert_eq!(persisted.system.hostname, "committed");
         std::fs::remove_dir_all(directory).unwrap();
     }
 

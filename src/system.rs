@@ -1202,23 +1202,75 @@ fn read_regular_policy(path: &Path, limit: usize, private: bool) -> Result<Optio
     ))
 }
 
-/// Install file `contents` at a (root-owned) `path`. Tries a direct write first
-/// (works as root, e.g. the boot service) and falls back to staging in a
-/// wheel-writable temp and `sudo install`-ing it (the admin running `configure`).
+/// Install file `contents` at a (root-owned) `path`, mode 0644. Written directly
+/// when the caller owns the directory (root, e.g. the boot service), otherwise
+/// staged privately and installed through sudo (the admin running `configure`).
+///
+/// Always a replacement, never an in-place rewrite (CTRL-20): a daemon that
+/// (re)starts while the file is being written — velstra's `Restart=` reading
+/// `velstra.env`, networkd reading a unit — sees the old file or the new one,
+/// never a truncated one.
 pub fn install_file(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    if std::fs::write(path, contents).is_ok() {
+    install_runtime_atomic(path, contents, "0644", None)
+}
+
+/// Write `contents` beside `path`, flush it, and rename it into place. A caller
+/// that owns the parent directory does this directly, keeping ownership with the
+/// directory's owner. Anyone else, and every install that needs a group, stages
+/// privately in `/run/sentinel` and escalates `install` into a sibling followed
+/// by `mv`, so the escalated path is a rename too.
+fn install_runtime_atomic(
+    path: &Path,
+    contents: &str,
+    mode: &str,
+    group: Option<&str>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    ensure_dir(parent)?;
+    let owns_parent = std::fs::metadata(parent)?.uid() == unsafe { libc::geteuid() };
+    if owns_parent && group.is_none() {
+        let bits = u32::from_str_radix(mode, 8).context("file mode")?;
+        let mut stage = PrivateStage::create(parent, 0o600)?;
+        stage
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(bits))?;
+        stage.file.write_all(contents.as_bytes())?;
+        stage.file.sync_all()?;
+        std::fs::rename(&stage.path, path)
+            .with_context(|| format!("atomically replacing {}", path.display()))?;
+        std::fs::File::open(parent)?.sync_all()?;
         return Ok(());
     }
-    // Fall back to sudo: stage in /run/sentinel (wheel-writable) then install.
-    let tmp = Path::new("/run/sentinel").join(".net-unit.tmp");
-    stage_private(&tmp, contents)?;
-    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)
+        .with_context(|| format!("staging {} in /run/sentinel", path.display()))?;
+    staged.file.write_all(contents.as_bytes())?;
+    staged.file.sync_all()?;
+    let target = parent
+        .join(staged.path.file_name().context("staging filename")?)
+        .with_extension("install");
+    let (Some(source), Some(temporary), Some(destination)) =
+        (staged.path.to_str(), target.to_str(), path.to_str())
+    else {
         bail!("non-UTF-8 path");
     };
-    sudo("install", &["-m", "0644", tmp_s, dst_s])
+    let mut args = vec!["-m", mode];
+    if let Some(group) = group {
+        args.extend(["-g", group]);
+    }
+    args.extend([source, temporary]);
+    let result = (|| {
+        sudo("install", &args)?;
+        sudo("mv", &["-fT", "--", temporary, destination])
+    })();
+    if result.is_err() {
+        let _ = sudo("rm", &["-f", "--", temporary]);
+    }
+    result.with_context(|| format!("atomically installing {}", path.display()))
 }
 
 /// Install the appliance configuration at `path`, atomically, escalating when
@@ -1407,22 +1459,12 @@ impl Drop for PrivateStage {
 /// set in one atomic step in both the boot-service (root) and `configure`
 /// (admin) paths.
 pub fn install_secret_file(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    // Stage in /run/sentinel (wheel-writable) then install with the right
-    // mode+group. `install` resolves the group name and sets owner:group:mode
-    // atomically, so there is never a window where the private key is world- or
-    // wrong-group-readable.
-    let tmp = Path::new("/run/sentinel").join(".net-secret.tmp");
-    stage_private(&tmp, contents)?;
-    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
-        bail!("non-UTF-8 path");
-    };
-    sudo(
-        "install",
-        &["-m", "0640", "-g", "systemd-network", tmp_s, dst_s],
-    )
+    // Stage privately then install with the right mode+group into a sibling and
+    // rename it over the unit. `install` resolves the group name and sets
+    // owner:group:mode in one step, so there is never a window where the
+    // private key is world- or wrong-group-readable, and networkd never reads a
+    // half-written unit (CTRL-20).
+    install_runtime_atomic(path, contents, "0640", Some("systemd-network"))
 }
 
 /// Install a root-owned private file at `path`, mode **0600 root:root** —
@@ -2831,6 +2873,44 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a.contains("must-not-leak")));
+    }
+
+    #[test]
+    fn a_runtime_file_is_replaced_never_rewritten_in_place() {
+        // CTRL-20: velstra (Restart=on-failure) and networkd may open the file
+        // while a commit writes it. An in-place truncate+write lets them read a
+        // partial file; a rename gives them the old or the new one, whole.
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "sentinel-install-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("velstra.env");
+        std::fs::write(&path, "VELSTRA_IFACE=old0\n").unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        install_file(&path, "VELSTRA_IFACE=new0\n").unwrap();
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, "VELSTRA_IFACE=old0\n",
+            "the open file was rewritten in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "VELSTRA_IFACE=new0\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from("velstra.env")]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1415,7 +1415,7 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
     let _update = crate::update_stage::UpdateLock::acquire()?;
-    let (disk, active, inactive) = update_target()?;
+    let (disk, active, inactive) = update_target(commit)?;
     if !commit {
         eprintln!(
             "(dry-run — re-run with --commit to write slot {} and switch the boot default)",
@@ -1499,11 +1499,12 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
 
 /// The slot an update writes: the running disk, its active slot, and the
 /// inactive one that receives the image. Root only.
-fn update_target() -> Result<(String, &'static Slot, &'static Slot)> {
+fn update_target(commit: bool) -> Result<(String, &'static Slot, &'static Slot)> {
     require_community_writer(crate::boot_entry::native_enabled())?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("update must run as root (try `sudo sentinel update …`)");
     }
+    admit_slot_write(commit, crate::update_jobs::require_stable_boot)?;
     let disk = find_source_disk()?;
     let active = active_slot(&disk)?;
     let inactive = if active.name == SLOT_A.name {
@@ -1516,6 +1517,21 @@ fn update_target() -> Result<(String, &'static Slot, &'static Slot)> {
         active.name, inactive.name
     );
     Ok((disk, active, inactive))
+}
+
+/// The stable-boot precondition of every Community slot writer (CTRL-11):
+/// the CLI local-image, the CLI channel and the API job writers all reach the
+/// inactive slot through [`update_target`], so the refusal lives here rather
+/// than in one caller. A dry run only reports what a `--commit` would meet.
+fn admit_slot_write(commit: bool, stable_boot: impl FnOnce() -> Result<()>) -> Result<()> {
+    match stable_boot() {
+        Ok(()) => Ok(()),
+        Err(error) if !commit => {
+            eprintln!("note: a --commit would be refused right now: {error:#}");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The *identity* of the slot, not only its contents, and it is checked
@@ -1575,7 +1591,7 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
     use std::os::unix::fs::FileTypeExt;
 
     let _update = crate::update_stage::UpdateLock::acquire()?;
-    let (disk, active, inactive) = update_target()?;
+    let (disk, active, inactive) = update_target(commit)?;
     // Not a let-chain: the appliance's pinned compiler predates them.
     let same_disk = matches!(
         (source.canonicalize(), std::path::Path::new(&disk).canonicalize()),
@@ -1809,6 +1825,10 @@ fn signed_update_observed(
     // Lock before fetching to bound aggregate staging and serialize local,
     // remote and unsigned update writers without locking config commits.
     let _update = crate::update_stage::UpdateLock::acquire()?;
+    // Refuse an unstable boot before a multi-GiB download, not only after it.
+    if commit {
+        crate::update_jobs::require_stable_boot()?;
+    }
     (hooks.phase)(UpdatePhase::Metadata)?;
     let offer = update::check_offer(chan)?;
     if let Some(expected) = expected {
@@ -1829,7 +1849,7 @@ fn signed_update_observed(
 
     // Only now, past both crypto gates, does the image reach the slot-writer.
     (hooks.phase)(UpdatePhase::Verifying)?;
-    let (disk, active, inactive) = update_target()?;
+    let (disk, active, inactive) = update_target(commit)?;
     let source = std::path::Path::new("<anonymous signed channel image>");
     let image = VerifiedImage::from_file(file, source, &manifest.sha256)?;
     let mut before_write = || {
@@ -2426,6 +2446,14 @@ mod tests {
         assert_eq!(super::SEALED_PARTS.collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
     }
     use super::*;
+
+    #[test]
+    fn a_committed_slot_write_is_refused_on_an_unstable_boot_and_a_dry_run_only_reports() {
+        let unstable = || anyhow::bail!("unblessed counted trial");
+        assert!(admit_slot_write(true, unstable).is_err());
+        admit_slot_write(false, unstable).unwrap();
+        admit_slot_write(true, || Ok(())).unwrap();
+    }
 
     fn loader_variable(attributes: u32, value: &str) -> Vec<u8> {
         let mut bytes = attributes.to_le_bytes().to_vec();
