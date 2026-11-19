@@ -1838,6 +1838,9 @@
           persist = false;
         };
         masquerade-leak = import ./nix/masquerade-leak-test.nix { inherit pkgs self; };
+        # Control, not product qualification: the nat-capacity-pressure workload
+        # through plain kernel forwarding + nftables masquerade.
+        nat-pressure-reference = import ./nix/nat-pressure-reference-test.nix { inherit pkgs self; };
         nat-capacity-pressure = import ./nix/nat-capacity-pressure-test.nix {
           inherit pkgs self;
           counts = [ 1 64 12000 15000 16000 17000 20000 ];
