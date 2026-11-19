@@ -412,6 +412,43 @@ fn dp17_rules_beyond_a_trie_are_refused_with_the_map_and_its_limit() {
     );
 }
 
+/// An address-less rule is one entry in EACH source trie on the agent (fabric
+/// DP-11), so 5,000 of them fit both tries and 9,000 overflow both; a family
+/// scope keeps a rule out of the other family's trie.
+#[test]
+fn dp17_an_address_less_rule_counts_in_both_source_tries() {
+    let rules = |n: usize, family: &str| {
+        let mut text = with("");
+        for i in 0..n.div_ceil(1000) {
+            let lo = 1000 + i * 1000;
+            let hi = lo + (n - i * 1000).min(1000) - 1;
+            text.push_str(&format!(
+                "[[rule]]\nname = \"r{i}\"\nfrom = \"wan\"\nproto = \"tcp\"\nport = \"{lo}-{hi}\"\naction = \"accept\"\n{family}"
+            ));
+        }
+        text
+    };
+    let msg = format!(
+        "{:#}",
+        super::check_capacity(&Appliance::from_toml(&rules(9000, "")).unwrap())
+            .expect_err("9000 address-less entries overflow both source tries")
+    );
+    assert!(
+        msg.contains("PORT_RULES (") && msg.contains("PORT_RULES6 ("),
+        "{msg}"
+    );
+    let v4 = format!(
+        "{:#}",
+        super::check_capacity(&Appliance::from_toml(&rules(9000, "family = \"ipv4\"\n")).unwrap())
+            .expect_err("9000 IPv4-only entries overflow the IPv4 source trie")
+    );
+    assert!(
+        v4.contains("PORT_RULES (") && !v4.contains("PORT_RULES6"),
+        "{v4}"
+    );
+    assert!(super::check_capacity(&Appliance::from_toml(&rules(5000, "")).unwrap()).is_ok());
+}
+
 #[test]
 fn perf03_a_global_blocklist_is_counted_once_per_zone_policy() {
     // 70,000 × (2 zones + the default policy) = 210,000 fits; a third zone

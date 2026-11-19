@@ -40,8 +40,10 @@ const SYNPROXY: usize = 256;
 
 /// Which rule trie a compiled port rule lands in — the agent's own split:
 /// an IPv6 source or destination has its own trie, a v4 destination (or a
-/// local one) the destination trie, and everything else — a v4 source or no
-/// address at all — the source trie.
+/// local one) the destination trie, a v4 source the IPv4 source trie, and a
+/// rule naming no address at all BOTH source tries (one entry in each, unless
+/// `family` scopes it to one), because the IPv6 datapath never consults the
+/// IPv4 tries (fabric DP-11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Trie {
     Source4,
@@ -55,7 +57,7 @@ impl Trie {
         match self {
             Trie::Source4 => "PORT_RULES (IPv4 source / address-less rules)",
             Trie::Destination4 => "DST_RULES (IPv4 destination rules)",
-            Trie::Source6 => "PORT_RULES6 (IPv6 source rules)",
+            Trie::Source6 => "PORT_RULES6 (IPv6 source / address-less rules)",
             Trie::Destination6 => "DST_RULES6 (IPv6 destination rules)",
         }
     }
@@ -101,9 +103,30 @@ fn trie_entries(rule: &PortRule, local: (usize, usize)) -> Vec<(Trie, usize)> {
         (Some(s), _) if v6(s) => Trie::Source6,
         (_, Some(d)) if v6(d) => Trie::Destination6,
         (_, Some(_)) => Trie::Destination4,
-        _ => Trie::Source4,
+        (Some(_), None) => Trie::Source4,
+        (None, None) => {
+            let mut out = Vec::new();
+            if rule.family.as_deref() != Some("ipv6") {
+                out.push((Trie::Source4, 1));
+            }
+            if rule.family.as_deref() != Some("ipv4") {
+                out.push((Trie::Source6, 1));
+            }
+            return out;
+        }
     };
     vec![(trie, 1)]
+}
+
+/// Rate-limit slots one compiled rule takes on the agent: one per rule it
+/// writes, however many tries that rule lands in. A `dst-local` rule is
+/// written as one rule per local address.
+fn limit_slots(rule: &PortRule, entries: &[(Trie, usize)]) -> usize {
+    if rule.dst_local {
+        entries.iter().map(|(_, n)| n).sum()
+    } else {
+        usize::from(!entries.is_empty())
+    }
 }
 
 /// One map over its limit, with what fills it.
@@ -144,8 +167,7 @@ fn rule_maps(cfg: &VelstraConfig, local: (usize, usize), errors: &mut Vec<String
                 *slot.1.entry(label.clone()).or_default() += n;
             }
             if rule.limit.is_some() {
-                // The agent spends one rate-limit slot per trie entry.
-                let n: usize = entries.iter().map(|(_, n)| n).sum();
+                let n = limit_slots(rule, &entries);
                 limits.0 += n;
                 *limits.1.entry(label).or_default() += n;
             }
