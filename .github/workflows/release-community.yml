@@ -120,7 +120,9 @@ jobs:
           python3 scripts/image_cve_gate.py run --image "$RUNNER_TEMP/cve-scan.raw" \
             --out "$RUNNER_TEMP/cve-scan" --fsck-erofs "$(command -v fsck.erofs)" || status=$?
           rm -f "$RUNNER_TEMP/cve-scan.raw"
-          python3 scripts/check_image_closure.py "$RUNNER_TEMP/cve-scan/closure.txt" || status=1
+          python3 scripts/check_image_closure.py \
+            --allow "linux-headers-static=string reference from the static security-wrapper binaries" \
+            "$RUNNER_TEMP/cve-scan/closure.txt" || status=1
           exit "$status"
       - name: Retain the CVE verdict
         if: always()

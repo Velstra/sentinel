@@ -60,13 +60,21 @@ def classify(path):
     return None
 
 
-def forbidden(paths):
-    """Pure check: the offending entries, each with its path and reason."""
-    result = []
+def forbidden(paths, allowed=()):
+    """Pure check: the offending entries, each with its path and reason.
+
+    `allowed` names packages (pname) an explicit, reviewed exception lets
+    through; each exception must still match something, so a stale one fails.
+    """
+    result, used = [], set()
     for path in paths:
         reason = classify(path)
-        if reason is not None:
+        if reason is not None and parse_store_name(path)[0] in allowed:
+            used.add(parse_store_name(path)[0])
+        elif reason is not None:
             result.append({"path": path, "reason": reason})
+    for name in sorted(set(allowed) - used):
+        result.append({"path": name, "reason": "stale exception (matches nothing)"})
     return result
 
 
@@ -82,7 +90,16 @@ def read_paths(stream):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("closure", help="file with one store path per line, or - for stdin")
+    parser.add_argument("--allow", action="append", default=[], metavar="PNAME=REASON",
+                        help="reviewed exception for one package; the reason is mandatory")
     args = parser.parse_args(argv)
+    allowed = []
+    for entry in args.allow:
+        name, _, reason = entry.partition("=")
+        if not name or not reason.strip():
+            print(f"closure check refused exception {entry!r}: PNAME=REASON required", file=sys.stderr)
+            return 2
+        allowed.append(name)
     try:
         if args.closure == "-":
             paths = read_paths(sys.stdin)
@@ -92,7 +109,7 @@ def main(argv=None):
     except (OSError, ValueError) as error:
         print(f"closure check refused its input: {error}", file=sys.stderr)
         return 2
-    offenders = forbidden(paths)
+    offenders = forbidden(paths, allowed)
     for entry in offenders:
         print(f"FORBIDDEN {entry['reason']}: {entry['path']}")
     if offenders:

@@ -1895,6 +1895,60 @@
         install-boot-luks-retry = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; invalidAttempts = 2; };
         install-boot-raid1 = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1"; };
         install-boot-raid1-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1-luks"; };
+        legacy-hash-login = import ./nix/legacy-hash-login-test.nix { inherit pkgs self; };
+        image-first-boot = import ./nix/image-first-boot-test.nix { inherit pkgs self; seedImage = seedImage; };
+        image-first-boot-mke2fs = import ./nix/image-first-boot-test.nix { inherit pkgs self; seeding = "mke2fs"; };
+        # IMG-06: no compiler, binutils, kernel headers or -dev output may ship.
+        image-closure = pkgs.runCommand "sentinel-image-closure" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          # The one reviewed exception: every NixOS setuid wrapper (sudo, su,
+          # unix_chkpwd, mount, ...) is a static musl binary that keeps a string
+          # reference to the kernel headers it was compiled against. Headers,
+          # no compiler; gcc, binutils and glibc-dev left with rsyslog's Mongo
+          # output.
+          python3 -B ${./scripts/check_image_closure.py} \
+            --allow "linux-headers-static=string reference from the static security-wrapper binaries" \
+            ${pkgs.closureInfo {
+            rootPaths = [ self.nixosConfigurations.sentinel-image.config.system.build.toplevel ];
+          }}/store-paths
+          touch $out
+        '';
+        # The release CVE gate and closure check (IMG-05), as pure unit tests.
+        image-gate-unit = pkgs.runCommand "sentinel-image-gate-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p scripts tests
+          cp ${./scripts/image_cve_gate.py} scripts/image_cve_gate.py
+          cp ${./scripts/check_image_closure.py} scripts/check_image_closure.py
+          cp ${./scripts/nix_cpe_map.json} scripts/nix_cpe_map.json
+          cp ${./scripts/cve-waivers.json} scripts/cve-waivers.json
+          cp ${./tests/test_image_cve_gate.py} tests/test_image_cve_gate.py
+          cp ${./tests/test_image_closure.py} tests/test_image_closure.py
+          python3 -B -m unittest discover -s tests -p 'test_image_c*.py' -v
+          touch $out
+        '';
+        # PROV-01 seeding tool, end to end against real e2fsprogs.
+        seed-image-unit = pkgs.runCommand "sentinel-seed-image-unit" {
+          nativeBuildInputs = [ pkgs.python3 ];
+          SEED_E2E = "1";
+          SEED_SFDISK = "${pkgs.util-linux}/bin/sfdisk";
+          SEED_DEBUGFS = "${pkgs.e2fsprogs}/bin/debugfs";
+          SEED_E2FSCK = "${pkgs.e2fsprogs}/bin/e2fsck";
+          SEED_MKFS_EXT4 = "${pkgs.e2fsprogs}/bin/mkfs.ext4";
+          SEED_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
+          SEED_SENTINEL = "${sentinel}/bin/sentinel";
+        } ''
+          mkdir -p scripts tests
+          cp ${./scripts/seed-image.py} scripts/seed-image.py
+          cp ${./tests/test_seed_image.py} tests/test_seed_image.py
+          python3 -B -m unittest discover -s tests -p 'test_seed_image.py' -v 2>&1 | tee log
+          ! grep -q "skipped" log
+          touch $out
+        '';
+        # STATIC-08: the console harness reaps its browser and profile on every path.
+        console-harness-unit = pkgs.runCommand "sentinel-console-harness-unit" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+          cp ${./tests/console/harness.mjs} harness.mjs
+          cp ${./tests/console/harness-cleanup.unit.mjs} harness-cleanup.unit.mjs
+          node --test harness-cleanup.unit.mjs
+          touch $out
+        '';
         state-growth-unit = pkgs.runCommand "sentinel-state-growth-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
           mkdir -p test
           cp ${./nix/grow-state.py} test/grow-state.py

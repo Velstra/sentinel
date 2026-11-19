@@ -33,6 +33,10 @@ REQUIRED_SAFETY_CHECKS = frozenset({
     "nat", "hairpin", "reject", "commit", "ntp", "bootfallback", "boothealth",
     "ipsec", "vti",
     "ha-pair", "ha-two-node", "ha-two-node-flow", "ha-napt-mixed-version",
+    # Audit 8b6181: the seeded first boot, the shipped closure, the CVE gate's
+    # own tests and imported legacy password hashes.
+    "image-first-boot", "image-first-boot-mke2fs", "image-closure", "image-gate-unit",
+    "seed-image-unit", "legacy-hash-login",
 })
 
 

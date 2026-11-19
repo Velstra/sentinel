@@ -109,5 +109,22 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
 
+
+class Exceptions(unittest.TestCase):
+    HEADERS = "/nix/store/" + "a" * 32 + "-linux-headers-static-6.18.7"
+
+    def test_a_reviewed_exception_lets_only_that_package_through(self):
+        gcc = "/nix/store/" + "b" * 32 + "-gcc-15.3.0"
+        found = closure.forbidden([self.HEADERS, gcc], allowed=["linux-headers-static"])
+        self.assertEqual([entry["path"] for entry in found], [gcc])
+
+    def test_a_stale_exception_fails(self):
+        found = closure.forbidden(["/nix/store/" + "c" * 32 + "-glibc-2.42-100"],
+                                  allowed=["linux-headers-static"])
+        self.assertEqual(found[0]["reason"], "stale exception (matches nothing)")
+
+    def test_an_exception_needs_a_reason(self):
+        self.assertEqual(closure.main(["--allow", "linux-headers-static", "-"]), 2)
+
 if __name__ == "__main__":
     unittest.main()
