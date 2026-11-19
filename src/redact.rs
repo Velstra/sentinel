@@ -339,7 +339,7 @@ const EVERY_SECRET: &[&str] = &[
     "system aaa tacacs 10.0.0.10 secret zq-tacacs-secret",
     // The machine credential, twice over.
     "system config-sync peer 10.0.0.2",
-    "system config-sync secret zq-machine-credential-0123456789abcdef",
+    "system config-sync secret d5af4c516f58cbb252c954f76e2bbb2308dd6c689f562830ba1dbc967cb5313d",
     "system ha-witness listen 10.0.0.3:5440",
     "system ha-witness secret zq-witness-credential-0123456789abcdefghij",
     // Fleet and update entitlements.
@@ -542,7 +542,7 @@ mod tests {
         let account = views(&appliance(&a, Disclosure::NoMachineCredential).unwrap());
         let shown = leaked(&account, &secrets);
         for credential in [
-            "zq-machine-credential-0123456789abcdef",
+            "d5af4c516f58cbb252c954f76e2bbb2308dd6c689f562830ba1dbc967cb5313d",
             "zq-witness-credential-0123456789abcdefghij",
         ] {
             assert!(!shown.iter().any(|s| s == credential), "{credential} shown");

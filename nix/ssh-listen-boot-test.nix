@@ -10,7 +10,7 @@ let
   leased = "10.78.0.11";
   absent = "10.78.0.99";
   checker = "${pkgs.python3}/bin/python3 -I ${./boot-health.py}";
-  token = "ssh-listen-boot-disposable-credential";
+  token = "b4c4c677e22a74fec54fff894e7d47e86a4a4e9539dff596e275ea1a036417ff";
 in
 pkgs.testers.runNixOSTest {
   name = "sentinel-ssh-listen-address-before-dhcp-lease";

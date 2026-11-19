@@ -15487,7 +15487,7 @@ backends = ["10.0.0.11:8443"]
         let mut s = Session::empty();
         for line in [
             "set system hostname fw1",
-            "set system config-sync secret unit-test-credential-at-least-32-bytes",
+            "set system config-sync secret d706d87cff5f3a57df9482efec10cd52f21a76fd45c7ec1127f2979707d26c4c",
             "set system conntrack-sync listen 0.0.0.0:5429",
             "set system conntrack-sync peer 10.9.0.2",
             "set system conntrack-sync peer 10.9.0.3",
@@ -15539,7 +15539,7 @@ backends = ["10.0.0.11:8443"]
         assert!(s.commit().is_err());
         run(
             &mut s,
-            "set system config-sync secret unit-test-credential-at-least-32-bytes",
+            "set system config-sync secret d706d87cff5f3a57df9482efec10cd52f21a76fd45c7ec1127f2979707d26c4c",
         )
         .unwrap();
         assert!(s.commit().is_ok());

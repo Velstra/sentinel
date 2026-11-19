@@ -529,7 +529,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut old = member("a", "vera");
         old.system.config_sync.peers = vec!["10.0.0.2".into()];
-        old.system.config_sync.secret = Some("outbox-forms-fixture-credential-0123456789".into());
+        old.system.config_sync.secret =
+            Some("778ff5046b537a889e31684517e3a011e2abdf1c9f4a1100d9249432527e5559".into());
         let mut new = old.clone();
         new.firewall.stateful = false;
         enqueue_previous_at(&path, &new, Some(&old)).unwrap();

@@ -15988,7 +15988,7 @@
                   "su admin -c \"printf '%s\\n' "
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
-                  "'set system config-sync secret configsync-vm-fixture-credential-0123456789' "
+                  "'set system config-sync secret 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb' "
                   "commit save exit "
                   "| sentinel configure\""
               )
@@ -16001,7 +16001,7 @@
               backup.succeed("test $(stat -c %u /var/lib/sentinel/api-token) = 0; test $(stat -c %a /var/lib/sentinel/api-token) = 600")
               # The privileged installer also publishes into its own staging
               # directory. This must not attempt install(source, source).
-              backup.succeed("grep -q configsync-vm-fixture-credential-0123456789 /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
+              backup.succeed("grep -q 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
               # PROV-05: the administrator's ordinary CLI reads work without
               # sudo even when a seeding step left the saved file root 0600.
               backup.succeed("chmod 600 /var/lib/sentinel/appliance.toml")
@@ -16035,7 +16035,7 @@
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
                   "'set interface eth1 mtu 1400' "
-                  "'set system config-sync secret configsync-vm-fixture-credential-0123456789' "
+                  "'set system config-sync secret 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb' "
                   "commit save exit | sentinel configure\""
               )
 
@@ -16050,7 +16050,7 @@
                   "su admin -c \"printf '%s\\n' "
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
-                  "'set system config-sync secret configsync-vm-fixture-credential-0123456789' "
+                  "'set system config-sync secret 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb' "
                   "'set system config-sync peer 10.9.0.2' "
                   "'set firewall rule synced-rule from lan' "
                   "'set firewall rule synced-rule action accept' "

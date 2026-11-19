@@ -238,9 +238,11 @@ async fn a_read_only_session_can_sign_out() {
 async fn the_machine_token_cannot_be_signed_out() {
     let st = bench(&local_config(hash(), ""), Arc::new(ConfiguredServers));
     let machine = st.token.clone();
+    // The same 401 an unknown bearer gets: a distinct answer for "valid, but
+    // not a session" made sign-out a guessing oracle (review of CTRL-01).
     assert_eq!(
         status_of(&st, bearer("POST", "/api/v1/sign-out", &machine, "")).await,
-        StatusCode::BAD_REQUEST
+        StatusCode::UNAUTHORIZED
     );
     assert!(resolve_caller(&st, &machine).is_some());
     // …and it never idles out.

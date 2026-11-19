@@ -1,8 +1,8 @@
 { pkgs, self, twoNode ? false }:
 let
   pairArguments = if twoNode then "--mode two-node" else "--witness 10.3.0.3:5440";
-  secret = "pair-vm-credential-with-at-least-32-bytes";
-  cluster = "f3b87b448394bd3e40442bcb14054727";
+  secret = "d4395189177f612f3793150697309b135254b44f6dea0271cf85d4749d4096a3";
+  cluster = "58c25c76a204fa3275cd6da1110e3e09";
   physicalControl = node: if node == 1 then "ctrl-primary" else "ctrl-secondary";
   logicalControl = node: if node == 1 then "sync-primary" else "sync-secondary";
   qemuCommon = import "${pkgs.path}/nixos/lib/qemu-common.nix" {
@@ -69,7 +69,7 @@ in pkgs.testers.runNixOSTest {
       services.velstra.appliance=lib.mkForce ((pkgs.formats.toml {}).generate "pair-witness-appliance.toml" {
         # The derived key `sentinel ha witness-key` prints for this token and
         # cluster; the witness never holds the members' machine token.
-        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";key="b080d20c3e5dfd7ba3cfc3f7a2713448f452ebd8b56a9ef6dac76ff570b69da8";inherit cluster;member=["10.3.0.1" "10.3.0.2"];};};
+        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";key="aee3e1d647a17e8d6acc8b18491b16b7d75cb0eece1d3fd40555286ef7243214";inherit cluster;member=["10.3.0.1" "10.3.0.2"];};};
         interface=[
           {name="eth1";zone="control";}
           {name="witness-sync";parent="eth1";vlan=43;address="10.3.0.3/24";zone="control";}
@@ -191,7 +191,7 @@ in pkgs.testers.runNixOSTest {
         witness_node.succeed("! grep -rq '${secret}' /var/lib/sentinel /run/sentinel")
         # The printed key is what this witness was given.
         printed=primary.succeed("printf %s '${secret}' | sentinel ha witness-key --secret-stdin")
-        assert 'key = "b080d20c3e5dfd7ba3cfc3f7a2713448f452ebd8b56a9ef6dac76ff570b69da8"' in printed and 'cluster = "${cluster}"' in printed, printed
+        assert 'key = "aee3e1d647a17e8d6acc8b18491b16b7d75cb0eece1d3fd40555286ef7243214"' in printed and 'cluster = "${cluster}"' in printed, printed
     # A credential failure must happen before either document changes.
     before=primary.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
     secondary_before=secondary.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]

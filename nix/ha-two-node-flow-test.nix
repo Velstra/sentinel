@@ -1,7 +1,7 @@
 { pkgs, self, legacyPackage ? null }:
 let
   legacyPath = if legacyPackage == null then "" else toString legacyPackage;
-  secret = "two-node-flow-vm-only-credential-at-least-32-bytes";
+  secret = "3fc09889bc23d47751124c1e3841bd6140e4a4759d174eb8922ae47746b67f1a";
   cluster = "two-node-flow-cluster-0123456789";
   appliance = node: (pkgs.formats.toml {}).generate "two-node-flow-member.toml" {
     system = {

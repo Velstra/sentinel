@@ -1,7 +1,7 @@
 { pkgs, self, synproxy ? false, leased ? false, wireguard ? false, masquerade ? false }:
 let
   name = if masquerade then "sentinel-ha-masquerade-failover" else if wireguard then "sentinel-ha-wireguard-failover" else if leased && synproxy then "sentinel-ha-witness-synproxy-failover" else if leased then "sentinel-ha-witness-failover" else if synproxy then "sentinel-ha-synproxy-failover" else "sentinel-ha-failover";
-  secret = "ha-vm-test-credential-at-least-32-bytes";
+  secret = "3495f763f76345f694398991ac86dc4f1b6c48ab2334e10f5b4a3ddd1fc4bd50";
   appliance = number: priority: (pkgs.formats.toml {}).generate "ha-appliance.toml" {
     system = {
       hostname = if number == "1" then "master" else "backup";
@@ -125,7 +125,7 @@ in pkgs.testers.runNixOSTest {
         # Only the derived witness key (`sentinel ha witness-key`), never the
         # members' credential; only the two members may open sessions. A long
         # peer silence gives the lone-survivor check room to observe the wait.
-        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";key="c0b85d40a476e906218005259304678cbafc193059b70394a58334edfb13882b";cluster="vm-cluster-0123456789";member=["10.3.0.1" "10.3.0.2"];peer-silence-ms=20000;};};
+        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";key="ede32ebbc01f514a3c8bde6847eea86ad380a43132139a495002b91c52d0ac1a";cluster="vm-cluster-0123456789";member=["10.3.0.1" "10.3.0.2"];peer-silence-ms=20000;};};
         interface=[{name="eth1";address="10.3.0.3/24";zone="control";}];
         firewall.default_action="accept";
       });

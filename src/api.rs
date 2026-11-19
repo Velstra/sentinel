@@ -610,12 +610,16 @@ async fn security_headers(req: Request, next: Next) -> Response {
 /// configured token. The comparison is constant-time so a wrong token leaks no
 /// timing signal about how many bytes were right.
 ///
-/// Wrong bearers are counted per source (CTRL-01): a source that presented
-/// [`crate::api_throttle::BEARER_FAILURES`] invalid ones is refused with 429
-/// — before its bearer is even looked at, so a correct guess made while locked
-/// does not get through either. A request with no peer address (an
-/// in-process caller) is not counted. A request with no bearer at all is not a
-/// guess and is not counted.
+/// Wrong bearers are counted per source (CTRL-01): once a source has
+/// presented [`crate::api_throttle::BEARER_FAILURES`] invalid ones, its
+/// further invalid ones get 429. A **valid** credential is never refused for
+/// its source's failures — a flood from a shared NAT, or a table of locked
+/// addresses, must not lock out the operator or the HA peer — with one
+/// exception: the peer credential while the configured secret is weak. Such a
+/// secret is guessable online, so a locked source cannot keep trying it; the
+/// strong secrets admission requires and the 256-bit session and machine
+/// tokens are not. A request with no peer address (an in-process caller), or
+/// no bearer at all, is not counted.
 async fn require_token(
     State(state): State<Arc<ApiState>>,
     mut req: Request,
@@ -625,16 +629,6 @@ async fn require_token(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| crate::api_throttle::source(ci.0.ip()));
-    let failures = &crate::api_throttle::tables().bearer_failures;
-    if let Some(source) = &source
-        && let Err(refusal) = failures.check(source)
-    {
-        return too_many(
-            &refusal,
-            "too many failed authentications from your address; try again later".into(),
-        )
-        .into_response();
-    }
     let provided = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -644,11 +638,19 @@ async fn require_token(
         return unauthorised();
     };
     let Some(caller) = resolve_caller(&state, token) else {
-        if let Some(source) = &source {
-            let _ = failures.count(source);
-        }
-        return unauthorised();
+        return bearer_failure(source);
     };
+    if caller.credential == Credential::Peer
+        && let Some(source) = &source
+        && peer_secret_is_weak(&state)
+        && let Err(refusal) = crate::api_throttle::tables().bearer_failures.check(source)
+    {
+        return too_many(
+            &refusal,
+            "too many failed authentications from your address; try again later".into(),
+        )
+        .into_response();
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // A read-only caller may read anything and change nothing. The split is by
@@ -804,6 +806,16 @@ fn resolve_caller_at(state: &ApiState, presented: &str, now: u64) -> Option<Call
         permission,
         credential: Credential::Session,
     })
+}
+
+/// Whether the configured config-sync secret is one admission would refuse.
+fn peer_secret_is_weak(state: &ApiState) -> bool {
+    state
+        .appliance()
+        .ok()
+        .as_ref()
+        .and_then(peer_secret)
+        .is_some_and(|secret| crate::config::sync_secret_weakness(secret).is_some())
 }
 
 /// The peer credential `a` configures: its non-empty config-sync secret.
@@ -1014,17 +1026,6 @@ async fn post_login(
 ) -> Result<Json<Value>, ApiError> {
     let tables = crate::api_throttle::tables();
     let peer_ip = connect_info.map(|ci| crate::api_throttle::source(ci.0.ip()));
-    // A locked address is refused up front — cheaply, before the password hash
-    // that a guesser is really trying to spend the box's CPU on — and an
-    // address that is let through has already spent one of its attempts.
-    if let Some(ip) = peer_ip {
-        tables.sign_in_sources.count(&ip).map_err(|refusal| {
-            too_many(
-                &refusal,
-                "too many sign-in attempts from your address; try again later".into(),
-            )
-        })?;
-    }
     let username = body
         .get("username")
         .and_then(|v| v.as_str())
@@ -1051,6 +1052,25 @@ async fn post_login(
         )));
     }
     let origin = peer_ip.unwrap_or(crate::api_throttle::UNKNOWN_SOURCE);
+    // A locked address is refused up front — cheaply, before the password hash
+    // that a guesser is really trying to spend the box's CPU on — and an
+    // address that is let through has already spent one of its attempts. The
+    // one exception is the shared overflow budget of a table full of locked
+    // addresses: an origin that signed this account in before is not turned
+    // away because strangers exhausted it (its own pair budget still applies).
+    if let Some(ip) = peer_ip {
+        match tables.sign_in_sources.count(&ip) {
+            Ok(_) => {}
+            Err(crate::api_throttle::Refusal::Busy(_))
+                if tables.sign_in.is_trusted(&username, ip) => {}
+            Err(refusal) => {
+                return Err(too_many(
+                    &refusal,
+                    "too many sign-in attempts from your address; try again later".into(),
+                ));
+            }
+        }
+    }
     let attempts = tables
         .sign_in
         .begin(&username, origin)
@@ -1105,8 +1125,10 @@ async fn post_login(
 /// else is the same 401 every unknown bearer gets.
 async fn post_sign_out(
     State(state): State<Arc<ApiState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    let source = connect_info.map(|ci| crate::api_throttle::source(ci.0.ip()));
     let Some(presented) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1117,25 +1139,37 @@ async fn post_sign_out(
         return unauthorised();
     };
     let outcome = tokio::task::spawn_blocking(move || {
-        if crate::api_session::close(&state.tokens_dir, &presented) {
-            Some(true)
-        } else if resolve_caller(&state, &presented)
-            .is_some_and(|caller| caller.credential != Credential::Session)
-        {
-            Some(false)
-        } else {
-            None
-        }
+        crate::api_session::close(&state.tokens_dir, &presented)
     })
     .await;
     match outcome {
-        Ok(Some(true)) => Json(json!({ "signed_out": true })).into_response(),
-        Ok(Some(false)) => ApiError::bad_request(anyhow!(
-            "the machine token and the config-sync credential are not sessions; rotate them instead of signing them out"
-        ))
-        .into_response(),
-        Ok(None) => unauthorised(),
+        Ok(true) => Json(json!({ "signed_out": true })).into_response(),
+        // Anything that is not a session — the machine token and the peer
+        // credential included — gets the one refusal every unknown bearer
+        // gets, and counts as a failed authentication. A distinct answer for
+        // "valid, but not a session" made this unthrottled route a guessing
+        // oracle for the config-sync secret (CTRL-01).
+        Ok(false) => bearer_failure(source),
         Err(e) => ApiError::internal(anyhow!("sign-out task: {e}")).into_response(),
+    }
+}
+
+/// The answer to a bearer that authenticated nothing: 429 when its source has
+/// used up [`crate::api_throttle::BEARER_FAILURES`], else the uniform 401 —
+/// counted either way. Only a *failed* bearer is ever throttled here; a valid
+/// one is never refused for its source's failures (see [`require_token`]).
+fn bearer_failure(source: Option<std::net::IpAddr>) -> Response {
+    let Some(source) = source else {
+        return unauthorised();
+    };
+    let failures = &crate::api_throttle::tables().bearer_failures;
+    match failures.count(&source) {
+        Ok(_) => unauthorised(),
+        Err(refusal) => too_many(
+            &refusal,
+            "too many failed authentications from your address; try again later".into(),
+        )
+        .into_response(),
     }
 }
 
@@ -1439,12 +1473,6 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// `GET /api/v1/config` — the running appliance config as JSON (the same
-/// [`Appliance`] the CLI edits), with every secret redacted. A read-only token
-/// can reach this endpoint, so the config-sync secret (the peer credential every
-/// member of the pair accepts), WireGuard private keys, IPsec PSKs, RADIUS
-/// and TACACS+ secrets, the SNMP community and login password hashes / TOTP
-/// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 /// Reload rotated machine credentials without restarting management. Never use
 /// a cached credential after its persistent source becomes unreadable.
 fn machine_token(state: &ApiState) -> Result<String> {
@@ -1524,6 +1552,18 @@ async fn ha_proof(
         eprintln!("api: HA enrollment proof requested from {source}");
     }
     let key = enrollment_key(&state).map_err(ApiError::internal)?;
+    // A weak secret is what an offline guess is after; an upgraded box that
+    // still holds one keeps its pairing but hands out no proof of it until
+    // the secret is rotated (pairing with it is refused at admission anyway).
+    if peer_secret_is_weak(&state) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            anyhow!(
+                "this member's config-sync secret is too weak to prove; rotate it with \
+                 `sentinel ha secret generate` before pairing"
+            ),
+        ));
+    }
     let proof = crate::ha::enrollment_proof(&key, &nonce, &pin).map_err(ApiError::bad_request)?;
     Ok(Json(json!({"proof": proof})))
 }
@@ -1543,22 +1583,47 @@ async fn ha_enrollment(
     axum::Extension(caller): axum::Extension<Caller>,
 ) -> Result<Response, ApiError> {
     require_ha_machine(&state, &caller)?;
+    let peer = caller.credential == Credential::Peer;
     // The apply lock can be held for minutes by a provisional worker; waiting
     // for it on an async worker parked that worker (CTRL-06).
-    tokio::task::spawn_blocking(move || enrollment_document(&state))
+    tokio::task::spawn_blocking(move || enrollment_document(&state, peer))
         .await
         .map_err(|e| ApiError::internal(anyhow!("enrollment task: {e}")))?
 }
 
-fn enrollment_document(state: &ApiState) -> Result<Response, ApiError> {
+/// The member's configuration for the pairing peer, and its revision.
+///
+/// To the peer credential the document is handed without the sections the
+/// receiver never takes from a pairing anyway ([`enrollment_view`]): it used
+/// to carry every account's password hash and TOTP secret and the AAA
+/// servers' secrets, an offline crack away from an administrator login
+/// (CTRL-09). The revision is the view's own, so a pairing client — this
+/// release's or an older one — finds the document consistent, and
+/// [`receive_pairing`] accepts that revision as the baseline.
+fn enrollment_document(state: &ApiState, peer: bool) -> Result<Response, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
-    let appliance = state.appliance().map_err(ApiError::internal)?;
+    let mut appliance = state.appliance().map_err(ApiError::internal)?;
+    if peer {
+        appliance = enrollment_view(appliance);
+    }
     let revision = crate::ha::revision(&appliance).map_err(ApiError::internal)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({"appliance": appliance, "revision": revision})),
     )
         .into_response())
+}
+
+/// `a` without its account list, AAA servers and update channels — the
+/// secret-bearing parts of the management trust a pairing never changes
+/// ([`crate::configsync::keep_member_trust`]). SSH, groups and the console
+/// carry no secret and stay: the pairing peer captures the SSH binding as
+/// this member's identity.
+fn enrollment_view(mut a: Appliance) -> Appliance {
+    a.system.logins = Vec::new();
+    a.system.aaa = Default::default();
+    a.update = None;
+    a
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1574,14 +1639,19 @@ async fn ha_pair(
     Json(request): Json<PairRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_ha_machine(&state, &caller)?;
+    let peer = caller.credential == Credential::Peer;
     // A flock and a full live apply (systemctl, link waits): never on an async
     // worker (CTRL-06), like every other mutating handler.
-    tokio::task::spawn_blocking(move || receive_pairing(&state, request))
+    tokio::task::spawn_blocking(move || receive_pairing(&state, request, peer))
         .await
         .map_err(|e| ApiError::internal(anyhow!("pairing task: {e}")))?
 }
 
-fn receive_pairing(state: &ApiState, mut request: PairRequest) -> Result<Json<Value>, ApiError> {
+fn receive_pairing(
+    state: &ApiState,
+    mut request: PairRequest,
+    peer: bool,
+) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let local = state.appliance().map_err(ApiError::internal)?;
     // A pairing is not a way to replace who manages this member (CTRL-09):
@@ -1605,10 +1675,28 @@ fn receive_pairing(state: &ApiState, mut request: PairRequest) -> Result<Json<Va
     if desired == current {
         return Ok(Json(json!({"saved": true, "revision": desired})));
     }
-    if current != request.expected_revision {
+    // The peer read the enrollment view, not the full document.
+    let viewed =
+        crate::ha::revision(&enrollment_view(local.clone())).map_err(ApiError::internal)?;
+    if current != request.expected_revision && viewed != request.expected_revision {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             anyhow!("configuration changed during enrollment; reload and retry"),
+        ));
+    }
+    // Enrollment is how an unpaired member gets its pair; it is not a way for
+    // the peer credential to rewrite a member that is already paired — its
+    // addresses, listeners, secret and peer identity (CTRL-09). Repeating a
+    // completed pairing is answered above as already applied; anything else
+    // on a paired member needs the member's own machine credential, or
+    // unpairing it first.
+    if peer && local.system.ha.as_ref().is_some_and(|h| h.enabled) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!(
+                "this member is already paired; the config-sync credential cannot re-pair it \
+                 with a different configuration"
+            ),
         ));
     }
     let next = request
@@ -1632,6 +1720,12 @@ fn receive_pairing(state: &ApiState, mut request: PairRequest) -> Result<Json<Va
     replace_config(state, request.appliance)
 }
 
+/// `GET /api/v1/config` — the running appliance config as JSON (the same
+/// [`Appliance`] the CLI edits), with every secret redacted. A read-only token
+/// can reach this endpoint, so the config-sync secret (the peer credential every
+/// member of the pair accepts), WireGuard private keys, IPsec PSKs, RADIUS
+/// and TACACS+ secrets, the SNMP community and login password hashes / TOTP
+/// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let appliance = state.appliance().map_err(ApiError::internal)?;
     let mut value = serde_json::to_value(&appliance)
@@ -2978,6 +3072,16 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
     use std::io::Write;
     f.write_all(token.as_bytes())
         .with_context(|| format!("writing the API token {}", path.display()))?;
+    // Record that this token is Sentinel's own (see machine_token_disposition).
+    let marker = minted_marker(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&marker)
+        .and_then(|mut m| m.write_all(minted_digest(&token).as_bytes()))
+        .with_context(|| format!("recording the API token {}", marker.display()))?;
     Ok(token)
 }
 
@@ -2989,23 +3093,62 @@ pub(crate) fn generate_machine_token() -> Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Whether the machine token file's content `current` is one this release
-/// would keep, given the configured config-sync `secret` (CTRL-01, CTRL-07).
+/// Where Sentinel records that it minted the machine token at `token`: the
+/// SHA-256 of the token it wrote, beside it, root-only.
+pub(crate) fn minted_marker(token: &Path) -> PathBuf {
+    token.with_extension("minted")
+}
+
+/// The marker's content for `token`.
+pub(crate) fn minted_digest(token: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// What to do with the machine token file (CTRL-01, CTRL-07).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TokenDisposition {
+    /// Minted by Sentinel and recorded so: keep it.
+    Keep,
+    /// Not recorded (minted by an earlier release, or placed by hand) and not
+    /// a config-sync secret: keep it and record it.
+    Adopt,
+    /// A config-sync secret an earlier release installed — the current one, or
+    /// one any archived configuration names: replace it with a fresh token.
+    Replace,
+}
+
+/// Decide what to do with machine token `current`.
 ///
 /// Earlier releases *wrote the config-sync secret into the machine token
 /// file*, so the operator-chosen shared string was the full-access local
-/// bearer, and deleting the secret later left it there, still valid. A token
-/// is kept only if it has the shape [`generate_machine_token`] mints (43
-/// URL-safe base64 characters, which [`crate::config::generate_sync_secret`]'s
-/// 64 hex digits never have) and is not the configured secret. Anything else
-/// is a secret an earlier release installed — current or since removed — and
-/// is replaced by a fresh random token.
-pub(crate) fn machine_token_is_independent(current: &str, secret: Option<&str>) -> bool {
-    let generated = current.len() == 43
-        && current
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    generated && secret.is_none_or(|secret| !ct_eq(current.as_bytes(), secret.as_bytes()))
+/// bearer, and deleting or changing the secret later left it there, still
+/// valid. Provenance is tracked explicitly: Sentinel records the digest of
+/// every token it mints ([`minted_marker`]). A token that matches its record
+/// is kept. One that does not is replaced if it is the configured secret or
+/// appears in an archived configuration (`mentioned`, asked only then) — a
+/// secret, current or removed — and otherwise adopted: an earlier release
+/// minted it, or an operator put it there, and neither is a reason to break
+/// the automation that uses it.
+pub(crate) fn machine_token_disposition(
+    current: &str,
+    configured: Option<&str>,
+    minted: Option<&str>,
+    mentioned: impl FnOnce() -> bool,
+) -> TokenDisposition {
+    if configured.is_some_and(|secret| ct_eq(current.as_bytes(), secret.as_bytes())) {
+        return TokenDisposition::Replace;
+    }
+    if minted.is_some_and(|digest| ct_eq(digest.as_bytes(), minted_digest(current).as_bytes())) {
+        return TokenDisposition::Keep;
+    }
+    if mentioned() {
+        return TokenDisposition::Replace;
+    }
+    TokenDisposition::Adopt
 }
 
 /// Whether `name` is a valid account name — the same POSIX-ish shape a
@@ -3364,7 +3507,7 @@ mod tests {
 
     const TOKEN: &str = "test-token-abc123";
     /// The config-sync secret of the test pairs: strong enough to be admitted.
-    const PEER_SECRET: &str = "legacy-pair-fixture-credential-0123456789";
+    const PEER_SECRET: &str = "67d0a04c9e6010954873106342dc89c03a00430a29f5eb5295e33894d03ab07d";
 
     // Dedicated failed-show disclosure regressions reuse this module's real
     // account/HTTPS fixtures rather than introducing a second auth setup.
@@ -3846,6 +3989,69 @@ mod tests {
         );
     }
 
+    /// Review of CTRL-09: on a member that is already paired, the peer
+    /// credential could POST a different pairing and rewrite its addresses,
+    /// listeners, secret and peer identity. A repeat of the applied pairing
+    /// is still answered as applied; a different one needs the machine token.
+    #[tokio::test]
+    async fn the_peer_credential_cannot_re_pair_a_paired_member() {
+        let path = seed("paired-member");
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let desired = crate::ha::paired_fixture();
+        let secret = desired.system.config_sync.secret.clone().unwrap();
+        let pair = |token: &str, expected: String, a: &Appliance| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ha/pair")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&PairRequest {
+                        expected_revision: expected,
+                        appliance: a.clone(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        // First enrollment, as a pairing client does it: the expected revision
+        // is the one the enrollment view carried.
+        let viewed =
+            crate::ha::revision(&enrollment_view(Appliance::load(&path).unwrap())).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(pair(TOKEN, viewed, &desired))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        let paired = Appliance::load(&path).unwrap();
+        let current = crate::ha::revision(&paired).unwrap();
+        // A repeat is idempotent for the peer credential too.
+        let resp = app
+            .clone()
+            .oneshot(pair(&secret, current.clone(), &desired))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        // A different document is refused to it and changes nothing.
+        let mut hostile = desired.clone();
+        hostile.system.hostname = "taken-over".into();
+        let resp = app.oneshot(pair(&secret, current, &hostile)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{}",
+            body_string(resp).await
+        );
+        assert_eq!(
+            Appliance::load(&path).unwrap().system.hostname,
+            paired.system.hostname
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// CTRL-06: `ha_pair` took the configuration's transaction lock and ran
     /// the live apply on the async worker itself. While another transaction
     /// held the lock, every such request parked a worker; on a two-core box
@@ -4042,29 +4248,61 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     /// CTRL-07: an earlier release wrote the config-sync secret into the
-    /// machine token file and nothing ever took it out again — not removing the
-    /// secret, not unpairing. A token the API minted itself is kept; one that
-    /// is the configured secret, or has any other shape (a secret since
-    /// removed), is to be replaced at the next apply.
+    /// machine token file and nothing ever took it out again — not removing
+    /// the secret, not changing it. Provenance is recorded, not guessed from
+    /// the token's shape: a token Sentinel minted is kept; a configured secret
+    /// is replaced; so is one an archived configuration names (a secret since
+    /// removed), whatever its length; anything else is adopted, so an
+    /// operator's own token is not overwritten on every apply.
     #[test]
     fn a_machine_token_that_holds_a_config_sync_secret_is_retired() {
+        use TokenDisposition::*;
         let minted = generate_machine_token().unwrap();
-        assert!(machine_token_is_independent(&minted, None));
-        assert!(machine_token_is_independent(&minted, Some(PEER_SECRET)));
+        let record = minted_digest(&minted);
+        let never = || false;
+        assert_eq!(
+            machine_token_disposition(&minted, None, Some(&record), never),
+            Keep
+        );
+        assert_eq!(
+            machine_token_disposition(&minted, Some(PEER_SECRET), Some(&record), never),
+            Keep
+        );
         // The current secret, installed by an earlier release.
-        assert!(!machine_token_is_independent(
-            PEER_SECRET,
-            Some(PEER_SECRET)
-        ));
-        // A secret since removed from the configuration: still retired.
-        assert!(!machine_token_is_independent(PEER_SECRET, None));
-        assert!(!machine_token_is_independent("summer2026", None));
-        // A generated config-sync secret can never pass for a machine token.
-        let secret = crate::config::generate_sync_secret().unwrap();
-        assert!(!machine_token_is_independent(&secret, None));
-        // Even a secret that happens to have the minted shape is retired while
-        // it is the configured secret.
-        assert!(!machine_token_is_independent(&minted, Some(&minted)));
+        assert_eq!(
+            machine_token_disposition(PEER_SECRET, Some(PEER_SECRET), None, never),
+            Replace
+        );
+        // Even recorded: a token that is the configured secret never stays.
+        assert_eq!(
+            machine_token_disposition(&minted, Some(&minted), Some(&record), never),
+            Replace
+        );
+        // A removed secret of any shape — the minted 43-character one too —
+        // is found in the archive and replaced.
+        assert_eq!(
+            machine_token_disposition(PEER_SECRET, None, None, || true),
+            Replace
+        );
+        assert_eq!(
+            machine_token_disposition(&minted, None, None, || true),
+            Replace
+        );
+        // An unrecorded token nobody configured: an earlier release's mint, or
+        // an operator's own. Kept, and recorded from now on.
+        assert_eq!(
+            machine_token_disposition("operator-chosen", None, None, never),
+            Adopt
+        );
+        assert_eq!(
+            machine_token_disposition(&minted, None, Some(&minted_digest("other")), never),
+            Adopt
+        );
+        // The archive is consulted only when the record does not decide.
+        assert_eq!(
+            machine_token_disposition(&minted, None, Some(&record), || panic!("asked")),
+            Keep
+        );
     }
 
     #[test]
@@ -5050,7 +5288,10 @@ action="reject"
         // A short secret in a field that may be short (the config-sync secret
         // no longer may), and an escaped one in the free-form config-sync
         // secret (which may hold quotes and backslashes, not control bytes).
-        for secret in ["x", "advisory-secret-\"quoted\\value-0123456789-end"] {
+        for secret in [
+            "x",
+            "advisory\"quoted\\9f2c7a1eb84d5f0e3c6a29b17d4e8f05a3c6b2d9e1f7a4c8",
+        ] {
             let path = seed("working");
             let mut candidate = advisory_candidate();
             candidate.rules[0].action = crate::config::Action::Accept;
@@ -5858,7 +6099,7 @@ action="reject"
     }
 
     const MACHINE_CREDENTIALS: [&str; 2] = [
-        "zq-machine-credential-0123456789abcdef",
+        "d5af4c516f58cbb252c954f76e2bbb2308dd6c689f562830ba1dbc967cb5313d",
         "zq-witness-credential-0123456789abcdefghij",
     ];
 
@@ -6044,7 +6285,7 @@ action="reject"
         // account's own choosing, a peer of its choosing behind the restored
         // marker, a fingerprint, and the witness credential.
         let marker = format!("\"{REDACTED}\"");
-        let chosen = "\"account-chosen-credential-0123456789\"";
+        let chosen = "\"80a3a4bc4f25e32f0d8a8eb1ab92f3812bf84ab88f86310fee7ff92e056a9ca5\"";
         // The marker's first occurrence after a section header: both withheld
         // credentials read the same.
         let choose_in = |section: &str| {
@@ -6094,7 +6335,7 @@ action="reject"
         // The CLI door the console uses: the same verbs, the same refusal.
         for (script, field) in [
             (
-                "set system config-sync secret account-chosen-credential-0123456789\ncommit\n",
+                "set system config-sync secret 80a3a4bc4f25e32f0d8a8eb1ab92f3812bf84ab88f86310fee7ff92e056a9ca5\ncommit\n",
                 "system config-sync secret",
             ),
             (
@@ -6182,7 +6423,7 @@ action="reject"
         let rotated = full
             .replace(
                 MACHINE_CREDENTIALS[0],
-                "rotated-machine-credential-0123456789",
+                "24b3d443718c37122b372f916339ac94013df25fe4bad9754dcd79cacd50d670",
             )
             .replace("\"10.0.0.2\"", "\"10.0.0.9\"");
         let resp = app
@@ -6212,7 +6453,7 @@ action="reject"
         assert_eq!(after.system.config_sync.peers, ["10.0.0.9"]);
         assert_eq!(
             after.system.config_sync.secret.as_deref(),
-            Some("rotated-machine-credential-0123456789")
+            Some("24b3d443718c37122b372f916339ac94013df25fe4bad9754dcd79cacd50d670")
         );
     }
 
@@ -6531,8 +6772,9 @@ action="reject"
 
     /// CTRL-01: thirty wrong bearers in a row used to be thirty 401s, never a
     /// 429 — online guessing ran at full speed. A source that keeps failing
-    /// is now refused before its bearer is even looked at; another source is
-    /// unaffected.
+    /// now gets 429 for its further failures; a valid credential from the
+    /// same source is still served (a shared NAT or a flood must not lock out
+    /// the operator or the HA peer); another source is unaffected.
     #[tokio::test]
     async fn wrong_bearers_from_one_source_are_throttled() {
         let app = router(state(seed("bearer-throttle")));
@@ -6551,7 +6793,10 @@ action="reject"
         }
         let resp = app
             .clone()
-            .oneshot(from_source(get("/api/v1/status", Some(TOKEN)), guesser))
+            .oneshot(from_source(
+                get("/api/v1/status", Some("guess-30")),
+                guesser,
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -6560,6 +6805,17 @@ action="reject"
             "a source that guessed thirty bearers was not throttled"
         );
         assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        let valid = app
+            .clone()
+            .oneshot(from_source(get("/api/v1/status", Some(TOKEN)), guesser))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            valid,
+            StatusCode::OK,
+            "a valid credential was refused for its source's failures"
+        );
         let other = app
             .oneshot(from_source(
                 get("/api/v1/status", Some(TOKEN)),
@@ -6569,6 +6825,127 @@ action="reject"
             .unwrap()
             .status();
         assert_eq!(other, StatusCode::OK);
+    }
+
+    /// Review of CTRL-01: sign-out sits outside the token middleware, and it
+    /// used to tell "valid but not a session" (400) from "unknown" (401) and
+    /// never throttle — an oracle for the peer secret. Now one answer, counted.
+    #[tokio::test]
+    async fn sign_out_is_not_a_guessing_oracle() {
+        let (_, b) = legacy_pair();
+        let app = router(sync_state(&b));
+        let sign_out = |token: &str, from: [u8; 4]| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/sign-out")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let app = app.clone();
+            async move {
+                app.oneshot(from_source(request, from))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        let source = [198, 18, 3, 1];
+        assert_eq!(
+            sign_out(PEER_SECRET, source).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            sign_out("not-the-secret", source).await,
+            StatusCode::UNAUTHORIZED
+        );
+        for n in 0..30 {
+            let _ = sign_out(&format!("guess-{n}"), source).await;
+        }
+        assert_eq!(
+            sign_out("guess-again", source).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "sign-out guesses were not throttled"
+        );
+    }
+
+    /// Review of CTRL-01: a weak secret on an upgraded box is guessable
+    /// online, so for it alone the failure lock also applies to the correct
+    /// value — and the proof of it is not handed out at all.
+    #[tokio::test]
+    async fn a_weak_peer_secret_is_throttled_and_never_proved() {
+        let (_, mut b) = legacy_pair();
+        b.system.config_sync.secret = Some("summer2026".into());
+        let st = sync_state(&b);
+        let app = router(st.clone());
+        let source = [198, 18, 4, 1];
+        for n in 0..30 {
+            let _ = app
+                .clone()
+                .oneshot(from_source(
+                    get("/api/v1/status", Some(&format!("g{n}"))),
+                    source,
+                ))
+                .await;
+        }
+        let right = app
+            .clone()
+            .oneshot(from_source(
+                get("/api/v1/status", Some("summer2026")),
+                source,
+            ))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(right, StatusCode::TOO_MANY_REQUESTS);
+        let proof = app
+            .oneshot(get(&format!("/api/v1/ha/proof/{}", "c".repeat(64)), None))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            proof,
+            StatusCode::CONFLICT,
+            "a proof of a weak secret was handed out"
+        );
+    }
+
+    /// Review of CTRL-09: enrollment handed the peer credential the full
+    /// document — every account's password hash and TOTP secret, the AAA
+    /// secrets — an offline crack away from an administrator login. The peer
+    /// gets the enrollment view, whose revision a pairing then presents.
+    #[tokio::test]
+    async fn enrollment_withholds_account_and_directory_secrets_from_the_peer() {
+        let (_, mut b) = legacy_pair();
+        b.system.logins[0].hashed_password = Some(
+            "$6$saltsalt$OdRfXGmQ1yHEzqpO9yyU7nl0lDmy6cNKTRxkC1Yw8n0tXWJ1kPGePJ9qx4XJgZp5vSBiv5LG1oWLy5O3Ck5Ob1".into(),
+        );
+        let st = sync_state(&b);
+        let resp = router(st.clone())
+            .oneshot(get("/api/v1/ha/enrollment", Some(PEER_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("$6$saltsalt"),
+            "a password hash reached the peer"
+        );
+        let document: Value = serde_json::from_str(&body).unwrap();
+        let view: Appliance = serde_json::from_value(document["appliance"].clone()).unwrap();
+        assert_eq!(
+            document["revision"],
+            crate::ha::revision(&view).unwrap(),
+            "the view's own revision, so any pairing client finds it consistent"
+        );
+        // The machine token still sees the whole document.
+        let full = body_string(
+            router(st)
+                .oneshot(get("/api/v1/ha/enrollment", Some(TOKEN)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(full.contains("$6$saltsalt"));
     }
 
     /// CTRL-01: the unauthenticated HA proof is an oracle keyed by the

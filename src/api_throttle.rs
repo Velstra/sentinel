@@ -311,7 +311,7 @@ impl SignIn {
     /// in its window (which paces the reply), or refuse it.
     pub(crate) fn begin(&self, account: &str, origin: IpAddr) -> Result<u32, SignInRefusal> {
         let key = (account.to_string(), source(origin));
-        if !self.is_trusted(&key) {
+        if !self.trusted_pair(&key) {
             // Checked before the pair is counted, counted after: a refusal by
             // the distributed budget must not also spend the pair's.
             self.accounts
@@ -319,7 +319,7 @@ impl SignIn {
                 .map_err(SignInRefusal::NewOrigins)?;
         }
         let attempts = self.pairs.count(&key).map_err(SignInRefusal::Origin)?;
-        if !self.is_trusted(&key) {
+        if !self.trusted_pair(&key) {
             self.accounts
                 .count(&key.0)
                 .map_err(SignInRefusal::NewOrigins)?;
@@ -347,7 +347,12 @@ impl SignIn {
         trusted.insert(key, now);
     }
 
-    fn is_trusted(&self, key: &(String, IpAddr)) -> bool {
+    /// Whether `origin` signed `account` in before (see [`TRUSTED_ORIGIN`]).
+    pub(crate) fn is_trusted(&self, account: &str, origin: IpAddr) -> bool {
+        self.trusted_pair(&(account.to_string(), source(origin)))
+    }
+
+    fn trusted_pair(&self, key: &(String, IpAddr)) -> bool {
         guard(&self.trusted)
             .get(key)
             .is_some_and(|at| at.elapsed() <= TRUSTED_ORIGIN)
