@@ -105,13 +105,21 @@ in pkgs.testers.runNixOSTest {
                        "'tcp dst port 9092 or udp dst port 9093' "
                        ">/dev/null 2>/tmp/inbound.err & echo $! >/tmp/inbound.pid")
         client.wait_until_succeeds("grep -q 'listening on eth1' /tmp/inbound.err", timeout=30)
+        fw.succeed("rm -f /tmp/fwprobe.pcap /tmp/fwprobe.err; ${pkgs.tcpdump}/bin/tcpdump -n -U -i any -w /tmp/fwprobe.pcap "
+                   "'port 9092 or port 9093' >/dev/null 2>/tmp/fwprobe.err & echo $! >/tmp/fwprobe.pid")
+        fw.wait_until_succeeds("grep -q 'listening on any' /tmp/fwprobe.err", timeout=30)
+        sent = []
         for address in ("10.1.1.2", "2001:db8:101::2"):
-            server.execute(f"nc -z -w 2 {address} 9092")
-            server.execute(f"echo probe | nc -u -w 1 {address} 9093")
+            sent.append(server.execute(f"nc -v -z -w 2 {address} 9092 2>&1"))
+            sent.append(server.execute(f"echo probe | nc -v -u -w 1 {address} 9093 2>&1"))
         client.succeed("pid=$(cat /tmp/inbound.pid); kill -INT $pid; "
                        "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
+        fw.succeed("pid=$(cat /tmp/fwprobe.pid); kill -INT $pid; "
+                   "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
         global inbound_seen
-        inbound_seen = client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null")
+        inbound_seen = (client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null")
+                        + "probes: " + repr(sent) + "\nfirewall saw:\n"
+                        + fw.succeed("${pkgs.tcpdump}/bin/tcpdump -n -e -r /tmp/fwprobe.pcap 2>/dev/null"))
         return sum(1 for line in inbound_seen.splitlines()
                    if " 10.2.2.2." in line or " 2001:db8:102::2." in line)
     lines = [
@@ -163,9 +171,14 @@ in pkgs.testers.runNixOSTest {
 
     with subtest("TCP forwarding, checksums and static SNAT work across both families"):
         for address, result in [("10.2.2.2", "/tmp/tcp4"), ("2001:db8:102::2", "/tmp/tcp6")]:
+            # Held across the later subtests, which take well over 90 s, and
+            # patient enough to ride out the repair below: forwarding is off
+            # from the sysctl until the unchanged commit restores it (~12 s
+            # into a non-root commit), which TCP retransmission survives but a
+            # 5 s receive timeout did not.
             code = ("import socket,time; s=socket.create_connection((" + repr(address) + ",9090),5); "
-                    "f=open(" + repr(result) + ",'ab',buffering=0); "
-                    "exec(\"for i in range(90):\\n s.sendall(b'probe')\\n f.write(s.recv(200))\\n time.sleep(1)\")")
+                    "s.settimeout(60); f=open(" + repr(result) + ",'ab',buffering=0); "
+                    "exec(\"for i in range(300):\\n s.sendall(b'probe')\\n f.write(s.recv(200))\\n time.sleep(1)\")")
             client.succeed("python3 -c " + shlex.quote(code) + " >/tmp/tcp-probe.log 2>&1 &")
         client.wait_until_succeeds("grep -q 203.0.113.10 /tmp/tcp4", timeout=30)
         client.wait_until_succeeds("grep -q 2001:db8:101::2 /tmp/tcp6", timeout=30)
