@@ -198,6 +198,37 @@ in pkgs.testers.runNixOSTest {
                 receipt["phases"].append(analysis)
                 preserve("phase-" + str(count) + "-analysis.json", analysis)
                 preserve("nat-capacity-pressure.json", receipt)
+                # Diagnostics only (no pass criterion): what kind of failure each
+                # unverified held echo was, and the TCP/softirq counters that
+                # separate a probe-side bottleneck from a datapath drop.
+                kinds = {}
+                for row in probes["rows"]:
+                    if row.get("verified") is not True:
+                        failure = row.get("failure") or {}
+                        tag = str(failure.get("stage")) + "/" + str(failure.get("kind"))
+                        kinds[tag] = kinds.get(tag, 0) + 1
+                def tcp_delta(name):
+                    out = {}
+                    for host in ("client", "backend", "fw"):
+                        a = runtime_before_probe.get(host, {}).get("netstat", {})
+                        b = runtime_after_probe.get(host, {}).get("netstat", {})
+                        sa, sb = runtime_before_probe.get(host, {}).get("snmp", {}), runtime_after_probe.get(host, {}).get("snmp", {})
+                        row = {}
+                        for group, key, x, y in (("TcpExt", k, a, b) for k in ("ListenOverflows", "ListenDrops", "TCPBacklogDrop", "TCPTimeouts", "TCPAbortOnTimeout", "TCPLossProbes", "TCPRcvQDrop", "PAWSEstab")):
+                            try:
+                                row[key] = int(y[group][key]) - int(x[group][key])
+                            except (KeyError, TypeError, ValueError):
+                                pass
+                        for key in ("RetransSegs", "InErrs", "OutRsts", "EstabResets", "InCsumErrors"):
+                            try:
+                                row[key] = int(sb["Tcp"][key]) - int(sa["Tcp"][key])
+                            except (KeyError, TypeError, ValueError):
+                                pass
+                        out[host] = row
+                    return out
+                print("NAT-CAPACITY-DIAG " + json.dumps({"requested": count, "failure_kinds": kinds,
+                    "probe_keys": sorted(k for k in probes if k != "rows"),
+                    "tcp_delta_during_probe": tcp_delta(count)}, sort_keys=True, default=str))
                 print("NAT-CAPACITY-PHASE " + json.dumps({key: analysis[key] for key in (
                     "requested", "initial_nonce_echoes", "verified_held_echoes", "raw_maps", "passed")}, sort_keys=True))
         receipt["pressure_complete"] = counts[-1] == 20000 and receipt["phases"][-1]["requested"] == 20000
