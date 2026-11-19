@@ -55,6 +55,57 @@ let
       };
     });
 
+  # Go dependencies of the ACME client and the encrypted-DNS forwarder: lego
+  # 4.35.2 is the newest release and still pins golang.org/x/crypto 0.50.0
+  # (7 critical), x/net 0.53.0, x/text 0.36.0, grpc 1.80.0 and go-jose 4.1.4;
+  # dnsproxy 0.81.4 the same x/crypto, x/net and x/text. The patches are the
+  # go.mod/go.sum change of `go get` to the newest patch releases plus
+  # `go mod tidy` (x/crypto 0.59.0, x/net 0.63.0, x/text 0.44.0, grpc 1.85.0,
+  # go-jose 4.1.9); no source file changes. The versions stay, so the store
+  # names keep their length.
+  goDeps = name: patch: hash: assert lib.elem pkgs.${name}.version [ "4.35.2" "0.81.4" ];
+    pkgs.${name}.overrideAttrs (old: {
+      patches = (old.patches or [ ]) ++ [ patch ];
+      vendorHash = hash;
+    });
+  lego = goDeps "lego" ./security-patches/lego-deps.patch "sha256-XIdb2zwdjXKEpOzYiP2qQ3Yh4u6+lw23uAmwmNl7NIo=";
+  dnsproxy = goDeps "dnsproxy" ./security-patches/dnsproxy-deps.patch "sha256-t5cYzUSx98z9YohZhq+b2PSr/9C/3iv8HFQ/+o16aF8=";
+
+  # SQLite 3.54.1: three High advisories fixed in 3.54.0 (same release the
+  # enterprise overlay ships; same-length version string).
+  sqlite = assert pkgs.sqlite.version == "3.53.3";
+    pkgs.sqlite.overrideAttrs (old: {
+      version = "3.54.1";
+      # The 3.53.3 recipe's patches are upstream commits that 3.54.1 contains.
+      patches = [ ];
+      src = pkgs.fetchurl {
+        url = "https://sqlite.org/2026/sqlite-src-3540100.zip";
+        sha256 = "387e7f6cad4797b17848c07d453dc6606917bb356a6cfe5a3abafd38c240c71b";
+      };
+      docsrc = pkgs.fetchurl {
+        url = "https://sqlite.org/2026/sqlite-doc-3540100.zip";
+        sha256 = "e9f634ac28a4c7b48f5c389e4b08c039654ec1487512092b330ccfcfdc0816e0";
+      };
+      postInstall = ''
+        mkdir -p $doc/share/doc
+        unzip $docsrc
+        mv sqlite-doc-3540100 $doc/share/doc/sqlite
+      '';
+      meta = old.meta // {
+        identifiers = (old.meta.identifiers or { }) // {
+          cpeParts = lib.meta.cpeFullVersionWithVendor "sqlite" "3.54.1";
+        };
+      };
+    });
+
+  # Linux-PAM without Berkeley DB: db 4.8 (15 High advisories, fixed only in
+  # releases nixpkgs does not ship) is linked solely for pam_userdb, which no
+  # PAM stack on the appliance uses. The module is simply not built.
+  linux-pam = assert pkgs.linux-pam.version == "1.7.2";
+    pkgs.linux-pam.overrideAttrs (old: {
+      buildInputs = lib.filter (input: (input.pname or "") != "db") old.buildInputs;
+    });
+
   # IMG-02: the PAM side of imported password hashes. The management API
   # verifies $1$/$5$/$6$ with the pinned helper, but sshd, login and sudo go
   # through pam_unix and the system libcrypt, which nixpkgs builds with the
@@ -81,7 +132,7 @@ in
     default = true;
     description = ''
       Rewrite the system closure to the backported libcap, Net-SNMP,
-      Suricata and libxcrypt builds. Disable only to compare against the unpatched pin.
+      Suricata, lego, dnsproxy, SQLite, Linux-PAM and libxcrypt builds. Disable only to compare against the unpatched pin.
     '';
   };
 
@@ -90,7 +141,20 @@ in
       replace pkgs.libcap libcap
       ++ replace pkgs.net-snmp net-snmp
       ++ replace pkgs.libxcrypt libxcrypt
-      ++ replace pkgs.suricata suricata;
-    system.build.securityBackports = { inherit libcap net-snmp libxcrypt suricata; };
+      ++ replace pkgs.suricata suricata
+      ++ replace pkgs.lego lego
+      ++ replace pkgs.dnsproxy dnsproxy
+      ++ replace pkgs.sqlite sqlite
+      ++ replace pkgs.linux-pam linux-pam;
+    system.build.securityBackports = {
+      inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam;
+    };
+    assertions = [ {
+      # pam_userdb is not built (see linux-pam above); a stack that names it
+      # would fail closed at login, so refuse to build one instead.
+      assertion = !lib.any (service: lib.hasInfix "pam_userdb" (service.text or ""))
+        (lib.attrValues config.security.pam.services);
+      message = "a PAM service uses pam_userdb, which the backported Linux-PAM does not build";
+    } ];
   };
 }
