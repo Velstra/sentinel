@@ -128,6 +128,33 @@ in pkgs.testers.runNixOSTest {
         preserve(name + ".json", value)
         return value
 
+    def drop_counters():
+        # Diagnostics only: packet drops outside the datapath's own counters
+        # (softirq backlog, NIC/veth rings, qdiscs) on every host.
+        result = {}
+        for machine in (client, backend, fw):
+            softnet = machine.succeed("cat /proc/net/softnet_stat").split("\n")
+            dropped = sum(int(line.split()[1], 16) for line in softnet if line.strip())
+            squeezed = sum(int(line.split()[2], 16) for line in softnet if line.strip())
+            links = json.loads(machine.succeed("ip -s -j link show"))
+            link = {item["ifname"]: [item["stats64"]["rx"]["dropped"], item["stats64"]["tx"]["dropped"],
+                                     item["stats64"]["rx"].get("missed", 0)] for item in links if item["ifname"] != "lo"}
+            qdisc = json.loads(machine.succeed("tc -s -j qdisc show"))
+            qdrops = sum(int(item.get("drops", 0)) for item in qdisc)
+            result[machine.name] = dict(softnet_dropped=dropped, softnet_squeezed=squeezed, link=link, qdisc_drops=qdrops)
+        return result
+
+    def drop_delta(before, after):
+        out = {}
+        for host, b in before.items():
+            a = after[host]
+            out[host] = dict(softnet_dropped=a["softnet_dropped"] - b["softnet_dropped"],
+                             softnet_squeezed=a["softnet_squeezed"] - b["softnet_squeezed"],
+                             qdisc_drops=a["qdisc_drops"] - b["qdisc_drops"],
+                             link={k: [x - y for x, y in zip(a["link"][k], b["link"].get(k, [0, 0, 0]))]
+                                   for k in a["link"]})
+        return out
+
     def runtime_sample(name):
         # Keep workload/scheduler and kernel TCP evidence next to packet/map
         # results. A timeout with owned map state is not allocator attribution.
@@ -183,7 +210,9 @@ in pkgs.testers.runNixOSTest {
                 time.sleep(0.1)  # Let final handshake/ACK work quiesce before the batch walks.
                 before = sample("before-" + str(count))
                 runtime_before_probe = runtime_sample("before-probe-" + str(count))
+                drops_before = drop_counters()
                 probes = control("probe", "echo-" + str(count))
+                drops_after = drop_counters()
                 runtime_after_probe = runtime_sample("after-probe-" + str(count))
                 after = sample("after-" + str(count))
                 analysis = diagnostic.analyse(before, manifest, probes, template,
@@ -228,7 +257,8 @@ in pkgs.testers.runNixOSTest {
                     return out
                 print("NAT-CAPACITY-DIAG " + json.dumps({"requested": count, "failure_kinds": kinds,
                     "probe_keys": sorted(k for k in probes if k != "rows"),
-                    "tcp_delta_during_probe": tcp_delta(count)}, sort_keys=True, default=str))
+                    "tcp_delta_during_probe": tcp_delta(count),
+                    "drops_during_probe": drop_delta(drops_before, drops_after)}, sort_keys=True, default=str))
                 print("NAT-CAPACITY-PHASE " + json.dumps({key: analysis[key] for key in (
                     "requested", "initial_nonce_echoes", "verified_held_echoes", "raw_maps", "passed")}, sort_keys=True))
         receipt["pressure_complete"] = counts[-1] == 20000 and receipt["phases"][-1]["requested"] == 20000
