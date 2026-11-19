@@ -11446,6 +11446,31 @@ impl Appliance {
         }
     }
 
+    /// `config check` advisories for zoned physical NICs bound by kernel name
+    /// only (PROV-04). Predictable names follow the PCI slot order: detach one
+    /// port and reboot, and every later NIC takes the previous name, so a zone
+    /// silently moves to a different network. `hw-id` pins the name to the MAC.
+    /// Kept out of [`Appliance::warnings`]: commit and the API report those on
+    /// every change, and a lab box without bindings is not an error.
+    pub fn interface_identity_warnings(&self) -> Vec<String> {
+        self.interfaces
+            .iter()
+            .filter(|i| {
+                i.zone.is_some() && i.hw_id.is_none() && i.if_type.is_none() && !i.is_vlan()
+            })
+            .map(|i| {
+                format!(
+                    "interface {:?} (zone {:?}) is bound by kernel name only; a removed or \
+                     re-ordered NIC moves its zone to another port. Pin it with \
+                     `set interface {} hw-id <mac>`",
+                    i.name,
+                    i.zone.as_deref().unwrap_or_default(),
+                    i.name
+                )
+            })
+            .collect()
+    }
+
     /// Non-fatal advisories surfaced by operators' commit/check paths. A
     /// destination zone binds connected address prefixes, not the actual
     /// outgoing interface; unsupported source/broad forms can be wider still.
@@ -14673,6 +14698,39 @@ private-key = "{key}"
         );
         // A tunnel that names no declared wireguard interface is an error.
         assert!(Appliance::from_toml(&toml).is_err());
+    }
+
+    #[test]
+    fn zoned_nic_without_hw_id_draws_an_identity_warning_only_in_check() {
+        let a = Appliance::from_toml(
+            r#"
+            [system]
+            hostname = "fw"
+            [[interface]]
+            name = "enp3s0"
+            zone = "wan"
+            address = "dhcp"
+            [[interface]]
+            name = "enp4s0"
+            zone = "lan"
+            hw-id = "52:54:00:10:00:02"
+            address = "10.0.0.1/24"
+            [[interface]]
+            name = "enp5s0"
+            [[interface]]
+            name = "enp4s0.20"
+            zone = "lan"
+            address = "10.0.20.1/24"
+        "#,
+        )
+        .unwrap();
+        let warnings = a.interface_identity_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("\"enp3s0\"") && warnings[0].contains("hw-id"));
+        assert!(
+            !a.warnings().iter().any(|w| w.contains("kernel name only")),
+            "commit-time warnings must not carry the check-only advisory"
+        );
     }
 
     #[test]

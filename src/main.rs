@@ -3901,7 +3901,11 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
                     file.display()
                 );
             }
-            for warning in appliance.warnings() {
+            for warning in appliance
+                .warnings()
+                .into_iter()
+                .chain(appliance.interface_identity_warnings())
+            {
                 eprintln!("warning: {warning}");
             }
             Ok(())

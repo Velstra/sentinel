@@ -540,6 +540,23 @@
       factoryAppliance = ./example-appliance.toml;
       applianceData = builtins.fromTOML (builtins.readFile factoryAppliance);
 
+      # Offline first-boot seeding of a raw image's data partition (PROV-01):
+      # every tool pinned, including the very `sentinel` that boots the image,
+      # for `config check`.
+      seedImage = pkgs.writeShellApplication {
+        name = "sentinel-seed-image";
+        runtimeInputs = [ pkgs.python3 ];
+        text = ''
+          export SEED_SFDISK=${pkgs.util-linux}/bin/sfdisk
+          export SEED_DEBUGFS=${pkgs.e2fsprogs}/bin/debugfs
+          export SEED_E2FSCK=${pkgs.e2fsprogs}/bin/e2fsck
+          export SEED_SSH_KEYGEN=${pkgs.openssh}/bin/ssh-keygen
+          export SEED_SENTINEL=${sentinel}/bin/sentinel
+          export SEED_QEMU_IMG=${pkgs.qemu-utils}/bin/qemu-img
+          exec python3 -I ${./scripts/seed-image.py} "$@"
+        '';
+      };
+
       # The built, Secure-Boot-signed raw image's path — bundled into the
       # installer ISO and used as the `--source` in the live-install test.
       sentinelImageRaw =
@@ -565,6 +582,11 @@
         # renamed to `image` in newer nixpkgs.)
         #   nix build .#sentinel-image
         sentinel-image = self.nixosConfigurations.sentinel-image.config.system.build.finalImageSigned;
+        # The same image before any signature: it does not depend on the
+        # builder's development keys, so compare and attest this one (and its
+        # usrhash) across builders; the signed image differs by signature only.
+        sentinel-image-unsigned = self.nixosConfigurations.sentinel-image.config.system.build.unsignedImage;
+        seed-image = seedImage;
         # The live-boot installer ISO (carries the image above; runs `sentinel
         # install`).  nix build .#sentinel-iso
         sentinel-iso = self.nixosConfigurations.sentinel-iso.config.system.build.isoImage;
@@ -577,6 +599,10 @@
       # NOTE: `.#sentinel-image` by contrast builds a raw DISK IMAGE (flashable,
       # no run script) — that's why `./result/bin/run-*-vm` doesn't exist after
       # building it. Use this app to *boot*; build the image to *flash*.
+      apps.${system}.seed-image = {
+        type = "app";
+        program = "${seedImage}/bin/sentinel-seed-image";
+      };
       apps.${system}.vm = {
         type = "app";
         program = "${self.nixosConfigurations.appliance.config.system.build.vm}/bin/run-${applianceData.system.hostname}-vm";
