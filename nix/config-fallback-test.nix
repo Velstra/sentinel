@@ -74,13 +74,19 @@ pkgs.testers.runNixOSTest {
         assert "uncommitted" in output, output
         assert before == fw.succeed("sha256sum /var/lib/sentinel/appliance.toml")
 
+    # A configuration the data plane cannot hold: 200 rate-limited entries
+    # against its 127 limit slots (the agent's own validate refuses it too).
+    # The audit's original vector, a tcp_udp port-forward, is accepted since
+    # the compiler emits it as two entries (DP-18).
     with subtest("commit asks the data plane first, and a refusal is journaled"):
         output = configure([
-            "set nat destination game zone lan proto tcp_udp port 27015 to 192.0.2.10:27015",
+            "set firewall rule lim-flood from lan", "set firewall rule lim-flood proto tcp",
+            "set firewall rule lim-flood port 1000-1199", "set firewall rule lim-flood action accept",
+            "set firewall rule lim-flood limit 10",
             "commit",
         ], success=False)
         assert "commit ok" not in output, output
-        fw.fail("grep -q game /var/lib/sentinel/appliance.toml /run/sentinel/velstra.toml")
+        fw.fail("grep -q lim-flood /var/lib/sentinel/appliance.toml /run/sentinel/velstra.toml")
         if "data plane refuses" in output:
             fw.succeed("journalctl -b -t sentinel-commit | grep -q 'commit refused'")
         assert ssh_banner() == "SSH-2.0"
@@ -101,8 +107,8 @@ pkgs.testers.runNixOSTest {
         # since save itself now refuses such a configuration.
         fw.succeed(
             "cp ${good} /var/lib/sentinel/appliance.toml && "
-            "printf '%s\\n' '[[nat.destination]]' 'name = \"game\"' 'zone = \"lan\"' "
-            "'proto = \"tcp_udp\"' 'port = 27015' 'to = \"192.0.2.10:27015\"' "
+            "printf '%s\\n' '[[rule]]' 'name = \"lim-flood\"' 'from = \"lan\"' 'proto = \"tcp\"' "
+            "'port = \"1000-1199\"' 'action = \"accept\"' 'limit = 10' "
             ">> /var/lib/sentinel/appliance.toml"
         )
         fw.shutdown()
@@ -111,7 +117,7 @@ pkgs.testers.runNixOSTest {
         status = json.loads(fw.succeed("cat /run/sentinel/config-fallback.json"))
         assert status["applied"] == "last-known-good", status
         assert ssh_banner() == "SSH-2.0", "management must survive a refused saved config"
-        fw.fail("grep -q game /run/sentinel/running.toml")
+        fw.fail("grep -q lim-flood /run/sentinel/running.toml")
         assert "CONFIGURATION FALLBACK" in fw.succeed("sentinel show system")
         assert "CONFIGURATION FALLBACK" in fw.succeed("sentinel configure <<< 'exit' 2>&1")
         fw.succeed("journalctl -b | grep -q 'CONFIGURATION FALLBACK'")
@@ -120,7 +126,7 @@ pkgs.testers.runNixOSTest {
     with subtest("saving the running configuration clears the fallback"):
         configure(["save"])
         fw.fail("test -e /run/sentinel/config-fallback.json")
-        fw.fail("grep -q game /var/lib/sentinel/appliance.toml")
+        fw.fail("grep -q lim-flood /var/lib/sentinel/appliance.toml")
 
     with subtest("DP-17: a config only the kernel load refuses still boots reachable"):
         fw.succeed("cp ${good} /var/lib/sentinel/appliance.toml")
