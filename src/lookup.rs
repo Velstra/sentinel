@@ -43,9 +43,89 @@ const TIMEOUT_SECS: u32 = 8;
 /// link does not turn every field hint into a fresh eight-second wait.
 type Answer = (Instant, Option<String>);
 
+/// How many answers are remembered. Any read-only session can ask about any
+/// of four billion AS numbers or any address, so an unbounded cache was memory
+/// a viewer could fill at will (audit 8b6181, CTRL-28). Far more than a person
+/// typing into a form ever needs.
+const MAX_CACHED: usize = 1024;
+
+/// How many questions the appliance asks the outside world per minute, all
+/// callers together. Each one is a `curl` to a public registry or a resolver
+/// query from the box itself; unthrottled, the lookup endpoint turned any
+/// read-only session into a request generator aimed at rdap.org. Past the
+/// budget the answer is "not known" — the same answer an offline box gives —
+/// and it is not cached, so the hint works again a minute later.
+const MAX_ASKED_PER_MINUTE: u32 = 30;
+
 fn cache() -> &'static Mutex<HashMap<String, Answer>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Answer>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache, even if a panicking holder poisoned it: it holds hints, and a
+/// stale hint is better than every later lookup failing.
+fn cached() -> std::sync::MutexGuard<'static, HashMap<String, Answer>> {
+    cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Take one question from this minute's budget, or say there is none left.
+fn may_ask(now: Instant) -> bool {
+    static BUDGET: OnceLock<Mutex<(Instant, u32)>> = OnceLock::new();
+    let mut budget = BUDGET
+        .get_or_init(|| Mutex::new((now, 0)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    take(&mut budget, now)
+}
+
+/// The budget arithmetic of [`may_ask`], separate so it is testable.
+fn take(budget: &mut (Instant, u32), now: Instant) -> bool {
+    if now.duration_since(budget.0) >= Duration::from_secs(60) {
+        *budget = (now, 0);
+    }
+    if budget.1 >= MAX_ASKED_PER_MINUTE {
+        return false;
+    }
+    budget.1 += 1;
+    true
+}
+
+/// Remember `answer` under `key`, keeping at most [`MAX_CACHED`] entries:
+/// expired ones go first, then the oldest.
+fn remember(cache: &mut HashMap<String, Answer>, key: String, answer: Answer) {
+    if cache.len() >= MAX_CACHED && !cache.contains_key(&key) {
+        cache.retain(|_, (at, a)| at.elapsed() < if a.is_some() { TTL } else { TTL_UNKNOWN });
+    }
+    while cache.len() >= MAX_CACHED && !cache.contains_key(&key) {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    cache.insert(key, answer);
+}
+
+/// The one spelling of `value` for `kind`, so `065001` and `65001` (or two
+/// spellings of one IPv6 address) are one cache entry and one question, and a
+/// value that is not of its kind is refused before anything is asked.
+fn canonical(kind: &str, value: &str) -> Result<String> {
+    match kind {
+        "asn" => match value.parse::<u32>() {
+            Ok(n) => Ok(n.to_string()),
+            Err(_) => bail!("not an AS number: {value:?}"),
+        },
+        "ptr" => match value.parse::<std::net::IpAddr>() {
+            Ok(ip) => Ok(ip.to_string()),
+            Err(_) => bail!("not an address: {value:?}"),
+        },
+        other => bail!("unknown lookup {other:?} (asn | ptr)"),
+    }
 }
 
 fn curl_bin() -> String {
@@ -59,22 +139,25 @@ fn curl_bin() -> String {
 /// prose, or `None` when nothing is known — which includes "this appliance has
 /// no internet", and is not an error.
 pub fn lookup(kind: &str, value: &str) -> Result<Option<String>> {
+    let value = canonical(kind, value)?;
     let key = format!("{kind}/{value}");
-    if let Some((at, answer)) = cache().lock().unwrap().get(&key) {
+    if let Some((at, answer)) = cached().get(&key) {
         let ttl = if answer.is_some() { TTL } else { TTL_UNKNOWN };
         if at.elapsed() < ttl {
             return Ok(answer.clone());
         }
     }
+    // A reserved AS number is answered from the table here and costs nothing;
+    // everything else is a question to the outside world, and is rationed.
+    let local = kind == "asn" && value.parse().ok().and_then(reserved_asn).is_some();
+    if !local && !may_ask(Instant::now()) {
+        return Ok(None);
+    }
     let answer = match kind {
-        "asn" => asn(value)?,
-        "ptr" => ptr(value)?,
-        other => bail!("unknown lookup {other:?} (asn | ptr)"),
+        "asn" => asn(&value)?,
+        _ => ptr(&value)?,
     };
-    cache()
-        .lock()
-        .unwrap()
-        .insert(key, (Instant::now(), answer.clone()));
+    remember(&mut cached(), key, (Instant::now(), answer.clone()));
     Ok(answer)
 }
 
@@ -217,6 +300,34 @@ mod tests {
         assert!(asn("sixty-five thousand").is_err());
         assert!(ptr("not-an-address").is_err());
         assert!(lookup("weather", "tomorrow").is_err());
+    }
+
+    /// CTRL-28: two spellings are one question, and the cache stays bounded
+    /// however many distinct values a session asks about.
+    #[test]
+    fn the_cache_is_keyed_canonically_and_bounded() {
+        assert_eq!(canonical("asn", "065001").unwrap(), "65001");
+        assert_eq!(
+            canonical("ptr", "2001:0db8:0000::0001").unwrap(),
+            "2001:db8::1"
+        );
+        assert!(canonical("asn", "65001\n").is_err());
+        let mut cache = HashMap::new();
+        for n in 0..(MAX_CACHED + 50) {
+            remember(&mut cache, format!("asn/{n}"), (Instant::now(), None));
+        }
+        assert_eq!(cache.len(), MAX_CACHED);
+        assert!(cache.contains_key(&format!("asn/{}", MAX_CACHED + 49)));
+    }
+
+    /// CTRL-28: at most [`MAX_ASKED_PER_MINUTE`] outbound questions a minute.
+    #[test]
+    fn outbound_questions_are_rationed_per_minute() {
+        let start = Instant::now();
+        let mut budget = (start, 0);
+        let granted = (0..100).filter(|_| take(&mut budget, start)).count();
+        assert_eq!(granted, MAX_ASKED_PER_MINUTE as usize);
+        assert!(take(&mut budget, start + Duration::from_secs(61)));
     }
 
     /// Nothing here may panic or hang on an appliance with no route out: an

@@ -52,6 +52,7 @@ mod network_reconcile;
 mod observe;
 mod openapi;
 mod openconnect;
+mod opwords;
 mod passwd;
 mod pki;
 mod portal;
@@ -2688,6 +2689,9 @@ fn show_held_links() {
 }
 
 fn show_op(args: &[String]) -> Result<()> {
+    // Before anything else reads them: these words may be percent-decoded URL
+    // segments, and several of them go on into an argv or a socket line.
+    opwords::check_all(args)?;
     if observe::needs_capability(&saved_config_path())
         && let Some(operation) = observe::operation_for_show(args)
     {
@@ -2730,7 +2734,9 @@ fn show_op(args: &[String]) -> Result<()> {
         ["system", "commit", n] => show_revision(n),
         ["interfaces", rest @ ..] => {
             let mut a = vec!["-brief", "address", "show"];
-            a.extend(rest);
+            for word in rest {
+                a.push(opwords::ip_word(word)?);
+            }
             run_show(&ip, &a)?;
             if rest.is_empty() {
                 show_held_links();
@@ -2740,7 +2746,7 @@ fn show_op(args: &[String]) -> Result<()> {
         ["arp", rest @ ..] | ["neighbors", rest @ ..] => {
             let mut a = vec!["neighbor", "show"];
             if let Some(dev) = rest.first() {
-                a.extend(["dev", dev]);
+                a.extend(["dev", opwords::iface_word(dev)?]);
             }
             run_show(&ip, &a)
         }
@@ -2748,7 +2754,9 @@ fn show_op(args: &[String]) -> Result<()> {
         // IPv4/IPv6 routing — served by Wren's RIB; the kernel FIB is the
         // fallback when the daemon isn't reachable.
         ["ip", "route"] => run_show(&ip, &["route", "show"]),
-        ["ip", "route", proto] => run_show(&ip, &["route", "show", "proto", proto]),
+        ["ip", "route", proto] => {
+            run_show(&ip, &["route", "show", "proto", opwords::ip_word(proto)?])
+        }
         ["ipv6", "route"] => run_show(&ip, &["-6", "route", "show"]),
 
         // BGP: vtysh-flavoured spellings on top of wren's tree.
@@ -3516,6 +3524,7 @@ fn show_cgnat(addr: &str) -> Result<()> {
 /// Deliberately a separate verb from `show`: this changes what the box is doing,
 /// and `show` must stay something an operator can run without thinking.
 fn clear_op(args: &[String]) -> Result<()> {
+    opwords::check_all(args)?;
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
     match path.as_slice() {
         ["ids", "block", addr] => {
@@ -3530,13 +3539,16 @@ fn clear_op(args: &[String]) -> Result<()> {
         // C20: throw one device — or everybody — off the guest network without
         // waiting for a session to expire. Named by MAC because that is what a
         // session *is* and what `show portal sessions` lists.
-        ["portal", "session", mac] => clear_portal(&format!("revoke {mac} any")),
+        ["portal", "session", mac] => {
+            clear_portal(&format!("revoke {} any", opwords::mac_word(mac)?))
+        }
         ["portal", "sessions"] => clear_portal("revoke all"),
         // C18: close every port a host on the inside opened. One at a time is
         // `clear port-mapping <tcp|udp> <port>` — but the case that actually
         // happens is wanting them all gone at once.
         ["port-mapping", "mappings"] | ["port-mapping"] => clear_mapping("unmap all"),
         ["port-mapping", proto, port] => {
+            let (proto, port) = opwords::mapping_words(proto, port)?;
             let Ok(state) = portmap::load(std::path::Path::new(portmap::STATE_FILE)) else {
                 println!("no port mapping is configured");
                 return Ok(());
@@ -3847,10 +3859,12 @@ fn show_firewall_log(depth: &str, window: Option<&str>) -> Result<()> {
 
 /// The argument list, worked out and bounded, without running anything.
 ///
-/// Separate from the call so the bounds are testable: this is the only place
-/// where a word from a management request becomes an argument to another
-/// program, and a test that has to spawn `journalctl` to check it is a test
-/// nobody runs.
+/// Separate from the call so the bounds are testable: a word from a management
+/// request becomes an argument to another program here, and a test that has to
+/// spawn `journalctl` to check it is a test nobody runs. (It is not the only
+/// such place: `show interfaces`, `show arp` and `show ip route <proto>` pass
+/// words to `ip`, routing views to `wren`, and `clear` to the agent sockets;
+/// every one of those goes through [`opwords`] first.)
 fn firewall_log_args(depth: &str, window: Option<&str>) -> Result<Vec<String>> {
     const MAX_LINES: u32 = 5000;
     const WINDOWS: [&str; 5] = ["15m", "1h", "6h", "24h", "7d"];
