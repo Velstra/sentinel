@@ -164,18 +164,41 @@ impl Ledger {
                 old.public_key_sha256 == key,
                 "update signing key changed without an authorized key rotation"
             );
-            ensure!(
-                f.sequence >= old.sequence,
-                "signed update metadata rollback refused"
-            );
-            ensure!(
-                f.sequence != old.sequence || old.manifest_sha256 == manifest,
-                "signed update metadata sequence was reused for different bytes"
-            );
         } else {
+            // A channel label is configuration, not a trust boundary: whoever
+            // may rename the channel must not thereby enrol a new signer
+            // (CTRL-24). A first-ever check pins its key; later labels inherit.
+            let mut pinned = self.scopes.values().filter(|r| r.arch == f.arch).peekable();
+            ensure!(
+                pinned.peek().is_none() || pinned.any(|r| r.public_key_sha256 == key),
+                "update signing key differs from every key this appliance has pinned; a new \
+                 channel cannot introduce a signer without an authorized key rotation"
+            );
             ensure!(
                 self.scopes.len() < 1024,
                 "trusted update scope limit reached"
+            );
+        }
+        // One signer, one sequence space: the floor is the highest sequence
+        // this key has been seen at under ANY label, so a renamed or newly
+        // selected channel cannot reopen metadata the signer has moved past.
+        let signed: Vec<&Record> = self
+            .scopes
+            .values()
+            .filter(|r| r.arch == f.arch && r.public_key_sha256 == key)
+            .collect();
+        if let Some(floor) = signed.iter().map(|r| r.sequence).max() {
+            ensure!(
+                f.sequence >= floor,
+                "signed update metadata rollback refused"
+            );
+            ensure!(
+                f.sequence != floor
+                    || signed
+                        .iter()
+                        .filter(|r| r.sequence == floor)
+                        .all(|r| r.manifest_sha256 == manifest),
+                "signed update metadata sequence was reused for different bytes"
             );
         }
         self.max_time = now.max(self.max_time);
@@ -212,6 +235,51 @@ fn owned_file(dir: &File, name: &std::ffi::CStr, flags: i32, owner: u32) -> Resu
         "update trust file must be an owned mode-0600 regular file"
     );
     Ok(file)
+}
+
+/// Written once a ledger has been published, so a later missing ledger is
+/// recognisably lost state rather than an initialization that never finished.
+const PUBLISHED: &std::ffi::CStr = c"published";
+
+/// Whether a trust directory holding no ledger is merely an interrupted first
+/// initialization (CTRL-23): nothing in it but the lock and staged ledgers the
+/// first check could have left behind, and no record that a ledger was ever
+/// published. Anything else stays a refusal: a reset of an existing ledger
+/// must never read as a fresh start.
+fn never_published(dir: &File) -> Result<bool> {
+    let listing = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let mut staged = Vec::new();
+    for entry in std::fs::read_dir(&listing).context("listing update trust directory")? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+        let is_staged = name
+            .strip_prefix("ledger-")
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(hash_valid);
+        if is_staged {
+            staged.push(std::ffi::CString::new(name)?);
+        } else if name != "lock" {
+            // Includes PUBLISHED: a published ledger that is now missing.
+            return Ok(false);
+        }
+    }
+    for name in staged {
+        // An abandoned transaction is never read; removing it keeps the
+        // directory in the shape this check recognises.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    }
+    Ok(true)
+}
+
+/// Record durably that this directory has held a published ledger.
+fn mark_published(dir: &File, owner: u32) -> Result<()> {
+    let marker = owned_file(dir, PUBLISHED, libc::O_WRONLY | libc::O_CREAT, owner)
+        .context("recording the published update trust ledger")?;
+    marker.sync_all()?;
+    dir.sync_all()?;
+    Ok(())
 }
 
 fn observe_at(
@@ -268,9 +336,9 @@ fn observe_at(
             state
         }
         Err(e)
-            if created
-                && e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                && (created || never_published(&dir)?) =>
         {
             Ledger {
                 schema: 1,
@@ -314,6 +382,7 @@ fn observe_at(
             "cannot publish durable update trust ledger"
         );
         dir.sync_all()?;
+        mark_published(&dir, owner)?;
         if created {
             File::open(
                 directory
@@ -421,6 +490,82 @@ mod tests {
         assert!(write(&f, &"d".repeat(64), &"b".repeat(64), MIN_CLOCK + 304).is_err());
         std::fs::remove_file(directory.join("ledger.json")).unwrap();
         assert!(write(&f, &"d".repeat(64), &"b".repeat(64), MIN_CLOCK + 304).is_err());
+    }
+    #[test]
+    fn an_interrupted_first_initialization_does_not_refuse_updates_forever() {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let parent = super::super::Scratch::new().unwrap();
+        let directory = parent.join("trust");
+        let owner = unsafe { libc::geteuid() };
+        // The state a crash or ENOSPC leaves behind during the very first
+        // check: the directory and its lock exist, a staged ledger may exist,
+        // but no ledger was ever published.
+        DirBuilder::new().mode(0o700).create(&directory).unwrap();
+        for name in [
+            "lock",
+            "ledger-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.join(name))
+                .unwrap();
+        }
+        let write = |f: &Freshness, time| {
+            observe_at(
+                &directory,
+                owner,
+                f,
+                "enterprise",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                time,
+            )
+        };
+        write(&fresh(), MIN_CLOCK + 1).unwrap();
+        assert!(directory.join("ledger.json").exists());
+        // Once a ledger has been published, losing it is NOT a fresh start.
+        std::fs::remove_file(directory.join("ledger.json")).unwrap();
+        assert!(write(&fresh(), MIN_CLOCK + 2).is_err());
+        // Unknown state beside a missing ledger is never read as "empty".
+        let other = parent.join("other");
+        DirBuilder::new().mode(0o700).create(&other).unwrap();
+        std::fs::write(other.join("unexpected"), b"x").unwrap();
+        assert!(
+            observe_at(
+                &other,
+                owner,
+                &fresh(),
+                "enterprise",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                MIN_CLOCK + 1
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn a_new_channel_label_inherits_the_key_pin_and_sequence_floor() {
+        let parent = super::super::Scratch::new().unwrap();
+        let directory = parent.join("trust");
+        let owner = unsafe { libc::geteuid() };
+        let write = |label: &str, sequence, manifest: &str, key: &str| {
+            let mut f = fresh();
+            f.channel = label.into();
+            f.sequence = sequence;
+            observe_at(&directory, owner, &f, label, manifest, key, MIN_CLOCK + 1)
+        };
+        write("enterprise", 50, &"a".repeat(64), &"b".repeat(64)).unwrap();
+        // Renaming the channel must not let a different signer in.
+        assert!(write("renamed", 60, &"c".repeat(64), &"d".repeat(64)).is_err());
+        // Nor reopen sequences the pinned signer has already moved past.
+        assert!(write("renamed", 49, &"c".repeat(64), &"b".repeat(64)).is_err());
+        // The same signer at or above its floor may serve a new label.
+        write("renamed", 50, &"a".repeat(64), &"b".repeat(64)).unwrap();
+        write("renamed", 51, &"e".repeat(64), &"b".repeat(64)).unwrap();
+        // And the floor it reached there binds the original label too.
+        assert!(write("enterprise", 50, &"a".repeat(64), &"b".repeat(64)).is_err());
     }
     #[test]
     fn expiry_scope_future_ttl_and_unset_clock_fail_closed() {
