@@ -130,8 +130,11 @@ commit made on Backup. Use one management session at a time for shared policy;
 do not treat the standby as a private configuration sandbox. Conflicting
 concurrent revisions are rejected and remain pending for operator resolution.
 
-The CLI currently does not warn specifically about a Backup-originated commit.
-Check the member role and pending synchronization state before changing policy.
+A CLI `commit` on a member that is not the forwarding owner (HA Backup or
+Fenced) ends with a warning that names this member, the current owner and the
+term; the commit still applies here and replicates. If the role cannot be read
+before the commit, the warning says so instead. Check the member role and
+pending synchronization state before changing policy.
 
 ## Regression entry points
 

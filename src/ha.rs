@@ -1712,6 +1712,61 @@ pub fn render_status(status: &serde_json::Value) -> String {
     out
 }
 
+/// The warning a commit on a member that is not the forwarding owner carries
+/// (T4.8-bkcommit). `status` is the agent's `ha-status` report taken before the
+/// commit applied, or `None` when it could not be read; `ha_enabled` is whether
+/// the committed configuration pairs this member at all.
+///
+/// Master/Backup is forwarding ownership, not a configuration permission, so
+/// the commit is not refused: config sync delivers it to the active member,
+/// which applies it too. What the operator needs is to know that this is the
+/// member they changed.
+pub fn commit_role_warning(ha_enabled: bool, status: Option<&serde_json::Value>) -> Option<String> {
+    if !ha_enabled {
+        return None;
+    }
+    commit_role_text(status)
+}
+
+/// The data plane's HA role ahead of a commit, for [`commit_role_warning`].
+/// Outer `None`: the running configuration is not paired, so nothing is asked
+/// (and no privileged query is made). Inner `None`: paired, but unreadable.
+pub fn role_before_commit(running: Option<&Appliance>) -> Option<Option<serde_json::Value>> {
+    running
+        .and_then(|a| a.system.ha.as_ref())
+        .filter(|ha| ha.enabled)?;
+    Some(
+        crate::velstra::query("ha-status")
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok()),
+    )
+}
+
+fn commit_role_text(status: Option<&serde_json::Value>) -> Option<String> {
+    let Some(status) = status else {
+        return Some(
+            "could not read this member's HA role before the commit. If it is the Backup, \
+             config sync still delivers this change to the active member; check \
+             `sentinel show ha` on both members."
+                .into(),
+        );
+    };
+    let role = status["role"].as_str().unwrap_or("unknown");
+    if matches!(role, "Master" | "standalone") {
+        return None;
+    }
+    let number = |key: &str| status[key].as_u64().map_or("-".into(), |v| v.to_string());
+    Some(format!(
+        "this commit was made on HA {role} member node {}, not on the forwarding owner \
+         (node {}, term {}). It is live here now, and config sync delivers it to the active \
+         member, which applies it too. Make shared policy changes on one member at a time \
+         and check `sentinel show ha` on both.",
+        number("node"),
+        number("owner"),
+        number("term"),
+    ))
+}
+
 /// How long a standby may be unable to take over before somebody is told.
 /// Long enough to cover an ordinary configuration-sync delivery after a
 /// commit, short enough that the gap is not discovered by the next outage.
@@ -3061,6 +3116,33 @@ mod tests {
         let master = serde_json::json!({"role":"Master","node":1,"term":5,"owner":1,"lease_remaining_ms":180,"not_ready":null});
         assert!(render_status(&master).starts_with("HA Master\n"));
         assert!(render_status(&serde_json::json!({"role":"standalone"})).contains("standalone"));
+    }
+    /// T4.8-bkcommit: a commit on the Backup member was accepted with only the
+    /// generic management-access warning. The operator must be told which
+    /// member they changed and that the change reaches the active one too.
+    #[test]
+    fn a_commit_on_a_standby_member_is_named_as_such() {
+        let backup = serde_json::json!({"role":"Backup","node":2,"owner":1,"term":5});
+        let warning = commit_role_warning(true, Some(&backup)).expect("Backup must warn");
+        assert!(
+            warning.contains("HA Backup")
+                && warning.contains("node 2")
+                && warning.contains("node 1")
+                && warning.contains("config sync"),
+            "{warning}"
+        );
+        let fenced = serde_json::json!({"role":"Fenced","node":1,"owner":2,"term":9});
+        assert!(commit_role_warning(true, Some(&fenced)).is_some_and(|w| w.contains("HA Fenced")));
+        let master = serde_json::json!({"role":"Master","node":1,"owner":1,"term":5});
+        assert_eq!(commit_role_warning(true, Some(&master)), None);
+        let standalone = serde_json::json!({"role":"standalone"});
+        assert_eq!(commit_role_warning(true, Some(&standalone)), None);
+        // No HA configured: nothing to say, whatever the agent reports.
+        assert_eq!(commit_role_warning(false, Some(&backup)), None);
+        assert_eq!(commit_role_warning(false, None), None);
+        // HA configured but the role is unreadable: say so rather than imply
+        // this is the active member.
+        assert!(commit_role_warning(true, None).is_some_and(|w| w.contains("could not read")));
     }
     #[test]
     fn an_unready_standby_alerts_once_after_the_threshold_and_once_on_recovery() {
