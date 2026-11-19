@@ -37,18 +37,48 @@ use tokio::net::TcpStream;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
     pub per_source: usize,
+    pub per_network: usize,
     pub total: usize,
     pub header_read_timeout: Duration,
 }
 
 /// The appliance's limits. A console opens a handful of connections, a stack
-/// view and config-sync peer a few more; 64 per source leaves room for a busy
-/// operator workstation behind NAT, and 512 in total stays far below the
-/// unit's descriptor limit.
+/// view and config-sync peer a few more; 32 per source leaves room for a busy
+/// operator workstation behind NAT. A network (IPv4 /24, IPv6 /48 — what one
+/// party typically holds) gets 256, so filling the 4096 total takes sixteen
+/// unrelated networks, and 4096 stays far below the unit's descriptor limit.
 pub(crate) const LIMITS: Limits = Limits {
-    per_source: 64,
-    total: 512,
+    per_source: 32,
+    per_network: 256,
+    total: 4096,
     header_read_timeout: Duration::from_secs(10),
+};
+
+/// How long a request body may take to arrive once its head has. hyper's
+/// header deadline ends when the head is complete; a body trickled a byte at a
+/// time would otherwise hold its connection for as long as the client liked.
+pub(crate) const BODY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a body may take, and the most of it that is buffered.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BodyBound {
+    pub deadline: Duration,
+    pub limit: usize,
+}
+
+/// For authenticated routes: above every route's own limit (2 MiB by
+/// default), which the handler still enforces on the buffered body. Applied
+/// after authentication, so an anonymous client cannot make the server buffer
+/// it.
+pub(crate) const AUTHENTICATED_BODY: BodyBound = BodyBound {
+    deadline: BODY_DEADLINE,
+    limit: 4 * 1024 * 1024,
+};
+
+/// For the sign-in form, the one body an anonymous client may send.
+pub(crate) const SIGN_IN_BODY: BodyBound = BodyBound {
+    deadline: BODY_DEADLINE,
+    limit: 64 * 1024,
 };
 
 /// How often an HTTP/2 connection is pinged, and how long a ping may go
@@ -61,6 +91,31 @@ const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 struct Counts {
     total: usize,
     per_source: HashMap<IpAddr, usize>,
+    per_network: HashMap<IpAddr, usize>,
+}
+
+/// The network a source belongs to: its IPv4 /24 or IPv6 /48.
+fn network(source: IpAddr) -> IpAddr {
+    match source {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            IpAddr::from([a, b, c, 0])
+        }
+        IpAddr::V6(v6) => {
+            let mut bytes = v6.octets();
+            bytes[6..].fill(0);
+            IpAddr::from(bytes)
+        }
+    }
+}
+
+fn release(map: &mut HashMap<IpAddr, usize>, key: &IpAddr) {
+    if let Some(held) = map.get_mut(key) {
+        *held = held.saturating_sub(1);
+        if *held == 0 {
+            map.remove(key);
+        }
+    }
 }
 
 /// The open-connection counts every accepted connection is charged to.
@@ -84,13 +139,19 @@ impl Slots {
     /// Charge one connection from `peer`, or `None` when it is over a cap.
     fn acquire(self: &Arc<Self>, peer: IpAddr) -> Option<Slot> {
         let source = crate::api_throttle::source(peer);
+        let network = network(source);
         let mut counts = self.counts();
         let held = counts.per_source.get(&source).copied().unwrap_or(0);
-        if counts.total >= self.limits.total || held >= self.limits.per_source {
+        let in_network = counts.per_network.get(&network).copied().unwrap_or(0);
+        if counts.total >= self.limits.total
+            || held >= self.limits.per_source
+            || in_network >= self.limits.per_network
+        {
             return None;
         }
         counts.total += 1;
         counts.per_source.insert(source, held + 1);
+        counts.per_network.insert(network, in_network + 1);
         Some(Slot {
             slots: Arc::clone(self),
             source,
@@ -108,12 +169,8 @@ impl Drop for Slot {
     fn drop(&mut self) {
         let mut counts = self.slots.counts();
         counts.total = counts.total.saturating_sub(1);
-        if let Some(held) = counts.per_source.get_mut(&self.source) {
-            *held = held.saturating_sub(1);
-            if *held == 0 {
-                counts.per_source.remove(&self.source);
-            }
-        }
+        release(&mut counts.per_source, &self.source);
+        release(&mut counts.per_network, &network(self.source));
     }
 }
 
@@ -256,6 +313,43 @@ pub(crate) async fn serve(
     }
 }
 
+/// Read a request's body within `deadline` of its head, or answer 408.
+///
+/// Bodies are buffered (up to the bound's limit, else 413) before the handler
+/// runs; every handler reads its whole body anyway, and the per-route body
+/// limits still apply to the buffered body. Requests that carry no body by
+/// method are passed straight through, so the telemetry stream is untouched.
+pub(crate) async fn bounded_body(
+    axum::extract::State(bound): axum::extract::State<BodyBound>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{Method, StatusCode};
+    use axum::response::IntoResponse;
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    match tokio::time::timeout(bound.deadline, axum::body::to_bytes(body, bound.limit)).await {
+        Ok(Ok(bytes)) => {
+            next.run(axum::extract::Request::from_parts(
+                parts,
+                axum::body::Body::from(bytes),
+            ))
+            .await
+        }
+        Ok(Err(_)) => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "request body arrived too slowly",
+        )
+            .into_response(),
+    }
+}
+
 /// hyper enforces its header-read timeout and HTTP/2 keep-alive only with a
 /// timer, and axum-server configures none.
 fn bound_requests(
@@ -334,6 +428,7 @@ mod tests {
     async fn a_trickled_request_head_is_cut_off_at_the_deadline() {
         let limits = Limits {
             per_source: 8,
+            per_network: 8,
             total: 8,
             header_read_timeout: Duration::from_millis(800),
         };
@@ -372,6 +467,7 @@ mod tests {
     async fn one_source_is_capped_and_others_are_still_served() {
         let limits = Limits {
             per_source: 3,
+            per_network: 16,
             total: 16,
             header_read_timeout: Duration::from_secs(30),
         };
@@ -395,11 +491,94 @@ mod tests {
         assert!(health(&mut again).await.starts_with("HTTP/1.1 200"));
     }
 
+    /// Many sources of one network cannot take more than the network's share;
+    /// another network still gets in.
+    #[tokio::test]
+    async fn one_network_is_capped_across_its_sources() {
+        let limits = Limits {
+            per_source: 8,
+            per_network: 3,
+            total: 64,
+            header_read_timeout: Duration::from_secs(30),
+        };
+        let addr = start(limits).await;
+        let mut held = Vec::new();
+        for n in 1..=3 {
+            held.push(connect_from(&format!("127.0.0.{n}"), addr).await);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut over = connect_from("127.0.0.4", addr).await;
+        assert!(
+            closed_within(&mut over, Duration::from_secs(2)).await,
+            "a fourth source of one /24 got a connection past the network cap"
+        );
+        let mut elsewhere = connect_from("127.0.1.1", addr).await;
+        assert!(health(&mut elsewhere).await.starts_with("HTTP/1.1 200"));
+    }
+
+    /// A body trickled after a prompt head is cut off at the body deadline
+    /// with 408; a prompt body is served.
+    #[tokio::test]
+    async fn a_trickled_request_body_is_cut_off() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/echo",
+                axum::routing::post(|body: String| async move { body }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                BodyBound {
+                    deadline: Duration::from_millis(600),
+                    limit: 1024,
+                },
+                bounded_body,
+            ));
+        tokio::spawn(serve(Listen::Bound(listener), app, None, LIMITS));
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\nx")
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let mut answer = Vec::new();
+        let mut buf = [0u8; 256];
+        while started.elapsed() < Duration::from_secs(5) {
+            let _ = slow.write_all(b"x").await;
+            match tokio::time::timeout(Duration::from_millis(200), slow.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    answer.extend_from_slice(&buf[..n]);
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(
+            answer.starts_with("HTTP/1.1 408"),
+            "{answer:?} after {:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let mut prompt = TcpStream::connect(addr).await.unwrap();
+        prompt
+            .write_all(b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        let mut out = String::new();
+        prompt.read_to_string(&mut out).await.unwrap();
+        assert!(
+            out.starts_with("HTTP/1.1 200") && out.ends_with("ok"),
+            "{out}"
+        );
+    }
+
     /// All sources together cannot exceed the total either.
     #[tokio::test]
     async fn the_total_is_capped_across_sources() {
         let limits = Limits {
             per_source: 8,
+            per_network: 8,
             total: 4,
             header_read_timeout: Duration::from_secs(30),
         };

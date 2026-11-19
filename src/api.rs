@@ -368,6 +368,12 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
         .route("/api/v1/stack/:member/telemetry", get(get_stack_telemetry))
         .route("/api/v1/stack/:member/system/health", get(get_stack_health))
+        // A request body must arrive within its deadline (CTRL-05). Inside
+        // the token check, so only an authenticated caller is buffered.
+        .route_layer(middleware::from_fn_with_state(
+            crate::api_listener::AUTHENTICATED_BODY,
+            crate::api_listener::bounded_body,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
@@ -377,7 +383,13 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/openapi.json", get(get_openapi))
         // Signing in cannot require being signed in. The account's password is
         // checked here and a new session's token is handed back.
-        .route("/api/v1/login", post(post_login))
+        .route(
+            "/api/v1/login",
+            post(post_login).layer(middleware::from_fn_with_state(
+                crate::api_listener::SIGN_IN_BODY,
+                crate::api_listener::bounded_body,
+            )),
+        )
         // Signing out is open to every session, read-only ones included, so it
         // sits outside the middleware that refuses a read-only caller every
         // POST; the handler resolves the bearer itself, and a bearer that is
