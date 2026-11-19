@@ -68,6 +68,10 @@ pub(crate) struct Status {
     pub applied: Applied,
     /// Why the saved configuration was not used, scrubbed of secrets.
     pub reason: String,
+    /// Management rules a management-only fallback had to leave out because
+    /// what they match needs a live lookup (domain, feed or VPN-user groups).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<String>,
 }
 
 impl Status {
@@ -80,9 +84,17 @@ impl Status {
             }
             Applied::Nothing => "and no fallback configuration was accepted either",
         };
+        let dropped = if self.dropped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Management rules left out because they need a live lookup: {}.",
+                self.dropped.join(", ")
+            )
+        };
         format!(
             "CONFIGURATION FALLBACK: the data plane refused the saved configuration at boot \
-             ({}); {what}. Fix the configuration, `commit` it, then `save` to clear this.",
+             ({}); {what}.{dropped} Fix the configuration, `commit` it, then `save` to clear this.",
             self.reason
         )
     }
@@ -130,11 +142,8 @@ pub(crate) fn select_seed(
     };
     let secrets: Vec<&Appliance> = saved.iter().chain(last_good.iter()).collect();
     let why = reason(&refusal, &secrets);
-    let status = |applied| Status {
-        stage: "seed".into(),
-        applied,
-        reason: why.clone(),
-    };
+    let base = saved.as_ref().ok().or(last_good.as_ref()).cloned();
+    let status = |applied| status_for("seed", applied, why.clone(), base.as_ref());
     let refused = saved.as_ref().ok().and_then(|a| a.to_toml().ok());
     for (candidate, applied) in fallbacks(saved.as_ref().ok(), last_good.as_ref(), refused) {
         if accepts(&candidate).is_ok() {
@@ -146,6 +155,28 @@ pub(crate) fn select_seed(
         // (sshd, the console) still comes up and says why.
         Ok(appliance) => Ok((appliance, Some(status(Applied::Nothing)))),
         Err(error) => Err(error),
+    }
+}
+
+fn status_for(stage: &str, applied: Applied, reason: String, base: Option<&Appliance>) -> Status {
+    let dropped = match (applied, base) {
+        (Applied::ManagementOnly, Some(base)) => {
+            let ports = crate::lockout::management_ports(base);
+            base.rules
+                .iter()
+                .filter(|rule| {
+                    is_management_accept(base, rule, &ports) && !uses_static_groups_only(base, rule)
+                })
+                .map(|rule| rule.name.clone())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    Status {
+        stage: stage.into(),
+        applied,
+        reason,
+        dropped,
     }
 }
 
@@ -178,33 +209,18 @@ fn fallbacks(
 /// and their posture, routing and VPNs — everything that decides whether an
 /// administrator can get in. Kept from the policy: every enabled `accept`
 /// rule that can carry a packet to this box on a management port (or on every
-/// port), without its rate limit. Dropped: every other rule, every rule that
-/// names a group, NAT, load balancers, block lists, GeoIP and SYN protection —
-/// the parts whose size or shape the agent has refused before.
+/// port), without its rate limit. A rule written with static groups (address,
+/// port, MAC, interface) keeps them: the configuration that defines them is
+/// part of the reduction, and the compiler expands them into the concrete
+/// addresses and ports it always does. Dropped: every rule naming a group that
+/// needs a live lookup (domain, feed, VPN user), reported in the status; every
+/// other rule; NAT, load balancers, block lists, GeoIP and SYN protection — the
+/// parts whose size or shape the agent has refused before.
 pub(crate) fn management_only(appliance: &Appliance) -> Result<Appliance> {
     let mut reduced = appliance.clone();
     let ports = crate::lockout::management_ports(appliance);
     reduced.rules.retain(|rule| {
-        let reaches_box = match &rule.to {
-            None => true,
-            Some(zone) => appliance.zones.get(zone).is_some_and(|zone| zone.local),
-        };
-        let names_group = rule.source_group.is_some()
-            || rule.destination_group.is_some()
-            || rule.port_group.is_some()
-            || rule.source_mac_group.is_some()
-            || rule.interface_group.is_some();
-        let on_management = rule.port.is_empty()
-            || rule.port.iter().any(|spec| {
-                ports
-                    .iter()
-                    .any(|&port| crate::lockout::covers(*spec, port))
-            });
-        !rule.disabled
-            && rule.action == Action::Accept
-            && reaches_box
-            && !names_group
-            && on_management
+        is_management_accept(appliance, rule, &ports) && uses_static_groups_only(appliance, rule)
     });
     for rule in &mut reduced.rules {
         rule.limit = None;
@@ -222,6 +238,61 @@ pub(crate) fn management_only(appliance: &Appliance) -> Result<Appliance> {
     // Through the full validator: a reduction that is not a valid
     // configuration is no fallback.
     Appliance::from_toml(&reduced.to_toml()?).context("validating the management-only policy")
+}
+
+/// An enabled accept that can carry a management packet to this box.
+fn is_management_accept(
+    appliance: &Appliance,
+    rule: &crate::config::Rule,
+    ports: &std::collections::BTreeSet<u16>,
+) -> bool {
+    let reaches_box = match &rule.to {
+        None => true,
+        Some(zone) => appliance.zones.get(zone).is_some_and(|zone| zone.local),
+    };
+    let groups = &appliance.firewall.group;
+    let specs: Vec<crate::config::PortSpec> = match &rule.port_group {
+        Some(name) => groups.port.get(name).cloned().unwrap_or_default(),
+        None => rule.port.clone(),
+    };
+    let on_management = (specs.is_empty() && rule.port_group.is_none())
+        || specs.iter().any(|spec| {
+            ports
+                .iter()
+                .any(|&port| crate::lockout::covers(*spec, port))
+        });
+    !rule.disabled && rule.action == Action::Accept && reaches_box && on_management
+}
+
+/// Every group the rule names is one the configuration itself defines, so the
+/// reduction can compile it without a lookup. Domain, feed and VPN-user groups
+/// are folded into the address groups only at apply time, from DNS, the
+/// network or live sessions, so a saved address-group name is static only when
+/// it is not also one of those.
+fn uses_static_groups_only(appliance: &Appliance, rule: &crate::config::Rule) -> bool {
+    let groups = &appliance.firewall.group;
+    let address = |name: &Option<String>| {
+        name.as_ref().is_none_or(|name| {
+            groups.address.contains_key(name)
+                && !groups.domain.contains_key(name)
+                && !groups.feed.contains_key(name)
+                && !groups.user.contains_key(name)
+        })
+    };
+    address(&rule.source_group)
+        && address(&rule.destination_group)
+        && rule
+            .port_group
+            .as_ref()
+            .is_none_or(|name| groups.port.contains_key(name))
+        && rule
+            .source_mac_group
+            .as_ref()
+            .is_none_or(|name| groups.mac.contains_key(name))
+        && rule
+            .interface_group
+            .as_ref()
+            .is_none_or(|name| groups.interface.contains_key(name))
 }
 
 /// The last-known-good configuration, if there is a usable one. Read leniently
@@ -352,19 +423,12 @@ fn fall_back_live(config: &Path, act: &crate::repl::Apply, cause: &anyhow::Error
             continue;
         }
         if restore_with_retries(&candidate, act, applied) {
-            let status = Status {
-                stage: "verify".into(),
-                applied,
-                reason: why,
-            };
+            let base = active.as_ref().or(last_good.as_ref());
+            let status = status_for("verify", applied, why, base);
             return publish(Some(&candidate), &status);
         }
     }
-    let status = Status {
-        stage: "verify".into(),
-        applied: Applied::Nothing,
-        reason: why,
-    };
+    let status = status_for("verify", Applied::Nothing, why, None);
     publish(None, &status)?;
     Err(anyhow!("{}", status.describe()))
 }
@@ -499,6 +563,74 @@ to = "192.0.2.10:80"
     }
 
     #[test]
+    fn a_management_accept_written_with_static_groups_survives_with_its_addresses() {
+        let with_groups = format!(
+            "{SAVED}{}",
+            r#"
+[firewall.group.address]
+admins = ["192.0.2.50", "192.0.2.51/32"]
+[firewall.group.port]
+mgmt = [22]
+[firewall.group.domain]
+office = ["office.example"]
+[[rule]]
+name = "ssh-from-admins"
+from = "lan"
+to = "firewall"
+proto = "tcp"
+port_group = "mgmt"
+source_group = "admins"
+action = "accept"
+[[rule]]
+name = "ssh-from-office"
+from = "lan"
+to = "firewall"
+proto = "tcp"
+port = 22
+source_group = "office"
+action = "accept"
+"#
+        );
+        let base = Appliance::from_toml(&with_groups).unwrap();
+        let reduced = management_only(&base).unwrap();
+        let kept: Vec<_> = reduced
+            .rules
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .collect();
+        assert_eq!(kept, ["ssh-from-lan", "ssh-from-admins"], "{kept:?}");
+        let admins = reduced
+            .rules
+            .iter()
+            .find(|rule| rule.name == "ssh-from-admins")
+            .unwrap();
+        assert_eq!(
+            admins.resolved_sources(&reduced.firewall.group),
+            [
+                Some("192.0.2.50".to_string()),
+                Some("192.0.2.51/32".to_string())
+            ]
+        );
+        let compiled = crate::compile::compile(&reduced).to_toml().unwrap();
+        assert!(
+            compiled.contains("192.0.2.50"),
+            "the group did not reach the data plane"
+        );
+        let status = status_for(
+            "seed",
+            Applied::ManagementOnly,
+            "refused".into(),
+            Some(&base),
+        );
+        assert_eq!(status.dropped, ["ssh-from-office"]);
+        assert!(
+            status.describe().contains("live lookup: ssh-from-office"),
+            "{}",
+            status.describe()
+        );
+    }
+
+    #[test]
     fn an_unloadable_saved_configuration_still_boots_the_last_known_good() {
         let (chosen, status) = select_seed(
             Err(anyhow!(
@@ -556,6 +688,7 @@ to = "192.0.2.10:80"
             stage: "seed".into(),
             applied: Applied::ManagementOnly,
             reason: "refused".into(),
+            dropped: vec!["ssh-from-vpn-users".into()],
         };
         std::fs::write(&path, serde_json::to_string(&status).unwrap()).unwrap();
         assert_eq!(read_status_at(&path), Some(status));
