@@ -92,14 +92,19 @@ in pkgs.testers.runNixOSTest {
         # Counted where it would land, on the LAN host's wire, so the answer
         # does not depend on whether anything there would have replied. Both
         # families, TCP and UDP, to ports no rule mentions.
-        client.succeed("rm -f /tmp/inbound.pcap; tcpdump -n -U -i eth1 -w /tmp/inbound.pcap "
+        # The capture must be running before the first probe and finished
+        # before it is read: a fixed sleep raced a slow tcpdump start-up and
+        # read an empty file while the probes had in fact crossed (the client
+        # had answered them with resets).
+        client.succeed("rm -f /tmp/inbound.pcap /tmp/inbound.err; tcpdump -n -U -i eth1 -w /tmp/inbound.pcap "
                        "'(tcp dst port 9092 or udp dst port 9093) and (src host 10.2.2.2 or src host 2001:db8:102::2)' "
-                       ">/dev/null 2>&1 & echo $! >/tmp/inbound.pid")
-        client.sleep(1)
+                       ">/dev/null 2>/tmp/inbound.err & echo $! >/tmp/inbound.pid")
+        client.wait_until_succeeds("grep -q 'listening on eth1' /tmp/inbound.err", timeout=30)
         for address in ("10.1.1.2", "2001:db8:101::2"):
             server.execute(f"nc -z -w 2 {address} 9092")
             server.execute(f"echo probe | nc -u -w 1 {address} 9093")
-        client.succeed("kill -INT $(cat /tmp/inbound.pid); sleep 1")
+        client.succeed("pid=$(cat /tmp/inbound.pid); kill -INT $pid; "
+                       "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
         return int(client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null | wc -l").strip())
     lines = [
         "set interface eth1 zone lan", "set interface eth1 address 10.1.1.1/24",
