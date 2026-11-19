@@ -69,7 +69,8 @@ let
   '';
   stream = pkgs.writeText "ha-stream.py" ''
     import socket, time, json
-    connection = socket.create_connection(("10.1.0.10",8443),timeout=4)
+    # Through WireGuard the timeout must outlast one handshake retry (5 s).
+    connection = socket.create_connection(("10.1.0.10",8443),timeout=${if wireguard then "8" else "4"})
     connection.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
     reader = connection.makefile("rb")
     count = 0; maximum_gap = 0; last = time.monotonic()
@@ -160,6 +161,10 @@ in pkgs.testers.runNixOSTest {
             node.succeed("systemctl stop ha-packets")
             print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -tt -n -e -S -r /tmp/ha-packets.pcap 2>/dev/null | tail -n 55"))
         raise AssertionError(f"established TCP stream stalled after {label}")
+    # A WireGuard handover also needs the client's tunnel to handshake with
+    # the new owner: WireGuard retries an unanswered handshake after 5 s
+    # (REKEY_TIMEOUT), so its bound is that plus one second.
+    handover_bound=${if wireguard then "6.0" else "3.0"}
     def wait_forwarding(label, started, bound, paused=None):
         # Forwarding has resumed once the established stream advances again.
         before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
@@ -326,7 +331,7 @@ in pkgs.testers.runNixOSTest {
     for service in ("velstra.service","wren.service"):
         started=time.monotonic()
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
-        wait_forwarding(service+" SIGKILL on the owner",started,3.0)
+        wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
         backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
         check_stream(service+" abrupt exit")
         master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=25)
@@ -338,13 +343,19 @@ in pkgs.testers.runNixOSTest {
     assert master.succeed("cat /sys/class/net/dmz0/ifindex").strip()!=old_index
     master.succeed(python_command('import json,subprocess; old='+old_index+'; new=int(open("/sys/class/net/dmz0/ifindex").read()); entries=json.loads(subprocess.check_output(["bpftool","-j","map","dump","name","HA_IFACES"])); indexes={int.from_bytes(bytes(int(x,16) for x in row["key"]),"little") for row in entries}; assert old not in indexes and new in indexes, indexes'))
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
+    check_stream("recreated data link")
     # The witness outage removes authority from both live dataplanes.
+    witness_lost=time.monotonic()
     witness.succeed("systemctl stop sentinel-witness")
     time.sleep(0.5)
     for node in (master,backup):
         node.wait_until_succeeds("! ip -o address show eth2 | grep -q 10.2.0.100",timeout=5)
     witness.succeed("systemctl start sentinel-witness")
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
+    # Witness loss stops forwarding by design. Wait for this outage to end
+    # before the next fault: chaining two faults onto one stream measured
+    # neither, and (with the WireGuard handover) overran the stream's timeout.
+    wait_forwarding("witness outage (by design)",witness_lost,10.0)
     # SIGSTOP the data-plane userspace: the independent guard must still expire.
     master.succeed("systemctl kill --kill-who=main --signal=SIGSTOP velstra.service")
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
@@ -364,7 +375,7 @@ in pkgs.testers.runNixOSTest {
     check_stream("before the VM pause scenarios")
     started=time.monotonic()
     master.send_monitor_command("stop")
-    wait_forwarding("owner VM paused",started,5.0,paused=master)
+    wait_forwarding("owner VM paused",started,max(5.0,handover_bound),paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(8)
     master.send_monitor_command("cont")
@@ -377,7 +388,7 @@ in pkgs.testers.runNixOSTest {
     # (3) The next failure: the resumed standby takes over.
     started=time.monotonic()
     master.send_monitor_command("stop")
-    wait_forwarding("second consecutive pause failover",started,5.0,paused=master)
+    wait_forwarding("second consecutive pause failover",started,max(5.0,handover_bound),paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(3)
     master.send_monitor_command("cont")
