@@ -71,7 +71,16 @@ def load_table(path=DEFAULT_TABLE):
         raise ValueError("the kernel must be a critical package")
     if not isinstance(first_party, list):
         raise ValueError("first-party must be a list")
+    if not isinstance(table.get("generated", []), list):
+        raise ValueError("generated must be a list")
     return table
+
+
+def generated(table, name, version):
+    """A store path NixOS generates (a config dir, a PAM file) whose name only
+    looks like `<package>-<version>`: `dbus-1` and `polkit-1.pam` were matched
+    as dbus 1 and polkit 1, i.e. against advisories for releases from 2019."""
+    return f"{name}-{version}" in set(table.get("generated", []))
 
 
 def canonical(table, name):
@@ -104,6 +113,10 @@ def rewrite(sbom, table):
         if name in first_party:
             artifact["cpes"] = []
             report["first_party"].append(name)
+            continue
+        if generated(table, name, artifact.get("version", "")):
+            artifact["cpes"] = []
+            report.setdefault("generated", []).append(f"{name}-{artifact.get('version', '')}")
             continue
         cpe = cpe_for(table, name, artifact.get("version", ""))
         if cpe is None:
@@ -228,7 +241,7 @@ def collect(grype, vulnix, table):
                                 fix.get("state") or "", {"grype"}))
     for entry in vulnix:
         package = canonical(table, entry.get("pname", ""))
-        if package in first_party:
+        if package in first_party or generated(table, entry.get("pname", ""), entry.get("version", "")):
             continue
         scores = entry.get("cvssv3_basescore") or {}
         for cve in entry.get("affected_by", []):

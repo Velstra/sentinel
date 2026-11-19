@@ -145,6 +145,19 @@ class Rewrite(unittest.TestCase):
         self.assertEqual(wren["cpes"], [])
         self.assertIn("wren", report["first_party"])
 
+    def test_generated_nixos_files_are_not_packages(self):
+        # `dbus-1` (a config dir) and `polkit-1.pam` were matched as dbus 1 and
+        # polkit 1 against CVE-2019-12749 and CVE-2021-4034.
+        source = full_sbom()
+        source["artifacts"] += [nix_artifact("dbus", "1"), nix_artifact("polkit", "1.pam"),
+                                nix_artifact("dbus", "1.16.2")]
+        sbom, report = gate.rewrite(source, TABLE)
+        by = {(a["name"], a["version"]): a["cpes"] for a in sbom["artifacts"]}
+        self.assertEqual(by[("dbus", "1")], [])
+        self.assertEqual(by[("polkit", "1.pam")], [])
+        self.assertNotEqual(by[("dbus", "1.16.2")], [], "the real dbus keeps its CPE")
+        self.assertEqual(report["generated"], ["dbus-1", "polkit-1.pam"])
+
     def test_input_is_not_mutated(self):
         source = full_sbom()
         before = json.dumps(source, sort_keys=True)
@@ -298,6 +311,11 @@ class Policy(unittest.TestCase):
         self.assertFalse(verdict["pass"])
         self.assertEqual(verdict["blocking"][0]["sources"], ["vulnix"])
         self.assertEqual(verdict["summary"]["vulnix-only"], 1)
+
+    def test_vulnix_entries_for_generated_files_are_ignored(self):
+        vulnix = [{"pname": "polkit", "version": "1.pam", "affected_by": ["CVE-2021-4034"],
+                   "cvssv3_basescore": {"CVE-2021-4034": 7.8}}]
+        self.assertEqual(self.evaluate([], vulnix=vulnix)["blocking"], [])
 
     def test_vulnix_and_grype_merge(self):
         vulnix = [{"pname": "curl", "version": "8.22.0", "affected_by": ["CVE-2026-1"],

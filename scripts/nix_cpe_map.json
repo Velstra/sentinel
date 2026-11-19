@@ -729,5 +729,10 @@
    "vendor": "facebook",
    "product": "zstandard"
   }
- }
+ },
+ "generated": [
+  "dbus-1",
+  "polkit-1.pam"
+ ],
+ "generated-note": "Store names NixOS generates for configuration (the D-Bus config directory, polkit's PAM file) that parse as <package>-<version> but are not that package. Their CPEs are cleared and vulnix entries for them ignored. Additive key: loaders that ignore it keep reporting them."
 }
