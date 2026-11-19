@@ -16039,6 +16039,20 @@
                   "commit save exit | sentinel configure\""
               )
 
+              # A secret alone keeps the API on loopback (api-management-bind
+              # pins that); the push needs the backup reachable on its sync
+              # address. The probes above talk to 127.0.0.1, so bind it now. The
+              # setter enables the console; disable it again so the shared policy
+              # (web.enable is shared) still matches the primary's baseline.
+              backup.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set services web listen-address 10.9.0.2' "
+                  "'set services web enable false' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              backup.wait_until_succeeds("ss -tlnH 'src 10.9.0.2 and sport = :8080' | grep -q LISTEN", timeout=30)
+
               # Sanity: the rule is not on the backup yet.
               backup.fail("grep -q 'synced-rule' /var/lib/sentinel/appliance.toml")
 
@@ -16083,10 +16097,10 @@
               backup.succeed("test -f /var/lib/sentinel/web-tls/cert.pem")
               backup.succeed("test -f /var/lib/sentinel/web-tls/key.pem")
               backup.succeed(
-                  "curl -fsSk https://127.0.0.1:8080/api/v1/health | grep -q ok"
+                  "curl -fsSk https://10.9.0.2:8080/api/v1/health | grep -q ok"
               )
               backup.fail(
-                  "curl -fsS --max-time 5 http://127.0.0.1:8080/api/v1/health"
+                  "curl -fsS --max-time 5 http://10.9.0.2:8080/api/v1/health"
               )
               # And the primary pinned the backup's TLS key on first use (no
               # peer-fingerprint was configured), so the config was sent encrypted
