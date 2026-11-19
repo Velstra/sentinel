@@ -96,8 +96,11 @@ in pkgs.testers.runNixOSTest {
         # before it is read: a fixed sleep raced a slow tcpdump start-up and
         # read an empty file while the probes had in fact crossed (the client
         # had answered them with resets).
+        # Captured by port only and counted by source below, so a probe that
+        # arrives with a rewritten source shows up in the failure message
+        # instead of as an empty capture.
         client.succeed("rm -f /tmp/inbound.pcap /tmp/inbound.err; tcpdump -n -U -i eth1 -w /tmp/inbound.pcap "
-                       "'(tcp dst port 9092 or udp dst port 9093) and (src host 10.2.2.2 or src host 2001:db8:102::2)' "
+                       "'tcp dst port 9092 or udp dst port 9093' "
                        ">/dev/null 2>/tmp/inbound.err & echo $! >/tmp/inbound.pid")
         client.wait_until_succeeds("grep -q 'listening on eth1' /tmp/inbound.err", timeout=30)
         for address in ("10.1.1.2", "2001:db8:101::2"):
@@ -105,7 +108,10 @@ in pkgs.testers.runNixOSTest {
             server.execute(f"echo probe | nc -u -w 1 {address} 9093")
         client.succeed("pid=$(cat /tmp/inbound.pid); kill -INT $pid; "
                        "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
-        return int(client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null | wc -l").strip())
+        global inbound_seen
+        inbound_seen = client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null")
+        return sum(1 for line in inbound_seen.splitlines()
+                   if " 10.2.2.2." in line or " 2001:db8:102::2." in line)
     lines = [
         "set interface eth1 zone lan", "set interface eth1 address 10.1.1.1/24",
         "set interface eth1 address6 2001:db8:101::1/64",
@@ -149,7 +155,7 @@ in pkgs.testers.runNixOSTest {
             persist=True,
         )
         crossed = unsolicited_from_wan()
-        assert crossed >= 4, f"only {crossed} admitted probes crossed: the path itself is broken"
+        assert crossed >= 4, f"only {crossed} admitted probes crossed: the path itself is broken; captured:\n{inbound_seen}"
         configure("delete firewall rule wan-probe-tcp", "delete firewall rule wan-probe-udp", persist=True)
         assert unsolicited_from_wan() == 0
 
