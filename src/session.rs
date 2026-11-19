@@ -2817,14 +2817,20 @@ impl Session {
     }
 
     pub(crate) fn read_running_at(path: &Path) -> Result<Option<String>> {
-        match path.symlink_metadata() {
-            Ok(metadata) if metadata.is_file() => std::fs::read_to_string(path)
-                .map(Some)
-                .context("reading active configuration"),
-            Ok(_) => bail!("active configuration is not a regular file"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("inspecting active configuration"),
-        }
+        crate::system::read_owned_regular(path, 64 * 1024 * 1024)
+            .context("reading active configuration")
+    }
+
+    pub(crate) fn read_saved_at(path: &Path) -> Result<Option<Appliance>> {
+        crate::system::read_owned_regular(path, 64 * 1024 * 1024)?
+            .map(|text| {
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    Appliance::from_json(&text)
+                } else {
+                    Appliance::from_toml(&text)
+                }
+            })
+            .transpose()
     }
 
     /// Compare-and-swap precondition. Call while holding apply.lock, before
@@ -2851,8 +2857,10 @@ impl Session {
         let snapshot = Self::read_running_at(running)?;
         let draft = match &snapshot {
             Some(text) => Draft::from_appliance(&Appliance::from_toml(text)?),
-            None if path.exists() => Draft::from_appliance(&Appliance::load(path)?),
-            None => Draft::default(),
+            None => match Self::read_saved_at(path)? {
+                Some(appliance) => Draft::from_appliance(&appliance),
+                None => Draft::default(),
+            },
         };
         Ok(Self {
             draft,
@@ -2865,13 +2873,23 @@ impl Session {
 
     /// What another session has committed since this one started, if anything.
     /// `None` when nothing has changed under us.
-    pub fn committed_elsewhere(&self) -> Option<String> {
-        let now = Self::running_snapshot()?;
-        match &self.seen_running {
+    fn current_snapshot(&self) -> Result<Option<String>> {
+        if matches!(self.admission_baseline, AdmissionBaseline::Live) {
+            Self::read_running_at(Path::new(Self::RUNNING))
+        } else {
+            Ok(Self::running_snapshot())
+        }
+    }
+
+    pub fn committed_elsewhere(&self) -> Result<Option<String>> {
+        let Some(now) = self.current_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(match &self.seen_running {
             Some(seen) if *seen == now => None,
             // No snapshot when we started and one now: somebody committed.
             _ => Some(now),
-        }
+        })
     }
 
     /// Record what we have just applied, so our own commit does not read as
@@ -8915,7 +8933,7 @@ impl Session {
     /// the normal way to try something out, and therefore the normal way for
     /// two sessions to end up looking at different boxes.
     pub fn compare_running(&self) -> Result<String> {
-        let Some(running) = Self::running_snapshot() else {
+        let Some(running) = self.current_snapshot()? else {
             bail!(
                 "nothing has been committed on this box since it booted, so there is \
                  no running configuration to compare against — `compare` uses the \
@@ -8932,7 +8950,11 @@ impl Session {
     }
 
     pub fn compare(&self) -> Result<String> {
-        let baseline = if self.path.exists() {
+        let baseline = if matches!(self.admission_baseline, AdmissionBaseline::Live) {
+            Self::read_saved_at(&self.path)?
+                .map(|appliance| Draft::from_appliance(&appliance))
+                .unwrap_or_default()
+        } else if self.path.exists() {
             Draft::from_appliance(&Appliance::load(&self.path)?)
         } else {
             Draft::default()
@@ -13501,6 +13523,23 @@ mod tests {
         session.note_committed_at(&running, "new revision").unwrap();
         assert_eq!(session.seen_running.as_deref(), Some("new revision"));
         assert_eq!(std::fs::read_to_string(running).unwrap(), "new revision");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn live_session_accepts_protected_reader_json_and_refuses_saved_symlinks() {
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-live-json-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let saved = directory.join("saved.json");
+        let running = directory.join("running.toml");
+        let appliance = Appliance::from_toml("[system]\nhostname='json-live'\n").unwrap();
+        std::fs::write(&saved, serde_json::to_vec(&appliance).unwrap()).unwrap();
+        let session = Session::load_live_at(&saved, &running).unwrap();
+        assert_eq!(session.materialize().unwrap().system.hostname, "json-live");
+        let link = directory.join("linked.json");
+        std::os::unix::fs::symlink(&saved, &link).unwrap();
+        assert!(Session::load_live_at(&link, &running).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

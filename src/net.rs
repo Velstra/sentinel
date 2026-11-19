@@ -2440,7 +2440,7 @@ const API_ENV: &str = "/run/sentinel/api.env";
 // uplink — it used to be baked into the image at build time, which meant that
 // on any box whose NIC was not literally named `eth0` the agent failed to start
 // and the firewall silently did not run at all.
-const AGENT_ENV: &str = "/run/sentinel/velstra.env";
+pub(crate) const AGENT_ENV: &str = "/run/sentinel/velstra.env";
 const AGENT_UNIT: &str = "velstra.service";
 /// The routing daemon's control socket, which is also where its FlowSpec feed
 /// comes from. One socket, one daemon.
@@ -3803,6 +3803,24 @@ fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
              cannot attach and is not filtering. `show interfaces` lists the real names."
         );
     }
+    let env = agent_environment_for_iface(appliance, &iface);
+    let changed = file_changed(Path::new(AGENT_ENV), &env);
+    if changed {
+        system::install_file(Path::new(AGENT_ENV), &env)?;
+    }
+    if changed && mode == ApplyMode::Live {
+        system::service_restart(AGENT_UNIT).context("applying data-plane launch settings")?;
+    }
+    Ok(())
+}
+
+/// Prepare launch settings before the first dataplane activation. The caller
+/// owns the transactional snapshot/restore; rendering alone has no side effects.
+pub(crate) fn agent_environment(appliance: &Appliance) -> Option<String> {
+    agent_uplink(appliance).map(|iface| agent_environment_for_iface(appliance, &iface))
+}
+
+fn agent_environment_for_iface(appliance: &Appliance, iface: &str) -> String {
     // A3: whether the agent enforces what BGP peers advertise, as arguments the
     // unit splices in. Written here rather than baked into the unit for the same
     // reason the interface is: it is a decision an operator makes at run time,
@@ -3820,15 +3838,7 @@ fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         // enforcement is turned off.
         None => "VELSTRA_FLOWSPEC_ARGS=\n".to_string(),
     };
-    let env = format!("VELSTRA_IFACE={iface}\n{flowspec}");
-    let changed = file_changed(Path::new(AGENT_ENV), &env);
-    if changed {
-        system::install_file(Path::new(AGENT_ENV), &env)?;
-    }
-    if changed && mode == ApplyMode::Live {
-        system::service_restart(AGENT_UNIT).context("applying data-plane launch settings")?;
-    }
-    Ok(())
+    format!("VELSTRA_IFACE={iface}\n{flowspec}")
 }
 
 pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {

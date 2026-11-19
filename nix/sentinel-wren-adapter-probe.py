@@ -256,8 +256,11 @@ def failure_case(actor, active, foreign):
                     assert process.returncode != 0, "uninstallable route was acknowledged successfully"
                     assert output_path.stat().st_size <= 262144, "CLI output cap"
                     output = output_path.read_text()
-                    assert "rolled back to the previous running config" in output, output
+                    # Routing now follows network reconciliation, so recovery
+                    # must attest the broad last-good reconcile as well.
+                    assert "ROLLED BACK to the last-good running configuration" in output, output
                     assert "ROLLBACK INCOMPLETE" not in output, output
+                    assert "MIXED STATE" not in output, output
                     receipt = {"returncode": process.returncode, "output": output}
                     break
             if evidence is None:

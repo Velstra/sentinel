@@ -7237,7 +7237,8 @@ impl Appliance {
     pub(crate) fn load_active_at(path: &Path, running: &Path) -> Result<Self> {
         match crate::session::Session::read_running_at(running)? {
             Some(text) => Self::from_toml(&text).context("validating active configuration"),
-            None => Self::load(path),
+            None => crate::session::Session::read_saved_at(path)?
+                .context("saved configuration is missing"),
         }
     }
 

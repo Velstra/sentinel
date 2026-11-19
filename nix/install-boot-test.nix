@@ -166,6 +166,9 @@ pkgs.testers.runNixOSTest {
         key = installed.succeed("ssh-keygen -lf /var/lib/sentinel/ssh/ssh_host_ed25519_key.pub").split()[1]
         assert key != source_key, "installer copied a private source identity"
         version = installed.succeed("sentinel show version")
+        viewer_version = installed.succeed("su -s /bin/sh nobody -c 'sentinel show version'")
+        assert "not encrypted" in viewer_version, viewer_version
+        installed.fail("su -s /bin/sh nobody -c 'sudo -n id'")
         assert "release:    ${
           if withUpdate then "2.0.1" else "2.0.0"
         }-qa-install-boot" in version and "slot sentinel-${

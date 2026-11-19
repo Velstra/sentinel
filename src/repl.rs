@@ -163,7 +163,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             // committed since you started, say so here — this is where an
             // operator looks to find out what the box is doing, and letting them
             // read a stale answer is how two people undo each other's work.
-            if session.committed_elsewhere().is_some() {
+            if session.committed_elsewhere()?.is_some() {
                 eprintln!(
                     "{}",
                     ui::yellow(
@@ -499,9 +499,32 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // moves: the saved file is what the next boot loads, and the running
     // snapshot is what an *earlier* commit applied — which this commit is about
     // to overwrite with its own.
-    let saved_before = crate::config::Appliance::load(session.config_path()).ok();
-    let running_before = Session::running_snapshot()
-        .and_then(|toml| crate::config::Appliance::from_toml(&toml).ok());
+    let baselines = (|| -> Result<_> {
+        if act.enabled {
+            // Do not turn a root-only recovery baseline into None. The session
+            // reader and its rollback reader need the same privilege boundary.
+            Ok((
+                Session::read_saved_at(session.config_path())?,
+                Session::read_running_at(Path::new(Session::RUNNING))?
+                    .map(|text| crate::config::Appliance::from_toml(&text))
+                    .transpose()?,
+            ))
+        } else {
+            Ok((
+                crate::config::Appliance::load(session.config_path()).ok(),
+                Session::running_snapshot()
+                    .and_then(|text| crate::config::Appliance::from_toml(&text).ok()),
+            ))
+        }
+    })();
+    let (saved_before, running_before) = match baselines {
+        Ok(baselines) => baselines,
+        Err(error) => {
+            eprintln!("error: reading recovery configuration: {error:#}");
+            note_refusal();
+            return false;
+        }
+    };
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -813,6 +836,12 @@ impl std::error::Error for ServiceApplyFailure {
 /// Private dependency injection: production always uses the fixed system
 /// adapter; tests supply replies without replacing binaries or environment.
 trait ServiceControl: Clone + 'static {
+    fn launch_changed(&self) -> bool {
+        false
+    }
+    fn restore_launch(&self) -> Result<()> {
+        Ok(())
+    }
     fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()>;
     fn restore(&self, unit: &str, installed: &[u8], previous: &[u8]) -> Result<()> {
         self.reload(unit, Some(installed), previous)
@@ -825,6 +854,53 @@ trait ServiceControl: Clone + 'static {
 
 #[derive(Clone, Copy)]
 struct SystemServiceControl;
+
+#[derive(Clone)]
+struct DataplaneServiceControl {
+    environment: Option<Vec<u8>>,
+    previous_environment: Option<Vec<u8>>,
+}
+
+impl ServiceControl for DataplaneServiceControl {
+    fn launch_changed(&self) -> bool {
+        self.environment != self.previous_environment
+    }
+
+    fn restore_launch(&self) -> Result<()> {
+        restore_file(
+            Path::new(crate::net::AGENT_ENV),
+            self.previous_environment.as_deref(),
+        )
+    }
+
+    fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+        restore_file(
+            Path::new(crate::net::AGENT_ENV),
+            self.environment.as_deref(),
+        )?;
+        if self.launch_changed() && system::compiled_dataplane_enabled(next)? {
+            system::service_restart(unit)
+        } else {
+            SystemServiceControl.reload(unit, previous, next)
+        }
+    }
+
+    fn restore(&self, unit: &str, installed: &[u8], previous: &[u8]) -> Result<()> {
+        if self.launch_changed() && system::compiled_dataplane_enabled(previous)? {
+            system::service_restart(unit)
+        } else {
+            SystemServiceControl.restore(unit, installed, previous)
+        }
+    }
+
+    fn ready(&self, unit: &str) -> Result<()> {
+        SystemServiceControl.ready(unit)
+    }
+
+    fn wait_ready(&self, unit: &str) -> Result<()> {
+        SystemServiceControl.wait_ready(unit)
+    }
+}
 
 impl ServiceControl for SystemServiceControl {
     fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
@@ -1263,6 +1339,9 @@ fn restore_service<C: ServiceControl>(
     previous: Option<&[u8]>,
     control: &C,
 ) -> Result<()> {
+    control
+        .restore_launch()
+        .context("restoring previous service launch settings")?;
     restore_file(out, previous).context("restoring previous compiled file")?;
     let previous = previous.context(
         "candidate file removed, but no previous compiled configuration exists; daemon state is unknown",
@@ -1301,7 +1380,7 @@ fn apply_service_with<C: ServiceControl>(
 ) -> Result<Box<dyn FnOnce() -> Result<()>>> {
     ReadinessService::from_unit(unit)?;
     // This is a readiness snapshot, not a promise of ongoing cluster authority.
-    if prev == Some(new) && control.ready(unit).is_ok() {
+    if prev == Some(new) && !control.launch_changed() && control.ready(unit).is_ok() {
         let out = out.to_path_buf();
         let unit = unit.to_owned();
         let previous = new.to_vec();
@@ -1484,7 +1563,7 @@ fn scrub_diagnostic_secrets(text: &str, secrets: &[String]) -> String {
     scrubbed
 }
 
-/// Report a failure of the final, broad `net::apply` stage honestly.
+/// Report a failure after broad `net::apply` began, without a last-good target.
 ///
 /// That stage reconciles roughly thirty sub-systems — DNS, NTP, PKI, sshd, the
 /// login passwords, IPsec, the VPNs, the reverse proxy, IDS and the box services
@@ -1609,11 +1688,12 @@ fn mixed_or_rolled_message(
 
 /// Apply a validated appliance config to the running system: compile
 /// **everything** first (so a bad config is rejected before any live change),
-/// then apply firewall, routing and hostname in order — each of those three
-/// stages recording how to undo itself — and finally the broad `net::apply`.
+/// then apply firewall and hostname, reconcile network addresses/co-services,
+/// and finally routing. Firewall protection precedes link activation; new
+/// routes may depend on addresses from this same transaction.
 ///
-/// The atomic-rollback guarantee covers the first three stages directly (their
-/// undo stack), and — when `rollback_to` names the config the box was running
+/// The rollback stack covers firewall launch/configuration, hostname and
+/// routing directly. When `rollback_to` names the config the box was running
 /// before this commit — the broad `net::apply` too, by reconciling it back to
 /// that last-good config on failure (a level-triggered rollback, see
 /// [`unwind_to_last_good`]): most partial failures then become a TRUE rollback
@@ -1676,6 +1756,11 @@ fn apply_live_as(
     // them (None ⇒ there was no file, so rollback removes ours).
     let velstra_prev = read_previous_file(&act.velstra_out)?;
     let wren_prev = read_previous_file(&act.wren_out)?;
+    let previous_environment = read_previous_file(Path::new(crate::net::AGENT_ENV))?;
+    let dataplane_control = DataplaneServiceControl {
+        environment: crate::net::agent_environment(appliance).map(String::into_bytes),
+        previous_environment,
+    };
     let old_host = system::current_hostname();
 
     // ---- Phase 2: apply, each stage undoable on a later failure ----
@@ -1705,12 +1790,17 @@ fn apply_live_as(
             ));
         }
     }
+    // If routing later fails, its final recovery must follow the firewall undo:
+    // restoring the old hooks can itself raise a previously held-down uplink.
+    // Keep the HA guard earlier in the stack so it is still restored last.
+    let routing_recovery_slot = rb.steps.len();
     // Firewall install/reload may now have an earlier guard to unwind.
-    let undo = match apply_service(
+    let undo = match apply_service_with(
         &act.velstra_out,
         &act.unit,
         rendered.as_bytes(),
         velstra_prev.as_deref(),
+        dataplane_control,
     ) {
         Ok(undo) => undo,
         Err(error) => {
@@ -1723,24 +1813,6 @@ fn apply_live_as(
         }
     };
     rb.push("firewall", undo);
-
-    // Routing: install + reload the Wren daemon.
-    match apply_service(
-        &act.wren_out,
-        &act.wren_unit,
-        wren_rendered.as_bytes(),
-        wren_prev.as_deref(),
-    ) {
-        Ok(undo) => rb.push("routing", undo),
-        Err(e) => {
-            return Err(unwind_err(
-                rb,
-                e,
-                "routing",
-                [Some(appliance), rollback_to].into_iter().flatten(),
-            ));
-        }
-    }
 
     // Hostname: set it live.
     if let Err(e) = system::set_hostname(&appliance.system.hostname) {
@@ -1765,6 +1837,42 @@ fn apply_live_as(
         return Err(match rollback_to {
             Some(prev) => unwind_to_last_good(rb, e, prev),
             None => unwind_err_mixed(rb, e),
+        });
+    }
+    // Synchronous FIB convergence needs the newly reconciled interface addresses.
+    // On failure the broad network changes must also be undone, not just the
+    // compiled files. Keep the same last-good recovery path as net::apply.
+    if let Err(error) = apply_service(
+        &act.wren_out,
+        &act.wren_unit,
+        wren_rendered.as_bytes(),
+        wren_prev.as_deref(),
+    ) {
+        // The immediate service-local recovery may have encountered the new
+        // network (the old gateway can be unreachable there). Retry restoring
+        // Wren AFTER last-good network reconciliation AND firewall recovery,
+        // which restores the old uplink's hooks and can bring that link up.
+        let out = act.wren_out.clone();
+        let unit = act.wren_unit.clone();
+        let installed = wren_rendered.into_bytes();
+        rb.steps.insert(
+            routing_recovery_slot,
+            (
+                "routing",
+                Box::new(move || {
+                    restore_service(
+                        &out,
+                        &unit,
+                        &installed,
+                        wren_prev.as_deref(),
+                        &SystemServiceControl,
+                    )
+                }),
+            ),
+        );
+        return Err(match rollback_to {
+            Some(prev) => unwind_to_last_good(rb, error, prev),
+            None => unwind_err_mixed(rb, error),
         });
     }
     Ok(())
@@ -6241,6 +6349,8 @@ mod tests {
     struct TestServiceControl {
         reload: std::rc::Rc<std::cell::RefCell<ReloadHook>>,
         ready: std::rc::Rc<std::cell::RefCell<ReadyHook>>,
+        launch_changed: bool,
+        restore_launch: std::rc::Rc<dyn Fn() -> Result<()>>,
     }
 
     impl TestServiceControl {
@@ -6251,11 +6361,21 @@ mod tests {
             Self {
                 reload: std::rc::Rc::new(std::cell::RefCell::new(Box::new(reload))),
                 ready: std::rc::Rc::new(std::cell::RefCell::new(Box::new(ready))),
+                launch_changed: false,
+                restore_launch: std::rc::Rc::new(|| Ok(())),
             }
         }
     }
 
     impl ServiceControl for TestServiceControl {
+        fn launch_changed(&self) -> bool {
+            self.launch_changed
+        }
+
+        fn restore_launch(&self) -> Result<()> {
+            (self.restore_launch)()
+        }
+
         fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
             self.reload.borrow_mut()(unit, previous, next)
         }
@@ -6288,6 +6408,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn changed_launch_settings_force_reload_and_restore_before_the_old_daemon() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"unchanged-policy").unwrap();
+        let restored = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = restored.clone();
+        let mut calls = 0;
+        let mut control = TestServiceControl::new(
+            move |_, _, _| {
+                calls += 1;
+                if calls == 1 {
+                    assert!(!observed.get());
+                    anyhow::bail!("new interface could not start");
+                }
+                assert!(observed.get(), "old launch settings must precede recovery");
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        control.launch_changed = true;
+        let flag = restored.clone();
+        control.restore_launch = std::rc::Rc::new(move || {
+            flag.set(true);
+            Ok(())
+        });
+        assert!(
+            apply_service_with(
+                &path,
+                "velstra.service",
+                b"unchanged-policy",
+                Some(b"unchanged-policy"),
+                control
+            )
+            .is_err()
+        );
+        assert!(restored.get());
+        assert_eq!(std::fs::read(path).unwrap(), b"unchanged-policy");
+    }
+
+    #[test]
+    fn first_failed_service_restores_launch_settings_even_without_a_previous_config() {
+        let dir = ServiceTestDir::new();
+        let restored = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = restored.clone();
+        let mut control =
+            TestServiceControl::new(|_, _, _| anyhow::bail!("startup failed"), |_| Ok(()));
+        control.restore_launch = std::rc::Rc::new(move || {
+            flag.set(true);
+            Ok(())
+        });
+        assert!(
+            apply_service_with(&dir.config(), "velstra.service", b"new", None, control).is_err()
+        );
+        assert!(restored.get());
+        assert!(!dir.config().exists());
     }
 
     #[test]
@@ -8663,6 +8841,49 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("second"), "{:?}", failures);
         assert!(failures[0].contains("boom"), "{:?}", failures);
+    }
+
+    #[test]
+    fn routing_recovery_follows_old_packet_hooks_but_precedes_guard_restore() {
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut rb = Rollback::new();
+        let seen = order.clone();
+        rb.push("HA fence", move || {
+            seen.borrow_mut().push("guard");
+            Ok(())
+        });
+        let routing_recovery_slot = rb.steps.len();
+        for name in ["firewall", "hostname"] {
+            let seen = order.clone();
+            rb.push(name, move || {
+                seen.borrow_mut().push(name);
+                Ok(())
+            });
+        }
+        let seen = order.clone();
+        rb.steps.insert(
+            routing_recovery_slot,
+            (
+                "routing",
+                Box::new(move || {
+                    assert!(
+                        seen.borrow().contains(&"firewall"),
+                        "old hooks must be ready"
+                    );
+                    assert!(
+                        !seen.borrow().contains(&"guard"),
+                        "guard recovery stays last"
+                    );
+                    seen.borrow_mut().push("routing");
+                    Ok(())
+                }),
+            ),
+        );
+        assert!(rb.unwind().is_empty());
+        assert_eq!(
+            *order.borrow(),
+            ["hostname", "firewall", "routing", "guard"]
+        );
     }
 
     #[test]

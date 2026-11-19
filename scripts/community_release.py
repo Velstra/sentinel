@@ -29,7 +29,7 @@ ASSET_LIMIT = 2 * 1024**3
 REQUIRED_SAFETY_CHECKS = frozenset({
     "dataplane-conformance", "nat-capacity-pressure", "tcp-reset-validation",
     "ebpf-verifier-6-6", "ebpf-verifier-6-12", "ebpf-verifier-6-18",
-    "login-lifecycle", "auth-bounds", "observe-readonly", "wren-static-reload",
+    "login-lifecycle", "auth-bounds", "observe-readonly", "wren-static-reload", "apply-ordering",
     "nat", "hairpin", "reject", "commit", "ntp", "bootfallback", "boothealth",
     "ipsec", "vti",
     "ha-pair", "ha-two-node", "ha-two-node-flow", "ha-napt-mixed-version",
