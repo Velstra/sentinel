@@ -18,10 +18,14 @@ the audit's blocking findings are closed and requalified.
   signatures use a fixed signing time.
 - IMG-04: nixpkgs advanced to nixos-26.05 2026-11-16 (curl 8.23.0, OpenSSH
   10.6p2, zlib CVE-2026-85091, Linux 6.12.117, ...); libcap 2.78, the
-  Net-SNMP SMUX fix and Suricata 8.0.7 are backported into the shipped
-  closure without rebuilding nixpkgs. The eBPF object keeps its own pinned
+  Net-SNMP SMUX fix, Suricata 8.0.7, SQLite 3.54.1, lego/dnsproxy with current
+  golang.org/x and gRPC modules and a Linux-PAM without Berkeley DB are
+  backported into the shipped closure without rebuilding nixpkgs; HAProxy is
+  3.4.1. The eBPF object keeps its own pinned
   toolchain (`nixpkgs-ebpf`), so a userspace bump no longer moves `ebpfHash`.
-  Open CVEs remain (see the release gate); 1.0.0 is not releasable yet.
+  The gate's remaining 21 findings and 171 kernel matches have PROPOSED,
+  unreviewed waivers in `scripts/cve-waivers.json`; the gate fails until a
+  person reviews them.
 - IMG-05: an image-level CVE gate with a maintained Nix-to-NVD CPE table
   (`scripts/nix_cpe_map.json`), the kernel cataloger and vulnix as a second
   source; it fails when a critical package cannot be matched.
@@ -32,7 +36,8 @@ the audit's blocking findings are closed and requalified.
   (already on the candidate, now asserted at boot); pkexec is no longer setuid.
 - IMG-11 / STATIC-04: the image names its release (`IMAGE_VERSION`, raw file
   name), the agent's store name carries its crate version, ESP files no longer
-  date from 2098.
+  date from 2098, and `sentinel --version`, `show version` and the OpenAPI
+  info report the source revision.
 - IMG-12: the unprivileged-user-namespace builder prerequisite is documented.
 - STATIC-03: this changelog and the README no longer claim a 1.0.0 release.
 - STATIC-07 / STATIC-08: the console browser suite resolves the pinned password
