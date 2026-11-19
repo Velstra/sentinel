@@ -106,6 +106,21 @@ let
       buildInputs = lib.filter (input: (input.pname or "") != "db") old.buildInputs;
     });
 
+  # Berkeley DB 5.3.28 (the same 15 High advisories) is linked by exactly two
+  # packages in the closure; OpenLDAP and GnuPG reach it only through
+  # cyrus-sasl. iproute2 uses it for arpd alone (not run on the appliance) and
+  # cyrus-sasl for the sasldb password store (no SASL database is configured:
+  # LDAP binds are simple binds). Both are built without it, so arpd and the
+  # sasldb plugin are not built and db leaves the closure.
+  withoutDb = drv: lib.filter (input: (input.pname or "") != "db") drv.buildInputs;
+  iproute2 = assert pkgs.iproute2.version == "7.0.0";
+    pkgs.iproute2.overrideAttrs (old: { buildInputs = withoutDb old; });
+  cyrus_sasl = assert pkgs.cyrus_sasl.version == "2.1.28";
+    pkgs.cyrus_sasl.overrideAttrs (old: {
+      buildInputs = withoutDb old;
+      configureFlags = old.configureFlags ++ [ "--with-dblib=none" ];
+    });
+
   # IMG-02: the PAM side of imported password hashes. The management API
   # verifies $1$/$5$/$6$ with the pinned helper, but sshd, login and sudo go
   # through pam_unix and the system libcrypt, which nixpkgs builds with the
@@ -145,9 +160,11 @@ in
       ++ replace pkgs.lego lego
       ++ replace pkgs.dnsproxy dnsproxy
       ++ replace pkgs.sqlite sqlite
-      ++ replace pkgs.linux-pam linux-pam;
+      ++ replace pkgs.linux-pam linux-pam
+      ++ replace pkgs.iproute2 iproute2
+      ++ replace pkgs.cyrus_sasl cyrus_sasl;
     system.build.securityBackports = {
-      inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam;
+      inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl;
     };
     assertions = [ {
       # pam_userdb is not built (see linux-pam above); a stack that names it
