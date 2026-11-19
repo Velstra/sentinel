@@ -36,6 +36,14 @@ SOCKET = "/run/qa-nat-capacity.sock"
 FRAME_LIMIT = 4096
 REPLY_LIMIT = 64 * 1024 * 1024
 MAX_FLOWS = 20_000
+# Held echoes are sent in rounds of this many concurrent flows. 1024 lost
+# packets below every counter of the firewall VM: with all NAT/FW state
+# present and zero firewall softnet/link/qdisc/virtio-ring/IP drops, the
+# endpoints' own qdiscs dropped hundreds of segments and both endpoints took
+# ~38k RTOs, so later echoes missed the unchanged per-echo timeout. The
+# nftables reference shares this probe, so both lanes are paced identically;
+# totals, budgets and timeouts are unchanged.
+HELD_ECHO_BATCH = 512
 PROBE_REVISION = "prebound-endpoints-runtime-v3-echo-evidence"
 SERVER_METRICS = "/run/qa-nat-server-metrics.json"
 
@@ -343,13 +351,14 @@ class Client:
         started = time.monotonic()
         indices = sorted(self.streams)
         rows = []
-        for first in range(0, len(indices), 1024):
+        for first in range(0, len(indices), HELD_ECHO_BATCH):
             if time.monotonic() - started >= budget:
                 rows.extend(dict(id=i, verified=False, failure=dict(stage="probe-budget", kind="not-probed",
                                                                     detail="phase budget exhausted"))
                             for i in indices[first:])
                 break
-            rows.extend(await asyncio.gather(*(self.probe_one(i) for i in indices[first:first + 1024])))
+            rows.extend(await asyncio.gather(*(self.probe_one(i)
+                                               for i in indices[first:first + HELD_ECHO_BATCH])))
         return dict(version=1, probe_revision=PROBE_REVISION, event_loop=self.health.sample(),
                     round=self.round, rows=rows, seconds=time.monotonic() - started)
 
