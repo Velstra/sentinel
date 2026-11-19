@@ -154,11 +154,18 @@ peer credential, which may read what a read-only account reads (the stack view
 uses `status`, `show`, `telemetry/snapshot` and `system/health`; pairing uses
 `GET /api/v1/ha/enrollment`), push `PUT /api/v1/config-sync` and complete
 `POST /api/v1/ha/pair`. It cannot `PUT /api/v1/config`, post `configure` lines,
-stage updates or end a commit-confirm window. The root-only machine token in
-`/var/lib/sentinel/api-token` stays the local full-access credential; releases
-before this one wrote the secret into that file, and the first apply after the
-upgrade replaces such a file with a fresh random token (so do a token that has
-not the generated shape, which covers a secret removed earlier).
+stage updates or end a commit-confirm window. On a member that is already
+paired it cannot post a *different* pairing (a repeat of the applied one is
+answered as applied); and enrollment hands it the member's configuration
+without accounts, AAA servers and update channels, so no password hash or
+TOTP secret reaches a peer. The root-only machine token in
+`/var/lib/sentinel/api-token` stays the local full-access credential. Sentinel
+records the digest of every token it mints beside it (`api-token.minted`).
+Releases before this one wrote the secret into the token file; at the first
+apply after the upgrade a token that is the configured secret, or that any
+archived configuration names (a secret since removed), is replaced by a fresh
+random token. Any other unrecorded token — an earlier release's own, or one an
+operator placed there — is kept and recorded.
 
 A received push or pairing never changes who manages the receiver: its
 accounts (`system login`, with their keys, hashes and TOTP), `system group`,
@@ -169,17 +176,24 @@ set the pair's firewall, NAT, routing and VPN policy**, and through pairing its
 HA identity. Treat the secret as the authority to change the traffic policy of
 every member, and keep it to the members.
 
-The secret must be at least 32 bytes and not demonstrably weak (too few
-distinct characters, a repeated pattern, too small an alphabet for its length):
+The secret must be at least 32 bytes and estimate at 128 bits or more. The
+estimate is deliberately pessimistic about anything composed: words, runs of
+one letter case, sequences (`abcd`, `1234`) and repeats count for little, so a
+long passphrase is refused; 64 random hex digits (what `sentinel ha secret
+generate` prints) or 32 random bytes in base64 pass. The reason:
 the unauthenticated HA proof lets anybody who can reach the management port
 test guesses against it offline, so a dictionary word is a lost pair. A weak
 secret is refused when a configuration is admitted (commit, API, received push
 or pairing, `config check`). A box upgraded with one still boots and keeps its
-pairing, warns at every apply, and accepts no change until the secret is
-rotated on both members. The proof is limited to ten per source address per
-ten minutes, and thirty invalid bearers from one source lock it out of the
-API for five minutes (`429` with `Retry-After`). Every non-read use of the
-machine token or the peer credential is logged with its source address.
+pairing, warns at every apply, hands out no enrollment proof (`409`), and
+accepts no change until the secret is rotated on both members. The proof is
+limited to ten per source address per ten minutes. After thirty invalid
+bearers from one source in ten minutes, that source's further invalid ones
+get `429` (with `Retry-After`) for five minutes; a valid credential is still
+served, except the peer credential while the secret is weak. Sign-out answers
+every bearer that is not a session with the same `401` and counts it. Every
+non-read use of the machine token or the peer credential is logged with its
+source address.
 
 The receiving API always honors `services.web.listen-address` and `port`, even
 when `services.web.enable = false`. A secret alone leaves the default listener
@@ -312,10 +326,13 @@ signing in again ends the least recently used one — and the appliance at most
 1024. Responses carry `Strict-Transport-Security` (browsers ignore it over
 plaintext and over a certificate they warned about).
 
-Before any request is read, the listener caps open connections at 64 per
-source address (IPv6 /64) and 512 in all, and a request head must arrive whole
-within ten seconds; HTTP/2 connections are pinged and closed when the peer
-stops answering. A connection over a cap is closed as soon as it is accepted.
+Before any request is read, the listener caps open connections at 32 per
+source address (IPv6 /64), 256 per network (IPv4 /24, IPv6 /48) and 4096 in
+all, and a request head must arrive whole within ten seconds; HTTP/2
+connections are pinged and closed when the peer stops answering. A connection
+over a cap is closed as soon as it is accepted. After authentication (and for
+the sign-in form), a request body must arrive within 30 seconds or the request
+is answered `408`.
 
 ## Where a password is checked
 

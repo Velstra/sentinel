@@ -136,7 +136,10 @@ not the member's machine token. A peer holding it can:
 
 It cannot replace a member's whole configuration through the ordinary API,
 post `configure` lines, stage updates or confirm or revert a commit-confirm
-window. Neither a push nor a pairing changes who manages the receiver: its
+window, and it cannot post a different pairing to a member that is already
+paired (re-pairing a paired member needs that member's machine token, or
+unpairing it first; repeating the applied pairing works). Neither a push nor a
+pairing changes who manages the receiver: its
 accounts (with their SSH keys, password hashes and TOTP secrets), groups, AAA
 servers, update channels and keys, SSH server and serial console stay its own,
 so configure them on **each** member.
@@ -148,32 +151,39 @@ traffic policy of both members: anybody who obtains it, or controls a member,
 controls what both members forward. Keep the secret to the two members,
 rotate it if either is suspect (set a new generated value on both; the outbox
 delivers the rotation with the old credential), and treat a compromised
-member as a compromised pair. Enrollment also hands the peer the receiver's
-full configuration, including its local password hashes; prefer key-only SSH
-and strong, unique passwords on HA members.
+member as a compromised pair. Enrollment hands the peer the receiver's
+configuration without its accounts, AAA servers and update channels; the
+shared policy secrets in it (VPN keys, PSKs) are the pair's anyway.
 
-Each source address may request ten enrollment proofs per ten minutes, thirty
-invalid bearers lock a source out of the API for five minutes, and every
+Each source address may request ten enrollment proofs per ten minutes (a
+flood of fresh addresses can delay a pairing; retry), thirty invalid bearers
+make a source's further invalid ones `429` for five minutes, and every
 non-read use of the peer credential or the machine token is logged with its
 source address (`journalctl -u sentinel-api`).
 
 ### Upgrading a pair with a weak secret
 
 An appliance upgraded with a secret that is now considered weak still boots,
-keeps its pairing and serves its API, prints a warning at every apply, and
-refuses every configuration change until the secret is rotated. Rotate it on
+keeps its pairing and serves its API, prints a warning at every apply, hands
+out no enrollment proof, and refuses every configuration change until the
+secret is rotated. Descriptive strings such as `ha-test-credential-…` count
+as weak; use `sentinel ha secret generate`. Rotate it on
 both members, one commit each. The first boot of the new image also replaces
 `/var/lib/sentinel/api-token` when an earlier release had written the secret
-into it; read the new machine token from that file.
+(current or since removed) into it; read the new machine token from that
+file. A token you placed there yourself is kept.
 
 ### Mixed versions during an upgrade
 
 Pairing and config-sync keep working between a member that has been updated
 and one that has not: the proof, the bearer and the base revisions a push
 names are understood by both. While the members run different versions, do
-not change accounts, AAA, update, SSH or console settings on the older member —
-the updated one keeps its own and the older one's next push is then held as a
-conflict. Finish the upgrade promptly.
+not change accounts, AAA, update, SSH, console, BGP update-source or PPPoE
+local-address settings on either member: the updated member keeps its own, the
+older one still sends and adopts them, and the two then disagree on their
+shared revision, so the next push is held as a conflict (resolve it as any
+conflict). Pushes from the updated member still replace these settings on
+the older one, as before the upgrade. Finish the upgrade promptly.
 
 ## Configuration writes on either member
 
