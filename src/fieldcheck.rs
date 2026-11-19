@@ -149,6 +149,20 @@ pub(crate) fn pppoe_subscriber_password(name: &str, password: &str) -> Result<()
     Ok(())
 }
 
+/// `interface … pppoe password`: the uplink's secret, written to the same pppd
+/// secrets file as a subscriber's — where a leading `@` makes pppd read the
+/// secret from the file it names and send *that* to the access concentrator
+/// (an exfiltration of any root-readable file to whoever answers the PADI).
+pub(crate) fn pppoe_client_password(v: &str) -> Result<()> {
+    if v.starts_with('@') {
+        bail!(
+            "pppoe password: must not start with `@`, which makes pppd read the secret from a \
+             file"
+        );
+    }
+    Ok(())
+}
+
 /// `update channel … subscription-key`: sent as `Authorization: Bearer <key>`,
 /// so it must be an RFC 6750 `b64token` — anything else is header syntax.
 pub(crate) fn subscription_key(v: &str) -> Result<()> {
@@ -294,6 +308,28 @@ const RULES: &[Rule] = &[
         },
     },
     Rule {
+        fallback: "that PPPoE uplink is disabled",
+        find: |a| {
+            errors(a.interfaces.iter().filter(|i| !i.disabled).filter_map(|i| {
+                let p = i.pppoe.as_ref()?;
+                Some(
+                    pppoe_client_password(&p.password)
+                        .with_context(|| format!("interface {:?}", i.name)),
+                )
+            }))
+        },
+        neutralise: |a| {
+            for i in &mut a.interfaces {
+                if i.pppoe
+                    .as_ref()
+                    .is_some_and(|p| pppoe_client_password(&p.password).is_err())
+                {
+                    i.disabled = true;
+                }
+            }
+        },
+    },
+    Rule {
         fallback: "updates from that channel are unavailable",
         find: |a| {
             errors(a.update.iter().flat_map(|u| &u.channels).filter_map(|c| {
@@ -354,8 +390,9 @@ pub(crate) fn quarantine(appliance: &mut Appliance) -> Vec<String> {
         }
         for message in found {
             let line = format!(
-                "error: {message}. The saved configuration predates this check; at boot {}. \
-                 Fix the setting and commit: `config check` refuses it until then.",
+                "error: {message}. The saved configuration predates this check, so {} (at \
+                 boot and in this session). Fix the setting or commit as is to save that; \
+                 `config check` refuses the saved file until then.",
                 rule.fallback
             );
             eprintln!("{line}");

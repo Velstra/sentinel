@@ -7289,10 +7289,20 @@ impl Appliance {
     pub fn load_lenient(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::saved_lenient(path, &text)
+    }
+
+    /// [`Self::load_lenient`] for text already read from `path` (whose
+    /// extension picks the format). For the box's **own** saved configuration
+    /// only — the boot apply and an operator's `configure` session, which must
+    /// never be locked out by an update that tightened a rule (audit 8b6181,
+    /// CTRL-08). A document *received* from the API, a peer or a fleet
+    /// controller stays strict.
+    pub(crate) fn saved_lenient(path: &Path, text: &str) -> Result<Self> {
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            Self::parse_json(&text, UnknownKeys::Warn)
+            Self::parse_json(text, UnknownKeys::Warn)
         } else {
-            Self::parse_toml(&text, UnknownKeys::Warn)
+            Self::parse_toml(text, UnknownKeys::Warn)
         }
     }
 

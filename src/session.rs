@@ -2821,15 +2821,13 @@ impl Session {
             .context("reading active configuration")
     }
 
+    /// The box's saved configuration, read the way boot reads it: a value an
+    /// update has since refused is neutralised with a loud warning rather than
+    /// locking the operator out of `configure` (and out of the commit that
+    /// would fix it). The next commit saves the neutralised value.
     pub(crate) fn read_saved_at(path: &Path) -> Result<Option<Appliance>> {
         crate::system::read_owned_regular(path, 64 * 1024 * 1024)?
-            .map(|text| {
-                if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                    Appliance::from_json(&text)
-                } else {
-                    Appliance::from_toml(&text)
-                }
-            })
+            .map(|text| Appliance::saved_lenient(path, &text))
             .transpose()
     }
 
@@ -2906,8 +2904,10 @@ impl Session {
 
     /// Open a session, loading `path` as the candidate if it exists.
     pub fn load(path: &Path) -> Result<Self> {
+        // Lenient for the same reason as `read_saved_at`: this is a config the
+        // operator edits, not a document someone handed the appliance.
         let draft = if path.exists() {
-            Draft::from_appliance(&Appliance::load(path)?)
+            Draft::from_appliance(&Appliance::load_lenient(path)?)
         } else {
             Draft::default()
         };
@@ -3877,6 +3877,8 @@ impl Session {
                 self.draft.iface_mut(name).pppoe_mut().username = Some((*v).to_string());
             }
             ["interface", name, "pppoe", "password", v] => {
+                crate::fieldcheck::pppoe_client_password(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).pppoe_mut().password = Some((*v).to_string());
             }
             ["interface", name, "pppoe", "service-name", v] => {
@@ -8949,7 +8951,7 @@ impl Session {
                 .map(|appliance| Draft::from_appliance(&appliance))
                 .unwrap_or_default()
         } else if self.path.exists() {
-            Draft::from_appliance(&Appliance::load(&self.path)?)
+            Draft::from_appliance(&Appliance::load_lenient(&self.path)?)
         } else {
             Draft::default()
         };

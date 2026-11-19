@@ -262,8 +262,9 @@ fn screen_value(mut doc: Value, mode: Screen) -> Result<Option<String>> {
     for finding in &changed {
         eprintln!(
             "error: {finding}. The saved configuration predates this rule; each such \
-             character was replaced by a space so the appliance still comes up. Fix the \
-             setting and commit: `config check` refuses it until then."
+             character was replaced by a space so the appliance still comes up and can be \
+             configured. The next commit saves the replacement; `config check` refuses the \
+             saved file until then."
         );
     }
     Ok(Some(serde_json::to_string(&doc)?))

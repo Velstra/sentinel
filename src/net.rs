@@ -940,9 +940,15 @@ fn chrony_inputs_safe(ntp: &Ntp) -> Result<()> {
 /// subscriber may not be the `*` wildcard, and no secret may start with `@`
 /// (pppd would read the secret from the file it names).
 fn ppp_secrets_safe(ifaces: &[Interface], bng: &PppoeServer) -> Result<()> {
-    for p in ifaces.iter().filter_map(|i| i.pppoe.as_ref()) {
+    // The same rows `ppp_secrets_body` writes: only active uplinks.
+    for p in ifaces
+        .iter()
+        .filter(|i| is_active_pppoe(i))
+        .filter_map(|i| i.pppoe.as_ref())
+    {
         reject_unsafe("pppoe username", &p.username, &['"', '\\'])?;
         reject_unsafe("pppoe password", &p.password, &['"', '\\'])?;
+        crate::fieldcheck::pppoe_client_password(&p.password)?;
     }
     for u in &bng.users {
         reject_unsafe("pppoe-server user", &u.name, &[])?;

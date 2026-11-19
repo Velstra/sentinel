@@ -303,3 +303,76 @@ fn ctrl08_validate_walks_an_in_memory_candidate() {
         "{error}"
     );
 }
+
+const PPPOE_CLIENT: &str = "[[interface]]\nname = \"eth0\"\n[[interface]]\nname = \"ppp0\"\n\
+                            type = \"pppoe\"\nparent = \"eth0\"\nzone = \"wan\"\n\
+                            [interface.pppoe]\nusername = \"user@isp.example\"\n";
+
+/// CTRL-18, client side: a leading `@` makes pppd read the uplink's secret
+/// from the named file and send it to whichever concentrator answers. Refused
+/// on every path; at boot the uplink is disabled rather than dialled with it.
+#[test]
+fn ctrl18_a_pppoe_client_password_cannot_name_a_file() {
+    let doc = |password: &str| format!("{BASE}{PPPOE_CLIENT}password = {}\n", toml_str(password));
+    refused(&doc("s3cret@home"), &doc("@/etc/shadow"));
+
+    let mut session = crate::session::Session::empty();
+    session.set(&["system", "hostname", "edge"]).unwrap();
+    assert!(
+        session
+            .set(&["interface", "ppp0", "pppoe", "password", "@/etc/shadow"])
+            .is_err(),
+        "the CLI must refuse it at `set`"
+    );
+
+    let mut booted = Appliance::from_toml(&doc("s3cret")).unwrap();
+    booted.interfaces[1].pppoe.as_mut().unwrap().password = "@/etc/shadow".into();
+    assert!(booted.validate().is_err());
+    crate::fieldcheck::quarantine(&mut booted);
+    assert!(booted.interfaces[1].disabled, "the uplink must not dial");
+    booted
+        .validate()
+        .expect("what boot applies is itself valid");
+}
+
+/// An update must never lock an operator out of `configure`: a saved config
+/// holding a value a newer rule refuses opens (with the boot-time warning),
+/// and the next commit + save writes the neutralised value. Received
+/// documents stay strict.
+#[test]
+fn ctrl08_configure_opens_a_saved_config_an_update_made_invalid() {
+    let doc = format!(
+        "{BASE}[services.ssh]\nport = 2222\nloglevel = {}\n",
+        toml_str("LOUD")
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "sentinel-ctrl08-configure-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("appliance.toml");
+    std::fs::write(&path, &doc).unwrap();
+    assert!(
+        Appliance::from_toml(&doc).is_err(),
+        "received documents stay strict"
+    );
+
+    let mut session = crate::session::Session::load(&path).expect("configure must open");
+    let committed = session.commit().expect("the neutralised candidate commits");
+    assert_eq!(committed.services.ssh.loglevel, None);
+    assert_eq!(committed.services.ssh.port, Some(2222));
+    session.save(None).expect("save");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("LOUD"), "{saved}");
+    let reread = Appliance::from_toml(&saved).expect("the saved file is now strictly valid");
+    assert_eq!(reread.services.ssh.port, Some(2222));
+
+    // The live reader takes the same road.
+    std::fs::write(&path, &doc).unwrap();
+    let saved = crate::session::Session::read_saved_at(&path)
+        .expect("the saved reader must not lock the operator out")
+        .expect("present");
+    assert_eq!(saved.services.ssh.loglevel, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
