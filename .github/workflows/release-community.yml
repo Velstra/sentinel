@@ -103,6 +103,35 @@ jobs:
         run: |
           bash scripts/release-tools.sh python3 scripts/community_release.py build --version "$RELEASE_VERSION" --output "$RUNNER_TEMP/factory"
           python3 scripts/community_release.py budget --input "$RUNNER_TEMP/factory"
+      # The image, not the source tree: corrected Nix CPEs, the kernel
+      # cataloger and vulnix as a second source. A failure stops signing.
+      - name: Image CVE gate and build-toolchain closure check
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s tests -p 'test_image_*.py' -v
+          tools=$(nix build --inputs-from . --no-link --print-out-paths \
+            nixpkgs#syft nixpkgs#grype nixpkgs#vulnix nixpkgs#erofs-utils.out nixpkgs#zstd nixpkgs#util-linux.bin)
+          for tool in $tools; do if [ -d "$tool/bin" ]; then PATH="$tool/bin:$PATH"; fi; done
+          syft version && grype version && vulnix --version
+          grype db update
+          zstd -d "$RUNNER_TEMP/factory/factory.raw.zst" -o "$RUNNER_TEMP/cve-scan.raw"
+          status=0
+          python3 scripts/image_cve_gate.py run --image "$RUNNER_TEMP/cve-scan.raw" \
+            --out "$RUNNER_TEMP/cve-scan" --fsck-erofs "$(command -v fsck.erofs)" || status=$?
+          rm -f "$RUNNER_TEMP/cve-scan.raw"
+          python3 scripts/check_image_closure.py "$RUNNER_TEMP/cve-scan/closure.txt" || status=1
+          exit "$status"
+      - name: Retain the CVE verdict
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-cve-verdict
+          path: |
+            ${{ runner.temp }}/cve-scan/verdict.json
+            ${{ runner.temp }}/cve-scan/rewrite-report.json
+            ${{ runner.temp }}/cve-scan/closure.txt
+          if-no-files-found: warn
+          retention-days: 30
       - id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

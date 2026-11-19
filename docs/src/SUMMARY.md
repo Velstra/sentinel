@@ -40,6 +40,7 @@
 - [Build the CLI and agent](building/cli.md)
 - [Reproduce a build](building/reproducibility.md)
 - [Verify the source SBOM](building/sbom.md)
+- [Scan the image for known vulnerabilities](building/vulnerability-scan.md)
 - [Licenses and redistribution notices](building/notices.md)
 - [Dataplane support and limitations](reference/dataplane-support.md)
 - [Flake outputs](reference/flake-outputs.md)
