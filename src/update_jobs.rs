@@ -174,7 +174,7 @@ pub struct Snapshot {
 }
 impl Snapshot {
     fn stable(&self) -> bool {
-        self.permanent && self.selected_entry == self.next_entry
+        boot_stable(self.permanent, &self.selected_entry, &self.next_entry)
     }
     fn validate(&self) -> bool {
         self.validate_with(crate::boot_entry::native_enabled())
@@ -992,6 +992,66 @@ fn boot_entry_with_policy(
         return Err(Error(Code::UnstableBoot));
     }
     Ok((name.into(), next.into(), entry.permanent_for(slot, version)))
+}
+
+/// The stable-boot precondition shared by every Community slot writer
+/// (CTRL-11), judged from `bootctl list --json=short` output: the running
+/// image is permanently assessed (no boot counter left on its entry) and is
+/// also the next default. Writing the inactive slot during a counted trial
+/// destroys the only known-good image, so a failing trial would brick the box
+/// instead of rolling back. The API job path enforces the same predicate
+/// through [`Snapshot::stable`].
+pub(crate) fn stable_boot_from(
+    bootctl: &[u8],
+    slot: &str,
+    release: &str,
+    verity: &str,
+    native: bool,
+) -> anyhow::Result<()> {
+    let refused = |_| anyhow::anyhow!("{}", Code::UnstableBoot.message());
+    let (selected, next, permanent) =
+        boot_entry_with_policy(bootctl, slot, release, verity, native).map_err(refused)?;
+    anyhow::ensure!(
+        boot_stable(permanent, &selected, &next),
+        "{} The running entry {selected} is {}; the next default is {next}. Let the boot \
+         assessment bless (or roll back) the running image first: overwriting the other slot \
+         now would remove the only known-good fallback.",
+        Code::UnstableBoot.message(),
+        if permanent {
+            "blessed"
+        } else {
+            "an unblessed counted trial"
+        }
+    );
+    Ok(())
+}
+
+/// Observe the live boot selection and apply [`stable_boot_from`].
+pub(crate) fn require_stable_boot() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let refused = |_| anyhow::anyhow!("{}", Code::UnstableBoot.message());
+    let identity = crate::image::current();
+    let slot = identity
+        .slot
+        .context("cannot identify the running A/B slot; refusing to write the other one")?;
+    let verity = identity
+        .verity
+        .context("cannot identify the running verity image; refusing to write the other slot")?;
+    let release = update::running_version()?;
+    let (code, bytes) =
+        probe(&system::bin("bootctl"), &["list", "--json=short"], 5).map_err(refused)?;
+    anyhow::ensure!(code.success(), "{}", Code::UnstableBoot.message());
+    stable_boot_from(
+        &bytes,
+        slot,
+        &release,
+        &verity,
+        crate::boot_entry::native_enabled(),
+    )
+}
+
+fn boot_stable(permanent: bool, selected: &str, next: &str) -> bool {
+    permanent && selected == next
 }
 
 fn active_guids(slot: &str) -> JobResult<(String, String)> {
@@ -2595,6 +2655,40 @@ mod tests {
             "2.0.1",
             &sample().verity,
         )
+    }
+    #[test]
+    fn every_slot_writer_refuses_an_unblessed_trial_or_pending_default() {
+        let judge = |rows: &[serde_json::Value]| {
+            stable_boot_from(
+                &serde_json::to_vec(rows).unwrap(),
+                "sentinel-b",
+                "2.0.1",
+                &sample().verity,
+                false,
+            )
+        };
+        judge(&entries()).unwrap();
+        // Booted from a counted, not yet blessed entry: the other slot is the
+        // only known-good image and must not be overwritten.
+        let mut trial = entries();
+        for (key, value) in [
+            ("id", "sentinel-b+2-1.efi"),
+            ("path", "/boot/EFI/Linux/sentinel-b+2-1.efi"),
+            ("linux", "/EFI/Linux/sentinel-b+2-1.efi"),
+        ] {
+            trial[0][key] = value.into();
+        }
+        trial[0]["triesLeft"] = 2.into();
+        trial[0]["triesDone"] = 1.into();
+        let error = judge(&trial).expect_err("trial boot must be refused");
+        assert!(
+            format!("{error:#}").contains("permanently assessed"),
+            "{error:#}"
+        );
+        // Unreadable boot state is not a stable boot either.
+        assert!(
+            stable_boot_from(b"not json", "sentinel-b", "2.0.1", &sample().verity, false).is_err()
+        );
     }
     #[test]
     fn update_jobs_bootctl_uses_actual_source_esp_path_schema() {
