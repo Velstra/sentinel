@@ -26,6 +26,12 @@
   users.users.admin.initialPassword = lib.mkForce null;
   services.getty.autologinUser = lib.mkForce null;
 
+  # The image says which release it is (IMG-11): os-release IMAGE_VERSION, the
+  # raw file name and `show version` read this. Release builds still force the
+  # tagged version; this replaces the bare "1" of an ordinary source build.
+  velstra.appliance.imageVersion = lib.mkDefault
+    (builtins.fromTOML (builtins.readFile ../Cargo.toml)).package.version;
+
   assertions = [
     {
       assertion = config.users.users.admin.initialPassword == null

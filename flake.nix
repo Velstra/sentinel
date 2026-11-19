@@ -12,9 +12,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    # The eBPF object's toolchain (the fenix nightly, bpf-linker, LLVM) is
+    # pinned apart from the userspace package set. The object is a
+    # fixed-output derivation and embeds toolchain store paths in its BTF, so
+    # following every nixpkgs security bump would change its bytes (and
+    # ebpfHash) without any source change. Advance this deliberately, with
+    # ebpfHash and the verifier matrix, never as part of a CVE bump.
+    nixpkgs-ebpf.url = "github:NixOS/nixpkgs/1f607aa79b6356ed45d3cd3c8079c196e79efa2c";
     fenix = {
       url = "github:nix-community/fenix";
-      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nixpkgs.follows = "nixpkgs-ebpf";
     };
     # The Velstra Fabric source (the data-plane agent lives here). Source only —
     # we build it with our own toolchain, so it needs no flake of its own.
@@ -39,7 +46,7 @@
   };
 
   outputs =
-    { self, nixpkgs, fenix, fabric, fabric-legacy-napt, wren }:
+    { self, nixpkgs, nixpkgs-ebpf, fenix, fabric, fabric-legacy-napt, wren }:
     let
       system = "x86_64-linux";
 
@@ -70,6 +77,8 @@
 
       pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
         (import ./nix/compact-tests.nix);
+      # Only the fixed-output eBPF object is built from this set (see inputs).
+      pkgsEbpf = nixpkgs-ebpf.legacyPackages.${system};
       lib = nixpkgs.lib;
 
       # Verify existing imported hashes without enabling legacy hashes in PAM.
@@ -149,6 +158,31 @@
         '';
       };
 
+      # rsyslog as Sentinel renders it: imjournal in, omfwd out (UDP/TCP, no
+      # TLS driver), nothing else. Every optional output module drags its
+      # client library into the appliance: MongoDB pulled a C toolchain
+      # (IMG-06), PostgreSQL's libpq alone carried 38 open High CVEs. Add a
+      # module back here only together with the renderer that uses it.
+      rsyslogFlags = {
+        withMysql = false; withPostgres = false; withDbi = false; withNetSnmp = false;
+        withCurl = false; withGnutls = false; withGcrypt = false; withLognorm = false;
+        withMaxminddb = false; withOpenssl = false; withRelp = false; withRdkafka = false;
+        withMongo = false; withCzmq = false; withRabbitmq = false; withHiredis = false;
+      };
+
+      # HAProxy 3.4.1 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
+      # (FCGI record-length overflow) and CVE-2026-55204 (HPACK NULL deref
+      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixes
+      # both. A leaf package, so it is substituted directly where it is used.
+      haproxyFor = p: assert p.haproxy.version == "3.3.17";
+        p.haproxy.overrideAttrs (_: {
+          version = "3.4.1";
+          src = p.fetchurl {
+            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.1.tar.gz";
+            sha256 = "1y12pjsja0cgbd3cidvql1b48ib32r1qdr8prz3knzfp9z7c8qif";
+          };
+        });
+
       # --- the sentinel CLI (stable rustc is fine) ---------------------------
       sentinelCore = pkgs.rustPlatform.buildRustPackage {
         pname = "sentinel";
@@ -215,6 +249,7 @@
         # PATH ambiguity at runtime, for both the admin and the boot service.
         postBuild = ''
           wrapProgram $out/bin/sentinel \
+            --set SENTINEL_GIT_REVISION   ${self.rev or self.dirtyRev or "unknown"} \
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
@@ -385,11 +420,14 @@
         printf '%s' '${ebpfSourceIdentity}' > source-id
         llvm-objcopy --add-section .velstra.source-id=source-id target/bpfel-unknown-none/release/velstra
       '';
-      velstra-ebpf = pkgs.stdenv.mkDerivation {
+      velstra-ebpf = pkgsEbpf.stdenv.mkDerivation {
         pname = "velstra-ebpf";
+        # A build-time object only (its references are discarded, so it never
+        # enters the image closure or the SBOM); the name stays put so the
+        # fixed-output derivation is not rebuilt for a label.
         version = "0.1.0";
         src = fabric;
-        nativeBuildInputs = [ nightly pkgs.bpf-linker pkgs.python3 pkgs.llvm pkgs.git pkgs.cacert ];
+        nativeBuildInputs = [ nightly pkgsEbpf.bpf-linker pkgsEbpf.python3 pkgsEbpf.llvm pkgsEbpf.git pkgsEbpf.cacert ];
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
@@ -425,7 +463,9 @@
 
       velstra = rustPlatformNightly.buildRustPackage {
         pname = "velstra";
-        version = "0.1.0";
+        # From the agent crate: the store name said 0.1.0 while the binary said
+        # 0.4.1, and CVE matching keys on the store name (IMG-11, STATIC-04).
+        version = (builtins.fromTOML (builtins.readFile "${fabric}/velstra-app/Cargo.toml")).package.version;
         src = fabric;
         cargoLock = {
           lockFile = "${fabric}/Cargo.lock";
@@ -526,6 +566,23 @@
       factoryAppliance = ./example-appliance.toml;
       applianceData = builtins.fromTOML (builtins.readFile factoryAppliance);
 
+      # Offline first-boot seeding of a raw image's data partition (PROV-01):
+      # every tool pinned, including the very `sentinel` that boots the image,
+      # for `config check`.
+      seedImage = pkgs.writeShellApplication {
+        name = "sentinel-seed-image";
+        runtimeInputs = [ pkgs.python3 ];
+        text = ''
+          export SEED_SFDISK=${pkgs.util-linux}/bin/sfdisk
+          export SEED_DEBUGFS=${pkgs.e2fsprogs}/bin/debugfs
+          export SEED_E2FSCK=${pkgs.e2fsprogs}/bin/e2fsck
+          export SEED_SSH_KEYGEN=${pkgs.openssh}/bin/ssh-keygen
+          export SEED_SENTINEL=${sentinel}/bin/sentinel
+          export SEED_QEMU_IMG=${pkgs.qemu-utils}/bin/qemu-img
+          exec python3 -I ${./scripts/seed-image.py} "$@"
+        '';
+      };
+
       # The built, Secure-Boot-signed raw image's path — bundled into the
       # installer ISO and used as the `--source` in the live-install test.
       sentinelImageRaw =
@@ -551,6 +608,11 @@
         # renamed to `image` in newer nixpkgs.)
         #   nix build .#sentinel-image
         sentinel-image = self.nixosConfigurations.sentinel-image.config.system.build.finalImageSigned;
+        # The same image before any signature: it does not depend on the
+        # builder's development keys, so compare and attest this one (and its
+        # usrhash) across builders; the signed image differs by signature only.
+        sentinel-image-unsigned = self.nixosConfigurations.sentinel-image.config.system.build.unsignedImage;
+        seed-image = seedImage;
         # The live-boot installer ISO (carries the image above; runs `sentinel
         # install`).  nix build .#sentinel-iso
         sentinel-iso = self.nixosConfigurations.sentinel-iso.config.system.build.isoImage;
@@ -563,6 +625,10 @@
       # NOTE: `.#sentinel-image` by contrast builds a raw DISK IMAGE (flashable,
       # no run script) — that's why `./result/bin/run-*-vm` doesn't exist after
       # building it. Use this app to *boot*; build the image to *flash*.
+      apps.${system}.seed-image = {
+        type = "app";
+        program = "${seedImage}/bin/sentinel-seed-image";
+      };
       apps.${system}.vm = {
         type = "app";
         program = "${self.nixosConfigurations.appliance.config.system.build.vm}/bin/run-${applianceData.system.hostname}-vm";
@@ -650,13 +716,14 @@
             # Sentinel-owned unit (below), off until a `[[services.reverse-proxy]]`
             # frontend is configured; on PATH so `sentinel commit` can `haproxy -c`
             # the rendered config before reloading.
-            pkgs.haproxy
+            (haproxyFor pkgs)
             # Remote syslog (roadmap C12): rsyslog reads the journal (imjournal) and
             # forwards RFC 5424 to the configured collectors. A Sentinel-owned unit
             # (below), off until `[services.syslog]` names a target. It never
             # replaces the local journal — this is an additional copy on the wire,
             # so losing the collector never costs you the local log.
-            pkgs.rsyslog
+            # Built with only what Sentinel renders (rsyslogFlags, IMG-06).
+            (pkgs.rsyslog.override rsyslogFlags)
             # Alert notifications (roadmap C23): msmtp is a send-only SMTP client,
             # so the appliance mails an alert without ever running a listening mail
             # server. Webhooks reuse the curl already pinned above.
@@ -829,7 +896,22 @@
               # `--any` returns as soon as ONE link is online (a static-addressed
               # link reaches routable in ~1s), and the leading `-` + `--timeout`
               # mean a stuck uplink is ignored after 30s rather than blocking boot.
-              ExecStartPre = "-${pkgs.systemd}/lib/systemd/systemd-networkd-wait-online --any --timeout=30";
+              # Name the links Sentinel configured: they are held with
+              # ActivationPolicy=manual, which makes RequiredForOnline default to
+              # no, so a bare `--any` ignored every one of them and always sat
+              # out the full timeout (+31 s on every boot, IMG-07). No managed
+              # link at all means nothing to wait for.
+              ExecStartPre = "-${pkgs.writeShellScript "sentinel-wait-configured-links" ''
+                set -u
+                links=()
+                for unit in /run/systemd/network/10-sentinel-*.network; do
+                  [ -e "$unit" ] || continue
+                  name=$(${pkgs.gnused}/bin/sed -n 's/^Name=\([^[:space:]*?]*\)$/\1/p;/^\[Network\]/q' "$unit" | ${pkgs.coreutils}/bin/head -n1)
+                  [ -n "$name" ] && links+=("--interface=$name")
+                done
+                [ "''${#links[@]}" -gt 0 ] || exit 0
+                exec ${pkgs.systemd}/lib/systemd/systemd-networkd-wait-online --any --timeout=30 "''${links[@]}"
+              ''}";
               # No `--config`: the stage picks what a commit applied since boot, else
               # the saved file — naming one would pin it to the saved file.
               ExecStart = "${sentinel}/bin/sentinel apply-boot-late";
@@ -1218,7 +1300,7 @@
             ];
             serviceConfig = {
               Type = "exec";
-              ExecStart = "${pkgs.rsyslog}/bin/rsyslogd -n -i NONE -f /run/sentinel/rsyslog.conf";
+              ExecStart = "${pkgs.rsyslog.override rsyslogFlags}/bin/rsyslogd -n -i NONE -f /run/sentinel/rsyslog.conf";
               Restart = "on-failure";
               RestartSec = "5s";
             };
@@ -1620,10 +1702,10 @@
             unitConfig.StartLimitIntervalSec = 0;
             serviceConfig = {
               Type = "exec";
-              ExecStart = "${pkgs.haproxy}/bin/haproxy -W -f /run/sentinel/haproxy/haproxy.cfg";
+              ExecStart = "${haproxyFor pkgs}/bin/haproxy -W -f /run/sentinel/haproxy/haproxy.cfg";
               # `haproxy -c` gates the reload in proxy::apply, so a running proxy is
               # only ever replaced with a config haproxy accepts.
-              ExecReload = "${pkgs.haproxy}/bin/haproxy -c -f /run/sentinel/haproxy/haproxy.cfg";
+              ExecReload = "${haproxyFor pkgs}/bin/haproxy -c -f /run/sentinel/haproxy/haproxy.cfg";
               Restart = "on-failure";
               RestartSec = "5s";
             };
@@ -1682,7 +1764,16 @@
 
       nixosConfigurations.appliance = nixpkgs.lib.nixosSystem {
         inherit system;
-        modules = [ self.nixosModules.sentinel ];
+        modules = [
+          self.nixosModules.sentinel
+          # Development-VM convenience ONLY (`nix run .#vm`): SSH is key-only, so
+          # the QEMU console would otherwise be a dead end. A KNOWN password and
+          # an autologin — never reuse this configuration for a real box.
+          {
+            users.users.admin.initialPassword = "sentinel";
+            services.getty.autologinUser = "admin";
+          }
+        ];
       };
 
       # The same appliance, packaged as a verified-boot disk image (dm-verity
@@ -1692,6 +1783,12 @@
         modules = [
           self.nixosModules.sentinel
           ./nix/image.nix
+          # The shipped closure's security backports (IMG-04, IMG-02). Applied
+          # to the image (and to the checks that verify them), not to the
+          # shared module: the closure rewrite changes the store paths of
+          # everything above libcap/libxcrypt, and image-booting checks that
+          # run host store paths inside the guest would no longer find them.
+          ./nix/security-backports.nix
           # The verity image build reads `config.nixpkgs.hostPlatform` (efiArch);
           # define it explicitly (this nixpkgs' `nixosSystem` doesn't set it from
           # the `system` arg).
@@ -1819,6 +1916,60 @@
         install-boot-luks-retry = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; invalidAttempts = 2; };
         install-boot-raid1 = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1"; };
         install-boot-raid1-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1-luks"; };
+        legacy-hash-login = import ./nix/legacy-hash-login-test.nix { inherit pkgs self; };
+        image-first-boot = import ./nix/image-first-boot-test.nix { inherit pkgs self; seedImage = seedImage; };
+        image-first-boot-mke2fs = import ./nix/image-first-boot-test.nix { inherit pkgs self; seeding = "mke2fs"; };
+        # IMG-06: no compiler, binutils, kernel headers or -dev output may ship.
+        image-closure = pkgs.runCommand "sentinel-image-closure" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          # The one reviewed exception: every NixOS setuid wrapper (sudo, su,
+          # unix_chkpwd, mount, ...) is a static musl binary that keeps a string
+          # reference to the kernel headers it was compiled against. Headers,
+          # no compiler; gcc, binutils and glibc-dev left with rsyslog's Mongo
+          # output.
+          python3 -B ${./scripts/check_image_closure.py} \
+            --allow "linux-headers-static=string reference from the static security-wrapper binaries" \
+            ${pkgs.closureInfo {
+            rootPaths = [ self.nixosConfigurations.sentinel-image.config.system.build.toplevel ];
+          }}/store-paths
+          touch $out
+        '';
+        # The release CVE gate and closure check (IMG-05), as pure unit tests.
+        image-gate-unit = pkgs.runCommand "sentinel-image-gate-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p scripts tests
+          cp ${./scripts/image_cve_gate.py} scripts/image_cve_gate.py
+          cp ${./scripts/check_image_closure.py} scripts/check_image_closure.py
+          cp ${./scripts/nix_cpe_map.json} scripts/nix_cpe_map.json
+          cp ${./scripts/cve-waivers.json} scripts/cve-waivers.json
+          cp ${./tests/test_image_cve_gate.py} tests/test_image_cve_gate.py
+          cp ${./tests/test_image_closure.py} tests/test_image_closure.py
+          python3 -B -m unittest discover -s tests -p 'test_image_c*.py' -v
+          touch $out
+        '';
+        # PROV-01 seeding tool, end to end against real e2fsprogs.
+        seed-image-unit = pkgs.runCommand "sentinel-seed-image-unit" {
+          nativeBuildInputs = [ pkgs.python3 ];
+          SEED_E2E = "1";
+          SEED_SFDISK = "${pkgs.util-linux}/bin/sfdisk";
+          SEED_DEBUGFS = "${pkgs.e2fsprogs}/bin/debugfs";
+          SEED_E2FSCK = "${pkgs.e2fsprogs}/bin/e2fsck";
+          SEED_MKFS_EXT4 = "${pkgs.e2fsprogs}/bin/mkfs.ext4";
+          SEED_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
+          SEED_SENTINEL = "${sentinel}/bin/sentinel";
+        } ''
+          mkdir -p scripts tests
+          cp ${./scripts/seed-image.py} scripts/seed-image.py
+          cp ${./tests/test_seed_image.py} tests/test_seed_image.py
+          python3 -B -m unittest discover -s tests -p 'test_seed_image.py' -v 2>&1 | tee log
+          ! grep -q "skipped" log
+          touch $out
+        '';
+        # STATIC-08: the console harness reaps its browser and profile on every path.
+        console-harness-unit = pkgs.runCommand "sentinel-console-harness-unit" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+          cp ${./tests/console/harness.mjs} harness.mjs
+          cp ${./tests/console/harness-cleanup.unit.mjs} harness-cleanup.unit.mjs
+          node --test harness-cleanup.unit.mjs
+          touch $out
+        '';
         state-growth-unit = pkgs.runCommand "sentinel-state-growth-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
           mkdir -p test
           cp ${./nix/grow-state.py} test/grow-state.py

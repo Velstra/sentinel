@@ -18,6 +18,15 @@ ESP = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
 HASH = '77ff5f63-e7b6-4633-acf4-1565b864c0e6'
 STORE = '8484680c-9521-48c6-9c11-b0720656f69e'
 GENERIC = '0fc63daf-8483-4772-8e79-3d69d8477de4'
+EXT4_MAGIC = 0xEF53
+EXT4_INCOMPAT_64BIT = 0x80
+# Growth below this is not worth a check-and-resize pass: resize2fs leaves a
+# final partial group out when it would be smaller than its own overhead, so
+# a grown filesystem legitimately stays a little short of its partition.
+FILESYSTEM_SLACK_BYTES = 16*1024**2
+# Offline growth of a large disk writes new group metadata; give it room
+# without letting a stalled disk hold the boot forever.
+FILESYSTEM_TIMEOUT_SECONDS = 240
 
 
 def require(condition, message):
@@ -220,6 +229,60 @@ def split_mirror_report(disks, commands):
             'raw_data_growth_applicable':False}
 
 
+def ext4_geometry(superblock):
+    """Return (block_size, block_count) of an ext4 primary superblock."""
+    require(isinstance(superblock,bytes) and len(superblock) >= 1024, 'short ext4 superblock')
+    field = lambda offset, size: int.from_bytes(superblock[offset:offset+size],'little')
+    require(field(0x38,2) == EXT4_MAGIC, 'data partition holds no ext4 superblock')
+    log_block = field(0x18,4)
+    require(log_block <= 6, 'impossible ext4 block size')
+    count = field(0x04,4)
+    if field(0x60,4) & EXT4_INCOMPAT_64BIT:
+        count |= field(0x150,4) << 32
+    require(count > 0, 'empty ext4 filesystem')
+    return 1024 << log_block, count
+
+
+def read_superblock(device):
+    with os.fdopen(os.open(device,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC),'rb') as source:
+        source.seek(1024)
+        return source.read(1024)
+
+
+def partition_bytes(device):
+    return int((Path('/sys/class/block')/Path(device).name/'size').read_text().strip())*512
+
+
+def filesystem_growth(commands, data):
+    """Grow the unmounted data ext4 to its partition, offline.
+
+    The online resize that x-systemd.growfs performed ran while the first
+    writers were already allocating in group 0; on offline-seeded images that
+    first boot reported a corrupt group-0 inode bitmap and failed (PROV-02).
+    Checking and growing before the mount has no concurrent writer, and the
+    forced check finds a damaged seed before anything writes to it. Never fatal to the boot: a filesystem that cannot be
+    grown is still mounted at its existing size and the failure is reported.
+    """
+    try:
+        block, count = ext4_geometry(read_superblock(data))
+        before = block*count
+        available = partition_bytes(data)
+        require(before <= available, 'ext4 filesystem is larger than its partition')
+        if available-before <= FILESYSTEM_SLACK_BYTES:
+            return {'filesystem_growth':'unchanged','filesystem_bytes':before}
+        require(not mounted_device(data), 'data mounted before filesystem growth')
+        # e2fsck exit 1 means "errors corrected"; anything else stops growth.
+        commands.run('e2fsck','-f','-p',data,ok=(0,1),timeout=FILESYSTEM_TIMEOUT_SECONDS)
+        commands.run('resize2fs',data,timeout=FILESYSTEM_TIMEOUT_SECONDS)
+        block, count = ext4_geometry(read_superblock(data))
+        after = block*count
+        require(available-after <= FILESYSTEM_SLACK_BYTES and after > before,
+                'resize2fs did not grow the filesystem to its partition')
+        return {'filesystem_growth':'grown','filesystem_bytes_before':before,'filesystem_bytes':after}
+    except (ValueError,OSError,subprocess.SubprocessError) as error:
+        return {'filesystem_growth':'failed','filesystem_error':str(error)}
+
+
 def mounted_device(device):
     number = os.stat(device).st_rdev
     target = f'{os.major(number)}:{os.minor(number)}'
@@ -230,12 +293,12 @@ class Commands:
     def __init__(self, args):
         self.args = args
 
-    def run(self, tool, *args):
+    def run(self, tool, *args, ok=(0,), timeout=45):
         command = [getattr(self.args,tool),*map(str,args)]
-        out = subprocess.run(command,check=False,capture_output=True,text=True,timeout=45,
+        out = subprocess.run(command,check=False,capture_output=True,text=True,timeout=timeout,
                              env={'PATH':'/run/current-system/sw/bin','LANG':'C.UTF-8',
                                   'SYSTEMD_COLORS':'0','SYSTEMD_PAGER':'cat'})
-        require(out.returncode == 0, tool+' refused the verified boot-disk operation: '+out.stderr[-2000:])
+        require(out.returncode in ok, tool+' refused the verified boot-disk operation: '+out.stderr[-2000:])
         require(len(out.stdout) <= 1024**2, 'oversized '+tool+' response')
         return out.stdout
 
@@ -312,10 +375,10 @@ def run(args):
         # Preserve the valid installer geometry exactly; do not resize/shrink,
         # ignore a failed repart, or create a substitute plaintext filesystem.
         current = before['parts'][5]['size']*512
-        return {'status':'unchanged','disk':disk,'data':data,'old_bytes':current,'planned_bytes':current,
-                'writes':False,'protected_partitions_unchanged':True,
-                'planning':'existing data already covers verified GPT usable capacity within normal tail overhead',
-                'filesystem_growth':'separate x-systemd.growfs mount step; not asserted by this helper'}
+        report = {'status':'unchanged','disk':disk,'data':data,'old_bytes':current,'planned_bytes':current,
+                  'writes':False,'protected_partitions_unchanged':True,
+                  'planning':'existing data already covers verified GPT usable capacity within normal tail overhead'}
+        return report | (filesystem_growth(commands,data) if args.apply else {'filesystem_growth':'not-applied'})
     with tempfile.TemporaryDirectory(prefix='appliance-data-growth-',dir='/run') as temporary:
         directory = Path(temporary)
         require(stat.S_IMODE(directory.stat().st_mode) == 0o700, 'definitions are not private')
@@ -339,17 +402,17 @@ def run(args):
             kernel_size = int((Path('/sys/class/block')/Path(data).name/'size').read_text().strip())*512
             require(kernel_size == wanted, 'kernel did not accept the data-partition growth')
             require(identifier(commands.filesystem(data)['UUID']) == filesystem_id, 'data filesystem identity changed')
-    return {'status':'partition-grown' if args.apply and changed else 'unchanged' if not changed else 'dry-run',
-            'disk':disk,'data':data,'old_bytes':before['parts'][5]['size']*512,'planned_bytes':wanted,
-            'writes':bool(args.apply and changed),'protected_partitions_unchanged':True,
-            'planning':'verified header-only private sparse copy; no source GPT write before approval',
-            'filesystem_growth':'separate x-systemd.growfs mount step; not asserted by this helper'}
+    report = {'status':'partition-grown' if args.apply and changed else 'unchanged' if not changed else 'dry-run',
+              'disk':disk,'data':data,'old_bytes':before['parts'][5]['size']*512,'planned_bytes':wanted,
+              'writes':bool(args.apply and changed),'protected_partitions_unchanged':True,
+              'planning':'verified header-only private sparse copy; no source GPT write before approval'}
+    return report | (filesystem_growth(commands,data) if args.apply else {'filesystem_growth':'not-applied'})
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply',action='store_true',help='Grow only approved existing data partition before it is mounted')
-    for tool in ('sfdisk','blkid','repart','udevadm'):
+    for tool in ('sfdisk','blkid','repart','udevadm','e2fsck','resize2fs'):
         executable = 'systemd-repart' if tool == 'repart' else tool
         parser.add_argument('--'+tool,default='/run/current-system/sw/bin/'+executable)
     try:

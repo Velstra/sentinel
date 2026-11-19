@@ -38,8 +38,11 @@ for index, part in enumerate(regions, 1):
 report = {"layout": layout, "original_region_sha256": hashes,
           "state_not_mounted": True, "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
 if before:
-    assert hashes == before["original_region_sha256"], "growth changed existing partition payload"
+    # ESP, both verity/store slots: byte-identical. The data partition is NOT:
+    # its ext4 is now grown offline in the same unit (PROV-02), which rewrites
+    # superblock and group metadata by design; the test checks its files.
+    assert hashes[:5] == before["original_region_sha256"][:5], "growth changed a protected partition payload"
     expected = before["layout"]
     grow.validate_after(expected, table, layout["parts"][5]["size"]*512)
-    report["all_six_original_regions_unchanged"] = True
+    report["protected_regions_unchanged"] = True
 (directory/(stage+".json")).write_text(json.dumps(report, indent=2))

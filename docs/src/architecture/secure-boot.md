@@ -18,7 +18,7 @@ Look for the Secure Boot state. Use a signed appliance image and firmware with t
 
 ## Choose the signing identity
 
-Public source builds use development PK, KEK and db material whose private keys are readable in the Nix store. They are demonstration identities, not production secrets. The ESP carries enrollment payloads under `/loader/keys/sentinel/`.
+Public source builds use development PK, KEK and db material whose private keys are readable in the Nix store. They are demonstration identities, not production secrets. Because those keys are not secret, a source build ships no enrollment payloads for them: `/loader/keys/sentinel/` holds only a README unless a lab sets `velstra.appliance.secureBoot.developmentEnrollment`. A signed release installs its own payloads there.
 
 The public module does not provide a complete supported production key-custody, rotation and revocation workflow. Do not put production private keys in a derivation, repository, store path or appliance image. Production needs a separately reviewed signing boundary, protected custody, public-key enrollment and a tested revocation/recovery plan. The OTA signing identity is separate from the firmware identity.
 

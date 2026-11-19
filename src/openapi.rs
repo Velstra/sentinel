@@ -73,6 +73,8 @@ pub fn document() -> Value {
         "info": {
             "title": "Velstra Sentinel",
             "version": env!("CARGO_PKG_VERSION"),
+            // The commit this binary was built from, or "unknown" (STATIC-04).
+            "x-source-revision": crate::build_info::revision(),
             "description": "The appliance's management API: the same service that serves \
                 the console. Everything but `health`, `login` and this document sits behind \
                 a bearer token — the machine token in `/var/lib/sentinel/api-token`, or the \

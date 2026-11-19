@@ -39,10 +39,116 @@ function freePort() {
   });
 }
 
+// ---- browser processes and their profile directories ------------------------
+//
+// Every launched browser owns a throwaway profile directory. Those directories
+// used to outlive the run: `close()` sent SIGTERM and removed the directory in
+// the same tick, while Chromium was still writing to it, and a test that threw
+// before `close()` never removed it at all — over a thousand
+// `/tmp/sentinel-console-*` directories piled up. Now each browser is
+// registered here, `close()` removes its profile only once the whole process
+// group has exited, and the process 'exit' handler (also reached from SIGINT,
+// SIGTERM and SIGHUP) kills and removes whatever is still registered.
+
+const live = new Map(); // profile directory -> { proc, gone: Promise<void> }
+const CLOSE_GRACE_MS = Number(process.env.CONSOLE_CLOSE_GRACE_MS || 5000);
+let handlersInstalled = false;
+
+function signalGroup(proc, signal) {
+  // The browser runs in its own process group (spawned detached), so its
+  // renderer and utility children are signalled too, not orphaned onto the
+  // profile they were writing.
+  try { process.kill(-proc.pid, signal); return; } catch (e) { /* no group */ }
+  try { proc.kill(signal); } catch (e) { /* already gone */ }
+}
+
+function removeProfile(profile) {
+  // A renderer can still be flushing a file for a moment after the group was
+  // signalled; retry instead of leaving a half-removed directory behind.
+  try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  catch (e) { console.error(`could not remove browser profile ${profile}: ${e.message}`); }
+}
+
+/// Kill every browser still registered and remove its profile, synchronously.
+/// Runs from the process 'exit' handler, where nothing asynchronous happens.
+export function reapAll() {
+  for (const [profile, entry] of live) {
+    if (entry.proc && entry.proc.exitCode === null && entry.proc.signalCode === null) {
+      signalGroup(entry.proc, "SIGKILL");
+    }
+    removeProfile(profile);
+    live.delete(profile);
+  }
+}
+
+function installHandlers() {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+  process.on("exit", reapAll);
+  for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143], ["SIGHUP", 129]]) {
+    process.once(signal, () => process.exit(code));
+  }
+}
+
+/// Register a new profile directory (before the browser that uses it starts,
+/// so a launch that fails still has its directory removed).
+export function registerProfile(profile) {
+  installHandlers();
+  live.set(profile, { proc: null, gone: Promise.resolve() });
+}
+
+/// Attach the browser process that uses a registered profile.
+export function attachProcess(profile, proc) {
+  const gone = new Promise((resolve) => {
+    if (proc.exitCode !== null || proc.signalCode !== null) resolve();
+    else proc.once("exit", () => resolve());
+  });
+  live.set(profile, { proc, gone });
+}
+
+/// Stop the browser of a profile and remove the directory once it has exited:
+/// SIGTERM, then SIGKILL after a bounded grace period. Resolves when the
+/// directory is gone. Safe to call twice; callers that do not await it are
+/// still covered by the 'exit' handler.
+export async function releaseProfile(profile, { graceMs = CLOSE_GRACE_MS } = {}) {
+  const entry = live.get(profile);
+  if (!entry) return;
+  const { proc, gone } = entry;
+  if (proc && proc.exitCode === null && proc.signalCode === null) {
+    signalGroup(proc, "SIGTERM");
+    let timer;
+    const timedOut = new Promise((resolve) => { timer = setTimeout(() => resolve(true), graceMs); });
+    if (await Promise.race([gone.then(() => false), timedOut])) {
+      signalGroup(proc, "SIGKILL");
+      await gone;
+    }
+    clearTimeout(timer);
+  }
+  // The whole group was signalled; give its children a moment to let go.
+  if (proc) signalGroup(proc, "SIGKILL");
+  removeProfile(profile);
+  live.delete(profile);
+}
+
+/// The profile directories this process still owns (for tests of the above).
+export function liveProfiles() {
+  return [...live.keys()];
+}
+
 /// Launch a headless browser and connect to its first page.
 export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   if (!port) port = await freePort();
   const profile = mkdtempSync(join(tmpdir(), "sentinel-console-"));
+  registerProfile(profile);
+  try {
+    return await launch(profile, { port, width, height });
+  } catch (e) {
+    await releaseProfile(profile);
+    throw e;
+  }
+}
+
+async function launch(profile, { port, width, height }) {
   const proc = spawn(CHROME, [
     "--headless=new",
     `--remote-debugging-port=${port}`,
@@ -56,7 +162,8 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
     `--window-size=${width},${height}`,
     `--user-data-dir=${profile}`,
     "about:blank",
-  ], { stdio: ["ignore", "pipe", "pipe"] });
+  ], { stdio: ["ignore", "pipe", "pipe"], detached: true });
+  attachProcess(profile, proc);
 
   // The browser's own last words. When it dies mid-run — out of memory in a
   // build sandbox, a renderer crash — the only evidence is on its stderr, and
@@ -189,10 +296,11 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
     async screenshot() {
       return (await send("Page.captureScreenshot", { format: "png" })).result.data;
     },
+    /// Stop the browser and remove its profile once it has exited. Returns a
+    /// promise; `await` it where the next step needs the directory gone.
     close() {
       try { ws.close(); } catch (e) {}
-      proc.kill();
-      try { rmSync(profile, { recursive: true, force: true }); } catch (e) {}
+      return releaseProfile(profile);
     },
   };
 }
