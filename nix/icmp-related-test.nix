@@ -141,9 +141,12 @@ pkgs.testers.runNixOSTest {
     source_port = 41000
 
     def oracle(mode="related", nat=True):
-        # Explicit prohibitions are before the RELATED rule, just as they are
-        # before the exception in Sentinel. UDP probe admission is independent.
-        forbid = 'ip protocol icmp counter drop' if mode in ("explicit-deny", "block-icmp") else ""
+        # An explicit deny rule is before the RELATED rule, just as it is before
+        # the exception in Sentinel. block-icmp is not: it refuses NEW ICMP, so
+        # an error about a tracked flow is still delivered (audit DP-10/DP-C07).
+        # UDP probe admission is independent.
+        forbid = 'ip protocol icmp counter drop' if mode == "explicit-deny" else ""
+        after = 'ip protocol icmp counter drop' if mode == "block-icmp" else ""
         allow = 'ip protocol icmp counter accept' if mode in ("explicit-allow", "stateful-off-allow") else ""
         tracked = 'ct state established,related counter accept' if mode not in ("stateful-off", "stateful-off-allow") else ""
         rules = """
@@ -156,9 +159,11 @@ pkgs.testers.runNixOSTest {
               %s
               %s
               %s
+              %s
             }
             chain forward {
               type filter hook forward priority filter; policy drop;
+              %s
               %s
               %s
               %s
@@ -168,7 +173,7 @@ pkgs.testers.runNixOSTest {
               ct status dnat ip protocol udp counter accept
             }
           }
-        """ % (forbid, allow, tracked, forbid, allow, tracked)
+        """ % (forbid, allow, tracked, after, forbid, allow, tracked, after)
         if nat:
             rules += """
               table ip related_nat {
@@ -210,6 +215,7 @@ pkgs.testers.runNixOSTest {
             + [("port-min", True)]
             if mode == "related" else
             [("unrelated-non-nat", True)] if mode in ("explicit-allow", "stateful-off-allow") else
+            [("port-min", True)] if mode == "block-icmp" else
             [(mode, False)] if mode in ("missing-physical-state", "wrong-ingress", "expired-state") else
             [("port-min", False)]
         )
@@ -391,7 +397,10 @@ pkgs.testers.runNixOSTest {
                 "set firewall rule reject-errors action drop"]),
             ("block-icmp", ["delete firewall rule reject-errors", "set firewall zone wan block-icmp true"]),
         ]:
-            with subtest("RELATED does not bypass " + mode):
+            # block-icmp refuses new ICMP only; the error about the tracked flow
+            # is delivered on both paths (see the oracle above).
+            title = "RELATED passes " if mode == "block-icmp" else "RELATED does not bypass "
+            with subtest(title + mode):
                 script = "\n".join(commands + ["commit", "save"]) + "\n"
                 dut.succeed("printf %s " + shlex.quote(script) + " | sentinel configure")
                 oracle(mode)
