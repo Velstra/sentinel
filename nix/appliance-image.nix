@@ -58,33 +58,46 @@ let
   usrVerityType = "77ff5f63-e7b6-4633-acf4-1565b864c0e6";
 
   # --- Secure Boot ---------------------------------------------------------
-  # Self-signed PK/KEK/db keys. NOTE: generated at build time (cached, so stable
-  # across rebuilds) — a DEMO/default. A real deployment overrides these with the
-  # operator's own keys so updates stay signed by a key the firmware trusts.
+  # Self-signed DEVELOPMENT PK/KEK/db keys, generated per builder at build time.
+  # Their private halves sit in that builder's world-readable store, so they are
+  # no trust root and no enrollment payload for them ships unless
+  # `secureBoot.developmentEnrollment` asks for it (IMG-03). A release is
+  # re-signed outside the store with the release identity
+  # (scripts/community_release.py sign); attest a build by its UNSIGNED image
+  # (`system.build.image`) and its usrhash, which do not depend on these keys.
+  #
+  # Every signature is made at one fixed time, so the same keys give the same
+  # bytes: sbsign embeds the signing time and nothing else varies.
+  signingTime = "2025-01-01 00:00:00";
+  faketime = "TZ=UTC ${pkgs.libfaketime}/bin/faketime '${signingTime}'";
   sbKeys = pkgs.runCommand "${cfg.slotPrefix}-sb-keys" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir -p $out
     for k in PK KEK db; do
-      openssl req -new -x509 -newkey rsa:2048 -nodes -days 7300 -sha256 \
+      ${faketime} openssl req -new -x509 -newkey rsa:2048 -nodes -days 7300 -sha256 \
         -subj "/CN=${cfg.secureBootCommonName} $k/" \
         -keyout $out/$k.key -out $out/$k.crt
     done
   '';
-  # systemd-boot, signed with the db key (the firmware verifies it).
-  signedSdBoot =
-    pkgs.runCommand "${cfg.slotPrefix}-systemd-boot-signed.efi"
-      { nativeBuildInputs = [ pkgs.sbsigntool ]; }
-      ''sbsign --key ${sbKeys}/db.key --cert ${sbKeys}/db.crt --output $out ${sdBoot}'';
-  # PK/KEK/db enrollment payloads for the operator (baked under /loader/keys).
+  # PK/KEK/db enrollment payloads for the development keys (opt-in only).
   sbGuid = "a5a5a5a5-1234-5678-9abc-def012345678";
   sbAuth = pkgs.runCommand "${cfg.slotPrefix}-sb-auth" { nativeBuildInputs = [ pkgs.efitools ]; } ''
     mkdir -p $out
     cert-to-efi-sig-list -g ${sbGuid} ${sbKeys}/PK.crt  PK.esl
     cert-to-efi-sig-list -g ${sbGuid} ${sbKeys}/KEK.crt KEK.esl
     cert-to-efi-sig-list -g ${sbGuid} ${sbKeys}/db.crt  db.esl
-    sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/PK.key  -c ${sbKeys}/PK.crt  PK  PK.esl  $out/PK.auth
-    sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/PK.key  -c ${sbKeys}/PK.crt  KEK KEK.esl $out/KEK.auth
-    sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/KEK.key -c ${sbKeys}/KEK.crt db  db.esl  $out/db.auth
+    ${faketime} sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/PK.key  -c ${sbKeys}/PK.crt  PK  PK.esl  $out/PK.auth
+    ${faketime} sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/PK.key  -c ${sbKeys}/PK.crt  KEK KEK.esl $out/KEK.auth
+    ${faketime} sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/KEK.key -c ${sbKeys}/KEK.crt db  db.esl  $out/db.auth
   '';
+  # Kept in the ESP so a release signer has the directory to install its own
+  # enrollment payloads into, and so an operator finds out why there are none.
+  sbKeysReadme = pkgs.writeText "README.txt" ''
+    This image was signed with per-build DEVELOPMENT Secure Boot keys.
+    Their private keys are not secret, so no enrollment payload is provided
+    for them. Enroll the payloads published with a signed release instead.
+  '';
+  # Files in the ESP that carry an Authenticode signature (both sd-boot copies).
+  sdBootTargets = [ "/EFI/BOOT/BOOT${lib.toUpper efiArch}.EFI" "/EFI/systemd/systemd-boot${efiArch}.efi" ];
   # The slot-A UKI's filename in the ESP, e.g. `sentinel-a+3.efi`.
   ukiFile = "${config.boot.uki.name}+${toString config.boot.uki.tries}.efi";
 in
@@ -188,6 +201,16 @@ in
       default = "Velstra Sentinel Secure Boot";
       description = "CN prefix of the generated demo Secure Boot keys.";
     };
+    secureBoot.developmentEnrollment = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Ship PK/KEK/db enrollment payloads for the per-build development keys
+        under /loader/keys/<slotPrefix>. Off: those private keys are readable in
+        the builder's store, so enrolling them trusts anyone with that store.
+        Enable only for a lab that enrolls a key it generated itself.
+      '';
+    };
   };
 
   config = {
@@ -272,12 +295,26 @@ in
           chmod +w "$img"
           # ESP is the first partition; mtools addresses it at its byte offset.
           start=$(sfdisk -d "$img" | grep 'name="esp"' | grep -oE 'start=[[:space:]]*[0-9]+' | grep -oE '[0-9]+')
-          off=$(( start * 512 ))
-          mcopy -i "$img@@$off" "::/EFI/Linux/${ukiFile}" uki.efi
-          sbsign --key ${sbKeys}/db.key --cert ${sbKeys}/db.crt --output uki.signed.efi uki.efi
-          sbverify --cert ${sbKeys}/db.crt uki.signed.efi
-          mcopy -o -i "$img@@$off" uki.signed.efi "::/EFI/Linux/${ukiFile}"
+          esp="$img@@$(( start * 512 ))"
+          # Sign systemd-boot and the UKI here, not inside the repart build: the
+          # unsigned image then does not depend on this builder's keys.
+          for item in ${lib.escapeShellArgs sdBootTargets} "/EFI/Linux/${ukiFile}"; do
+            mcopy -i "$esp" "::$item" pe.efi
+            ${faketime} sbsign --key ${sbKeys}/db.key --cert ${sbKeys}/db.crt --output pe.signed.efi pe.efi
+            sbverify --cert ${sbKeys}/db.crt pe.signed.efi
+            mcopy -o -i "$esp" pe.signed.efi "::$item"
+            rm pe.efi pe.signed.efi
+          done
+          # Store files have mtime 1 (1970), which FAT cannot hold and mtools
+          # wrapped to 2098 (IMG-11). Give every ESP file the signing time.
+          mkdir esp
+          mcopy -s -n -i "$esp" "::/*" esp/
+          find esp -exec touch -h -d '${signingTime}Z' {} +
+          (cd esp && find . -type f | sort) | while read -r file; do
+            mcopy -m -o -i "$esp" "esp/$file" "::''${file#.}"
+          done
         '';
+    system.build.unsignedImage = config.system.build.image;
 
     # NixOS 26.05 already installs boot-complete.target and bless-boot when
     # systemd has bootloader support. Add only the optional health gate;
@@ -470,14 +507,15 @@ in
             Format = "vfat";
             SizeMinBytes = cfg.espSize;
           };
-          # Bake the **signed** systemd-boot + its config into the ESP (the
-          # verityStore module injects the signed slot-A UKI on top via
-          # finalPartitions). The PK/KEK/db enrollment payloads go under
-          # /loader/keys/<prefix> so an operator can enroll them from the firmware.
+          # Bake the UNSIGNED systemd-boot + its config into the ESP (the
+          # verityStore module injects the slot-A UKI on top via
+          # finalPartitions); finalImageSigned signs both afterwards.
           contents = {
-            "/EFI/BOOT/BOOT${lib.toUpper efiArch}.EFI".source = signedSdBoot;
-            "/EFI/systemd/systemd-boot${efiArch}.efi".source = signedSdBoot;
+            "/EFI/BOOT/BOOT${lib.toUpper efiArch}.EFI".source = sdBoot;
+            "/EFI/systemd/systemd-boot${efiArch}.efi".source = sdBoot;
             "/loader/loader.conf".source = loaderConf;
+            "/loader/keys/${cfg.slotPrefix}/README.txt".source = sbKeysReadme;
+          } // lib.optionalAttrs cfg.secureBoot.developmentEnrollment {
             "/loader/keys/${cfg.slotPrefix}/PK.auth".source = "${sbAuth}/PK.auth";
             "/loader/keys/${cfg.slotPrefix}/KEK.auth".source = "${sbAuth}/KEK.auth";
             "/loader/keys/${cfg.slotPrefix}/db.auth".source = "${sbAuth}/db.auth";

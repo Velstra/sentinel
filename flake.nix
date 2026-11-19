@@ -437,7 +437,9 @@
 
       velstra = rustPlatformNightly.buildRustPackage {
         pname = "velstra";
-        version = "0.1.0";
+        # From the agent crate: the store name said 0.1.0 while the binary said
+        # 0.4.1, and CVE matching keys on the store name (IMG-11, STATIC-04).
+        version = (builtins.fromTOML (builtins.readFile "${fabric}/velstra-app/Cargo.toml")).package.version;
         src = fabric;
         cargoLock = {
           lockFile = "${fabric}/Cargo.lock";
@@ -668,7 +670,10 @@
             # (below), off until `[services.syslog]` names a target. It never
             # replaces the local journal — this is an additional copy on the wire,
             # so losing the collector never costs you the local log.
-            pkgs.rsyslog
+            # Built without the MongoDB output (never rendered): its client
+            # library carried a whole C toolchain (gcc, binutils, glibc-dev,
+            # linux-headers) into the appliance closure (IMG-06).
+            (pkgs.rsyslog.override { withMongo = false; })
             # Alert notifications (roadmap C23): msmtp is a send-only SMTP client,
             # so the appliance mails an alert without ever running a listening mail
             # server. Webhooks reuse the curl already pinned above.
@@ -841,7 +846,22 @@
               # `--any` returns as soon as ONE link is online (a static-addressed
               # link reaches routable in ~1s), and the leading `-` + `--timeout`
               # mean a stuck uplink is ignored after 30s rather than blocking boot.
-              ExecStartPre = "-${pkgs.systemd}/lib/systemd/systemd-networkd-wait-online --any --timeout=30";
+              # Name the links Sentinel configured: they are held with
+              # ActivationPolicy=manual, which makes RequiredForOnline default to
+              # no, so a bare `--any` ignored every one of them and always sat
+              # out the full timeout (+31 s on every boot, IMG-07). No managed
+              # link at all means nothing to wait for.
+              ExecStartPre = "-${pkgs.writeShellScript "sentinel-wait-configured-links" ''
+                set -u
+                links=()
+                for unit in /run/systemd/network/10-sentinel-*.network; do
+                  [ -e "$unit" ] || continue
+                  name=$(${pkgs.gnused}/bin/sed -n 's/^Name=\([^[:space:]*?]*\)$/\1/p;/^\[Network\]/q' "$unit" | ${pkgs.coreutils}/bin/head -n1)
+                  [ -n "$name" ] && links+=("--interface=$name")
+                done
+                [ "''${#links[@]}" -gt 0 ] || exit 0
+                exec ${pkgs.systemd}/lib/systemd/systemd-networkd-wait-online --any --timeout=30 "''${links[@]}"
+              ''}";
               # No `--config`: the stage picks what a commit applied since boot, else
               # the saved file — naming one would pin it to the saved file.
               ExecStart = "${sentinel}/bin/sentinel apply-boot-late";
@@ -1225,7 +1245,7 @@
             ];
             serviceConfig = {
               Type = "exec";
-              ExecStart = "${pkgs.rsyslog}/bin/rsyslogd -n -i NONE -f /run/sentinel/rsyslog.conf";
+              ExecStart = "${pkgs.rsyslog.override { withMongo = false; }}/bin/rsyslogd -n -i NONE -f /run/sentinel/rsyslog.conf";
               Restart = "on-failure";
               RestartSec = "5s";
             };
@@ -1689,7 +1709,16 @@
 
       nixosConfigurations.appliance = nixpkgs.lib.nixosSystem {
         inherit system;
-        modules = [ self.nixosModules.sentinel ];
+        modules = [
+          self.nixosModules.sentinel
+          # Development-VM convenience ONLY (`nix run .#vm`): SSH is key-only, so
+          # the QEMU console would otherwise be a dead end. A KNOWN password and
+          # an autologin — never reuse this configuration for a real box.
+          {
+            users.users.admin.initialPassword = "sentinel";
+            services.getty.autologinUser = "admin";
+          }
+        ];
       };
 
       # The same appliance, packaged as a verified-boot disk image (dm-verity

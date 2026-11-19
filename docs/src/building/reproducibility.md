@@ -35,6 +35,14 @@ Populate or copy the required store paths and fixed-output sources first. A sour
 
 Pinned inputs improve repeatability; they do not by themselves prove byte-for-byte reproducibility. Compare independently built artifacts, record their hashes and account for signing and other variable inputs.
 
+## Compare the unsigned image, not the signed one
+
+Two builds of the same revision produce the same **unsigned** verity image (`nix build .#sentinel-image-unsigned`) and the same `usrhash` (the dm-verity root hash on the kernel command line, which binds the whole store partition). Those are the artifacts to compare and attest: the unsigned image carries an unsigned systemd-boot and UKI, so it does not depend on any key.
+
+`nix build .#sentinel-image` then signs systemd-boot and the UKI with development PK/KEK/db keys that each builder generates for itself inside a derivation. Their private keys are therefore readable in that builder's Nix store; they are demonstration keys, not secrets, and no enrollment payloads (`PK.auth`, `KEK.auth`, `db.auth`) are shipped for them unless a lab opts in with `velstra.appliance.secureBoot.developmentEnrollment`. Every signature is made at one fixed signing time (2025-01-01 00:00:00 UTC), so a rebuild with the same keys gives the same bytes; a different builder has different keys and so a different signed image.
+
+Release images are signed afterwards, outside the store, with the release identity (`scripts/community_release.py sign` in the release workflow), which replaces every development signature and installs the release's enrollment payloads. To verify a release, compare its `usrhash` and unsigned payload with your own build, then check the signatures against the published release certificates.
+
 A fixed-output derivation can reuse an older cached object when its expected output hash is unchanged, even if a source revision changed. Verify the measured object and its ABI against the intended userspace cohort before accepting new hashes. Development ABI guards or a fixture's pins are not proof that the published appliance integrates them.
 
 Keep the eBPF Rust nightly and LLVM versions compatible. An offline-build claim requires the complete closure and a successful build with network access disabled, not merely a populated source cache.
