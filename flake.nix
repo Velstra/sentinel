@@ -158,6 +158,18 @@
         '';
       };
 
+      # rsyslog as Sentinel renders it: imjournal in, omfwd out (UDP/TCP, no
+      # TLS driver), nothing else. Every optional output module drags its
+      # client library into the appliance: MongoDB pulled a C toolchain
+      # (IMG-06), PostgreSQL's libpq alone carried 38 open High CVEs. Add a
+      # module back here only together with the renderer that uses it.
+      rsyslogFlags = {
+        withMysql = false; withPostgres = false; withDbi = false; withNetSnmp = false;
+        withCurl = false; withGnutls = false; withGcrypt = false; withLognorm = false;
+        withMaxminddb = false; withOpenssl = false; withRelp = false; withRdkafka = false;
+        withMongo = false; withCzmq = false; withRabbitmq = false; withHiredis = false;
+      };
+
       # --- the sentinel CLI (stable rustc is fine) ---------------------------
       sentinelCore = pkgs.rustPlatform.buildRustPackage {
         pname = "sentinel";
@@ -696,10 +708,8 @@
             # (below), off until `[services.syslog]` names a target. It never
             # replaces the local journal — this is an additional copy on the wire,
             # so losing the collector never costs you the local log.
-            # Built without the MongoDB output (never rendered): its client
-            # library carried a whole C toolchain (gcc, binutils, glibc-dev,
-            # linux-headers) into the appliance closure (IMG-06).
-            (pkgs.rsyslog.override { withMongo = false; })
+            # Built with only what Sentinel renders (rsyslogFlags, IMG-06).
+            (pkgs.rsyslog.override rsyslogFlags)
             # Alert notifications (roadmap C23): msmtp is a send-only SMTP client,
             # so the appliance mails an alert without ever running a listening mail
             # server. Webhooks reuse the curl already pinned above.
@@ -1271,7 +1281,7 @@
             ];
             serviceConfig = {
               Type = "exec";
-              ExecStart = "${pkgs.rsyslog.override { withMongo = false; }}/bin/rsyslogd -n -i NONE -f /run/sentinel/rsyslog.conf";
+              ExecStart = "${pkgs.rsyslog.override rsyslogFlags}/bin/rsyslogd -n -i NONE -f /run/sentinel/rsyslog.conf";
               Restart = "on-failure";
               RestartSec = "5s";
             };
