@@ -51,6 +51,21 @@ pub const LIFETIME: u64 = 12 * 60 * 60;
 /// timestamp nobody needs to the second.
 const TOUCH_EVERY: u64 = 60;
 
+/// How far into the future a session's timestamps may lie. A clock stepped
+/// back by NTP, or a VM resumed from a snapshot, moves a little; a session
+/// minted while the clock was hours ahead would otherwise read as brand new
+/// until the clock caught up again, outliving both of its limits by the skew.
+const CLOCK_SKEW: u64 = 5 * 60;
+
+/// The most sessions one account keeps. A sign-in beyond it ends that
+/// account's least recently used session: every sign-in is a file, and a
+/// script that signs in on every run must not fill the state partition.
+pub const MAX_SESSIONS_PER_ACCOUNT: usize = 16;
+
+/// The most sessions the appliance keeps in all, for the same reason across
+/// accounts (directory accounts are not listed anywhere to bound them by).
+const MAX_SESSIONS: usize = 1024;
+
 /// The largest session file read back. A record is a few hundred bytes; this
 /// only bounds what a corrupted or planted file can make the server allocate.
 const MAX_RECORD: u64 = 4096;
@@ -173,8 +188,49 @@ pub fn open(
     };
     let _guard = lock();
     ensure_dir(dir)?;
+    make_room(dir, user, now);
     write_record(dir, &record, true)?;
     Ok(token)
+}
+
+/// Before a new session for `user` is written: drop every session past its
+/// time limits, then that account's least recently used sessions beyond
+/// [`MAX_SESSIONS_PER_ACCOUNT`] - 1, then the appliance's beyond
+/// [`MAX_SESSIONS`] - 1. Best effort: a file that cannot be removed is not a
+/// reason to refuse a sign-in. The caller holds [`lock`].
+fn make_room(dir: &Path, user: &str, now: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut live: Vec<Record> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(record) = read_record(dir, &name) else {
+            continue;
+        };
+        if within_limits(&record, now) {
+            live.push(record);
+        } else {
+            let _ = std::fs::remove_file(dir.join(&name));
+        }
+    }
+    // Least recently used first.
+    live.sort_by_key(|r| (r.last_used, r.created));
+    let mine = live.iter().filter(|r| r.user == user).count();
+    let mut excess_mine = (mine + 1).saturating_sub(MAX_SESSIONS_PER_ACCOUNT);
+    let mut kept = Vec::with_capacity(live.len());
+    for record in live {
+        if excess_mine > 0 && record.user == user {
+            excess_mine -= 1;
+            let _ = std::fs::remove_file(dir.join(&record.digest));
+        } else {
+            kept.push(record);
+        }
+    }
+    let excess = (kept.len() + 1).saturating_sub(MAX_SESSIONS);
+    for record in kept.iter().take(excess) {
+        let _ = std::fs::remove_file(dir.join(&record.digest));
+    }
 }
 
 /// Who `presented` signs in as, and with what permission, at time `now` — or
@@ -244,11 +300,7 @@ pub fn sweep(dir: &Path, appliance: &Appliance, now: u64) -> Result<()> {
 /// permission, so even a digest collision could not carry a session across a
 /// change of permission.
 fn alive(record: &Record, appliance: &Appliance, now: u64) -> bool {
-    // A clock that has gone backwards past the sign-in is not a reason to trust
-    // a session longer; `saturating_sub` reads it as zero elapsed, and the
-    // lifetime still runs from `created` once time moves forward again.
-    if now.saturating_sub(record.last_used) > IDLE || now.saturating_sub(record.created) > LIFETIME
-    {
+    if !within_limits(record, now) {
         return false;
     }
     match grant(appliance, &record.user, record.directory) {
@@ -258,6 +310,20 @@ fn alive(record: &Record, appliance: &Appliance, now: u64) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether `record` is inside both of its time limits at `now`.
+///
+/// A record stamped more than [`CLOCK_SKEW`] in the future was written while
+/// the clock was wrong, and is not trusted: `saturating_sub` used to read it
+/// as zero seconds old, so a session minted with the clock a day ahead stayed
+/// alive for a day after the clock was corrected (CTRL-29).
+fn within_limits(record: &Record, now: u64) -> bool {
+    let horizon = now.saturating_add(CLOCK_SKEW);
+    record.created <= horizon
+        && record.last_used <= horizon
+        && now.saturating_sub(record.last_used) <= IDLE
+        && now.saturating_sub(record.created) <= LIFETIME
 }
 
 fn ensure_dir(dir: &Path) -> Result<()> {
@@ -334,6 +400,70 @@ mod tests {
              [[system.aaa.radius]]\nserver='192.0.2.9'\nsecret='directory-secret'\n",
         )
         .unwrap()
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sentinel-session-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn admin_session(dir: &Path, appliance: &Appliance, now: u64) -> String {
+        let (permission, digest) = grant(appliance, "admin", false).unwrap();
+        open(dir, "admin", permission, false, digest, now).unwrap()
+    }
+
+    /// CTRL-29: a session minted while the clock was a day ahead used to read
+    /// as zero seconds old once the clock was corrected (`saturating_sub`), so
+    /// it outlived its idle limit by the whole skew. A record from the future
+    /// beyond a small skew is not trusted at all.
+    #[test]
+    fn a_session_from_a_clock_that_ran_ahead_is_not_trusted_after_correction() {
+        let appliance = configured();
+        let dir = scratch("clock-ahead");
+        let corrected = 1_800_000_000;
+        let ahead = corrected + 24 * 60 * 60;
+        let token = admin_session(&dir, &appliance, ahead);
+        assert!(resolve(&dir, &appliance, &token, ahead).is_some());
+        assert!(
+            resolve(&dir, &appliance, &token, corrected + IDLE + 1).is_none(),
+            "a session from a day-ahead clock survived past its idle limit after correction"
+        );
+        // A small backwards step (NTP slew, a VM resumed) is tolerated.
+        let dir = scratch("clock-skew");
+        let token = admin_session(&dir, &appliance, corrected + 30);
+        assert!(resolve(&dir, &appliance, &token, corrected).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CTRL-29: every successful sign-in wrote one more session file, without
+    /// bound. One account keeps its newest sessions only.
+    #[test]
+    fn repeated_sign_ins_keep_a_bounded_number_of_sessions() {
+        let appliance = configured();
+        let dir = scratch("bounded");
+        let now = 1_800_000_000;
+        let tokens: Vec<String> = (0..(MAX_SESSIONS_PER_ACCOUNT as u64 + 24))
+            .map(|n| admin_session(&dir, &appliance, now + n))
+            .collect();
+        let files = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| is_session_name(&e.file_name().to_string_lossy()))
+            })
+            .count();
+        assert!(
+            files <= MAX_SESSIONS_PER_ACCOUNT,
+            "{files} session files for one account"
+        );
+        let later = now + tokens.len() as u64;
+        assert!(resolve(&dir, &appliance, tokens.last().unwrap(), later).is_some());
+        assert!(resolve(&dir, &appliance, &tokens[0], later).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -546,6 +546,16 @@ async fn security_headers(req: Request, next: Next) -> Response {
         header::REFERRER_POLICY,
         header::HeaderValue::from_static("no-referrer"),
     );
+    // CTRL-29: once a browser has reached the console over HTTPS it must not
+    // be talked down to plaintext by somebody on the path. Browsers ignore
+    // this header over plaintext and over a connection with certificate
+    // errors, so a self-signed console the operator clicked through is not
+    // pinned by it; `includeSubDomains` is left out because the appliance's
+    // name may sit inside a domain the operator does not own.
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        header::HeaderValue::from_static("max-age=31536000"),
+    );
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(
             header::CACHE_CONTROL,
@@ -6390,6 +6400,12 @@ action="reject"
             assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
             assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
             assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+            // CTRL-29: the console must not be downgradable to plaintext.
+            assert_eq!(
+                h.get(header::STRICT_TRANSPORT_SECURITY)
+                    .and_then(|v| v.to_str().ok()),
+                Some("max-age=31536000")
+            );
             let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
             assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
             assert!(csp.starts_with("default-src 'none'"), "{csp}");
