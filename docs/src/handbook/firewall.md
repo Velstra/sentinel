@@ -39,6 +39,10 @@ set firewall zone wan block-icmp true          # quiet on the WAN
 set firewall zone lan default-action accept    # trust the LAN
 ```
 
+`block-icmp` refuses new inbound ICMP, such as a ping from the internet, even where a rule accepts ICMP. Answers still arrive: the echo reply to a ping the firewall or a LAN host sent, and an ICMP error about a tracked connection — packet-too-big and fragmentation-needed included, so path-MTU discovery keeps working. Outbound ICMP is not affected. IPv6 neighbour discovery and MLD always pass on every zone, whatever its default action, rules or `block-icmp` say; without them no IPv6 neighbour on that link resolves. A zone needs no ICMPv6 rule for IPv6 to work.
+
+An IPv4 address rule applies to IPv4 only and an IPv6 address rule to IPv6 only. A rule that names no address applies to both families unless `family` limits it.
+
 ## Rules
 
 Scope each rule to the intended ingress and destination before applying it. This example scopes SSH from the management zone to the firewall's own addresses. `firewall` is not a reserved name: declare a zone that means "this appliance" by marking it local, once.
