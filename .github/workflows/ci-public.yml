@@ -55,6 +55,24 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # The image's CVE fixes arrive through the nixpkgs pin; the nightly run turns
+  # red when it ages past the window (STATIC-10). Also the image tooling's own
+  # tests: CVE gate, closure check, seeding tool.
+  input-freshness-and-image-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Image tooling unit tests
+        run: |
+          python3 -B -m unittest discover -s tests -p 'test_image_c*.py' -v
+          python3 -B -m unittest discover -s tests -p 'test_seed_image.py' -v
+          python3 -B -m unittest discover -s tests -p 'test_input_freshness.py' -v
+      - name: Locked inputs are immutable and nixpkgs is at most 21 days old
+        run: python3 scripts/check_input_freshness.py --max-age-days 21
+
   release-signing-controls:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

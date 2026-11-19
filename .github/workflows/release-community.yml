@@ -50,6 +50,7 @@ jobs:
           test "$RELEASE_ARTIFACT_BYTE_BUDGET" -gt 0
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           python3 scripts/check_repository_hygiene.py --history
+          python3 scripts/check_input_freshness.py --max-age-days 21
           python3 -B -m unittest discover -s tests -p 'test_community_release.py' -v
           python3 -c 'import os,sys; sys.path.insert(0,"scripts"); from community_release import version; print("version="+version(os.environ["REQUESTED_VERSION"]))' >> "$GITHUB_OUTPUT"
           echo "matrix=$(python3 scripts/community_release.py checks)" >> "$GITHUB_OUTPUT"
