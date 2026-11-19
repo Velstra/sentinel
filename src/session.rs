@@ -9875,6 +9875,9 @@ impl Session {
         // validating (mirrors `Appliance::from_toml`).
         appliance.normalize();
         appliance.validate()?;
+        // A candidate an operator is building must fit the data plane's maps
+        // (release audit DP-17); kept out of `validate` so boot never fails on it.
+        crate::compile::check_capacity(&appliance)?;
         Ok(appliance)
     }
 

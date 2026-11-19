@@ -7103,6 +7103,7 @@ impl Rule {
 /// because it was a compile-time property of the structs and the same structs
 /// are read by both a strict `config check` and a must-not-fail boot apply. See
 /// [`Appliance::parse_toml`].
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum UnknownKeys {
     /// An unknown key fails the parse, naming the key. For anything a person
     /// initiates.
@@ -7142,6 +7143,11 @@ impl Appliance {
                 .context("parsing TOML config")?;
         Self::account_for_unknown(&ignored, unknown)?;
         appliance.normalize();
+        if unknown == UnknownKeys::Warn {
+            for line in appliance.neutralise_for_boot() {
+                eprintln!("error: {line}");
+            }
+        }
         appliance.validate()?;
         Ok(appliance)
     }
@@ -7156,6 +7162,11 @@ impl Appliance {
         de.end().context("trailing data after JSON config")?;
         Self::account_for_unknown(&ignored, unknown)?;
         appliance.normalize();
+        if unknown == UnknownKeys::Warn {
+            for line in appliance.neutralise_for_boot() {
+                eprintln!("error: {line}");
+            }
+        }
         appliance.validate()?;
         Ok(appliance)
     }
@@ -11418,12 +11429,11 @@ impl Appliance {
         // cannot start with. Better to refuse the setting than to accept it and
         // discover the problem on the next boot.
         crate::wren::compile_wren(self).to_toml()?;
-        // …and to the data plane: every map the compiled policy fills has a
-        // fixed size, and the agent finding that out means a refused commit
-        // after the datapath gate has closed — or, for a saved config, a boot
-        // with every zoned link held down. Feed groups are empty here; the
-        // apply paths repeat this once they have been merged in.
-        crate::compile::check_capacity(self)?;
+        // Data-plane capacity is deliberately NOT checked here: `validate`
+        // also runs on the boot-time load, and a configuration that no longer
+        // fits must reach the boot fallback rather than fail validation first.
+        // `compile::check_capacity` runs on `config check`, the configure
+        // session's candidate, every live apply and every refresh instead.
         Ok(())
     }
 
@@ -11491,6 +11501,67 @@ impl Appliance {
             ));
         }
         out
+    }
+
+    /// Make a saved configuration that a newer validation refuses boot the way
+    /// it booted before, instead of not at all. Only the boot-time lenient
+    /// load calls this; every interactive path still refuses the same input,
+    /// so the operator has to fix it at the next commit.
+    ///
+    /// For each broad accept `validate_broad_accept` refuses (release audit
+    /// DP-14), an `error:` line names the rule and what is done to it:
+    /// - inert under an explicit zone default-action: dropped (it opened
+    ///   nothing, so the policy is unchanged);
+    /// - carrying qualifiers the data plane never honoured: the qualifiers are
+    ///   removed and the rule kept, which is exactly what was enforced before
+    ///   (the zone's default became accept). Dropping it instead would close a
+    ///   zone that was open on the previous boot — possibly the one management
+    ///   is reached through.
+    fn neutralise_for_boot(&mut self) -> Vec<String> {
+        let mut said = Vec::new();
+        let mut kept = Vec::with_capacity(self.rules.len());
+        for mut rule in std::mem::take(&mut self.rules) {
+            let refused = rule.is_broad()
+                && rule.source_mac_group.is_none()
+                && rule.action == Action::Accept
+                && self.validate_broad_accept(&rule).is_err();
+            if !refused {
+                kept.push(rule);
+                continue;
+            }
+            let inert = !rule.disabled
+                && self
+                    .zone_posture(&rule.from)
+                    .default_action
+                    .is_some_and(|d| d != Action::Accept);
+            if inert {
+                said.push(format!(
+                    "rule {:?}: dropped at boot — a broad accept under zone {:?}'s explicit \
+                     default-action has no effect; `commit` will refuse it until it is removed \
+                     or given a proto",
+                    rule.name, rule.from
+                ));
+                continue;
+            }
+            said.push(format!(
+                "rule {:?}: booted without source, destination, groups, family, direction, \
+                 icmp-type and log — a rule without `proto` never honoured them and opens all \
+                 of zone {:?}; `commit` will refuse it until it is given a proto",
+                rule.name, rule.from
+            ));
+            rule.source = None;
+            rule.source_group = None;
+            rule.destination = None;
+            rule.destination_group = None;
+            rule.interface_group = None;
+            rule.family = None;
+            rule.direction = None;
+            rule.icmp_type = None;
+            rule.log = false;
+            kept.push(rule);
+        }
+        self.rules = kept;
+        said
     }
 
     /// A broad accept (no `proto`) is not a rule the data plane carries: it
@@ -14429,6 +14500,69 @@ mru = 1492
     /// is between "come up and warn" and "come up blank". A field that does not
     /// PARSE, or a value that does not VALIDATE, must still fail even here; only
     /// an unrecognised *key* is tolerated.
+    /// A saved configuration that was valid before DP-14's refusal must
+    /// still boot (release audit P0 class: a new refusal must not brick a box
+    /// on its own saved config). The boot load neutralises the rule, says so,
+    /// and boots with the effect it had; the strict path still refuses it.
+    #[test]
+    fn a_saved_broad_accept_refused_by_dp14_still_boots_and_says_why() {
+        let text = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "wan"
+address = "198.51.100.2/24"
+[[interface]]
+name = "eth1"
+zone = "lan"
+address = "192.168.50.1/24"
+[zone.wan]
+default_action = "drop"
+[[rule]]
+name = "admin-only"
+from = "lan"
+source = "192.168.50.5"
+action = "accept"
+[[rule]]
+name = "wan-open"
+from = "wan"
+action = "accept"
+"#;
+        assert!(
+            Appliance::from_toml(text).is_err(),
+            "the strict path refuses it"
+        );
+        let path =
+            std::env::temp_dir().join(format!("sentinel-dp14-boot-{}.toml", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        let booted = Appliance::load_lenient(&path);
+        let _ = std::fs::remove_file(&path);
+        let booted = booted.expect("a pre-update saved config must still boot");
+        // The qualified accept keeps the effect it had (lan opens), minus the
+        // qualifier the data plane never honoured; the inert one is gone.
+        let admin = booted
+            .rules
+            .iter()
+            .find(|r| r.name == "admin-only")
+            .unwrap();
+        assert!(admin.source.is_none());
+        assert!(booted.rules.iter().all(|r| r.name != "wan-open"));
+        let cfg = crate::compile::compile(&booted);
+        let lan = cfg.policies.iter().find(|p| p.name == "lan").unwrap();
+        assert_eq!(
+            lan.default_action, "pass",
+            "the zone stays as open as it booted before"
+        );
+        // …and each change is announced.
+        let mut raw: Appliance = toml::from_str(text).unwrap();
+        let said = raw.neutralise_for_boot().join("\n");
+        assert!(
+            said.contains("admin-only") && said.contains("wan-open"),
+            "{said}"
+        );
+    }
+
     #[test]
     fn a_saved_config_with_a_key_from_a_newer_version_still_loads_leniently() {
         // A valid document plus one key no schema of this version has, at the

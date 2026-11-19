@@ -387,7 +387,8 @@ action = "accept"
 limit = 10
 "#,
     );
-    let err = Appliance::from_toml(&text).expect_err("200 limited entries > 127 slots");
+    let err = super::check_capacity(&Appliance::from_toml(&text).unwrap())
+        .expect_err("200 limited entries > 127 slots");
     let msg = format!("{err:#}");
     assert!(msg.contains("RULE_LIMITS") && msg.contains("127"), "{msg}");
 }
@@ -402,7 +403,8 @@ fn dp17_rules_beyond_a_trie_are_refused_with_the_map_and_its_limit() {
             lo + 999
         ));
     }
-    let err = Appliance::from_toml(&text).expect_err("9000 entries > 8192");
+    let err = super::check_capacity(&Appliance::from_toml(&text).unwrap())
+        .expect_err("9000 entries > 8192");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("PORT_RULES") && msg.contains("9000") && msg.contains("8192"),
@@ -419,11 +421,12 @@ fn perf03_a_global_blocklist_is_counted_once_per_zone_policy() {
         .collect();
     let blocklist = format!("[firewall]\nblocklist = [{}]\n", list.join(","));
     let two = format!("{}{blocklist}", BASE);
-    assert!(Appliance::from_toml(&two).is_ok());
+    assert!(super::check_capacity(&Appliance::from_toml(&two).unwrap()).is_ok());
     let three = format!(
         "{BASE}[[interface]]\nname = \"eth2\"\nzone = \"dmz\"\naddress = \"172.16.0.1/24\"\n{blocklist}"
     );
-    let err = Appliance::from_toml(&three).expect_err("280,000 entries > 262,144");
+    let err = super::check_capacity(&Appliance::from_toml(&three).unwrap())
+        .expect_err("280,000 entries > 262,144");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("BLOCKLIST (IPv4)") && msg.contains("280000"),
@@ -701,4 +704,28 @@ action = "drop"
     assert!(halves[0].get("direction").is_none(), "{halves:?}");
     // A MAC verdict is consulted once, from the Ethernet header.
     assert_eq!(directions("no-printers"), [None]);
+}
+
+/// The capacity refusal must not run inside `validate`: the boot-time load
+/// runs `validate`, and a configuration that no longer fits has to reach the
+/// boot fallback instead of failing before it (audit P0 class).
+#[test]
+fn dp17_capacity_is_not_part_of_validate_so_boot_can_fall_back() {
+    let mut text = with("");
+    for i in 0..9 {
+        let lo = 1000 + i * 1000;
+        text.push_str(&format!(
+            "[[rule]]\nname = \"r{i}\"\nfrom = \"wan\"\nproto = \"tcp\"\nport = \"{lo}-{}\"\naction = \"accept\"\n",
+            lo + 999
+        ));
+    }
+    let path = std::env::temp_dir().join(format!("sentinel-dp17-boot-{}.toml", std::process::id()));
+    std::fs::write(&path, &text).unwrap();
+    let booted = Appliance::load_lenient(&path);
+    let _ = std::fs::remove_file(&path);
+    let booted = booted.expect("an over-capacity saved config still loads for the boot fallback");
+    assert!(
+        super::check_capacity(&booted).is_err(),
+        "…and the explicit check still refuses it"
+    );
 }

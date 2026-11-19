@@ -3896,6 +3896,7 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
         }
         ConfigAction::Check { file, live } => {
             let appliance = Appliance::load(&file)?;
+            compile::check_capacity(&appliance)?;
             if live {
                 net::validate_present_interfaces(&appliance, &system::discover_interfaces())?;
                 println!("{} is valid for this host", file.display());
