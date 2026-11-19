@@ -158,6 +158,15 @@ class Rewrite(unittest.TestCase):
         self.assertNotEqual(by[("dbus", "1.16.2")], [], "the real dbus keeps its CPE")
         self.assertEqual(report["generated"], ["dbus-1", "polkit-1.pam"])
 
+    def test_generated_store_path_is_recognised_when_syft_trims_the_version(self):
+        # syft reports polkit-1.pam as polkit version "1".
+        source = full_sbom()
+        trimmed = nix_artifact("polkit", "1")
+        trimmed["metadata"] = {"path": "/nix/store/" + "i" * 32 + "-polkit-1.pam"}
+        source["artifacts"].append(trimmed)
+        sbom, _ = gate.rewrite(source, TABLE)
+        self.assertEqual([a["cpes"] for a in sbom["artifacts"] if a["name"] == "polkit"], [[]])
+
     def test_input_is_not_mutated(self):
         source = full_sbom()
         before = json.dumps(source, sort_keys=True)

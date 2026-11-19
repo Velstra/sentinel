@@ -76,11 +76,24 @@ def load_table(path=DEFAULT_TABLE):
     return table
 
 
-def generated(table, name, version):
+def generated(table, name, version, path=""):
     """A store path NixOS generates (a config dir, a PAM file) whose name only
     looks like `<package>-<version>`: `dbus-1` and `polkit-1.pam` were matched
-    as dbus 1 and polkit 1, i.e. against advisories for releases from 2019."""
-    return f"{name}-{version}" in set(table.get("generated", []))
+    as dbus 1 and polkit 1, i.e. against advisories for releases from 2019.
+    syft drops the `.pam` suffix from the version, so the store path's own
+    name is checked as well as name-version."""
+    names = set(table.get("generated", []))
+    stored = STORE_NAME.match(Path(path).name) if path else None
+    return f"{name}-{version}" in names or bool(stored and stored.group(1) in names)
+
+
+STORE_NAME = re.compile(r"^[0-9a-df-np-sv-z]{32}-(.+)$")
+
+
+def artifact_path(artifact):
+    metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+    locations = artifact.get("locations") or [{}]
+    return metadata.get("path") or locations[0].get("path", "")
 
 
 def canonical(table, name):
@@ -114,7 +127,7 @@ def rewrite(sbom, table):
             artifact["cpes"] = []
             report["first_party"].append(name)
             continue
-        if generated(table, name, artifact.get("version", "")):
+        if generated(table, name, artifact.get("version", ""), artifact_path(artifact)):
             artifact["cpes"] = []
             report.setdefault("generated", []).append(f"{name}-{artifact.get('version', '')}")
             continue
