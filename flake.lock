@@ -37,7 +37,7 @@
     "fenix": {
       "inputs": {
         "nixpkgs": [
-          "nixpkgs"
+          "nixpkgs-ebpf"
         ],
         "rust-analyzer-src": "rust-analyzer-src"
       },
@@ -71,12 +71,29 @@
         "type": "github"
       }
     },
+    "nixpkgs-ebpf": {
+      "locked": {
+        "lastModified": 1792898606,
+        "narHash": "sha256-Mg3rRjsbMqhSMxop5PYMXos8SwAjejrxSgVThTvP9eg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "1f607aa79b6356ed45d3cd3c8079c196e79efa2c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "1f607aa79b6356ed45d3cd3c8079c196e79efa2c",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "fabric": "fabric",
         "fabric-legacy-napt": "fabric-legacy-napt",
         "fenix": "fenix",
         "nixpkgs": "nixpkgs",
+        "nixpkgs-ebpf": "nixpkgs-ebpf",
         "wren": "wren"
       }
     },

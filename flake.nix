@@ -12,9 +12,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    # The eBPF object's toolchain (the fenix nightly, bpf-linker, LLVM) is
+    # pinned apart from the userspace package set. The object is a
+    # fixed-output derivation and embeds toolchain store paths in its BTF, so
+    # following every nixpkgs security bump would change its bytes (and
+    # ebpfHash) without any source change. Advance this deliberately, with
+    # ebpfHash and the verifier matrix, never as part of a CVE bump.
+    nixpkgs-ebpf.url = "github:NixOS/nixpkgs/1f607aa79b6356ed45d3cd3c8079c196e79efa2c";
     fenix = {
       url = "github:nix-community/fenix";
-      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nixpkgs.follows = "nixpkgs-ebpf";
     };
     # The Velstra Fabric source (the data-plane agent lives here). Source only —
     # we build it with our own toolchain, so it needs no flake of its own.
@@ -39,7 +46,7 @@
   };
 
   outputs =
-    { self, nixpkgs, fenix, fabric, fabric-legacy-napt, wren }:
+    { self, nixpkgs, nixpkgs-ebpf, fenix, fabric, fabric-legacy-napt, wren }:
     let
       system = "x86_64-linux";
 
@@ -70,6 +77,8 @@
 
       pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
         (import ./nix/compact-tests.nix);
+      # Only the fixed-output eBPF object is built from this set (see inputs).
+      pkgsEbpf = nixpkgs-ebpf.legacyPackages.${system};
       lib = nixpkgs.lib;
 
       # Verify existing imported hashes without enabling legacy hashes in PAM.
@@ -385,11 +394,14 @@
         printf '%s' '${ebpfSourceIdentity}' > source-id
         llvm-objcopy --add-section .velstra.source-id=source-id target/bpfel-unknown-none/release/velstra
       '';
-      velstra-ebpf = pkgs.stdenv.mkDerivation {
+      velstra-ebpf = pkgsEbpf.stdenv.mkDerivation {
         pname = "velstra-ebpf";
+        # A build-time object only (its references are discarded, so it never
+        # enters the image closure or the SBOM); the name stays put so the
+        # fixed-output derivation is not rebuilt for a label.
         version = "0.1.0";
         src = fabric;
-        nativeBuildInputs = [ nightly pkgs.bpf-linker pkgs.python3 pkgs.llvm pkgs.git pkgs.cacert ];
+        nativeBuildInputs = [ nightly pkgsEbpf.bpf-linker pkgsEbpf.python3 pkgsEbpf.llvm pkgsEbpf.git pkgsEbpf.cacert ];
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
