@@ -110,6 +110,7 @@ pkgs.testers.runNixOSTest {
     ''
       import hashlib
       import json
+      import re
       import os
       import subprocess
       import tempfile
@@ -217,6 +218,10 @@ pkgs.testers.runNixOSTest {
       check("IMG-04 the backported libcap and Suricata are the ones shipped",
             "-libcap-2.78-lib" in store and "-suricata-8.0.7" in store and "-libcap-2.77" not in store
             and "-suricata-8.0.3" not in store, [l for l in store.split() if "libcap" in l or "suricata" in l])
+      berkeley = [l for l in store.split() if re.search(r"-db-[0-9]", l)]
+      tools = machine.execute("ip -V && ldapwhoami -VV 2>&1 | head -1 && sqlite3 -version 2>/dev/null; true")[1]
+      check("IMG-04 no Berkeley DB ships and its former users still run",
+            berkeley == [] and "iproute2" in tools and "ldapwhoami" in tools.lower(), (berkeley, tools))
       assert not failures, "failed: " + ", ".join(failures)
     '';
 }
