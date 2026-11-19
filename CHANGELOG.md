@@ -2,7 +2,91 @@
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-26
+Nothing below has been released. The 1.0.0 candidate is under remediation after
+the independent release audit of 2026-11-18/19 (run 8b6181), whose verdict was
+No-Go for both editions. No `v1.0.0` tag exists, and none should be cut until
+the audit's blocking findings are closed and requalified.
+
+### Audit 8b6181 remediation (image, release gates and docs)
+
+- IMG-02: imported `$1$`/`$5$`/`$6$` hashes now work over SSH as well as the
+  API; the shipped libcrypt also verifies md5crypt and sha256crypt (new
+  passwords stay yescrypt). Checked by `checks.legacy-hash-login`.
+- IMG-03: no enrollment payloads ship for the per-build development keys;
+  systemd-boot and the UKI are signed after the image is assembled, so
+  `.#sentinel-image-unsigned` and its usrhash are the attestation target;
+  signatures use a fixed signing time.
+- IMG-04: nixpkgs advanced to nixos-26.05 2026-11-16 (curl 8.23.0, OpenSSH
+  10.6p2, zlib CVE-2026-85091, Linux 6.12.117, ...); libcap 2.78, the
+  Net-SNMP SMUX fix and Suricata 8.0.7 are backported into the shipped
+  closure without rebuilding nixpkgs. The eBPF object keeps its own pinned
+  toolchain (`nixpkgs-ebpf`), so a userspace bump no longer moves `ebpfHash`.
+  Open CVEs remain (see the release gate); 1.0.0 is not releasable yet.
+- IMG-05: an image-level CVE gate with a maintained Nix-to-NVD CPE table
+  (`scripts/nix_cpe_map.json`), the kernel cataloger and vulnix as a second
+  source; it fails when a critical package cannot be matched.
+- IMG-06: rsyslog is built with only the modules Sentinel renders; no
+  compiler, binutils or -dev output ships (`checks.image-closure`).
+- IMG-07: `sentinel-boot-late` waits only for the links Sentinel configured.
+- IMG-08 / EDGE-03: charon stays off without an IPsec configuration
+  (already on the candidate, now asserted at boot); pkexec is no longer setuid.
+- IMG-11 / STATIC-04: the image names its release (`IMAGE_VERSION`, raw file
+  name), the agent's store name carries its crate version, ESP files no longer
+  date from 2098.
+- IMG-12: the unprivileged-user-namespace builder prerequisite is documented.
+- STATIC-03: this changelog and the README no longer claim a 1.0.0 release.
+- STATIC-07 / STATIC-08: the console browser suite resolves the pinned password
+  helper (or stops with a clear message) and removes its Chromium profiles on
+  every exit path.
+- STATIC-09: a licensing and corresponding-source note for distributors.
+- STATIC-10: CI fails when nixpkgs is older than 21 days or an input floats.
+- STATIC-11: the exported modules set no password and no autologin; only the
+  development VM (`nix run .#vm`) has its known console login.
+- PROV-01: `nix run .#seed-image` seeds a raw image's data partition for a
+  cloud import, refusing configurations with no way in.
+- PROV-02 / HA-00: the data filesystem is checked and grown offline before its
+  check and mount, and a failed grow no longer fails the boot.
+- PROV-04: `sentinel config check` warns for zoned NICs without `hw-id`.
+
+### Changes since the 2026-10-26 candidate
+
+Summarised from the commit history between the 1.0.0 candidate date and the
+start of the remediation (102 commits); see `git log` for detail.
+
+- **Platform:** the appliance base moved to NixOS 26.05 with the Linux 6.12 LTS
+  kernel, verified against the 6.6, 6.12 and 6.18 eBPF verifiers. Fabric and
+  Wren are pinned to a single reviewed source cohort, with a legacy HA
+  allocator retained only as a test fixture.
+- **Updates:** durable, guarded OTA image-update jobs, the native update
+  provider, boot-identity validation of counted UKI names, bounded signed
+  downloads, validated update URLs, and an operational update console.
+- **Configuration and apply:** atomic configuration permissions under a
+  restrictive umask, concurrency-safe locks and group lookups, live firewall
+  intent preserved across periodic refresh, commit-confirm and rollback
+  publishing the running intent, transactional provisioning and uplink
+  rollback, and CLI failures propagated as exit status.
+- **HA and config sync:** config sync fenced durably before policy application
+  and authorized before acknowledgement; optional witness grants and two-node
+  pairing documented; HA continuity checks kept in the mandatory release floor.
+- **Management plane:** hardened admission authentication, authoritative
+  privileged command results, clustered management and system health, and
+  atomic HTTP 400 refusals attributed in the console without replay.
+- **Release engineering:** a Community release workflow that qualifies and
+  signs image bundles, a source SBOM with coverage checks, source and runtime
+  artifact policies, rejection of bootable artifacts anywhere in history, and
+  the real yescrypt helper in CI.
+- **Security fixes:** the findings of the 2026-10-26 security audit, the
+  Fabric XDP control-plane and malformed-packet fix, and the Rustix xattr
+  advisory in Sentinel and the pinned Fabric build.
+- **Documentation:** the operator manual rewritten around tested deployment
+  tasks, focused setup guides, branding, contribution templates and private
+  security reporting.
+
+## [1.0.0] — candidate dated 2026-10-26, never released
+
+This entry was written for a 1.0.0 release on 2026-10-26. That release was not
+tagged or published; the entry is kept as the record of what the candidate
+contained at that date. Later work is under [Unreleased].
 
 ### Added
 
