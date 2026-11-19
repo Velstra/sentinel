@@ -236,6 +236,7 @@
         # PATH ambiguity at runtime, for both the admin and the boot service.
         postBuild = ''
           wrapProgram $out/bin/sentinel \
+            --set SENTINEL_GIT_REVISION   ${self.rev or self.dirtyRev or "unknown"} \
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \

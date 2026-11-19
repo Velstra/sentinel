@@ -17,6 +17,7 @@ mod api;
 mod api_session;
 mod archive;
 mod boot_entry;
+mod build_info;
 mod capture;
 mod clock;
 mod compile;
@@ -161,7 +162,7 @@ impl From<RaidArg> for install::Raid {
 }
 
 #[derive(Parser)]
-#[command(name = "sentinel", version, about, long_about = None)]
+#[command(name = "sentinel", version = build_info::version(), about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -3005,6 +3006,7 @@ fn show_op(args: &[String]) -> Result<()> {
         ["subscription"] => show_subscription(),
         ["version"] => {
             println!("sentinel:   {}", env!("CARGO_PKG_VERSION"));
+            println!("revision:   {}", build_info::revision());
             print!("wren:       ");
             if run_checked(&system::bin("wren"), &["--version"]).is_err() {
                 println!("(not available)");
