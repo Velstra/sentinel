@@ -1826,6 +1826,7 @@
         # Known failures remain hard release gates, never expected-pass smoke tests.
         dataplane-conformance = import ./nix/dataplane-conformance.nix { inherit pkgs self; };
         firewall-policy-conformance = import ./nix/firewall-policy-conformance.nix { inherit pkgs self; };
+        icmp-related = import ./nix/icmp-related-test.nix { inherit pkgs self; };
         tcp-reset-validation = import ./nix/tcp-reset-validation-test.nix { inherit pkgs self; };
         # DP-28/PERF-04: a reload on top of a 120k blocklist must not stall traffic.
         agent-reconfigure-stall = import ./nix/agent-reconfigure-stall-test.nix { inherit pkgs self; };
