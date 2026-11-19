@@ -1373,7 +1373,11 @@ fn apply_boot(
         Appliance::load_lenient(config),
         boot_fallback::read_last_good(config),
         |candidate| {
-            let rendered = compile::compile(&resolve(candidate))
+            // Every refusal of the boot configuration lands here, including
+            // Sentinel-side capacity checks of the RESOLVED config (a feed that
+            // grew), so each one takes the fallback rather than failing boot.
+            let resolved = resolve(candidate);
+            let rendered = compile::compile(&resolved)
                 .to_toml()
                 .context("compiling firewall config")?;
             agent_contract::check_rendered(&rendered, &[candidate]).map(drop)
