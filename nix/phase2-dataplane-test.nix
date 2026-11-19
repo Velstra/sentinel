@@ -242,7 +242,7 @@ in pkgs.testers.runNixOSTest {
         before_ids = ids()
         code = ("import socket,time; s=socket.create_connection(('10.2.2.2',9090),5); "
                 "f=open('/tmp/held','ab',buffering=0); "
-                "exec(\"for i in range(60):\\n s.sendall(b'held')\\n f.write(s.recv(200))\\n time.sleep(0.5)\")")
+                "exec(\"for i in range(600):\\n s.sendall(b'held')\\n f.write(s.recv(200))\\n time.sleep(0.5)\")")
         client.succeed("python3 -c " + shlex.quote(code) + " >/tmp/held.log 2>&1 &")
         client.wait_until_succeeds("test -s /tmp/held", timeout=15)
         before = fw.succeed("systemctl show -p InvocationID --value velstra.service").strip()
@@ -254,7 +254,8 @@ in pkgs.testers.runNixOSTest {
         assert "aaa" in after_ids, after_ids
         for zone, policy in before_ids.items():
             assert after_ids[zone] == policy, (before_ids, after_ids)
-        # The connection opened before the commit keeps being answered after it.
+        # The connection opened before the commit keeps being answered after it
+        # (it runs for five minutes; a commit takes tens of seconds here).
         size = int(client.succeed("stat -c %s /tmp/held"))
         time.sleep(3)
         grown = int(client.succeed("stat -c %s /tmp/held"))
