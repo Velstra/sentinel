@@ -170,6 +170,19 @@
         withMongo = false; withCzmq = false; withRabbitmq = false; withHiredis = false;
       };
 
+      # HAProxy 3.4.1 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
+      # (FCGI record-length overflow) and CVE-2026-55204 (HPACK NULL deref
+      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixes
+      # both. A leaf package, so it is substituted directly where it is used.
+      haproxyFor = p: assert p.haproxy.version == "3.3.17";
+        p.haproxy.overrideAttrs (_: {
+          version = "3.4.1";
+          src = p.fetchurl {
+            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.1.tar.gz";
+            sha256 = "1y12pjsja0cgbd3cidvql1b48ib32r1qdr8prz3knzfp9z7c8qif";
+          };
+        });
+
       # --- the sentinel CLI (stable rustc is fine) ---------------------------
       sentinelCore = pkgs.rustPlatform.buildRustPackage {
         pname = "sentinel";
@@ -703,7 +716,7 @@
             # Sentinel-owned unit (below), off until a `[[services.reverse-proxy]]`
             # frontend is configured; on PATH so `sentinel commit` can `haproxy -c`
             # the rendered config before reloading.
-            pkgs.haproxy
+            (haproxyFor pkgs)
             # Remote syslog (roadmap C12): rsyslog reads the journal (imjournal) and
             # forwards RFC 5424 to the configured collectors. A Sentinel-owned unit
             # (below), off until `[services.syslog]` names a target. It never
@@ -1684,10 +1697,10 @@
             unitConfig.StartLimitIntervalSec = 0;
             serviceConfig = {
               Type = "exec";
-              ExecStart = "${pkgs.haproxy}/bin/haproxy -W -f /run/sentinel/haproxy/haproxy.cfg";
+              ExecStart = "${haproxyFor pkgs}/bin/haproxy -W -f /run/sentinel/haproxy/haproxy.cfg";
               # `haproxy -c` gates the reload in proxy::apply, so a running proxy is
               # only ever replaced with a config haproxy accepts.
-              ExecReload = "${pkgs.haproxy}/bin/haproxy -c -f /run/sentinel/haproxy/haproxy.cfg";
+              ExecReload = "${haproxyFor pkgs}/bin/haproxy -c -f /run/sentinel/haproxy/haproxy.cfg";
               Restart = "on-failure";
               RestartSec = "5s";
             };
