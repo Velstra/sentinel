@@ -73,13 +73,26 @@ impl Apply {
 /// one inside quotes is text. The reason for the rule: a password may contain
 /// `#` and must survive, while a pasted block of documented commands — or a
 /// saved `.cli` file with a header — must not fail on its own explanation.
-pub(crate) fn split_line(line: &str) -> Vec<String> {
+///
+/// A control character can never be part of a word (audit 8b6181, CTRL-08):
+/// systemd reads a lone CR as a line break, so a CR kept inside a quoted value
+/// became a second directive in whichever unit the value reached. Outside a
+/// word, whitespace control characters (a tab, the CR of a CRLF file) still
+/// only separate words; anything else is refused with the line, naming the
+/// character and never the value, which may be a password.
+pub(crate) fn split_line(line: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut have_word = false;
     let mut quoted = false;
     let mut escape = false;
     for c in line.chars() {
+        if crate::textcheck::is_forbidden(c) && (quoted || escape || !c.is_whitespace()) {
+            anyhow::bail!(
+                "the line contains the control character U+{:04X}, which no value may hold",
+                c as u32
+            );
+        }
         if escape {
             word.push(c);
             escape = false;
@@ -103,7 +116,7 @@ pub(crate) fn split_line(line: &str) -> Vec<String> {
                     have_word = false;
                 }
             }
-            '#' if !quoted && !have_word => return out, // a comment starts here
+            '#' if !quoted && !have_word => return Ok(out), // a comment starts here
             c => {
                 word.push(c);
                 have_word = true;
@@ -113,11 +126,18 @@ pub(crate) fn split_line(line: &str) -> Vec<String> {
     if have_word {
         out.push(word);
     }
-    out
+    Ok(out)
 }
 
 pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line: &str) -> bool {
-    let owned = split_line(line);
+    let owned = match split_line(line) {
+        Ok(words) => words,
+        Err(e) => {
+            eprintln!("{} {e}", ui::red("error:"));
+            note_refusal();
+            return false;
+        }
+    };
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     // `service` is what VyOS calls this subtree and what people type; the config
@@ -7295,13 +7315,37 @@ mod tests {
         assert_eq!(kw(&["delete", "firewall", "syn-protect", "443"]), ["mss"]);
     }
 
+    fn words(line: &str) -> Vec<String> {
+        split_line(line).unwrap()
+    }
+
+    #[test]
+    fn a_control_character_is_never_part_of_a_word() {
+        // CTRL-08: the CR a quoted value used to keep was a line break to
+        // systemd, and a second directive in the unit the value reached.
+        for line in [
+            "set services snmp location \"rack\r4\"",
+            "set services snmp location \"rack\n4\"",
+            "set services snmp location \"rack\\\r4\"",
+            "set services snmp location rack\u{0}4",
+            "set services snmp location rack\u{1b}4",
+            "set services snmp location \"rack\u{2028}4\"",
+            "set services snmp location \"rack\t4\"",
+        ] {
+            let error = split_line(line).expect_err(line);
+            assert!(error.to_string().contains("control character"), "{error}");
+        }
+        // Outside a word a tab or a CRLF's CR still only separates.
+        assert_eq!(words("set\ta b\r"), ["set", "a", "b"]);
+    }
+
     #[test]
     fn a_quoted_value_keeps_its_spaces_and_loses_its_quotes() {
         // Every free-text field — a certificate subject, a description, a portal
         // message — was unreachable before this: the words arrived separately and
         // the quotes ended up inside the value.
         assert_eq!(
-            split_line(r#"set pki ca house common-name "Velstra Test CA""#),
+            words(r#"set pki ca house common-name "Velstra Test CA""#),
             [
                 "set",
                 "pki",
@@ -7313,7 +7357,7 @@ mod tests {
         );
         // A quote inside a quoted value, and an empty value.
         assert_eq!(
-            split_line(r#"set x y "a \"b\" c""#),
+            words(r#"set x y "a \"b\" c""#),
             ["set", "x", "y", r#"a "b" c"#]
         );
         // A quote that does NOT begin a word is an ordinary character. This is
@@ -7322,7 +7366,7 @@ mod tests {
         // exactly as written, quotes included, or the rule that gets loaded is
         // not the rule that was typed.
         assert_eq!(
-            split_line(
+            words(
                 r#"set services ids rule alert icmp any any -> any any (msg:"an echo"; itype:8;)"#
             ),
             [
@@ -7342,18 +7386,18 @@ mod tests {
                 "itype:8;)"
             ]
         );
-        assert_eq!(split_line(r#"set x y """#), ["set", "x", "y", ""]);
+        assert_eq!(words(r#"set x y """#), ["set", "x", "y", ""]);
         // Unquoted behaviour is unchanged, comment rule included.
-        assert_eq!(split_line("  set  a   b  "), ["set", "a", "b"]);
-        assert_eq!(split_line("set a b # why"), ["set", "a", "b"]);
+        assert_eq!(words("  set  a   b  "), ["set", "a", "b"]);
+        assert_eq!(words("set a b # why"), ["set", "a", "b"]);
         assert_eq!(
-            split_line("set system login bob password corr#ect"),
+            words("set system login bob password corr#ect"),
             ["set", "system", "login", "bob", "password", "corr#ect"]
         );
         // A `#` inside quotes is text, not a comment.
-        assert_eq!(split_line(r#"set x y "a # b""#), ["set", "x", "y", "a # b"]);
-        assert_eq!(split_line("# whole line"), Vec::<String>::new());
-        assert_eq!(split_line(""), Vec::<String>::new());
+        assert_eq!(words(r#"set x y "a # b""#), ["set", "x", "y", "a # b"]);
+        assert_eq!(words("# whole line"), Vec::<String>::new());
+        assert_eq!(words(""), Vec::<String>::new());
     }
 
     #[test]

@@ -168,6 +168,9 @@ fn post_webhook(url: &str, body: &str) -> Result<()> {
             // never appears in the process list of a shared box.
             "--data-binary",
             "@-",
+            // The URL is the operator's, taken literally: without this curl
+            // expands `{a,b}` and `[1-100]` into a request per match (CTRL-29).
+            "--globoff",
             url,
         ])
         .stdin(std::process::Stdio::piped())

@@ -109,7 +109,10 @@ fn snapshot_path(config: &Path) -> PathBuf {
 fn previous_active(saved: &Path, running: &Path) -> Result<Appliance> {
     let baseline = system::read_owned_regular(saved, 64 * 1024 * 1024)?
         .context("commit-confirm needs a valid saved boot baseline; run `save` first")?;
-    let saved = Appliance::from_toml(&baseline).context("validating the saved boot baseline")?;
+    // Read as boot reads it (CTRL-08): a value a later update refuses must not
+    // block the commit that fixes it; reverting restores this file, which boots.
+    let saved =
+        Appliance::saved_lenient(saved, &baseline).context("validating the saved boot baseline")?;
     match Session::read_running_at(running)? {
         Some(text) => {
             Appliance::from_toml(&text).context("validating the previous active configuration")

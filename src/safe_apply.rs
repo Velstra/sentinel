@@ -317,7 +317,8 @@ fn begin_with(
          applying a management change"
     );
     let saved = system::read_owned_file(path)?.context("safe apply requires a saved baseline")?;
-    Appliance::from_toml(&saved).context("validating the rollback baseline")?;
+    // Read as boot reads it (CTRL-08): the revert restores this file, which boots.
+    Appliance::saved_lenient(path, &saved).context("validating the rollback baseline")?;
     let running = if act.enabled {
         session::Session::read_running_at(Path::new(session::Session::RUNNING))?
             .unwrap_or_else(|| saved.clone())

@@ -2821,15 +2821,13 @@ impl Session {
             .context("reading active configuration")
     }
 
+    /// The box's saved configuration, read the way boot reads it: a value an
+    /// update has since refused is neutralised with a loud warning rather than
+    /// locking the operator out of `configure` (and out of the commit that
+    /// would fix it). The next commit saves the neutralised value.
     pub(crate) fn read_saved_at(path: &Path) -> Result<Option<Appliance>> {
         crate::system::read_owned_regular(path, 64 * 1024 * 1024)?
-            .map(|text| {
-                if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                    Appliance::from_json(&text)
-                } else {
-                    Appliance::from_toml(&text)
-                }
-            })
+            .map(|text| Appliance::saved_lenient(path, &text))
             .transpose()
     }
 
@@ -2906,8 +2904,10 @@ impl Session {
 
     /// Open a session, loading `path` as the candidate if it exists.
     pub fn load(path: &Path) -> Result<Self> {
+        // Lenient for the same reason as `read_saved_at`: this is a config the
+        // operator edits, not a document someone handed the appliance.
         let draft = if path.exists() {
-            Draft::from_appliance(&Appliance::load(path)?)
+            Draft::from_appliance(&Appliance::load_lenient(path)?)
         } else {
             Draft::default()
         };
@@ -3667,20 +3667,13 @@ impl Session {
                 self.draft.iface_mut(name).bridge_port.learning = Some(parse_bool(v)?);
             }
             ["interface", name, "bond", "hash-policy", v] => {
-                if !matches!(
-                    *v,
-                    "layer2" | "layer2+3" | "layer3+4" | "encap2+3" | "encap3+4"
-                ) {
-                    bail!(
-                        "interface {name} bond hash-policy {v:?}: layer2 | layer2+3 | layer3+4 | encap2+3 | encap3+4"
-                    );
-                }
+                crate::fieldcheck::bond_hash_policy(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).bond.hash_policy = Some((*v).to_string());
             }
             ["interface", name, "bond", "lacp-rate", v] => {
-                if !matches!(*v, "slow" | "fast") {
-                    bail!("interface {name} bond lacp-rate {v:?}: slow | fast");
-                }
+                crate::fieldcheck::bond_lacp_rate(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).bond.lacp_rate = Some((*v).to_string());
             }
             ["interface", name, "bond", "min-links", v] => {
@@ -3807,7 +3800,8 @@ impl Session {
                 self.draft.iface_mut(name).dhcp.duid = Some(v.to_ascii_lowercase());
             }
             ["interface", name, "dhcp", "host-name", v] => {
-                crate::config::validate_hostname(v)?;
+                crate::fieldcheck::dhcp_host_name(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).dhcp.host_name = Some((*v).to_string());
             }
             ["interface", name, "dhcp", "vendor-class-id", v] => {
@@ -3883,6 +3877,8 @@ impl Session {
                 self.draft.iface_mut(name).pppoe_mut().username = Some((*v).to_string());
             }
             ["interface", name, "pppoe", "password", v] => {
+                crate::fieldcheck::pppoe_client_password(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).pppoe_mut().password = Some((*v).to_string());
             }
             ["interface", name, "pppoe", "service-name", v] => {
@@ -4429,10 +4425,9 @@ impl Session {
             // A TXT record whose value could not contain a space would be a TXT
             // record that cannot hold what people put in one.
             ["services", "dns", "txt-record", name, rest @ ..] if !rest.is_empty() => {
-                self.draft
-                    .dns
-                    .txt_record
-                    .insert((*name).to_string(), rest.join(" "));
+                let text = rest.join(" ");
+                crate::fieldcheck::dns_txt(&text)?;
+                self.draft.dns.txt_record.insert((*name).to_string(), text);
             }
             ["interface", name, "hw-id", v] => {
                 self.draft.iface_mut(name).hw_id = Some((*v).to_string());
@@ -4445,11 +4440,15 @@ impl Session {
                     .insert((*feature).to_string(), on);
             }
             ["system", "sysctl", key, "value", v] => {
+                crate::fieldcheck::sysctl_key(key)?;
                 self.draft
                     .sysctl
                     .insert((*key).to_string(), (*v).to_string());
             }
             ["services", "ntp", "allow-from", v] => {
+                for net in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    crate::fieldcheck::ntp_allow_from(net)?;
+                }
                 append_csv(&mut self.draft.ntp.allow_from, v);
             }
             ["services", "ntp", "serve-on", v] => {
@@ -4553,17 +4552,8 @@ impl Session {
                 self.draft.web.tls_key = Some((*v).to_string());
             }
             ["services", "ssh", "loglevel", v] => {
-                const LEVELS: [&str; 8] = [
-                    "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3",
-                ];
-                let want = v.to_ascii_uppercase();
-                if !LEVELS.contains(&want.as_str()) {
-                    bail!(
-                        "services ssh loglevel {v:?}: expected one of {}",
-                        LEVELS.join(", ")
-                    );
-                }
-                self.draft.ssh.loglevel = Some(want);
+                crate::fieldcheck::ssh_loglevel(v)?;
+                self.draft.ssh.loglevel = Some(v.to_ascii_uppercase());
             }
 
             // The serial console, and how far back the archive remembers.
@@ -4798,9 +4788,11 @@ impl Session {
                 self.draft.dyndns.hostname = Some((*v).to_string());
             }
             ["services", "dyndns", "login", v] => {
+                crate::fieldcheck::dyndns_login(v)?;
                 self.draft.dyndns.login = Some((*v).to_string());
             }
             ["services", "dyndns", "password", v] => {
+                crate::fieldcheck::dyndns_password(v)?;
                 self.draft.dyndns.password = Some((*v).to_string());
             }
             ["services", "dyndns", "interface", v] => {
@@ -5066,6 +5058,7 @@ impl Session {
                     Some(v.parse().with_context(|| format!("invalid mtu {v:?}"))?);
             }
             ["services", "pppoe-server", "user", name, "password", v] => {
+                crate::fieldcheck::pppoe_subscriber_password(name, v)?;
                 self.draft.pppoe_user_mut(name).password = (*v).to_string();
             }
             ["services", "pppoe-server", "user", name, "address", v] => {
@@ -6278,6 +6271,8 @@ impl Session {
                          `show configuration commands`, which carries it."
                     );
                 }
+                crate::fieldcheck::subscription_key(v)
+                    .map_err(|e| anyhow::anyhow!("update channel {name} {e}"))?;
                 self.draft.update_channel_mut(name).subscription_key = Some((*v).to_string());
             }
 
@@ -7441,6 +7436,7 @@ impl Session {
                     "enable" => s.enable = true,
                     "port" => s.port = None,
                     "listen-address" => s.listen_address = None,
+                    "loglevel" => s.loglevel = None,
                     "password-authentication" => s.password_authentication = false,
                     other => bail!("services ssh has no field {other:?}"),
                 }
@@ -8955,7 +8951,7 @@ impl Session {
                 .map(|appliance| Draft::from_appliance(&appliance))
                 .unwrap_or_default()
         } else if self.path.exists() {
-            Draft::from_appliance(&Appliance::load(&self.path)?)
+            Draft::from_appliance(&Appliance::load_lenient(&self.path)?)
         } else {
             Draft::default()
         };
@@ -12009,6 +12005,9 @@ fn render_draft_masked(
             if let Some(a) = &ssh.listen_address {
                 svc.push_str(&format!("        listen-address {a}\n"));
             }
+            if let Some(level) = &ssh.loglevel {
+                svc.push_str(&format!("        loglevel {level}\n"));
+            }
             if ssh.password_authentication {
                 svc.push_str("        password-authentication true\n");
             }
@@ -13767,7 +13766,6 @@ mod tests {
             (r"/tmp/cert\literal.pem", r"/tmp/key\literal.pem"),
             ("# certificate.pem", "# private-key.pem"),
             ("  certificate.pem  ", "  private-key.pem  "),
-            ("/tmp/cert\tname.pem", "/tmp/key\tname.pem"),
             (
                 "/tmp/cert $(literal);`text`&|<>*.pem",
                 "/tmp/key $(literal);`text`&|<>*.pem",
@@ -13792,7 +13790,7 @@ mod tests {
                             .iter()
                             .map(|line| {
                                 assert!(!line.contains('\n') && !line.contains('\r'));
-                                crate::repl::split_line(line)
+                                crate::repl::split_line(line).unwrap()
                             })
                             .filter(|words| words.get(3).is_some_and(|name| name == field))
                             .collect();
@@ -13842,7 +13840,15 @@ mod tests {
             .unwrap();
         let baseline = session.commit().unwrap();
         for field in ["tls-cert", "tls-key"] {
-            for value in ["", "\0", "/tmp/one\ntwo.pem", "/tmp/one\rtwo.pem"] {
+            // A tab is a control character like the rest: the one rule every
+            // setting obeys (audit 8b6181, CTRL-08), not an exception for paths.
+            for value in [
+                "",
+                "\0",
+                "/tmp/one\ntwo.pem",
+                "/tmp/one\rtwo.pem",
+                "/tmp/one\ttwo.pem",
+            ] {
                 let dirty = session.dirty;
                 let error = session
                     .set(&["services", "web", field, value])
@@ -13910,8 +13916,10 @@ mod tests {
             ] {
                 let commands = flatten_config(&rendered);
                 assert!(
-                    commands.iter().any(|line| crate::repl::split_line(line)
-                        == ["set", "services", "web", field, expected]),
+                    commands
+                        .iter()
+                        .any(|line| crate::repl::split_line(line).unwrap()
+                            == ["set", "services", "web", field, expected]),
                     "{field}: {commands:?}"
                 );
             }
@@ -15410,7 +15418,7 @@ backends = ["10.0.0.11:8443"]
     // Representation regressions must use the shipped quote-aware REPL
     // lexer. split_whitespace deliberately cannot model quoted filenames.
     fn run_cli_tokens(session: &mut Session, line: &str) -> Result<()> {
-        let owned = crate::repl::split_line(line);
+        let owned = crate::repl::split_line(line)?;
         let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
         match parts[0] {
             "set" => session.set(&parts[1..]),

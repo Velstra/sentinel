@@ -872,12 +872,91 @@ const DNSMASQ_CONF: &str = "sentinel.conf";
 /// environment-file parser strips quotes and backslashes before that.
 const ENV_WORD_UNSAFE: &[char] = &[' ', '"', '\'', '\\'];
 
+/// What ends or splits an unquoted ddclient value besides a line break: its
+/// parser takes whitespace and commas as option separators, quotes and a
+/// backslash as quoting, and `#` as a comment.
+const DDCLIENT_WORD_UNSAFE: &[char] = &[' ', '\t', ',', '"', '\'', '\\', '#'];
+
 fn reject_unsafe(field: &str, value: &str, extra: &[char]) -> Result<()> {
-    if let Some(c) = value.chars().find(|c| c.is_control() || extra.contains(c)) {
-        anyhow::bail!(
-            "{field} contains an unsafe character {c:?} that could corrupt the generated \
-             daemon config; remove it"
-        );
+    crate::textcheck::reject_unsafe(field, value, extra)
+}
+
+/// Render-time guard for the networkd units (audit 8b6181, CTRL-08/13/17).
+///
+/// The unit bodies interpolate dozens of interface fields with `format!`, and a
+/// line break in any one of them is a `[Section]` or a directive nobody
+/// configured — `ActivationPolicy=always-up` raising a zoned link before the
+/// data plane hooks it, `[Match] Name=*` capturing every other link. So every
+/// string of every interface (and of the WireGuard tunnels whose keys land in a
+/// `.netdev`) is checked here, before anything is rendered, and the two enums
+/// that reach a `.netdev` verbatim are checked against the values networkd
+/// takes. Independent of `Appliance::validate`, which should already have
+/// refused all of it.
+fn networkd_inputs_safe(appliance: &Appliance) -> Result<()> {
+    for i in &appliance.interfaces {
+        crate::textcheck::reject_unsafe_in(&format!("interface {}", i.name), i)?;
+        if let Some(h) = &i.bond.hash_policy {
+            crate::fieldcheck::bond_hash_policy(h)?;
+        }
+        if let Some(r) = &i.bond.lacp_rate {
+            crate::fieldcheck::bond_lacp_rate(r)?;
+        }
+    }
+    for t in &appliance.vpn.wireguard {
+        crate::textcheck::reject_unsafe_in(&format!("wireguard tunnel {}", t.name), t)?;
+    }
+    Ok(())
+}
+
+/// Render-time guard for the sshd drop-in (CTRL-03): every directive is one
+/// line of `sshd_config` read by a root daemon before authentication, so the
+/// level must be a level and nothing may hold a line break.
+fn ssh_dropin_safe(ssh: &Ssh) -> Result<()> {
+    crate::textcheck::reject_unsafe_in("services ssh", ssh)?;
+    if let Some(level) = &ssh.loglevel {
+        crate::fieldcheck::ssh_loglevel(level)?;
+    }
+    if let Some(a) = &ssh.listen_address {
+        reject_unsafe("ssh listen-address", a, &[' ', '\t', '#', '"'])?;
+    }
+    Ok(())
+}
+
+/// Render-time guard for chrony.conf (CTRL-16): `server <host> iburst` and
+/// `allow <net>` are single directives, so a host is one word and a network is
+/// an address or a prefix.
+fn chrony_inputs_safe(ntp: &Ntp) -> Result<()> {
+    for up in &ntp.upstream {
+        reject_unsafe("ntp upstream", up, &[' ', '\t', '#', '"'])?;
+    }
+    for net in &ntp.allow_from {
+        crate::fieldcheck::ntp_allow_from(net)?;
+    }
+    Ok(())
+}
+
+/// Render-time guard for pppd's chap/pap secrets (CTRL-18): each row is quoted
+/// words, so no field may hold a quote, a backslash or a line break, a
+/// subscriber may not be the `*` wildcard, and no secret may start with `@`
+/// (pppd would read the secret from the file it names).
+fn ppp_secrets_safe(ifaces: &[Interface], bng: &PppoeServer) -> Result<()> {
+    // The same rows `ppp_secrets_body` writes: only active uplinks.
+    for p in ifaces
+        .iter()
+        .filter(|i| is_active_pppoe(i))
+        .filter_map(|i| i.pppoe.as_ref())
+    {
+        reject_unsafe("pppoe username", &p.username, &['"', '\\'])?;
+        reject_unsafe("pppoe password", &p.password, &['"', '\\'])?;
+        crate::fieldcheck::pppoe_client_password(&p.password)?;
+    }
+    for u in &bng.users {
+        reject_unsafe("pppoe-server user", &u.name, &[])?;
+        reject_unsafe("pppoe-server password", &u.password, &[])?;
+        crate::fieldcheck::pppoe_subscriber(u)?;
+    }
+    if let Some(ac) = &bng.ac_name {
+        reject_unsafe("pppoe-server ac-name", ac, &['"', '\\', ' ', '\t'])?;
     }
     Ok(())
 }
@@ -1001,7 +1080,7 @@ fn dnsmasq_conf_body(dns: &Dns) -> Result<Option<String>> {
     // an honest "no such record".
     for (name, text) in &dns.txt_record {
         reject_unsafe("dns txt-record name", name, &['/', ','])?;
-        reject_unsafe("dns txt-record text", text, &['\n'])?;
+        reject_unsafe("dns txt-record text", text, &['"', '\\'])?;
         body.push_str(&format!("local=/{name}/\n"));
         body.push_str(&format!("txt-record={name},\"{text}\"\n"));
     }
@@ -1094,6 +1173,7 @@ pub enum ApplyMode {
 /// order (chronyd reads the drop-in on its own start).
 fn apply_chrony(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(CHRONY_CONFDIR).join(CHRONY_CONF);
+    chrony_inputs_safe(&appliance.services.ntp)?;
     let body = chrony_conf_body(&appliance.services.ntp, &appliance.interfaces);
     crate::reconcile::service_file(&path, Some(&body), mode, system::install_file, |changed| {
         if changed {
@@ -1564,7 +1644,7 @@ fn ddclient_conf_body(dd: &Dyndns) -> Result<Option<String>> {
     // Every interpolated field lands on its own `key=value` (or bare) line, so a
     // newline in any of them would inject a directive; the password is additionally
     // single-quoted, so a literal `'` would break out of the quoting.
-    reject_unsafe("dyndns hostname", hostname, &[])?;
+    reject_unsafe("dyndns hostname", hostname, DDCLIENT_WORD_UNSAFE)?;
     let provider = dd.provider.as_deref().unwrap_or("dyndns2");
     crate::config::validate_dyndns_provider(provider)?;
     let mut body = String::from("# rendered by sentinel — dynamic DNS (ddclient)\n");
@@ -1578,15 +1658,17 @@ fn ddclient_conf_body(dd: &Dyndns) -> Result<Option<String>> {
         None => body.push_str("use=web\n"),
     }
     if let Some(server) = &dd.server {
-        reject_unsafe("dyndns server", server, &[])?;
+        reject_unsafe("dyndns server", server, DDCLIENT_WORD_UNSAFE)?;
         body.push_str(&format!("server={server}\n"));
     }
     if let Some(login) = &dd.login {
-        reject_unsafe("dyndns login", login, &[])?;
+        // ddclient splits an unquoted value on whitespace and commas into
+        // further options (`usev4=cmdv4 cmdv4=…` is a root command): CTRL-02.
+        crate::fieldcheck::dyndns_login(login)?;
         body.push_str(&format!("login={login}\n"));
     }
     if let Some(password) = &dd.password {
-        reject_unsafe("dyndns password", password, &['\''])?;
+        reject_unsafe("dyndns password", password, &['\'', '\\'])?;
         body.push_str(&format!("password='{password}'\n"));
     }
     body.push_str(&format!("{hostname}\n"));
@@ -2192,6 +2274,7 @@ fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     apply_logins(appliance, mode)?;
 
     let dropin = Path::new(SSH_DROPIN);
+    ssh_dropin_safe(ssh)?;
     let body = ssh_dropin_body(ssh);
     let dropin_changed = file_changed(dropin, &body);
     system::install_file(dropin, &body)?;
@@ -3035,6 +3118,7 @@ fn apply_pppoe(appliance: &Appliance) -> Result<()> {
     // Credentials (CHAP + PAP). A change re-dials every session (any could use
     // the changed line). Removed when no PPPoE interface remains.
     let mut secrets_changed = false;
+    ppp_secrets_safe(ifaces, &appliance.services.pppoe_server)?;
     match ppp_secrets_body(ifaces, &appliance.services.pppoe_server) {
         Some(body) => {
             let changed = file_changed(Path::new(PPP_CHAP_SECRETS), &body);
@@ -3844,6 +3928,7 @@ fn agent_environment_for_iface(appliance: &Appliance, iface: &str) -> String {
 pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     preflight_login_accounts(appliance)?;
     crate::ipsec_guards::prepare(appliance)?;
+    networkd_inputs_safe(appliance)?;
     let ifaces = &appliance.interfaces;
 
     // The members named as a bond's `primary`. Collected from the bonds, applied
@@ -4182,6 +4267,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // it is installed 0640 root:systemd-network (readable by networkd, not by
     // ordinary users); everything else stays the default 0644.
     for (name, body) in &writes {
+        // A CR is a line break to systemd's parser, and a NUL ends the read:
+        // neither may reach a unit, whatever produced it.
+        crate::textcheck::reject_unsafe_text(&format!("networkd unit {name}"), body)?;
         if previous.get(name) == Some(body) {
             continue;
         }
@@ -4691,6 +4779,10 @@ fn apply_sysctl(appliance: &Appliance) -> Result<()> {
     let mut body =
         String::from("# Written by sentinel from [system.sysctl] and per-interface settings.\n");
     for (key, value) in &params {
+        // `key = value` lines: a line break in either, or a space or `=` in the
+        // name, is a second parameter (CTRL-29).
+        crate::fieldcheck::sysctl_key(key)?;
+        reject_unsafe("system sysctl value", value, &[])?;
         body.push_str(&format!("{key} = {value}\n"));
     }
     for (dir, iface, knob, value) in &per_link {
@@ -8130,6 +8222,10 @@ fn observation_identity_requires_active_matching_managed_uid() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "net_inject_props.rs"]
+mod inject_props;
 
 #[cfg(test)]
 mod management_bind_tests {

@@ -2483,7 +2483,10 @@ async fn post_configure(
         }.map_err(ApiError::internal)?;
         let mut commit = false;
         for (index, line) in body.lines().enumerate() {
-            let words = repl::split_line(line);
+            let words = match repl::split_line(line) {
+                Ok(words) => words,
+                Err(error) => return Err(ApiError::bad_request(anyhow!("line {} refused: {error:#}", index + 1))),
+            };
             let args: Vec<&str> = words.iter().map(String::as_str).collect();
             let result = match args.as_slice() {
                 [] => Ok(()),
@@ -4830,7 +4833,7 @@ action="reject"
 
     #[tokio::test]
     async fn destination_zone_admission_redacts_secrets_in_refused_rule_names() {
-        for secret in ["x", "admission-secret-\"quoted\\value\nend"] {
+        for secret in ["x", "admission-secret-\"quoted\\value-end"] {
             let path = seed("working");
             let original = std::fs::read(&path).unwrap();
             let mut candidate = advisory_candidate();
@@ -4873,7 +4876,7 @@ action="reject"
 
     #[tokio::test]
     async fn api_advisory_redacts_short_and_escaped_secrets_in_success_responses() {
-        for secret in ["x", "advisory-secret-\"quoted\\value\nend"] {
+        for secret in ["x", "advisory-secret-\"quoted\\value-end"] {
             let path = seed("working");
             let mut candidate = advisory_candidate();
             candidate.rules[0].action = crate::config::Action::Accept;
