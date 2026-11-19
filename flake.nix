@@ -15980,13 +15980,15 @@
               primary.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.1", timeout=20)
               backup.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.2", timeout=20)
 
-              # The backup arms the receiving side: the shared secret becomes its API
-              # token and widens the API to listen off-box.
+              # The backup arms the receiving side: the shared secret becomes the
+              # credential its API accepts from the peer and widens the API to
+              # listen off-box. It is not the machine token (CTRL-01), so the
+              # administrative API calls below use the root-only token file.
               backup.succeed(
                   "su admin -c \"printf '%s\\n' "
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
-                  "'set system config-sync secret shared-token-123' "
+                  "'set system config-sync secret configsync-vm-fixture-credential-0123456789' "
                   "commit save exit "
                   "| sentinel configure\""
               )
@@ -15999,7 +16001,7 @@
               backup.succeed("test $(stat -c %u /var/lib/sentinel/api-token) = 0; test $(stat -c %a /var/lib/sentinel/api-token) = 600")
               # The privileged installer also publishes into its own staging
               # directory. This must not attempt install(source, source).
-              backup.succeed("grep -q shared-token-123 /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
+              backup.succeed("grep -q configsync-vm-fixture-credential-0123456789 /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
 
               with subtest("real receive-journal ENOSPC refuses before live apply"):
                   backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} disk-full")
@@ -16028,7 +16030,7 @@
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
                   "'set interface eth1 mtu 1400' "
-                  "'set system config-sync secret shared-token-123' "
+                  "'set system config-sync secret configsync-vm-fixture-credential-0123456789' "
                   "commit save exit | sentinel configure\""
               )
 
@@ -16043,7 +16045,7 @@
                   "su admin -c \"printf '%s\\n' "
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
-                  "'set system config-sync secret shared-token-123' "
+                  "'set system config-sync secret configsync-vm-fixture-credential-0123456789' "
                   "'set system config-sync peer 10.9.0.2' "
                   "'set firewall rule synced-rule from lan' "
                   "'set firewall rule synced-rule action accept' "
@@ -16096,18 +16098,18 @@
               for interface in desired["interface"]:
                   if interface["name"]=="eth1": interface["mtu"]=1450
               primary.succeed("printf %s "+shlex.quote(json.dumps(desired))+" >/tmp/ha-api.json")
-              primary.succeed("curl -fsSk -X PUT -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
+              primary.succeed("curl -fsSk -X PUT -H \"Authorization: Bearer $(cat /var/lib/sentinel/api-token)\" -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
               import time
               deadline = time.monotonic() + 90
               while time.monotonic() < deadline:
-                  pending_revision = json.loads(primary.succeed("curl -fsSk -H 'Authorization: Bearer shared-token-123' https://127.0.0.1:8080/api/v1/config/transaction"))["pending"]
+                  pending_revision = json.loads(primary.succeed("curl -fsSk -H \"Authorization: Bearer $(cat /var/lib/sentinel/api-token)\" https://127.0.0.1:8080/api/v1/config/transaction"))["pending"]
                   assert pending_revision is not None
                   if pending_revision["ready"]:
                       break
                   time.sleep(0.2)
               else:
                   raise AssertionError("API configuration worker did not finish")
-              primary.succeed("curl -fsSk -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary " + shlex.quote(json.dumps(dict(id=pending_revision["id"]))) + " https://127.0.0.1:8080/api/v1/config/confirm")
+              primary.succeed("curl -fsSk -H \"Authorization: Bearer $(cat /var/lib/sentinel/api-token)\" -H 'Content-Type: application/json' --data-binary " + shlex.quote(json.dumps(dict(id=pending_revision["id"]))) + " https://127.0.0.1:8080/api/v1/config/confirm")
               primary.succeed("grep -q api-synced-rule /var/lib/sentinel/configsync/pending.json; test $(stat -c %a /var/lib/sentinel/configsync/pending.json) = 600")
               primary.succeed("systemctl is-active --quiet sentinel-configsync.timer")
               backup.fail("grep -q api-synced-rule /var/lib/sentinel/appliance.toml")

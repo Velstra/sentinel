@@ -92,6 +92,11 @@ pub(crate) fn check(previous: Option<&Appliance>, candidate: &Appliance) -> Resu
             names
         );
     }
+    // CTRL-01: a weak config-sync secret is an offline-guessable credential.
+    // Refused for every admitted change, not grandfathered: the box still
+    // boots and pairs with it (boot does not use this gate), but no change is
+    // accepted until it is rotated.
+    candidate.refuse_weak_sync_secret()?;
     Ok(())
 }
 

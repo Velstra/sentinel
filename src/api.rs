@@ -3134,6 +3134,8 @@ mod tests {
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-token-abc123";
+    /// The config-sync secret of the test pairs: strong enough to be admitted.
+    const PEER_SECRET: &str = "legacy-pair-fixture-credential-0123456789";
 
     // Dedicated failed-show disclosure regressions reuse this module's real
     // account/HTTPS fixtures rather than introducing a second auth setup.
@@ -4726,11 +4728,18 @@ action="reject"
 
     #[tokio::test]
     async fn api_advisory_redacts_short_and_escaped_secrets_in_success_responses() {
-        for secret in ["x", "advisory-secret-\"quoted\\value\nend"] {
+        // A short secret in a field that may be short (the config-sync secret
+        // no longer may), and an escaped one in the free-form config-sync
+        // secret (which may hold quotes and backslashes, not control bytes).
+        for secret in ["x", "advisory-secret-\"quoted\\value-0123456789-end"] {
             let path = seed("working");
             let mut candidate = advisory_candidate();
             candidate.rules[0].action = crate::config::Action::Accept;
-            candidate.system.config_sync.secret = Some(secret.into());
+            if secret.len() == 1 {
+                candidate.services.snmp.community = Some(secret.into());
+            } else {
+                candidate.system.config_sync.secret = Some(secret.into());
+            }
             candidate.rules[0].name = format!("label-{secret}");
             candidate.validate().unwrap();
             let response = router(state(path))
@@ -6103,7 +6112,7 @@ action="reject"
         let member = |name: &str, own: &str, peer: &str, priority: u8| {
             Appliance::from_toml(&format!(
                 "[system]\nhostname = \"{name}\"\n\
-                 [system.config-sync]\npeer = [\"{peer}\"]\nsecret = \"shared-secret\"\n\
+                 [system.config-sync]\npeer = [\"{peer}\"]\nsecret = \"{PEER_SECRET}\"\n\
                  [[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n\
                  [[system.login]]\nusername = \"vera\"\ngroup = \"ops\"\n\
                  [[interface]]\nname = \"wan\"\naddress = \"{own}/24\"\nzone = \"wan\"\n\

@@ -15,7 +15,7 @@ import urllib.request
 CONFIG = Path("/var/lib/sentinel/appliance.toml")
 MARKER = CONFIG.with_suffix(".configsync-received")
 RECORD = Path("/tmp/configsync-receive-proof.json")
-TOKEN = "shared-token-123"  # Disposable fixture credential, never production.
+TOKEN = "configsync-vm-fixture-credential-0123456789"  # Disposable fixture credential, never production.
 RESULTS = Path("/tmp/configsync-receive-results.json")
 
 
