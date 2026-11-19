@@ -531,6 +531,33 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             return false;
         }
     };
+    // From here to the recorded RUNNING the commit must finish or roll back,
+    // whatever happens to the terminal (CTRL-15).
+    // Off-box nothing live is touched and there is nothing to protect.
+    let guard = act.enabled.then(crate::commit_guard::Guard::enter);
+    let committed = commit_admitted(session, act, saved_before, running_before);
+    let deferred = guard
+        .as_ref()
+        .and_then(crate::commit_guard::Guard::deferred);
+    drop(guard);
+    if let Some(signal) = deferred {
+        eprintln!(
+            "{}",
+            ui::yellow(&format!(
+                "note: signal {signal} arrived during the commit and was deferred until it finished"
+            ))
+        );
+    }
+    committed
+}
+
+/// The part of `commit` after admission: validate, activate, record.
+fn commit_admitted(
+    session: &mut Session,
+    act: &Apply,
+    saved_before: Option<crate::config::Appliance>,
+    running_before: Option<crate::config::Appliance>,
+) -> bool {
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -709,6 +736,8 @@ fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
         if act.enabled {
             session.ensure_current()?;
         }
+        // Like commit: finish or roll back whatever happens to the terminal.
+        let _guard = act.enabled.then(crate::commit_guard::Guard::enter);
         crate::archive::rollback(session, act, n)
     })();
     match restored {
@@ -740,17 +769,35 @@ impl Rollback {
         self.steps.push((what, Box::new(undo)));
     }
 
+    /// The apply completed: nothing is left to undo.
+    fn disarm(&mut self) {
+        self.steps.clear();
+    }
+
     /// Run every recorded undo in reverse order. Returns the names of any that
     /// themselves failed, so the operator learns exactly what is left
     /// inconsistent (rather than a bare "commit failed").
-    fn unwind(self) -> Vec<String> {
+    fn unwind(mut self) -> Vec<String> {
         let mut failures = Vec::new();
-        for (what, undo) in self.steps.into_iter().rev() {
+        for (what, undo) in std::mem::take(&mut self.steps).into_iter().rev() {
             if let Err(e) = undo() {
                 failures.push(format!("{what} ({e})"));
             }
         }
         failures
+    }
+}
+
+/// A rollback stack dropped while still armed — the apply was abandoned by a
+/// panic between two stages — undoes what it recorded rather than leaving the
+/// earlier stages live over a later one that never ran (CTRL-15).
+impl Drop for Rollback {
+    fn drop(&mut self) {
+        for (what, undo) in std::mem::take(&mut self.steps).into_iter().rev() {
+            if let Err(error) = undo() {
+                eprintln!("warning: undoing {what} after an abandoned apply: {error:#}");
+            }
+        }
     }
 }
 
@@ -1905,6 +1952,7 @@ fn apply_live_as(
             None => unwind_err_mixed(rb, error),
         });
     }
+    rb.disarm();
     Ok(())
 }
 
@@ -8873,6 +8921,33 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("second"), "{:?}", failures);
         assert!(failures[0].contains("boom"), "{:?}", failures);
+    }
+
+    #[test]
+    fn an_abandoned_apply_undoes_its_stages_and_a_finished_one_does_not() {
+        // CTRL-15: a panic between two stages dropped the stack and left the
+        // earlier stages live. An armed stack now undoes itself on drop.
+        let undone = std::rc::Rc::new(std::cell::Cell::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut rb = Rollback::new();
+            let seen = undone.clone();
+            rb.push("firewall", move || {
+                seen.set(seen.get() + 1);
+                Ok(())
+            });
+            panic!("EIO while reporting progress");
+        }));
+        assert!(result.is_err());
+        assert_eq!(undone.get(), 1, "the abandoned stage was not undone");
+        let mut rb = Rollback::new();
+        let seen = undone.clone();
+        rb.push("firewall", move || {
+            seen.set(seen.get() + 1);
+            Ok(())
+        });
+        rb.disarm();
+        drop(rb);
+        assert_eq!(undone.get(), 1, "a finished apply was undone");
     }
 
     #[test]

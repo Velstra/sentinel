@@ -21,6 +21,7 @@ mod boot_entry;
 mod boot_fallback;
 mod capture;
 mod clock;
+mod commit_guard;
 mod compile;
 mod config;
 mod configsync;
