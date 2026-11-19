@@ -4457,10 +4457,23 @@ mod ha_curl_tests {
             std::env::set_var("HTTPS_PROXY", "http://proxy.attacker.example:3128");
             std::env::set_var("SSLKEYLOGFILE", "/tmp/stolen-keys");
         }
-        let out = curl_command_for(fake.to_str().unwrap())
-            .arg("https://peer.example")
-            .output()
-            .unwrap();
+        // Another test thread may fork while this one still holds the stub's
+        // write descriptor; the forked child keeps it until its own exec, and
+        // exec of a file open for writing fails with ETXTBSY. The window is
+        // that short, so retry rather than fail the release build on it.
+        let mut attempts = 0;
+        let out = loop {
+            match curl_command_for(fake.to_str().unwrap())
+                .arg("https://peer.example")
+                .output()
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => break other.unwrap(),
+            }
+        };
         unsafe {
             std::env::remove_var("HTTPS_PROXY");
             std::env::remove_var("SSLKEYLOGFILE");
