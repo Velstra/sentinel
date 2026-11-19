@@ -920,11 +920,7 @@ pub fn arm_confirm(minutes: u32, cfg: &Path, original: &Path) -> Result<()> {
         "--timer-property=AccuracySec=1s".into(),
         "--property=Type=exec".into(),
     ];
-    for (k, v) in std::env::vars() {
-        if k.starts_with("SENTINEL_") {
-            args.push(format!("--setenv={k}={v}"));
-        }
-    }
+    args.extend(confirm_setenv_args(std::env::vars()));
     // Everything after the options is the command to run when the timer fires.
     args.push(exe_s.to_string());
     args.push("confirm-rollback".into());
@@ -936,6 +932,39 @@ pub fn arm_confirm(minutes: u32, cfg: &Path, original: &Path) -> Result<()> {
     args.push(original_s.into());
     let argref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_priv("systemd-run", &argref)
+}
+
+/// The `--setenv` arguments the commit-confirm timer carries: the tool pins
+/// and data directories the rollback needs to resolve the same binaries and
+/// read the same data as the session that armed it — and nothing else.
+///
+/// Never a credential (CTRL-21): a `--setenv` sits in `systemd-run`'s argv in
+/// `/proc/*/cmdline` and in the unit's `Environment=`, which every local user
+/// can read with `systemctl show`. An allow-list, so a variable added later is
+/// not forwarded until somebody decides it should be: a `SENTINEL_*_BIN` pin
+/// whose value is an executable path in the Nix store (the shape the wrapper
+/// sets; the other `systemd-run` builders forward the same), and the named
+/// data directories the rollback's compile reads.
+fn confirm_setenv_args(vars: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+    const DATA: [&str; 4] = [
+        "SENTINEL_GEOIP_DIR",
+        "SENTINEL_FEED_CACHE",
+        "SENTINEL_METRICS_DIR",
+        "SENTINEL_SURICATA_SHARE",
+    ];
+    vars.into_iter()
+        .filter(|(key, value)| {
+            let pin = key.starts_with("SENTINEL_")
+                && key.ends_with("_BIN")
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                && value.starts_with("/nix/store/")
+                && !value.chars().any(char::is_control);
+            pin || DATA.contains(&key.as_str()) && !value.chars().any(char::is_control)
+        })
+        .map(|(key, value)| format!("--setenv={key}={value}"))
+        .collect()
 }
 
 /// Disarm the `commit-confirm` timer (best-effort). Only the **timer** is
@@ -2766,6 +2795,43 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CTRL-21: a transient unit's `--setenv` lands in `/proc/*/cmdline` of
+    /// `systemd-run` and in the unit's `Environment=`, which any local user can
+    /// read with `systemctl show`. Tool pins and data directories are carried;
+    /// a credential never is.
+    #[test]
+    fn confirm_timer_forwards_tool_environment_but_never_a_credential() {
+        let vars = [
+            ("SENTINEL_IP_BIN", "/nix/store/x-iproute2/bin/ip"),
+            (
+                "SENTINEL_MKPASSWD_BIN",
+                "/nix/store/x-mkpasswd/bin/mkpasswd",
+            ),
+            ("SENTINEL_GEOIP_DIR", "/var/lib/sentinel/geoip"),
+            ("SENTINEL_API_TOKEN", "machine-token-must-not-leak"),
+            ("SENTINEL_LUKS_PASSPHRASE", "passphrase-must-not-leak"),
+            ("SENTINEL_UPDATE_SUBSCRIPTION_KEY", "key-must-not-leak"),
+            ("SENTINEL_PEER_SECRET", "secret-must-not-leak"),
+            ("SENTINEL_ADMIN_PASSWORD", "password-must-not-leak"),
+            ("SENTINEL_X_CREDENTIAL", "credential-must-not-leak"),
+            ("SENTINEL_PSK", "psk-must-not-leak"),
+            ("SENTINEL_SECRET_BIN", "secret-must-not-leak-as-a-bin-name"),
+            ("SENTINEL_NEW_FEATURE", "unknown-must-not-leak"),
+            ("PATH", "/run/current-system/sw/bin"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let args = confirm_setenv_args(vars);
+        assert_eq!(
+            args,
+            [
+                "--setenv=SENTINEL_IP_BIN=/nix/store/x-iproute2/bin/ip",
+                "--setenv=SENTINEL_MKPASSWD_BIN=/nix/store/x-mkpasswd/bin/mkpasswd",
+                "--setenv=SENTINEL_GEOIP_DIR=/var/lib/sentinel/geoip",
+            ]
+        );
+        assert!(!args.iter().any(|a| a.contains("must-not-leak")));
+    }
 
     #[test]
     fn privileged_mutations_run_exactly_once_for_each_actor_and_outcome() {

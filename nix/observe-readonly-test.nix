@@ -64,7 +64,7 @@ in pkgs.testers.runNixOSTest {
         for unit in ("multi-user.target", "sentinel-boot.service", "velstra.service"):
             machine.wait_for_unit(unit)
 
-    secret = "public-observe-fixture-machine-secret-never-a-real-token"
+    secret = "f39ad37b578d1a4377ebee286e3a3ed3650b383aff12b751f893f342b0a43257"
     config = "/var/lib/sentinel/appliance.toml"
     running = "/run/sentinel/running.toml"
     registry = "/var/lib/sentinel/login-accounts.json"

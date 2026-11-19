@@ -459,8 +459,8 @@ pub fn witness_warnings(a: &Appliance) -> Vec<String> {
     let mut out = Vec::new();
     if !w.secret.is_empty() {
         out.push(
-            "system ha-witness secret is the members' enrollment credential and API machine \
-             token; replace it with the derived key from `sentinel ha witness-key`"
+            "system ha-witness secret is the members' enrollment and config-sync credential; \
+             replace it with the derived key from `sentinel ha witness-key`"
                 .into(),
         );
     }
@@ -1787,7 +1787,7 @@ pub(crate) fn paired_fixture() -> Appliance {
 hostname="primary"
 [system.config-sync]
 peer=["10.20.0.2:8080"]
-secret="abcdefghijklmnopqrstuvwxyz0123456789"
+secret="011fc2994e39d251141540f87a69092b3f22a86767f7283de7eeedb3897bedf6"
 [system.conntrack-sync]
 listen="10.20.0.1:5429"
 peer=["10.20.0.2:5429"]
@@ -2906,7 +2906,7 @@ mod tests {
     #[test]
     fn a_legacy_credential_witness_keeps_its_pair_but_is_told_to_migrate() {
         let witness = witness_appliance(
-            "secret=\"abcdefghijklmnopqrstuvwxyz0123456789\"\ncluster=\"test-cluster-0123456789\"\n",
+            "secret=\"011fc2994e39d251141540f87a69092b3f22a86767f7283de7eeedb3897bedf6\"\ncluster=\"test-cluster-0123456789\"\n",
         )
         .unwrap();
         let runtime = witness_runtime(witness.system.ha_witness.as_ref().unwrap()).unwrap();
@@ -2933,7 +2933,7 @@ mod tests {
         for bad in [
             format!("key=\"{key}\"\n"),
             format!(
-                "key=\"{key}\"\nsecret=\"abcdefghijklmnopqrstuvwxyz0123456789\"\ncluster=\"test-cluster-0123456789\"\n"
+                "key=\"{key}\"\nsecret=\"011fc2994e39d251141540f87a69092b3f22a86767f7283de7eeedb3897bedf6\"\ncluster=\"test-cluster-0123456789\"\n"
             ),
             "key=\"short\"\ncluster=\"test-cluster-0123456789\"\n".into(),
             format!("key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"10.20.0.1\"]\n"),

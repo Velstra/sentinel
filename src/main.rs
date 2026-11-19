@@ -14,7 +14,9 @@ mod acme;
 mod admission;
 mod alert;
 mod api;
+mod api_listener;
 mod api_session;
+mod api_throttle;
 mod archive;
 mod boot_entry;
 mod capture;
@@ -174,17 +176,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum HaCommand {
-    /// Pair this primary with a secondary using its bootstrap machine token.
+    /// Pair this primary with a secondary using its enrollment credential.
     ///
-    /// The token is read from standard input (`--secret-stdin`), or prompted
-    /// for without echo on a terminal. It is the secondary's API machine token:
-    /// on a command line it would sit in the process list and shell history.
+    /// The credential is the secondary's `system config-sync secret` (generate
+    /// one with `sentinel ha secret generate`). It is read from standard input
+    /// (`--secret-stdin`), or prompted for without echo on a terminal: on a
+    /// command line it would sit in the process list and shell history.
     Pair {
         peer: String,
         /// Refused: a token in argv is visible to every local user.
         #[arg(long, hide = true, conflicts_with = "secret_stdin")]
         secret: Option<String>,
-        /// Read the machine token from standard input.
+        /// Read the enrollment credential from standard input.
         #[arg(long)]
         secret_stdin: bool,
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -206,9 +209,14 @@ enum HaCommand {
         /// The pair's cluster identifier, when one was set explicitly.
         #[arg(long)]
         cluster: Option<String>,
-        /// Read the machine token from standard input.
+        /// Read the enrollment credential from standard input.
         #[arg(long)]
         secret_stdin: bool,
+    },
+    /// Config-sync / HA enrollment secrets.
+    Secret {
+        #[command(subcommand)]
+        command: HaSecretCommand,
     },
     /// Alert when a standby stays unable to take over (systemd worker).
     #[command(hide = true)]
@@ -218,13 +226,24 @@ enum HaCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum HaSecretCommand {
+    /// Print a fresh random secret for `system config-sync secret`.
+    ///
+    /// 32 random bytes as 64 hex digits on standard output, nothing else, so
+    /// it can be piped. Set the same value on both members; a weak secret is
+    /// refused at commit because the HA enrollment proof lets anybody who can
+    /// reach the management port test guesses against it offline.
+    Generate,
+}
+
 /// The pair token, from standard input or a no-echo prompt. One trailing line
 /// ending is the terminator `echo` or a here-string adds, not part of the token.
 fn read_pair_token(from_stdin: bool, argv: Option<String>) -> Result<String> {
     use std::io::{IsTerminal, Read};
     anyhow::ensure!(
         argv.is_none(),
-        "--secret puts the machine token in the process list and shell history; \
+        "--secret puts the enrollment credential in the process list and shell history; \
          pipe it with --secret-stdin, or omit both to be prompted"
     );
     let mut value = if !from_stdin && std::io::stdin().is_terminal() {
@@ -767,6 +786,15 @@ async fn main() -> Result<()> {
             println!("[system.ha-witness]");
             println!("cluster = \"{cluster}\"");
             println!("key = \"{}\"", ha::witness_key(&token, &cluster));
+            Ok(())
+        }
+        Command::Ha {
+            command:
+                HaCommand::Secret {
+                    command: HaSecretCommand::Generate,
+                },
+        } => {
+            println!("{}", config::generate_sync_secret()?);
             Ok(())
         }
         Command::Ha {
@@ -3084,6 +3112,24 @@ fn show_op(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod ha_cli_tests {
     use super::*;
+    #[test]
+    fn ha_secret_generate_parses_and_produces_an_admissible_secret() {
+        let cli = Cli::try_parse_from(["sentinel", "ha", "secret", "generate"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ha {
+                command: HaCommand::Secret {
+                    command: HaSecretCommand::Generate
+                }
+            }
+        ));
+        let a = config::generate_sync_secret().unwrap();
+        let b = config::generate_sync_secret().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(config::sync_secret_weakness(&a), None);
+    }
     #[test]
     fn pair_modes_parse_without_putting_the_token_in_arguments() {
         let cli = Cli::try_parse_from([

@@ -2532,15 +2532,103 @@ const API_UNIT: &str = "sentinel-api.service";
 const API_LISTENER: &str = "/run/sentinel/api-listener.json";
 
 /// Reconcile the receiving side of HA config sync to `[system.config-sync]`: a
-/// configured `secret` becomes the API's bearer token and starts the API at its
-/// configured management bind; it never widens an address. Live only
+/// configured `secret` starts the API at its configured management bind (the
+/// API accepts it as the peer credential); it never widens an address. Live only
 /// touches the unit; at boot the API starts on its own with the files in place.
+///
+/// The secret is **not** written into the machine token file any more
+/// (CTRL-01): the API reads it from the active configuration and accepts it as
+/// the peer credential, which may only read and synchronize. A token file an
+/// earlier release filled with the secret — current, or since removed
+/// (CTRL-07) — is replaced by a fresh random token here, at the first apply
+/// after the upgrade and at every apply after.
 fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let cs = &appliance.system.config_sync;
-    if let Some(secret) = &cs.secret {
-        system::install_token(Path::new(API_TOKEN), secret)?;
+    retire_shared_machine_token(Path::new(API_TOKEN), cs.secret.as_deref());
+    if let Some(why) = cs
+        .secret
+        .as_deref()
+        .and_then(crate::config::sync_secret_weakness)
+    {
+        eprintln!(
+            "{}",
+            crate::ui::yellow(&format!(
+                "warning: system config-sync secret {why}. Anybody who can reach the management \
+                 port can test guesses against it offline. No configuration change is accepted \
+                 until it is rotated: run `sentinel ha secret generate` and set the result on \
+                 both members."
+            ))
+        );
     }
     apply_api(appliance, mode)
+}
+
+/// Retire a machine token an earlier release filled with a config-sync secret
+/// ([`crate::api::machine_token_disposition`]). Best effort: the API keeps
+/// serving either way, and a token that cannot be read or replaced is said so
+/// in the journal rather than failing the whole apply.
+fn retire_shared_machine_token(path: &Path, secret: Option<&str>) {
+    let current = match system::read_owned_private(path, 4096) {
+        Ok(Some(current)) => current.trim().to_string(),
+        // Absent: the API mints (and records) a random one when it starts.
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!(
+                "warning: could not check the API machine token {}: {error:#}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let marker = crate::api::minted_marker(path);
+    let minted = system::read_owned_private(&marker, 256).ok().flatten();
+    let mentioned =
+        || archived_configs_mention(Path::new(crate::session::DEFAULT_CONFIG), &current);
+    let disposition = crate::api::machine_token_disposition(
+        &current,
+        secret,
+        minted.as_deref().map(str::trim),
+        mentioned,
+    );
+    let outcome = match disposition {
+        crate::api::TokenDisposition::Keep => return,
+        crate::api::TokenDisposition::Adopt => {
+            system::install_ha_secret(&marker, &crate::api::minted_digest(&current))
+        }
+        crate::api::TokenDisposition::Replace => crate::api::generate_machine_token()
+            .and_then(|token| {
+                system::install_token(path, &token)?;
+                system::install_ha_secret(&marker, &crate::api::minted_digest(&token))
+            })
+            .map(|()| {
+                eprintln!(
+                    "config-sync: the API machine token held a config-sync secret (an earlier \
+                     release installed it there); replaced it with a new random token in {}. The \
+                     secret now only authenticates config-sync and HA pairing.",
+                    path.display()
+                )
+            }),
+    };
+    if let Err(error) = outcome {
+        eprintln!(
+            "warning: could not update the API machine token {}: {error:#}",
+            path.display()
+        );
+    }
+}
+
+/// Whether `token` appears in the saved configuration or any archived revision
+/// of it — i.e. was a configured secret at some point. Unreadable revisions
+/// are skipped (this runs as root at boot, where they are readable).
+fn archived_configs_mention(config: &Path, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let saved = std::fs::read_to_string(config).is_ok_and(|text| text.contains(token));
+    saved
+        || (0..crate::archive::list_revisions(config).len()).any(|n| {
+            crate::archive::read_revision(config, n).is_ok_and(|text| text.contains(token))
+        })
 }
 
 /// Reconcile the one HTTP server the box runs: the web console and the REST API
@@ -4389,7 +4477,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     apply_metrics(appliance, mode)?;
     apply_dnsproxy(appliance, mode)?;
     apply_policy_routes(appliance, mode)?;
-    // HA config sync (roadmap C21): the receiving side — share the token + widen
+    // HA config sync (roadmap C21): the receiving side — retire a shared machine token + start
     // the API when a secret is set. The sending side (push) is driven from commit.
     apply_agent_iface(appliance, mode)?;
     apply_configsync(appliance, mode)?;

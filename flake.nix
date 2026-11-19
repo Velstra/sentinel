@@ -886,6 +886,11 @@
               ExecStart = "${sentinel}/bin/sentinel api --listen $SENTINEL_API_LISTEN --config /var/lib/sentinel/appliance.toml --token-file /var/lib/sentinel/api-token";
               Restart = "on-failure";
               RestartSec = "5s";
+              # CTRL-05: the listener caps itself at 512 connections; the
+              # default soft limit of 1024 descriptors left too little room
+              # beside them for session files, child processes and the
+              # outbound peer and update requests the API makes.
+              LimitNOFILE = 65536;
             };
           };
 
@@ -15975,13 +15980,15 @@
               primary.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.1", timeout=20)
               backup.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.2", timeout=20)
 
-              # The backup arms the receiving side: the shared secret becomes its API
-              # token and widens the API to listen off-box.
+              # The backup arms the receiving side: the shared secret becomes the
+              # credential its API accepts from the peer and widens the API to
+              # listen off-box. It is not the machine token (CTRL-01), so the
+              # administrative API calls below use the root-only token file.
               backup.succeed(
                   "su admin -c \"printf '%s\\n' "
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
-                  "'set system config-sync secret shared-token-123' "
+                  "'set system config-sync secret 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb' "
                   "commit save exit "
                   "| sentinel configure\""
               )
@@ -15994,7 +16001,12 @@
               backup.succeed("test $(stat -c %u /var/lib/sentinel/api-token) = 0; test $(stat -c %a /var/lib/sentinel/api-token) = 600")
               # The privileged installer also publishes into its own staging
               # directory. This must not attempt install(source, source).
-              backup.succeed("grep -q shared-token-123 /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
+              backup.succeed("grep -q 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
+              # PROV-05: the administrator's ordinary CLI reads work without
+              # sudo even when a seeding step left the saved file root 0600.
+              backup.succeed("chmod 600 /var/lib/sentinel/appliance.toml")
+              backup.succeed("su admin -c 'sentinel trace --in eth1 tcp 10.9.0.1 10.9.0.2 22'")
+              backup.succeed("chmod 640 /var/lib/sentinel/appliance.toml")
 
               with subtest("real receive-journal ENOSPC refuses before live apply"):
                   backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} disk-full")
@@ -16023,9 +16035,23 @@
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
                   "'set interface eth1 mtu 1400' "
-                  "'set system config-sync secret shared-token-123' "
+                  "'set system config-sync secret 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb' "
                   "commit save exit | sentinel configure\""
               )
+
+              # A secret alone keeps the API on loopback (api-management-bind
+              # pins that); the push needs the backup reachable on its sync
+              # address. The probes above talk to 127.0.0.1, so bind it now. The
+              # setter enables the console; disable it again so the shared policy
+              # (web.enable is shared) still matches the primary's baseline.
+              backup.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set services web listen-address 10.9.0.2' "
+                  "'set services web enable false' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              backup.wait_until_succeeds("ss -tlnH 'src 10.9.0.2 and sport = :8080' | grep -q LISTEN", timeout=30)
 
               # Sanity: the rule is not on the backup yet.
               backup.fail("grep -q 'synced-rule' /var/lib/sentinel/appliance.toml")
@@ -16038,7 +16064,7 @@
                   "su admin -c \"printf '%s\\n' "
                   "'set firewall global default-action accept' "
                   "'set interface eth1 zone lan' "
-                  "'set system config-sync secret shared-token-123' "
+                  "'set system config-sync secret 2ef6313b921fdd5e573b774390c79a7603f5b151b18e047c34096f126a0c58cb' "
                   "'set system config-sync peer 10.9.0.2' "
                   "'set firewall rule synced-rule from lan' "
                   "'set firewall rule synced-rule action accept' "
@@ -16071,10 +16097,10 @@
               backup.succeed("test -f /var/lib/sentinel/web-tls/cert.pem")
               backup.succeed("test -f /var/lib/sentinel/web-tls/key.pem")
               backup.succeed(
-                  "curl -fsSk https://127.0.0.1:8080/api/v1/health | grep -q ok"
+                  "curl -fsSk https://10.9.0.2:8080/api/v1/health | grep -q ok"
               )
               backup.fail(
-                  "curl -fsS --max-time 5 http://127.0.0.1:8080/api/v1/health"
+                  "curl -fsS --max-time 5 http://10.9.0.2:8080/api/v1/health"
               )
               # And the primary pinned the backup's TLS key on first use (no
               # peer-fingerprint was configured), so the config was sent encrypted
@@ -16091,18 +16117,18 @@
               for interface in desired["interface"]:
                   if interface["name"]=="eth1": interface["mtu"]=1450
               primary.succeed("printf %s "+shlex.quote(json.dumps(desired))+" >/tmp/ha-api.json")
-              primary.succeed("curl -fsSk -X PUT -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
+              primary.succeed("curl -fsSk -X PUT -H \"Authorization: Bearer $(cat /var/lib/sentinel/api-token)\" -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
               import time
               deadline = time.monotonic() + 90
               while time.monotonic() < deadline:
-                  pending_revision = json.loads(primary.succeed("curl -fsSk -H 'Authorization: Bearer shared-token-123' https://127.0.0.1:8080/api/v1/config/transaction"))["pending"]
+                  pending_revision = json.loads(primary.succeed("curl -fsSk -H \"Authorization: Bearer $(cat /var/lib/sentinel/api-token)\" https://127.0.0.1:8080/api/v1/config/transaction"))["pending"]
                   assert pending_revision is not None
                   if pending_revision["ready"]:
                       break
                   time.sleep(0.2)
               else:
                   raise AssertionError("API configuration worker did not finish")
-              primary.succeed("curl -fsSk -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary " + shlex.quote(json.dumps(dict(id=pending_revision["id"]))) + " https://127.0.0.1:8080/api/v1/config/confirm")
+              primary.succeed("curl -fsSk -H \"Authorization: Bearer $(cat /var/lib/sentinel/api-token)\" -H 'Content-Type: application/json' --data-binary " + shlex.quote(json.dumps(dict(id=pending_revision["id"]))) + " https://127.0.0.1:8080/api/v1/config/confirm")
               primary.succeed("grep -q api-synced-rule /var/lib/sentinel/configsync/pending.json; test $(stat -c %a /var/lib/sentinel/configsync/pending.json) = 600")
               primary.succeed("systemctl is-active --quiet sentinel-configsync.timer")
               backup.fail("grep -q api-synced-rule /var/lib/sentinel/appliance.toml")

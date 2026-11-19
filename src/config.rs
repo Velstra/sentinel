@@ -4536,6 +4536,202 @@ impl ConfigSync {
     }
 }
 
+/// A configuration file's text, read the way the appliance's own CLI must be
+/// able to read it (PROV-05).
+///
+/// The administrator runs `configure`, `trace` and friends as themselves, not
+/// as root (`nix/appliance.nix`): Sentinel writes the saved configuration
+/// 0640 root:wheel, and the CLI escalates through the protected reader when a
+/// file is not readable to it. `Appliance::load` read with plain `std::fs`,
+/// so a saved file left 0600 by a seeding step made `sentinel trace` (and any
+/// other path through `load`) fail with Permission denied unless run under
+/// sudo. On a refused read, a non-root caller now asks the same protected
+/// reader the session code uses (root- or caller-owned regular file, not
+/// group/world-writable); when that is not available either, the original
+/// error is what the operator sees.
+fn read_config_text(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && !crate::system::is_root() =>
+        {
+            match crate::system::read_owned_regular(path, 64 * 1024 * 1024) {
+                Ok(Some(text)) => Ok(text),
+                _ => Err(error).with_context(|| format!("reading {}", path.display())),
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// The byte lengths a `system config-sync secret` may have.
+pub const SYNC_SECRET_BYTES: std::ops::RangeInclusive<usize> = 32..=1024;
+
+/// The least entropy a config-sync secret must be estimated to carry.
+const SYNC_SECRET_MIN_BITS: f64 = 128.0;
+
+/// Why `secret` cannot be a config-sync / HA enrollment credential, or `None`.
+///
+/// The secret is a credential an unauthenticated client can test offline: the
+/// HA enrollment proof (`GET /api/v1/ha/proof/<nonce>`) answers anybody with an
+/// HMAC keyed by it, and that proof is what lets a member be paired before
+/// either side holds the other's identity. A short or patterned string falls
+/// to a dictionary in milliseconds (CTRL-01: `summer2026` was cracked from one
+/// proof in 0.16 ms). Nothing can measure the entropy of a string a person
+/// chose, so this refuses what is *demonstrably* weak — too short, too few
+/// distinct characters, a repeated pattern, too small an alphabet for its
+/// length — and the supported source is `sentinel ha secret generate`.
+pub fn sync_secret_weakness(secret: &str) -> Option<String> {
+    let bytes = secret.as_bytes();
+    if !SYNC_SECRET_BYTES.contains(&bytes.len()) {
+        return Some(format!(
+            "must contain {}..{} bytes (it has {})",
+            SYNC_SECRET_BYTES.start(),
+            SYNC_SECRET_BYTES.end(),
+            bytes.len()
+        ));
+    }
+    if secret.chars().any(char::is_control) {
+        return Some("must not contain control characters".into());
+    }
+    let distinct: std::collections::BTreeSet<u8> = bytes.iter().copied().collect();
+    if distinct.len() < 10 {
+        return Some(format!(
+            "uses only {} distinct characters; a random secret uses many more",
+            distinct.len()
+        ));
+    }
+    // A repeated short pattern (`summer2026summer2026…`) has few distinct
+    // four-byte windows for its length; a random string has almost none twice.
+    let windows: Vec<&[u8]> = bytes.windows(4).collect();
+    let unique: std::collections::BTreeSet<&[u8]> = windows.iter().copied().collect();
+    if (unique.len() as f64) < 0.75 * windows.len() as f64 {
+        return Some("repeats a short pattern".into());
+    }
+    let bits = estimated_bits(bytes);
+    if bits < SYNC_SECRET_MIN_BITS {
+        return Some(format!(
+            "reads like words or a sequence rather than random data (about {bits:.0} bits \
+             estimated, at least {SYNC_SECRET_MIN_BITS:.0} needed)"
+        ));
+    }
+    None
+}
+
+/// A conservative estimate of the entropy in `bytes`, for refusing secrets a
+/// person made up.
+///
+/// Each byte is worth `log2` of the alphabet the whole string draws from
+/// (lowercase, uppercase, digits, other), except where it is predictable:
+/// - a byte that continues a constant step of -1, 0 or +1 (`aaaa`, `abcd`,
+///   `4321`) is worth one bit;
+/// - a letter inside a run of four or more letters of one case is worth 1.5
+///   bits — English text carries about that much per letter, so a passphrase
+///   of words (`pair-vm-credential-with-…`) estimates far below its length;
+/// - a separator (`-`, `_`, `.`, space) between such runs is worth one bit.
+///
+/// Random data loses little: 64 hex digits estimate about 300 bits and never
+/// fell below 200 in simulation; a 44-byte base64 string about 250. The estimate is deliberately pessimistic for
+/// anything that looks composed; the generator is the supported source.
+fn estimated_bits(bytes: &[u8]) -> f64 {
+    type Class = (fn(&u8) -> bool, u32);
+    let classes: [Class; 4] = [
+        (u8::is_ascii_lowercase, 26),
+        (u8::is_ascii_uppercase, 26),
+        (u8::is_ascii_digit, 10),
+        (|b: &u8| !b.is_ascii_alphanumeric(), 33),
+    ];
+    let alphabet: u32 = classes
+        .iter()
+        .filter(|(member, _)| bytes.iter().any(member))
+        .map(|(_, size)| size)
+        .sum();
+    let per_byte = f64::from(alphabet.max(2)).log2();
+    // Mark the bytes inside runs of ≥4 same-case letters.
+    let mut in_word = vec![false; bytes.len()];
+    let mut start = 0;
+    while start < bytes.len() {
+        let case = |b: u8| {
+            if b.is_ascii_lowercase() {
+                1
+            } else if b.is_ascii_uppercase() {
+                2
+            } else {
+                0
+            }
+        };
+        let kind = case(bytes[start]);
+        let mut end = start + 1;
+        while end < bytes.len() && kind != 0 && case(bytes[end]) == kind {
+            end += 1;
+        }
+        if kind != 0 && end - start >= 4 {
+            in_word[start..end].fill(true);
+        }
+        start = end;
+    }
+    let mut bits = 0.0;
+    for (i, &b) in bytes.iter().enumerate() {
+        // The third byte of a constant step of -1, 0 or +1 (`aaa`, `abc`,
+        // `321`): a lone repeated pair occurs in random data, a run does not.
+        let sequence = i >= 2 && {
+            let (one, two) = (i16::from(bytes[i - 1]), i16::from(bytes[i - 2]));
+            let step = i16::from(b) - one;
+            step.abs() <= 1 && step == one - two
+        };
+        bits += if sequence {
+            1.0
+        } else if in_word[i] {
+            1.5
+        } else if matches!(b, b'-' | b'_' | b'.' | b' ')
+            && (i > 0 && in_word[i - 1] || in_word.get(i + 1).copied().unwrap_or(false))
+        {
+            1.0
+        } else {
+            per_byte
+        };
+    }
+    bits
+}
+
+/// A fresh config-sync secret: 32 random bytes as 64 lowercase hex digits.
+///
+/// Hex rather than the machine token's URL-safe base64, so the two are never
+/// mistaken for each other by a person, and so the value needs no quoting in
+/// the CLI or a shell.
+pub fn generate_sync_secret() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("generating a secret: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+impl Appliance {
+    /// Refuse a configuration whose config-sync secret is weak (see
+    /// [`sync_secret_weakness`]).
+    ///
+    /// Deliberately not part of [`Appliance::validate`]: validation also runs
+    /// at boot and on every load, and an appliance upgraded with a weak secret
+    /// must still come up, keep its pairing and answer its management API.
+    /// This is checked where a configuration is *admitted* — a commit, an API
+    /// write, a received pairing or push, `config check` — so such a box warns
+    /// at every apply and refuses every change until the secret is rotated
+    /// (`sentinel ha secret generate`, set on both members).
+    pub fn refuse_weak_sync_secret(&self) -> Result<()> {
+        if let Some(secret) = &self.system.config_sync.secret
+            && let Some(why) = sync_secret_weakness(secret)
+        {
+            bail!(
+                "system config-sync secret {why}. It authenticates HA pairing and config-sync \
+                 and anybody who can reach the management port can test guesses against it \
+                 offline; generate one with `sentinel ha secret generate` and set it on both \
+                 members"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Whether `s` is curl's `--pinnedpubkey sha256//<base64>` value: the standard
 /// base64 of a 32-byte SHA-256, which is 43 base64 characters plus one `=` pad.
 pub fn is_valid_pinned_sha256(s: &str) -> bool {
@@ -7248,8 +7444,7 @@ impl Appliance {
     /// Load and validate a config file, picking the format by extension
     /// (`.json` → JSON, anything else → TOML).
     pub fn load(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = read_config_text(path)?;
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             Self::from_json(&text)
         } else {
@@ -7287,8 +7482,7 @@ impl Appliance {
     /// fails, because only *unknown keys* are tolerated, never a value that does
     /// not parse or does not validate.
     pub fn load_lenient(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = read_config_text(path)?;
         Self::saved_lenient(path, &text)
     }
 
@@ -16073,6 +16267,74 @@ virtual-address = ["10.0.0.254"]
         );
         appliance.system.conntrack_sync.peers = vec!["10.9.0.2".into()];
         assert!(appliance.validate().is_ok());
+    }
+
+    /// CTRL-01: the config-sync secret only had to be non-empty, and the HA
+    /// proof endpoint hands anybody an HMAC keyed by it — `summer2026` was
+    /// cracked offline from one proof. Demonstrably weak secrets are refused
+    /// at admission; what `sentinel ha secret generate` prints, and the VM
+    /// fixtures' long descriptive strings, are accepted.
+    #[test]
+    fn weak_config_sync_secrets_are_refused_and_generated_ones_accepted() {
+        for weak in [
+            "summer2026",
+            "shared-token-123",
+            &"s".repeat(32),
+            "summer2026summer2026summer2026ab",
+            "abababababababababababababababababab",
+            "12345678901234567890123456789012",
+            "with\na-newline-inside-the-secret-value!",
+            &"x".repeat(1025),
+            // Long, but words and sequences (the review's examples; the VM
+            // fixtures used to look like this).
+            "pair-vm-credential-with-at-least-32-bytes",
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "two-node-flow-vm-only-credential-at-least-32-bytes",
+            "correct horse battery staple extra words here",
+            "public-observe-fixture-machine-secret-never-a-real-token",
+        ] {
+            assert!(
+                sync_secret_weakness(weak).is_some(),
+                "{weak:?} was accepted"
+            );
+            let mut appliance = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+            appliance.system.config_sync.secret = Some(weak.into());
+            let error = appliance.refuse_weak_sync_secret().unwrap_err().to_string();
+            assert!(error.contains("sentinel ha secret generate"), "{error}");
+            assert!(
+                !error.contains(weak),
+                "the refusal must not echo the secret"
+            );
+        }
+        // Every generated secret, not just one: the estimate must never refuse
+        // what the generator prints.
+        for _ in 0..2000 {
+            let generated = generate_sync_secret().unwrap();
+            assert_eq!(
+                sync_secret_weakness(&generated),
+                None,
+                "{generated:?} was refused"
+            );
+        }
+        // `openssl rand -base64 32`-style secrets are random too.
+        for strong in [
+            "q3Jx8Pz0Vt+Lm1Nw4Ry7Bk2Hc5Df9Ga6Se0Ui3Oj8Kl=",
+            "8f1c2e0b9a7d4c3e5f6a1b2c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e",
+        ] {
+            assert_eq!(sync_secret_weakness(strong), None, "{strong:?} was refused");
+        }
+        // Unset is not weak: there is nothing to guess.
+        let appliance = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        assert!(appliance.refuse_weak_sync_secret().is_ok());
+    }
+
+    /// Validation runs at boot. A box upgraded with a weak secret must still
+    /// load its configuration; only admission refuses it.
+    #[test]
+    fn a_weak_secret_still_loads_so_an_upgraded_box_boots() {
+        let text = "[system]\nhostname = \"fw\"\n[system.config-sync]\nsecret = \"summer2026\"\npeer = [\"10.9.0.2\"]\n";
+        let appliance = Appliance::from_toml(text).unwrap();
+        assert!(appliance.refuse_weak_sync_secret().is_err());
     }
 }
 
