@@ -14,6 +14,39 @@ cargo build --locked
 CONSOLE_TEST_FILE=layout.test.mjs tests/console/run.sh target/debug/sentinel
 ```
 
+### Password helper
+
+Account tests create and check real password hashes with an external `mkpasswd`.
+The appliance's Nix wrapper pins it through `SENTINEL_MKPASSWD_BIN`; a
+cargo-built binary has no pin. `run.sh` therefore uses, in order: an exported
+`SENTINEL_MKPASSWD_BIN`, the pin inside a Nix-wrapped binary, or the `mkpasswd`
+on `PATH` (resolved to an absolute path). It probes the helper for yescrypt and
+stops with exit status 2 if there is none or it cannot produce yescrypt, rather
+than letting every account test fail with "no hash was stored". The pinned
+helper, which also verifies imported `$1$`, `$5$` and `$6$` hashes, is:
+
+```sh
+nix build .#password-hasher --out-link result-password-hasher
+export SENTINEL_MKPASSWD_BIN=$PWD/result-password-hasher/bin/mkpasswd
+```
+
+A distribution `mkpasswd` (Debian/Ubuntu `whois`) works for the suites but may
+lack the legacy schemes; use the pinned one when testing imported hashes.
+
+### Browser profiles
+
+Each browser gets a throwaway `/tmp/sentinel-console-*` profile. The harness
+removes it once the browser's whole process group has exited (SIGTERM, then
+SIGKILL after `CONSOLE_CLOSE_GRACE_MS`, default 5000), and removes any profile
+still registered when the process exits — including after a failed test, a
+failed launch, or SIGINT/SIGTERM/SIGHUP. Leftover `sentinel-console-*`
+directories are no longer expected; one that appears is a harness bug. The
+cleanup itself has a browser-free unit test:
+
+```sh
+node --test tests/console/harness-cleanup.unit.mjs
+```
+
 ## Run the frontend gate
 
 Select the suites below for the change being verified:

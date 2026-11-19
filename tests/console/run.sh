@@ -24,6 +24,35 @@ if [ -z "$bin" ]; then
   bin="$root/target/debug/sentinel"
 fi
 
+# Account passwords are hashed and checked by an external `mkpasswd`. The
+# appliance's Nix wrapper pins it (SENTINEL_MKPASSWD_BIN); a cargo-built binary
+# has no pin and, because the helper runs with a cleared environment, no PATH
+# lookup either — every account test then fails with "no hash was stored". Pin
+# one here, or stop before the suite starts and say how to get one.
+if [ -z "${SENTINEL_MKPASSWD_BIN:-}" ]; then
+  if [ "$(head -c 2 "$bin")" = "#!" ] && grep -q 'SENTINEL_MKPASSWD_BIN' "$bin"; then
+    : # a Nix wrapper; it sets its own pinned helper
+  elif helper=$(command -v mkpasswd); then
+    export SENTINEL_MKPASSWD_BIN
+    SENTINEL_MKPASSWD_BIN=$(readlink -f "$helper")
+  else
+    echo "no password helper: set SENTINEL_MKPASSWD_BIN to a yescrypt-capable mkpasswd," >&2
+    echo "for example the pinned one:  nix build .#password-hasher --out-link result-password-hasher" >&2
+    echo "                              export SENTINEL_MKPASSWD_BIN=\$PWD/result-password-hasher/bin/mkpasswd" >&2
+    exit 2
+  fi
+fi
+if [ -n "${SENTINEL_MKPASSWD_BIN:-}" ]; then
+  probe=$(printf 'probe\n' | "$SENTINEL_MKPASSWD_BIN" --stdin --method=yescrypt --rounds=5 2>/dev/null || true)
+  case "$probe" in
+    '$y$'*) ;;
+    *)
+      echo "SENTINEL_MKPASSWD_BIN=$SENTINEL_MKPASSWD_BIN cannot generate yescrypt hashes;" >&2
+      echo "use the pinned helper: nix build .#password-hasher" >&2
+      exit 2 ;;
+  esac
+fi
+
 # Preseeded machine credentials obey the API's private-file contract.
 umask 077
 work=$(mktemp -d)
