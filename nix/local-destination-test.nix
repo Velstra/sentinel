@@ -127,11 +127,6 @@ pkgs.testers.runNixOSTest {
         firewall.wait_until_succeeds(f"ss -ltn | grep -q ':{port} '", timeout=10)
     lan.wait_until_succeeds("ss -ltn | grep -q ':2222 '", timeout=10)
 
-    compiled = firewall.succeed("cat /run/sentinel/velstra.toml")
-    # The member-independent form: no address of this box is in the policy.
-    assert "dst-local = true" in compiled, compiled
-    assert lease not in compiled and "10.84.1.254/32" not in compiled, compiled
-
     def why():
         return ("\ncompiled:\n" + firewall.execute("cat /run/sentinel/velstra.toml")[1]
                 + "\nstatistics:\n" + firewall.execute("sentinel show firewall statistics")[1]
@@ -161,5 +156,10 @@ pkgs.testers.runNixOSTest {
     with subtest("DP-15: a direction-less drop keeps SMTP out and lets it leave"):
         assert reaches(lan, "10.81.0.10", 25), "LAN SMTP leaving through mgmt was dropped" + why()
         assert not reaches(mgmt, "10.84.1.10", 25), "inbound SMTP from mgmt was admitted" + why()
+
+    with subtest("the compiled policy names no address of this box (HA-02)"):
+        compiled = firewall.succeed("cat /run/sentinel/velstra.toml")
+        assert "dst-local = true" in compiled, compiled
+        assert lease not in compiled and "10.84.1.254/32" not in compiled, compiled
   '';
 }
