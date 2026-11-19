@@ -1328,6 +1328,11 @@ fn fwsched_timer_body(appliance: &Appliance) -> Option<String> {
         body.push_str(line);
         body.push('\n');
     }
+    // A schedule is decided by the wall clock at compile time, so a clock
+    // that is wrong at boot and stepped later by NTP — or a time-zone change
+    // — must re-apply too. Otherwise the box keeps the state it computed from
+    // the wrong time until the next boundary, which can be days away.
+    body.push_str("OnClockChange=true\nOnTimezoneChange=true\n");
     body.push_str("\n[Install]\nWantedBy=timers.target\n");
     Some(body)
 }
@@ -5158,6 +5163,37 @@ mod tests {
     /// A box with no domain group must not carry the refresh timer at all — an
     /// idle timer that re-applies the whole config every 15 minutes is a moving
     /// part nobody asked for.
+    /// DP-40: a schedule is evaluated against the wall clock when the policy
+    /// is compiled. A box that boots with a wrong clock and is stepped by NTP
+    /// later must re-apply then, not at the next window boundary.
+    #[test]
+    fn the_schedule_timer_also_fires_when_the_clock_or_time_zone_changes() {
+        let appliance = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+[[rule]]
+name = "office"
+from = "lan"
+proto = "tcp"
+port = 22
+action = "accept"
+[rule.schedule]
+days = ["mon"]
+start = "09:00"
+end = "17:00"
+"#,
+        )
+        .unwrap();
+        let body = fwsched_timer_body(&appliance).expect("a schedule needs the timer");
+        assert!(body.contains("OnCalendar=Mon 09:00"), "{body}");
+        assert!(body.contains("OnClockChange=true"), "{body}");
+        assert!(body.contains("OnTimezoneChange=true"), "{body}");
+    }
+
     #[test]
     fn the_domain_timer_exists_only_when_a_domain_group_does() {
         let plain = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
