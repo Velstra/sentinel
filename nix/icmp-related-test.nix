@@ -283,7 +283,13 @@ pkgs.testers.runNixOSTest {
         _, nat_before = map_entries("CONNTRACK")
         nat_keys = [flow_key(0, "198.18.20.50", "198.18.10.100", port, 18199),
             flow_key(0, "198.18.20.51", "198.18.20.1", 18199, port)]
-        assert all(key in nat_before for key in nat_keys), "both existing hairpin NAT directions required"
+        # With one-second UDP idle limits the mapping can already have expired
+        # by the time the peer reports ready, and the agent's reclaimer
+        # (DP-07) deletes expired state instead of leaving it to LRU
+        # eviction. Then the guard is checked against an absent mapping: the
+        # ICMP error must not recreate it.
+        if mode != "expired-state":
+            assert all(key in nat_before for key in nat_keys), "both existing hairpin NAT directions required"
         endpoints.succeed("systemctl is-active --quiet " + unit)
         removed_keys = []
         if mode == "missing-physical-state":
@@ -332,7 +338,7 @@ pkgs.testers.runNixOSTest {
         _, nat_after = map_entries("CONNTRACK")
         # An ICMP error must never refresh counters/age, create a replacement or
         # make an expired mapping live. Background expiry may remove old state.
-        unchanged = all(key not in nat_after or nat_after[key] == nat_before[key] for key in nat_keys)
+        unchanged = all(key not in nat_after or nat_after[key] == nat_before.get(key) for key in nat_keys)
         row["guard_evidence"] = {"physical_policy_guard": mode, "wire_request": request,
             "packet_injected": True, "peer_release": action,
             "injection_method": "wan-raw" if mode == "wrong-ingress" else "backend-raw",
