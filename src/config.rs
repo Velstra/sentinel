@@ -4532,6 +4532,35 @@ impl ConfigSync {
     }
 }
 
+/// A configuration file's text, read the way the appliance's own CLI must be
+/// able to read it (PROV-05).
+///
+/// The administrator runs `configure`, `trace` and friends as themselves, not
+/// as root (`nix/appliance.nix`): Sentinel writes the saved configuration
+/// 0640 root:wheel, and the CLI escalates through the protected reader when a
+/// file is not readable to it. `Appliance::load` read with plain `std::fs`,
+/// so a saved file left 0600 by a seeding step made `sentinel trace` (and any
+/// other path through `load`) fail with Permission denied unless run under
+/// sudo. On a refused read, a non-root caller now asks the same protected
+/// reader the session code uses (root- or caller-owned regular file, not
+/// group/world-writable); when that is not available either, the original
+/// error is what the operator sees.
+fn read_config_text(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && !crate::system::is_root() =>
+        {
+            match crate::system::read_owned_regular(path, 64 * 1024 * 1024) {
+                Ok(Some(text)) => Ok(text),
+                _ => Err(error).with_context(|| format!("reading {}", path.display())),
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// The byte lengths a `system config-sync secret` may have.
 pub const SYNC_SECRET_BYTES: std::ops::RangeInclusive<usize> = 32..=1024;
 
@@ -7320,8 +7349,7 @@ impl Appliance {
     /// Load and validate a config file, picking the format by extension
     /// (`.json` → JSON, anything else → TOML).
     pub fn load(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = read_config_text(path)?;
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             Self::from_json(&text)
         } else {
@@ -7359,8 +7387,7 @@ impl Appliance {
     /// fails, because only *unknown keys* are tolerated, never a value that does
     /// not parse or does not validate.
     pub fn load_lenient(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = read_config_text(path)?;
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             Self::parse_json(&text, UnknownKeys::Warn)
         } else {

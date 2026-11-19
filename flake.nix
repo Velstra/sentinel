@@ -16002,6 +16002,11 @@
               # The privileged installer also publishes into its own staging
               # directory. This must not attempt install(source, source).
               backup.succeed("grep -q configsync-vm-fixture-credential-0123456789 /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
+              # PROV-05: the administrator's ordinary CLI reads work without
+              # sudo even when a seeding step left the saved file root 0600.
+              backup.succeed("chmod 600 /var/lib/sentinel/appliance.toml")
+              backup.succeed("su admin -c 'sentinel trace --in eth1 tcp 10.9.0.1 10.9.0.2 22'")
+              backup.succeed("chmod 640 /var/lib/sentinel/appliance.toml")
 
               with subtest("real receive-journal ENOSPC refuses before live apply"):
                   backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} disk-full")
