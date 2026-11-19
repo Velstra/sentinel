@@ -153,9 +153,12 @@ pub(crate) fn validate_with(
     if status.success() {
         return Ok(());
     }
+    // The private staging path means nothing to the reader.
+    let stderr = String::from_utf8_lossy(&stderr)
+        .replace(&*file.to_string_lossy(), "the compiled configuration");
     bail!(
         "the data plane refuses this configuration: {}",
-        summary(&String::from_utf8_lossy(&stderr), configurations)
+        summary(&stderr, configurations)
     )
 }
 
@@ -172,7 +175,7 @@ pub(crate) fn summary(stderr: &str, configurations: &[&Appliance]) -> String {
     let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !excerpt(line))
+        .filter(|line| !line.is_empty() && *line != "Caused by:" && !excerpt(line))
         .map(|line| line.strip_prefix("Error: ").unwrap_or(line))
         .take(SUMMARY_LINES)
         .collect();
@@ -199,7 +202,9 @@ mod tests {
             "#!/bin/sh\n\
              [ \"$1\" = validate ] || exit 64\n\
              if grep -q local_destination \"$2\"; then\n\
-             echo 'Error: TOML parse error at line 3, column 1' >&2\n\
+             echo \"Error: parsing config $2\" >&2\n\
+             echo 'Caused by:' >&2\n\
+             echo 'TOML parse error at line 3, column 1' >&2\n\
              echo '  |' >&2\n\
              echo \"3 | $(grep source-quote \"$2\")\" >&2\n\
              echo '  | ^^^^^' >&2\n\
@@ -248,6 +253,15 @@ mod tests {
             "secret leaked: {error}"
         );
         assert!(!error.contains('\n'), "{error}");
+        assert!(
+            !error.contains("sentinel-validate-"),
+            "staging path leaked: {error}"
+        );
+        assert!(!error.contains("Caused by"), "{error}");
+        assert!(
+            error.contains("parsing config the compiled configuration"),
+            "{error}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

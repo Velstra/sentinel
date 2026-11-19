@@ -36,6 +36,10 @@ pub const STATUS: &str = "/run/sentinel/config-fallback.json";
 
 /// How long the verifier waits for the agent before judging it.
 const READY_DEADLINE: Duration = Duration::from_secs(90);
+/// How often one fallback is tried before the next one is.
+const RESTORE_ATTEMPTS: u32 = 3;
+/// The pause between those tries.
+const RESTORE_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Restarts after which a never-ready agent is judged without waiting longer.
 const RESTARTS_BEFORE_JUDGING: u32 = 3;
 
@@ -331,16 +335,13 @@ fn fall_back_live(config: &Path, act: &crate::repl::Apply, cause: &anyhow::Error
             eprintln!("fallback {applied:?} refused by the data plane: {error:#}");
             continue;
         }
-        match crate::repl::restore_live(&candidate, act) {
-            Ok(()) => {
-                let status = Status {
-                    stage: "verify".into(),
-                    applied,
-                    reason: why,
-                };
-                return publish(Some(&candidate), &status);
-            }
-            Err(error) => eprintln!("fallback {applied:?} could not be applied: {error:#}"),
+        if restore_with_retries(&candidate, act, applied) {
+            let status = Status {
+                stage: "verify".into(),
+                applied,
+                reason: why,
+            };
+            return publish(Some(&candidate), &status);
         }
     }
     let status = Status {
@@ -350,6 +351,25 @@ fn fall_back_live(config: &Path, act: &crate::repl::Apply, cause: &anyhow::Error
     };
     publish(None, &status)?;
     Err(anyhow!("{}", status.describe()))
+}
+
+/// Apply one fallback, retrying a few times. At this point of the boot the
+/// held links are coming up and addresses are being assigned, and the agent
+/// refuses a reload whose host inventory changed underneath it; the VM check
+/// saw exactly that transient refuse a perfectly good last-known-good once.
+fn restore_with_retries(candidate: &Appliance, act: &crate::repl::Apply, applied: Applied) -> bool {
+    for attempt in 1..=RESTORE_ATTEMPTS {
+        match crate::repl::restore_live(candidate, act) {
+            Ok(()) => return true,
+            Err(error) => eprintln!(
+                "fallback {applied:?} attempt {attempt} of {RESTORE_ATTEMPTS} could not be applied: {error:#}"
+            ),
+        }
+        if attempt < RESTORE_ATTEMPTS {
+            std::thread::sleep(RESTORE_RETRY_DELAY);
+        }
+    }
+    false
 }
 
 #[cfg(test)]
