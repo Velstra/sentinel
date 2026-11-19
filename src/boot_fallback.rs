@@ -418,6 +418,10 @@ fn fall_back_live(config: &Path, act: &crate::repl::Apply, cause: &anyhow::Error
     let why = reason(cause, &secrets);
     let refused = active.as_ref().and_then(|a| a.to_toml().ok());
     for (candidate, applied) in fallbacks(active.as_ref(), last_good.as_ref(), refused) {
+        if let Err(error) = crate::compile::check_capacity(&candidate) {
+            eprintln!("fallback {applied:?} does not fit the data plane: {error:#}");
+            continue;
+        }
         if let Err(error) = crate::agent_contract::check(&candidate) {
             eprintln!("fallback {applied:?} refused by the data plane: {error:#}");
             continue;

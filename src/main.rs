@@ -529,8 +529,8 @@ enum Command {
     /// it next (auto-rollback to the current slot if it fails).
     ///
     /// `<target>` is either a local image/block-device path (written directly —
-    /// the trusted-image form), or one of the signed-channel keywords (roadmap
-    /// C13, using the saved `[update]` channel):
+    /// the trusted-image form), or one of the signed-channel keywords (using
+    /// the saved `[update]` channel):
     ///
     /// * `check` — fetch + verify the signed release manifest and print the
     ///   available version (needs neither root nor the disk);
@@ -604,7 +604,7 @@ enum Command {
         #[arg(long, hide = true)]
         original_config: Option<PathBuf>,
     },
-    /// Deliver an alert for a failed unit (roadmap C23). Invoked by systemd's
+    /// Deliver an alert for a failed unit. Invoked by systemd's
     /// `OnFailure=` on the units Sentinel owns, not by hand — it reads the saved
     /// config's `[services.alerts]` and notifies every configured target.
     Alert {
@@ -614,14 +614,14 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Serve NAT-PMP (roadmap C18). Run by `sentinel-portmap.service` from the
+    /// Serve NAT-PMP. Run by `sentinel-portmap.service` from the
     /// settings an apply rendered, not by hand.
     PortMap {
         /// The resolved settings the last apply rendered.
         #[arg(long, default_value = portmap::STATE_FILE)]
         state: PathBuf,
     },
-    /// Serve the captive portal (roadmap C20). Run by
+    /// Serve the captive portal. Run by
     /// `sentinel-portal.service` from the saved config, not by hand: it binds
     /// the appliance's own address in the gated zone, and the address only
     /// exists once the network is up.
@@ -630,7 +630,7 @@ enum Command {
         #[arg(long, default_value = portal::STATE_FILE)]
         state: PathBuf,
     },
-    /// Follow the detector's alerts and block what they name (roadmap C11).
+    /// Follow the detector's alerts and block what they name.
     /// Run by `sentinel-ids-watch.service` while `block-on-alert` is set, not by
     /// hand. Every block it asks for expires, and none survive an agent restart.
     IdsWatch,
@@ -651,11 +651,11 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Carry UDP broadcasts between segments (roadmap C18). Run by
+    /// Carry UDP broadcasts between segments. Run by
     /// `sentinel-broadcast-relay.service` from the config an apply rendered, not
     /// by hand.
     BroadcastRelay,
-    /// Obtain or renew the ACME certificates the config declares (roadmap C19).
+    /// Obtain or renew the ACME certificates the config declares.
     /// Run by `sentinel-acme.service` from its timer, not by hand.
     AcmeRenew,
     /// List the ports a Velstra controller currently knows about.
@@ -664,7 +664,7 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:50052")]
         controller: String,
     },
-    /// Serve the REST management API (roadmap C12) over the same config model the
+    /// Serve the REST management API over the same config model the
     /// CLI edits: `GET/PUT /api/v1/config`, `GET /api/v1/status`,
     /// `GET /api/v1/show/*`. Bearer-token auth; binds localhost by default (widen
     /// with `--listen 0.0.0.0:<port>`). A `PUT` validates + applies live + saves
@@ -1340,6 +1340,10 @@ fn apply_candidate(
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(candidate)));
+    // Validation saw feed groups empty. A refresh whose fetched feed no longer
+    // fits the data plane leaves the running policy in force and says why.
+    compile::check_capacity(&appliance)
+        .context("feed, domain and user groups as resolved; the running policy is unchanged")?;
     // This is the path `sentinel-fwsched.service` runs at every window
     // boundary, so it is where a schedule is decided by the clock. Saying so
     // here puts it in the journal beside the re-apply that acted on it, which
@@ -1410,6 +1414,7 @@ fn apply_boot(
             // Sentinel-side capacity checks of the RESOLVED config (a feed that
             // grew), so each one takes the fallback rather than failing boot.
             let resolved = resolve(candidate);
+            compile::check_capacity(&resolved)?;
             let rendered = compile::compile(&resolved)
                 .to_toml()
                 .context("compiling firewall config")?;
@@ -3999,6 +4004,7 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
         }
         ConfigAction::Check { file, live } => {
             let appliance = Appliance::load(&file)?;
+            compile::check_capacity(&appliance)?;
             // The same verdict commit, save and the boot seed ask for.
             match agent_contract::check(&appliance)? {
                 agent_contract::Verdict::Accepted => {
@@ -4469,6 +4475,24 @@ mod tests {
         assert!(super::firewall_refresh_source(&saved, &running).is_err());
         // ENOTDIR is not absence and must never quietly choose saved policy.
         assert!(super::firewall_refresh_source(&saved, &saved.join("running")).is_err());
+    }
+
+    /// STATIC-13: operator-facing help must not leak internal planning codes
+    /// ("roadmap C12"). Every subcommand's long help is rendered and searched.
+    #[test]
+    fn cli_help_names_no_internal_roadmap_codes() {
+        use clap::CommandFactory;
+        let mut root = super::Cli::command();
+        let mut pages = vec![root.render_long_help().to_string()];
+        for sub in root.get_subcommands_mut() {
+            pages.push(sub.render_long_help().to_string());
+        }
+        for page in pages {
+            assert!(
+                !page.contains("roadmap"),
+                "help leaks a roadmap code:\n{page}"
+            );
+        }
     }
 
     #[test]

@@ -1835,6 +1835,9 @@ fn apply_live_as(
     let appliance = &crate::identity::with_resolved(&crate::feed::with_fetched(
         &crate::domain::with_resolved(appliance),
     ));
+    // Validation saw these groups empty; a fetched feed can carry thousands of
+    // prefixes, so the data-plane budget is checked again on what is applied.
+    compile::check_capacity(appliance).context("feed, domain and user groups as resolved")?;
     let rendered = compile::compile(appliance)
         .to_toml()
         .context("compiling firewall config")?;
@@ -2844,18 +2847,12 @@ const SERVICES_NODES: &[Cand] = &[
         "syslog",
         "ship the journal to remote collectors (rsyslog, RFC 5424)",
     ),
-    (
-        "alerts",
-        "notify on a failed unit: webhook and/or mail (roadmap C23)",
-    ),
+    ("alerts", "notify on a failed unit: webhook and/or mail"),
     (
         "flow-export",
         "ship flow records to an IPFIX collector (RFC 7011)",
     ),
-    (
-        "ids",
-        "intrusion detection: watch links with suricata (roadmap C11)",
-    ),
+    ("ids", "intrusion detection: watch links with suricata"),
 ];
 // `services portal <Tab>`: which zone is gated, and what a visitor has to do.
 const PORTAL_FIELDS: &[Cand] = &[
@@ -4741,6 +4738,7 @@ const RULE_DIRECTIONS: &[Cand] = &[
         "out",
         "traffic leaving them, including what this box originates (IPv4 only)",
     ),
+    ("both", "arriving and leaving traffic alike"),
 ];
 /// `firewall rule <n> icmp-type <Tab>` — the names worth offering, both families.
 /// A number is accepted too; the registry is longer than any list worth shipping.

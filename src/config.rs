@@ -4945,7 +4945,8 @@ pub struct Firewall {
     /// without an explicit rule. On by default (a real firewall default).
     #[serde(default = "default_true")]
     pub stateful: bool,
-    /// Drop inbound ICMP at firewalled interfaces (echo, etc.). Off by default
+    /// Drop NEW inbound ICMP at firewalled interfaces (echo requests, etc.);
+    /// replies, errors about tracked flows and IPv6 ND/MLD still pass. Off by default
     /// — ICMP is useful (PMTU, ping); turn on to go quiet.
     #[serde(default)]
     pub block_icmp: bool,
@@ -7058,7 +7059,11 @@ pub struct Rule {
     /// address already implies its family and needs nothing here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
-    /// Restrict this rule to one direction (`in` / `out`). Absent means both.
+    /// The direction this rule applies in: `in` (traffic arriving from the
+    /// `from` zone), `out` (traffic leaving through that zone's links) or
+    /// `both`. Absent means `in` — what `from <zone>` says. It used to mean
+    /// both, which made `from wan proto tcp port 25 drop` also stop LAN hosts
+    /// sending mail out through WAN (release audit DP-15).
     ///
     /// `out` is the only way to describe traffic **this box originates**: the
     /// egress hook is where a locally-generated packet is seen, and rules that
@@ -7357,6 +7362,9 @@ impl Appliance {
         appliance.normalize();
         if unknown == UnknownKeys::Warn {
             crate::fieldcheck::quarantine(&mut appliance);
+            for line in appliance.neutralise_for_boot() {
+                eprintln!("error: {line}");
+            }
         }
         appliance.validate()?;
         Ok(appliance)
@@ -7377,6 +7385,9 @@ impl Appliance {
         appliance.normalize();
         if unknown == UnknownKeys::Warn {
             crate::fieldcheck::quarantine(&mut appliance);
+            for line in appliance.neutralise_for_boot() {
+                eprintln!("error: {line}");
+            }
         }
         appliance.validate()?;
         Ok(appliance)
@@ -8788,8 +8799,19 @@ impl Appliance {
                 // to be in use on — naming one is the whole point.
                 let is_local = self.zones.get(zone.as_str()).is_some_and(|z| z.local);
                 if !is_local && !zones_in_use.contains(zone.as_str()) {
+                    // The usual way here is `to firewall` copied from an
+                    // example: a zone meaning "this box" is an ordinary zone
+                    // marked local, not a reserved name.
+                    let hint = if which == "to" {
+                        format!(
+                            " — to mean this appliance itself, declare it a local zone: \
+                             `set firewall zone {zone} local true`"
+                        )
+                    } else {
+                        String::new()
+                    };
                     bail!(
-                        "rule {:?}: {which} zone {zone:?} has no interface",
+                        "rule {:?}: {which} zone {zone:?} has no interface{hint}",
                         rule.name
                     );
                 }
@@ -8868,9 +8890,12 @@ impl Appliance {
                 bail!("rule {:?}: family {f:?} is not ipv4 or ipv6", rule.name);
             }
             if let Some(d) = &rule.direction
-                && !matches!(d.as_str(), "in" | "out")
+                && !matches!(d.as_str(), "in" | "out" | "both")
             {
-                bail!("rule {:?}: direction {d:?} is not in or out", rule.name);
+                bail!(
+                    "rule {:?}: direction {d:?} is not in, out or both",
+                    rule.name
+                );
             }
             if rule.source.is_some() && rule.source_group.is_some() {
                 bail!(
@@ -8989,6 +9014,9 @@ impl Appliance {
                     rule.name,
                     rule.from
                 );
+            }
+            if rule.is_broad() && rule.source_mac_group.is_none() && rule.action == Action::Accept {
+                self.validate_broad_accept(rule)?;
             }
             // A referenced group must be declared.
             if let Some(g) = &rule.source_group
@@ -9146,6 +9174,18 @@ impl Appliance {
             if dst.port == 0 {
                 bail!("nat destination {:?}: port 0 is not valid", dst.name);
             }
+            // The data plane's port-forward is keyed on (zone, protocol, port)
+            // and parses tcp and udp only; `tcp_udp` compiles to one forward
+            // each. Anything else used to pass here and make the agent refuse
+            // the whole configuration at commit — or at boot.
+            if !dst.proto.concrete().iter().all(|p| p.has_ports()) {
+                bail!(
+                    "nat destination {:?}: proto {} carries no ports to forward — a \
+                     port-forward is tcp, udp or tcp_udp",
+                    dst.name,
+                    proto_str(dst.proto)
+                );
+            }
             let (_to_ip, to_port) = parse_host_port(&dst.to)
                 .with_context(|| format!("nat destination {:?}", dst.name))?;
             // An explicit `ip:0` target port is invalid (a bare `ip` with no
@@ -9182,29 +9222,37 @@ impl Appliance {
                     lb.zone
                 );
             }
-            // The datapath keys a service by (policy, vip, port, proto). A second
-            // service on the same tuple would not conflict — it would overwrite
-            // the first in the map, silently.
-            let proto = match lb.proto {
-                Proto::Tcp => "tcp",
-                Proto::Udp => "udp",
-                other => proto_str(other),
-            };
-            if !lb_keys.insert((lb.zone.as_str(), proto, lb.port)) {
+            // A service is keyed by (policy, vip, port, proto) and the agent
+            // parses tcp and udp only; `tcp_udp` compiles to one service each.
+            // The comment that stood here claimed `Proto` was tcp|udp — it has
+            // eleven variants, and icmp/esp/gre/tcp_udp all passed to be refused
+            // by the agent at commit.
+            if !lb.proto.concrete().iter().all(|p| p.has_ports()) {
                 bail!(
-                    "load-balancer {:?}: zone {:?} already fronts {proto}/{} — one service \
-                     per (zone, protocol, port)",
+                    "load-balancer {:?}: proto {} carries no ports to balance — a load \
+                     balancer is tcp, udp or tcp_udp",
                     lb.name,
-                    lb.zone,
-                    lb.port
+                    proto_str(lb.proto)
                 );
+            }
+            // A second service on the same tuple would not conflict — it would
+            // overwrite the first in the map, silently.
+            for &concrete in lb.proto.concrete() {
+                let proto = proto_str(concrete);
+                if !lb_keys.insert((lb.zone.as_str(), proto, lb.port)) {
+                    bail!(
+                        "load-balancer {:?}: zone {:?} already fronts {proto}/{} — one service \
+                         per (zone, protocol, port)",
+                        lb.name,
+                        lb.zone,
+                        lb.port
+                    );
+                }
             }
             validate_ipv4(&lb.vip).with_context(|| format!("load-balancer {:?} vip", lb.name))?;
             if lb.port == 0 {
                 bail!("load-balancer {:?}: port 0 is not valid", lb.name);
             }
-            // No protocol check is needed: `Proto` is tcp|udp, so a protocol the
-            // load balancer cannot key a port on is unrepresentable here.
             for backend in &lb.backends {
                 let (_ip, port) = parse_host_port(backend)
                     .with_context(|| format!("load-balancer {:?} backend {backend:?}", lb.name))?;
@@ -11376,8 +11424,9 @@ impl Appliance {
         }
         // GeoIP (roadmap C15): a country the image has no addresses for would
         // block nothing while `show` listed it — the worst outcome for a feature
-        // whose whole job is to block. And the data plane's blocklist is one map
-        // across every policy, so the total across zones is what has to fit.
+        // whose whole job is to block. How many prefixes the countries add, per
+        // zone, is counted with every other map by `compile::capacity_errors`
+        // at the end of validation.
         {
             // Every declared country is checked, even one no interface uses yet:
             // finding out it is unknown when a zone is first assigned is worse.
@@ -11389,36 +11438,8 @@ impl Appliance {
                     }
                 }
             }
-            let mut size: BTreeMap<&str, usize> = BTreeMap::new();
             for cc in &wanted {
-                size.insert(cc.as_str(), geoip_prefixes(cc)?.len());
-            }
-            // The cost is per zone: each zone's policy carries its own copy.
-            let mut total = 0usize;
-            let mut zones: Vec<&str> = self
-                .interfaces
-                .iter()
-                .filter(|i| !i.disabled)
-                .filter_map(|i| i.zone.as_deref())
-                .collect();
-            zones.sort_unstable();
-            zones.dedup();
-            for zone in zones {
-                for cc in &self.zone_posture(zone).geoip_block {
-                    total += size.get(cc.as_str()).copied().unwrap_or(0);
-                }
-            }
-            // Mirrors `velstra_common::MAX_BLOCKLIST`, the source of truth.
-            // Duplicated because Sentinel does not link the data-plane crates,
-            // and the alternative is finding the ceiling as a half-programmed
-            // firewall.
-            const MAX_BLOCKLIST: usize = 262_144;
-            if total > MAX_BLOCKLIST {
-                bail!(
-                    "firewall geoip-block: {total} prefixes across all zones exceeds the \
-                     data plane's {MAX_BLOCKLIST}; block fewer countries, or block them \
-                     on fewer zones"
-                );
+                geoip_prefixes(cc)?;
             }
         }
 
@@ -11651,6 +11672,191 @@ impl Appliance {
         // cannot start with. Better to refuse the setting than to accept it and
         // discover the problem on the next boot.
         crate::wren::compile_wren(self).to_toml()?;
+        // Data-plane capacity is deliberately NOT checked here: `validate`
+        // also runs on the boot-time load, and a configuration that no longer
+        // fits must reach the boot fallback rather than fail validation first.
+        // `compile::check_capacity` runs on `config check`, the configure
+        // session's candidate, every live apply and every refresh instead.
+        Ok(())
+    }
+
+    /// Advisories for settings the data plane cannot carry the way they read,
+    /// each said where the operator is already reading (`config check`,
+    /// `commit`) rather than discovered on the wire.
+    fn compile_contract_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let web = &self.services.web;
+        if web.enable && web.listen_address.is_none() {
+            out.push(format!(
+                "services web: no listen-address is set, so the console and API listen on {} \
+                 only — reachable from this box (for example through an SSH tunnel) and from \
+                 no network. Set `services web listen-address <address>` to an address this \
+                 box holds on the management segment to serve it there",
+                web.bind()
+            ));
+        }
+        // Reflection needs the public address at compile time, and a DHCP
+        // uplink only learns it at run time — so the plain forward is
+        // emitted and the reflection silently was not.
+        for dst in self
+            .nat
+            .destination
+            .iter()
+            .filter(|d| !d.disabled && d.hairpin)
+        {
+            let static_public = self.interfaces.iter().any(|i| {
+                !i.disabled
+                    && i.zone.as_deref() == Some(dst.zone.as_str())
+                    && i.address
+                        .as_deref()
+                        .and_then(|a| a.split('/').next())
+                        .is_some_and(|a| a.parse::<std::net::Ipv4Addr>().is_ok())
+            });
+            if !static_public {
+                out.push(format!(
+                    "nat destination {:?}: hairpin has no effect — zone {:?} has no static IPv4 \
+                     address (a DHCP or PPPoE uplink learns its address only at run time), so \
+                     internal clients reaching the public address are not reflected. Use \
+                     split DNS for internal clients, or give the uplink a static address",
+                    dst.name, dst.zone
+                ));
+            }
+        }
+        // The data plane keys its SYN proxy on the TCP port alone.
+        if !self.firewall.syn_protect.is_empty() {
+            let ports = self
+                .firewall
+                .syn_protect
+                .iter()
+                .map(|s| s.port.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!(
+                "firewall syn-protect {ports}: the SYN proxy answers every IPv4 TCP SYN to \
+                 {} arriving on any zone, including connections this network's own clients \
+                 open outward to that port elsewhere; those connections lose window scaling, \
+                 SACK and timestamps. IPv6 SYNs are not proxied",
+                if self.firewall.syn_protect.len() == 1 {
+                    "that port"
+                } else {
+                    "those ports"
+                }
+            ));
+        }
+        out
+    }
+
+    /// Make a saved configuration that a newer validation refuses boot the way
+    /// it booted before, instead of not at all. Only the boot-time lenient
+    /// load calls this; every interactive path still refuses the same input,
+    /// so the operator has to fix it at the next commit.
+    ///
+    /// For each broad accept `validate_broad_accept` refuses (release audit
+    /// DP-14), an `error:` line names the rule and what is done to it:
+    /// - inert under an explicit zone default-action: dropped (it opened
+    ///   nothing, so the policy is unchanged);
+    /// - carrying qualifiers the data plane never honoured: the qualifiers are
+    ///   removed and the rule kept, which is exactly what was enforced before
+    ///   (the zone's default became accept). Dropping it instead would close a
+    ///   zone that was open on the previous boot — possibly the one management
+    ///   is reached through.
+    fn neutralise_for_boot(&mut self) -> Vec<String> {
+        let mut said = Vec::new();
+        let mut kept = Vec::with_capacity(self.rules.len());
+        for mut rule in std::mem::take(&mut self.rules) {
+            let refused = rule.is_broad()
+                && rule.source_mac_group.is_none()
+                && rule.action == Action::Accept
+                && self.validate_broad_accept(&rule).is_err();
+            if !refused {
+                kept.push(rule);
+                continue;
+            }
+            let inert = !rule.disabled
+                && self
+                    .zone_posture(&rule.from)
+                    .default_action
+                    .is_some_and(|d| d != Action::Accept);
+            if inert {
+                said.push(format!(
+                    "rule {:?}: dropped at boot — a broad accept under zone {:?}'s explicit \
+                     default-action has no effect; `commit` will refuse it until it is removed \
+                     or given a proto",
+                    rule.name, rule.from
+                ));
+                continue;
+            }
+            said.push(format!(
+                "rule {:?}: booted without source, destination, groups, family, direction, \
+                 icmp-type and log — a rule without `proto` never honoured them and opens all \
+                 of zone {:?}; `commit` will refuse it until it is given a proto",
+                rule.name, rule.from
+            ));
+            rule.source = None;
+            rule.source_group = None;
+            rule.destination = None;
+            rule.destination_group = None;
+            rule.interface_group = None;
+            rule.family = None;
+            rule.direction = None;
+            rule.icmp_type = None;
+            rule.log = false;
+            kept.push(rule);
+        }
+        self.rules = kept;
+        said
+    }
+
+    /// A broad accept (no `proto`) is not a rule the data plane carries: it
+    /// sets its zone's default to `pass`. Everything that would narrow it —
+    /// an address, a group, a family, a direction, a log flag — therefore has
+    /// nowhere to go, and used to be dropped without a word:
+    /// `from lan source 192.168.50.5 accept` let the whole LAN in. And under a
+    /// zone whose `default-action` is set explicitly, the posture is that
+    /// setting, so the same rule did nothing at all while reading as an
+    /// opening. Both are refused, naming what cannot be honoured.
+    fn validate_broad_accept(&self, rule: &Rule) -> Result<()> {
+        let ignored: Vec<&str> = [
+            (rule.source.is_some(), "source"),
+            (rule.source_group.is_some(), "source-group"),
+            (rule.destination.is_some(), "destination"),
+            (rule.destination_group.is_some(), "destination-group"),
+            (rule.interface_group.is_some(), "interface-group"),
+            (rule.family.is_some(), "family"),
+            (rule.direction.is_some(), "direction"),
+            (rule.icmp_type.is_some(), "icmp-type"),
+            (rule.log, "log"),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect();
+        if !ignored.is_empty() {
+            bail!(
+                "rule {:?}: without `proto` this rule is not a rule the data plane carries — it \
+                 sets zone {:?}'s default to accept everything — so it cannot honour {}. Give it \
+                 a proto (and a port for tcp/udp) to make those apply, or remove them",
+                rule.name,
+                rule.from,
+                ignored.join(", ")
+            );
+        }
+        if !rule.disabled
+            && let Some(default) = self.zone_posture(&rule.from).default_action
+            && default != Action::Accept
+        {
+            bail!(
+                "rule {:?}: has no effect — zone {:?} sets default-action {}, which decides \
+                 its posture, so a rule without `proto` opens nothing. Give the rule a proto \
+                 (and a port for tcp/udp), or remove the zone's default-action",
+                rule.name,
+                rule.from,
+                match default {
+                    Action::Accept => "accept",
+                    Action::Drop => "drop",
+                    Action::Reject => "reject",
+                }
+            );
+        }
         Ok(())
     }
 
@@ -11700,6 +11906,8 @@ impl Appliance {
         let mut out = Vec::new();
         out.extend(crate::ha::witness_warnings(self));
         out.extend(crate::compile::destination_zone_warnings(self));
+        out.extend(crate::compile::rule_key_warnings(self));
+        out.extend(self.compile_contract_warnings());
         // An encrypted upstream named by hostname cannot be reached until
         // something resolves that hostname, and that something has to be
         // plaintext. Without one the box looks like "DNS is broken" rather than
@@ -14535,6 +14743,69 @@ mru = 1492
     /// is between "come up and warn" and "come up blank". A field that does not
     /// PARSE, or a value that does not VALIDATE, must still fail even here; only
     /// an unrecognised *key* is tolerated.
+    /// A saved configuration that was valid before DP-14's refusal must
+    /// still boot (release audit P0 class: a new refusal must not brick a box
+    /// on its own saved config). The boot load neutralises the rule, says so,
+    /// and boots with the effect it had; the strict path still refuses it.
+    #[test]
+    fn a_saved_broad_accept_refused_by_dp14_still_boots_and_says_why() {
+        let text = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "wan"
+address = "198.51.100.2/24"
+[[interface]]
+name = "eth1"
+zone = "lan"
+address = "192.168.50.1/24"
+[zone.wan]
+default_action = "drop"
+[[rule]]
+name = "admin-only"
+from = "lan"
+source = "192.168.50.5"
+action = "accept"
+[[rule]]
+name = "wan-open"
+from = "wan"
+action = "accept"
+"#;
+        assert!(
+            Appliance::from_toml(text).is_err(),
+            "the strict path refuses it"
+        );
+        let path =
+            std::env::temp_dir().join(format!("sentinel-dp14-boot-{}.toml", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        let booted = Appliance::load_lenient(&path);
+        let _ = std::fs::remove_file(&path);
+        let booted = booted.expect("a pre-update saved config must still boot");
+        // The qualified accept keeps the effect it had (lan opens), minus the
+        // qualifier the data plane never honoured; the inert one is gone.
+        let admin = booted
+            .rules
+            .iter()
+            .find(|r| r.name == "admin-only")
+            .unwrap();
+        assert!(admin.source.is_none());
+        assert!(booted.rules.iter().all(|r| r.name != "wan-open"));
+        let cfg = crate::compile::compile(&booted);
+        let lan = cfg.policies.iter().find(|p| p.name == "lan").unwrap();
+        assert_eq!(
+            lan.default_action, "pass",
+            "the zone stays as open as it booted before"
+        );
+        // …and each change is announced.
+        let mut raw: Appliance = toml::from_str(text).unwrap();
+        let said = raw.neutralise_for_boot().join("\n");
+        assert!(
+            said.contains("admin-only") && said.contains("wan-open"),
+            "{said}"
+        );
+    }
+
     #[test]
     fn a_saved_config_with_a_key_from_a_newer_version_still_loads_leniently() {
         // A valid document plus one key no schema of this version has, at the
