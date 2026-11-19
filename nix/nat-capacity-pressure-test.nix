@@ -157,10 +157,14 @@ in pkgs.testers.runNixOSTest {
                                  config_hash=fw.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0])
         # The first snapshot supplies old IDs only. A real agent restart must
         # create new maps, so no earlier load-test bindings contaminate this run.
+        # The appliance's agent persists its state across restarts (DP-27), so
+        # release what it pinned while it is stopped to get fresh maps.
         fw.wait_until_succeeds("${command} snapshot --output /run/qa-capacity-initial.json", timeout=30)
         initial = read_json(fw, "/run/qa-capacity-initial.json")
         preserve("initial-raw-maps.json", initial)
-        fw.succeed("systemctl restart velstra.service")
+        fw.succeed("systemctl stop velstra.service")
+        fw.succeed("${self.packages.x86_64-linux.velstra}/bin/velstra release-datapath")
+        fw.succeed("systemctl start velstra.service")
         fw.wait_until_succeeds("${command} snapshot --output /run/qa-capacity-baseline.json", timeout=30)
         baseline = read_json(fw, "/run/qa-capacity-baseline.json")
         preserve("baseline-raw-maps.json", baseline)

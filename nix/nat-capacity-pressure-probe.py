@@ -419,7 +419,8 @@ def validate_metadata(info):
     need(type(info.get("id")) is int and info["id"] > 0 and info.get("type") == kind,
          "unexpected kernel map identity/type")
     need(info.get("bytes_key") == key_size and info.get("bytes_value") == value_size
-         and type(info.get("max_entries")) is int and 1 <= info["max_entries"] <= 65536,
+         # The agent sizes the state maps at load (DP-06): up to 6 x 4,194,304.
+         and type(info.get("max_entries")) is int and 1 <= info["max_entries"] <= 1 << 25,
          "unexpected kernel map ABI/capacity")
     return info
 
