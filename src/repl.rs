@@ -3910,7 +3910,10 @@ const GLOBAL_FIELDS: &[Cand] = &[
         "stateful",
         "track flows so return traffic is allowed (true|false)",
     ),
-    ("block-icmp", "drop inbound ICMP by default (true|false)"),
+    (
+        "block-icmp",
+        "drop new inbound ICMP by default; replies, errors and ND still pass (true|false)",
+    ),
     (
         "default-action",
         "default ingress action (accept|drop|reject)",
@@ -3937,7 +3940,10 @@ const ZONE_FIELDS: &[Cand] = &[
     ),
     ("description", "free-text label for this zone"),
     ("stateful", "stateful inspection for this zone (true|false)"),
-    ("block-icmp", "drop inbound ICMP on this zone (true|false)"),
+    (
+        "block-icmp",
+        "drop new inbound ICMP on this zone; replies, errors and ND still pass (true|false)",
+    ),
     (
         "default-action",
         "ingress action for this zone (accept|drop|reject)",

@@ -111,6 +111,30 @@ pub fn trace(appliance: &Appliance, q: &Query) -> anyhow::Result<Trace> {
     Walk::new(appliance, &cfg, q)?.run()
 }
 
+/// Whether an ICMPv6 message of `kind` from `src` is link control the data
+/// plane admits before any policy (fabric `icmpv6_link_control`, DP-10): router
+/// and neighbour discovery (133-137) and MLD (130-132, 143). The data plane
+/// also requires code 0 and the link-scope hop limit, which a question to this
+/// walk cannot state, so a genuine on-link message is assumed.
+fn icmpv6_link_control(kind: u8, src: &IpAddr) -> bool {
+    let IpAddr::V6(src) = src else {
+        return false;
+    };
+    let link_local = src.segments()[0] & 0xffc0 == 0xfe80;
+    let unspecified = src.is_unspecified();
+    match kind {
+        // Router solicitation, MLD reports (v1, v2).
+        133 | 131 | 143 => link_local || unspecified,
+        // Router advertisement, redirect, MLD query and done.
+        134 | 137 | 130 | 132 => link_local,
+        // Neighbour solicitation (`::` is duplicate address detection).
+        135 => true,
+        // Neighbour advertisement.
+        136 => !unspecified,
+        _ => false,
+    }
+}
+
 /// The state of one walk. A struct rather than a long function so each stage
 /// reads on its own and the order they run in is one list at the bottom.
 struct Walk<'a> {
@@ -474,11 +498,25 @@ impl<'a> Walk<'a> {
             );
             return Outcome::Final("pass", "port-forward".into());
         }
+        if self.q.proto == "icmpv6"
+            && let Some(kind) = self.q.icmp_type
+            && icmpv6_link_control(kind, &self.q.src)
+        {
+            self.step(
+                "rules",
+                "ICMPv6 neighbour discovery and multicast listener messages are admitted \
+                 before any rule or block-icmp: IPv6 cannot work on the link without them, \
+                 and they create no connection state",
+            );
+            return Outcome::Final("pass", "ICMPv6 link control".into());
+        }
         if is_icmp && policy.drop_icmp {
             self.step(
                 "rules",
                 format!(
-                    "zone {} has block-icmp; every ICMP packet is dropped",
+                    "zone {} has block-icmp; new inbound ICMP is dropped (an answer to \
+                     something sent from here, such as an echo reply, and an error about a \
+                     tracked connection still pass)",
                     policy.name
                 ),
             );
@@ -1185,6 +1223,47 @@ to = "10.9.0.10:80"
         assert_eq!(t.destination, "10.9.0.10:80");
         assert!(stage(&t, "dnat").contains("port-forward web"));
         assert_eq!(t.egress_interface.as_deref(), Some("dmz0"));
+    }
+
+    /// block-icmp refuses NEW inbound ICMP; ND/MLD is admitted before it and
+    /// before any rule, as the data plane does (fabric DP-10).
+    #[test]
+    fn block_icmp_spares_icmpv6_link_control_and_says_new_inbound() {
+        let text = BOX
+            .replace("[zone.wan]", "[zone.wan]\nblock_icmp = true")
+            .replace(
+                "address = \"198.51.100.2/24\"",
+                "address = \"198.51.100.2/24\"\naddress6 = \"2001:db8:1::2/64\"",
+            );
+        let appliance = Appliance::from_toml(&text).unwrap();
+        let q = |src: &str, icmp_type: u8| Query {
+            in_interface: "wan0".into(),
+            proto: "icmpv6".into(),
+            src: src.parse().unwrap(),
+            dst: "2001:db8:1::2".parse().unwrap(),
+            port: 0,
+            src_mac: None,
+            icmp_type: Some(icmp_type),
+        };
+        for (src, kind) in [
+            ("fe80::1", 135),
+            ("::", 135),
+            ("fe80::1", 136),
+            ("fe80::1", 134),
+        ] {
+            let t = trace(&appliance, &q(src, kind)).unwrap();
+            assert_eq!(
+                (t.verdict.as_str(), t.decided_by.as_str()),
+                ("pass", "ICMPv6 link control"),
+                "{src} type {kind}: {t:?}"
+            );
+        }
+        // A router advertisement from a global source is not link control.
+        let t = trace(&appliance, &q("2001:db8::1", 134)).unwrap();
+        assert_eq!(t.decided_by, "block-icmp", "{t:?}");
+        let t = trace(&appliance, &q("fe80::1", 128)).unwrap();
+        assert_eq!(t.decided_by, "block-icmp", "{t:?}");
+        assert!(stage(&t, "rules").contains("new inbound ICMP"), "{t:?}");
     }
 
     #[test]
