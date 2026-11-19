@@ -20,7 +20,7 @@ in pkgs.testers.runNixOSTest {
         interfaces.eth1.ipv4.addresses = [{ address = "198.18.20.50"; prefixLength = 24; }];
         defaultGateway = { address = "198.18.20.1"; interface = "eth1"; };
       };
-      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 pkgs.ethtool ];
       systemd.services.qa-capacity-client = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
@@ -43,7 +43,7 @@ in pkgs.testers.runNixOSTest {
           { address = "198.18.10.254"; prefixLength = 24; }
         ];
       };
-      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 pkgs.ethtool ];
       systemd.services.qa-capacity-peer = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
@@ -74,7 +74,7 @@ in pkgs.testers.runNixOSTest {
           nat.source = [{ name = "wan-masquerade"; zone = "wan"; }];
         });
       };
-      environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.iproute2 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.iproute2 pkgs.ethtool ];
     };
   };
   testScript = ''
@@ -141,7 +141,20 @@ in pkgs.testers.runNixOSTest {
                                      item["stats64"]["rx"].get("missed", 0)] for item in links if item["ifname"] != "lo"}
             qdisc = json.loads(machine.succeed("tc -s -j qdisc show"))
             qdrops = sum(int(item.get("drops", 0)) for item in qdisc)
-            result[machine.name] = dict(softnet_dropped=dropped, softnet_squeezed=squeezed, link=link, qdisc_drops=qdrops)
+            # virtio-net ring/XDP statistics: drops the guest cannot see as
+            # link/qdisc drops (ring full, XDP drop/redirect failures).
+            nic = {}
+            for name in link:
+                if name == "eth0":
+                    continue
+                for line in machine.execute("ethtool -S " + name + " 2>/dev/null")[1].splitlines():
+                    key, _, value = line.strip().partition(":")
+                    if value.strip().isdigit() and ("drop" in key or "xdp" in key or "kick" in key or "full" in key):
+                        nic[name + "." + key] = int(value)
+            snmp = machine.succeed("cat /proc/net/snmp").splitlines()
+            ip = dict(zip(snmp[0].split()[1:], map(int, snmp[1].split()[1:]))) if snmp and snmp[0].startswith("Ip:") else {}
+            result[machine.name] = dict(softnet_dropped=dropped, softnet_squeezed=squeezed, link=link, qdisc_drops=qdrops,
+                                        nic=nic, ip={k: ip.get(k, 0) for k in ("InDiscards", "OutDiscards", "ForwDatagrams", "OutNoRoutes", "InHdrErrors", "InAddrErrors")})
         return result
 
     def drop_delta(before, after):
@@ -152,7 +165,9 @@ in pkgs.testers.runNixOSTest {
                              softnet_squeezed=a["softnet_squeezed"] - b["softnet_squeezed"],
                              qdisc_drops=a["qdisc_drops"] - b["qdisc_drops"],
                              link={k: [x - y for x, y in zip(a["link"][k], b["link"].get(k, [0, 0, 0]))]
-                                   for k in a["link"]})
+                                   for k in a["link"]},
+                             nic={k: v - b["nic"].get(k, 0) for k, v in a["nic"].items() if v - b["nic"].get(k, 0)},
+                             ip={k: v - b["ip"].get(k, 0) for k, v in a["ip"].items()})
         return out
 
     def runtime_sample(name):
