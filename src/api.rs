@@ -1340,6 +1340,14 @@ async fn ha_enrollment(
     axum::Extension(caller): axum::Extension<Caller>,
 ) -> Result<Response, ApiError> {
     require_ha_machine(&state, &caller)?;
+    // The apply lock can be held for minutes by a provisional worker; waiting
+    // for it on an async worker parked that worker (CTRL-06).
+    tokio::task::spawn_blocking(move || enrollment_document(&state))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("enrollment task: {e}")))?
+}
+
+fn enrollment_document(state: &ApiState) -> Result<Response, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let appliance = state.appliance().map_err(ApiError::internal)?;
     let revision = crate::ha::revision(&appliance).map_err(ApiError::internal)?;
@@ -1363,6 +1371,14 @@ async fn ha_pair(
     Json(request): Json<PairRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_ha_machine(&state, &caller)?;
+    // A flock and a full live apply (systemctl, link waits): never on an async
+    // worker (CTRL-06), like every other mutating handler.
+    tokio::task::spawn_blocking(move || receive_pairing(&state, request))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("pairing task: {e}")))?
+}
+
+fn receive_pairing(state: &ApiState, request: PairRequest) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let local = state.appliance().map_err(ApiError::internal)?;
     request
@@ -1404,7 +1420,7 @@ async fn ha_pair(
         ));
     }
     // Received enrollment must not enqueue a reverse configuration push.
-    replace_config(&state, request.appliance)
+    replace_config(state, request.appliance)
 }
 
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
@@ -3587,6 +3603,58 @@ mod tests {
             resolve_caller(&first, &credential).is_some(),
             "another appliance revoked this fixture's valid local browser session"
         );
+    }
+
+    /// CTRL-06: `ha_pair` took the configuration's transaction lock and ran
+    /// the live apply on the async worker itself. While another transaction
+    /// held the lock, every such request parked a worker; on a two-core box
+    /// two of them wedged the whole API, sign-in included. On a one-thread
+    /// runtime the symptom is direct: nothing else runs until the lock is free.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pairing_waiting_for_the_transaction_lock_does_not_hold_the_runtime() {
+        let path = seed("unpaired-blocking");
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let expected = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/ha/pair")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&PairRequest {
+                    expected_revision: expected,
+                    appliance: crate::ha::paired_fixture(),
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let lock_path = path.with_extension("transaction.lock");
+        let (held, release) = (
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+            std::time::Duration::from_millis(1500),
+        );
+        let holder = {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                let _lock = system::lock_config_at(&lock_path).unwrap();
+                held.wait();
+                std::thread::sleep(release);
+            })
+        };
+        held.wait();
+        let pairing = tokio::spawn(app.oneshot(request));
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waited = started.elapsed();
+        holder.join().unwrap();
+        let _ = pairing.await;
+        assert!(
+            waited < std::time::Duration::from_millis(1000),
+            "a 50 ms timer took {waited:?}: the pairing blocked the runtime on the lock"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
