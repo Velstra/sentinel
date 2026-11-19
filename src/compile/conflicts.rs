@@ -92,6 +92,17 @@ pub(crate) fn strictness(action: &str) -> u8 {
     }
 }
 
+/// The family a rule is really scoped to. An ICMP or ICMPv6 rule can only ever
+/// match its own family, so a `family` written on it changes nothing in the data
+/// plane and must not make two otherwise identical entries look different.
+fn family(r: &PortRule) -> Option<&str> {
+    match r.proto {
+        "icmp" => Some("ipv4"),
+        "icmpv6" => Some("ipv6"),
+        _ => r.family.as_deref(),
+    }
+}
+
 /// Everything but the key: two entries that agree on all of it are the same
 /// entry written twice (overlapping groups do this), not a conflict.
 fn verdict(
@@ -101,10 +112,10 @@ fn verdict(
     bool,
     Option<u32>,
     Option<u32>,
-    &Option<String>,
+    Option<&str>,
     &Option<String>,
 ) {
-    (r.action, r.log, r.limit, r.burst, &r.family, &r.direction)
+    (r.action, r.log, r.limit, r.burst, family(r), &r.direction)
 }
 
 /// Two entries that differ only in being the `in` and the `out` half.
@@ -114,13 +125,13 @@ fn mirrored(a: &PortRule, b: &PortRule) -> bool {
         (Some("in"), Some("out")) | (Some("out"), Some("in"))
     );
     halves
-        && (a.action, a.log, a.limit, a.burst, &a.family)
-            == (b.action, b.log, b.limit, b.burst, &b.family)
+        && (a.action, a.log, a.limit, a.burst, family(a))
+            == (b.action, b.log, b.limit, b.burst, family(b))
 }
 
 /// Whether `outer`'s family/direction scope covers everything `inner`'s does.
 fn covers(outer: &PortRule, inner: &PortRule) -> bool {
-    let family = outer.family.is_none() || outer.family == inner.family;
+    let family = family(outer).is_none() || family(outer) == family(inner);
     let direction = outer.direction.is_none() || outer.direction == inner.direction;
     family && direction
 }

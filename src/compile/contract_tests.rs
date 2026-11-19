@@ -254,6 +254,45 @@ fn dp30_the_stricter_of_two_rules_on_one_key_is_the_only_one_emitted() {
     }
 }
 
+/// An ICMPv6 rule can only match IPv6, so `family = "ipv6"` on it is no scope
+/// at all: an `in` echo-reply drop and an `out` one that also says
+/// `family ipv6` are the two halves of one entry, not a conflict the first
+/// rule wins (which left outgoing echo replies unblocked; checks.icmptype).
+#[test]
+fn dp30_an_icmp_family_scope_does_not_split_an_in_out_pair() {
+    let a = Appliance::from_toml(&with(
+        r#"
+[[rule]]
+name = "no-ping6"
+from = "wan"
+proto = "icmpv6"
+direction = "in"
+icmp-type = "echo-reply"
+action = "drop"
+[[rule]]
+name = "no-replies6"
+from = "wan"
+proto = "icmpv6"
+family = "ipv6"
+direction = "out"
+icmp-type = "echo-reply"
+action = "drop"
+"#,
+    ))
+    .unwrap();
+    let cfg = emitted(&a);
+    let typed: Vec<_> = rules(&cfg, "wan")
+        .into_iter()
+        .filter(|r| r["proto"].as_str() == Some("icmpv6"))
+        .collect();
+    assert_eq!(typed.len(), 1, "{typed:?}");
+    assert!(
+        typed[0].get("direction").is_none(),
+        "both directions: {typed:?}"
+    );
+    assert_eq!(typed[0]["action"].as_str(), Some("drop"), "{typed:?}");
+}
+
 // ---- DP-18: forwards and services carry only protocols with ports -----------
 
 #[test]
