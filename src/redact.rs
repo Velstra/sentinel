@@ -16,8 +16,9 @@
 //! - a **read-write account** sees every secret except the machine credential.
 //!   It could set any of the others anyway, so hiding them protects nothing,
 //!   while the machine credential is the one thing an account must not be able
-//!   to turn into: it is the peer's full-access token, it has no account to
-//!   withdraw, and it is what lets a request skip the account's own limits;
+//!   to turn into: it is the credential the pair's members accept from each
+//!   other (config-sync pushes and pairing), it has no account to withdraw,
+//!   and it is what lets a request skip the account's own limits;
 //! - a **read-only account** sees no secret at all — "may read everything" is
 //!   about the configuration's shape, never about the keys inside it.
 
@@ -73,8 +74,9 @@ pub const SECRET_FIELDS: &[&str] = &[
 ];
 
 /// Where the machine credential lives in a serialised [`Appliance`]: the
-/// config-sync secret (which is written to this box's API token file, so it
-/// *is* the full-access token) and the HA witness secret (the same pairing
+/// config-sync secret (the peer credential the API accepts for config-sync and
+/// pairing; since CTRL-01 no longer the local full-access token) and the HA
+/// witness secret (the same pairing
 /// credential, by the HA setup's own instruction). Paths, not names: a field
 /// called `secret` elsewhere — a RADIUS secret — is an ordinary secret.
 pub const MACHINE_CREDENTIALS: &[&[&str]] = &[

@@ -53,22 +53,84 @@ pub const BASE_PARAMETER: &str = "base";
 
 /// How many base revisions a push carries at most: the oldest (what the peer
 /// had before this member's undelivered commits began) and the most recent
-/// ones. A peer that is away for longer than this many commits and *also*
-/// lost an acknowledgement in the middle of them reports a conflict instead.
-const MAX_BASES: usize = 32;
+/// ones, each in both of its forms ([`base_revisions`]), so 32 revisions. A
+/// peer that is away for longer than that many commits and *also* lost an
+/// acknowledgement in the middle of them reports a conflict instead.
+const MAX_BASES: usize = 64;
+
+/// Settings that decide who manages a member and how, which config-sync never
+/// carries from one member to another (CTRL-09): accounts and their keys and
+/// hashes, permission groups, the AAA servers, update channels and the keys
+/// that verify images, the SSH server and the serial console.
+///
+/// A peer used to be able to replace every one of these by pushing a document
+/// — making itself, or anybody it liked, a permanent administrator of the
+/// receiver, or swapping the key that vouches for OS images. The receiver now
+/// keeps its own. This is a subset of the fleet fence
+/// (`fleet::local_only_sections`); the rest of that fence (HA identity,
+/// config-sync, conntrack-sync and the web listener) is already member
+/// identity that [`crate::ha::materialize_peer`] and the legacy merge handle.
+pub(crate) fn keep_member_trust(incoming: &mut Appliance, local: &Appliance) {
+    incoming.system.logins = local.system.logins.clone();
+    incoming.system.groups = local.system.groups.clone();
+    incoming.system.aaa = local.system.aaa.clone();
+    incoming.update = local.update.clone();
+    incoming.services.ssh = local.services.ssh.clone();
+    incoming.system.console = local.system.console.clone();
+}
+
+/// The names of the sections [`keep_member_trust`] keeps, as the fleet fence
+/// names them.
+#[cfg(test)]
+pub(crate) const MEMBER_TRUST_SECTIONS: [&str; 6] = [
+    "system.login",
+    "system.group",
+    "system.aaa",
+    "update",
+    "services.ssh",
+    "system.console",
+];
+
+fn blank_member_trust(a: &mut Appliance) {
+    a.system.logins = Vec::new();
+    a.system.groups = Vec::new();
+    a.system.aaa = Default::default();
+    a.update = None;
+    a.services.ssh = Default::default();
+    a.system.console = Default::default();
+}
 
 /// The revision of the part of `a` that config-sync converges: the same on
 /// both members of a pair that are in sync, whichever member computes it.
 ///
 /// Member-local facts differ by design and are taken out first — the exact
-/// set the receiver keeps when it merges a push (`api::merge_synced_config`).
-/// For a paired HA member that set is everything [`crate::ha::materialize_peer`]
-/// rewrites, so rather than re-listing it the shared view *is* node 1's
-/// document, normalised by one round trip through the peer's view: node 2
-/// computes it as `m(m(m(self)))`, node 1 as `m(m(self))`, and since node 2's
-/// document is node 1's materialised (or the other way round), both arrive at
-/// the same text. Legacy config-sync blanks the fields its merge preserves.
+/// set the receiver keeps when it merges a push (`api::merge_synced_config`),
+/// including the management trust [`keep_member_trust`] fences: two members
+/// whose accounts differ are still in sync.
 pub fn shared_revision(a: &Appliance) -> Result<String> {
+    let mut view = shared_view(a)?;
+    blank_member_trust(&mut view);
+    crate::ha::revision(&view)
+}
+
+/// The shared revision as releases before the management-trust fence
+/// computed it, which still hashed accounts, AAA, update channels, SSH and the
+/// console. A member that has not been updated yet sends its bases in this
+/// form and compares what it holds against it, so during a rolling upgrade a
+/// push carries both forms and a receiver accepts either (see
+/// [`receive::prepare`]). Remove once no supported release predates the fence.
+pub fn legacy_shared_revision(a: &Appliance) -> Result<String> {
+    crate::ha::revision(&shared_view(a)?)
+}
+
+/// For a paired HA member the member-local set is everything
+/// [`crate::ha::materialize_peer`] rewrites, so rather than re-listing it the
+/// shared view *is* node 1's document, normalised by one round trip through
+/// the peer's view: node 2 computes it as `m(m(m(self)))`, node 1 as
+/// `m(m(self))`, and since node 2's document is node 1's materialised (or the
+/// other way round), both arrive at the same text. Legacy config-sync blanks
+/// the fields its merge preserves.
+fn shared_view(a: &Appliance) -> Result<Appliance> {
     let mut a = a.clone();
     // Never pushed, always the receiver's own.
     a.fleet = None;
@@ -102,7 +164,15 @@ pub fn shared_revision(a: &Appliance) -> Result<String> {
             a
         }
     };
-    crate::ha::revision(&view)
+    Ok(view)
+}
+
+/// Both forms of `a`'s shared revision a push names as its base: the current
+/// one and the one a not-yet-updated peer computes ([`legacy_shared_revision`]).
+fn base_revisions(a: &Appliance) -> Result<Vec<String>> {
+    let mut forms = vec![shared_revision(a)?, legacy_shared_revision(a)?];
+    forms.dedup();
+    Ok(forms)
 }
 
 /// Whether this member holds a commit it has not delivered to every peer yet.
@@ -166,11 +236,11 @@ fn enqueue_previous_at(
     let mut prior_secrets = Vec::new();
     // What each peer has: the previous configuration, if it received it, or
     // still the base of the push it has not received yet.
-    let delivered_base = match previous.map(shared_revision).transpose() {
-        Ok(base) => base,
+    let delivered_base = match previous.map(base_revisions).transpose() {
+        Ok(base) => base.unwrap_or_default(),
         Err(error) => {
             eprintln!("config-sync: cannot compute the shared revision: {error:#}");
-            None
+            Vec::new()
         }
     };
     let mut bases: BTreeMap<String, Vec<String>> = appliance
@@ -178,7 +248,8 @@ fn enqueue_previous_at(
         .config_sync
         .peers
         .iter()
-        .filter_map(|p| Some((p.clone(), vec![delivered_base.clone()?])))
+        .filter(|_| !delivered_base.is_empty())
+        .map(|p| (p.clone(), delivered_base.clone()))
         .collect();
     if let Some(text) = system::read_owned_file(path)? {
         let previous_pending: Pending = serde_json::from_str(&text)?;
@@ -191,10 +262,14 @@ fn enqueue_previous_at(
             match previous_pending.bases.get(peer) {
                 Some(earlier) => {
                     let mut chain = earlier.clone();
-                    chain.extend(delivered_base.clone());
-                    chain.dedup();
+                    chain.extend(delivered_base.iter().cloned());
+                    // Not `dedup`: both forms of one revision are adjacent and
+                    // distinct, and an earlier revision can recur.
+                    let mut seen = std::collections::BTreeSet::new();
+                    chain.retain(|base| seen.insert(base.clone()));
                     if chain.len() > MAX_BASES {
-                        chain.drain(1..chain.len() - (MAX_BASES - 1));
+                        // Keep the oldest revision in both forms.
+                        chain.drain(2..chain.len() - (MAX_BASES - 2));
                     }
                     bases.insert(peer.clone(), chain);
                 }
@@ -378,6 +453,58 @@ fn flush_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn member(name: &str, login: &str) -> Appliance {
+        Appliance::from_toml(&format!(
+            "[system]\nhostname = \"{name}\"\n\
+             [[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n\
+             [[system.login]]\nusername = \"{login}\"\ngroup = \"ops\"\n\
+             [services.ssh]\nport = 2222\n"
+        ))
+        .unwrap()
+    }
+
+    /// CTRL-09: management trust is member-local, so two members whose
+    /// accounts or SSH settings differ are in sync; the pre-fence form still
+    /// tells them apart, which is what an older peer computes.
+    #[test]
+    fn members_that_differ_only_in_management_trust_share_a_revision() {
+        let a = member("a", "vera");
+        let mut b = member("b", "otto");
+        b.services.ssh.port = Some(22);
+        assert_eq!(shared_revision(&a).unwrap(), shared_revision(&b).unwrap());
+        assert_ne!(
+            legacy_shared_revision(&a).unwrap(),
+            legacy_shared_revision(&b).unwrap()
+        );
+        let mut c = a.clone();
+        c.firewall.stateful = false;
+        assert_ne!(shared_revision(&a).unwrap(), shared_revision(&c).unwrap());
+    }
+
+    /// Rolling upgrade: a push names its base in both forms, so a peer that
+    /// has not been updated yet — which compares against the pre-fence form —
+    /// still recognises the base it holds.
+    #[test]
+    fn a_push_names_its_base_in_both_revision_forms() {
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-outbox-forms-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("pending.json");
+        let _ = std::fs::remove_file(&path);
+        let mut old = member("a", "vera");
+        old.system.config_sync.peers = vec!["10.0.0.2".into()];
+        old.system.config_sync.secret = Some("outbox-forms-fixture-credential-0123456789".into());
+        let mut new = old.clone();
+        new.firewall.stateful = false;
+        enqueue_previous_at(&path, &new, Some(&old)).unwrap();
+        let pending: Pending =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let bases = &pending.bases["10.0.0.2"];
+        assert!(bases.contains(&shared_revision(&old).unwrap()));
+        assert!(bases.contains(&legacy_shared_revision(&old).unwrap()));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
     #[test]
     fn pending_secret_rotations_survive_following_edits_and_ambiguous_acknowledgements() {
         use std::os::unix::fs::PermissionsExt;

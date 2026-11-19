@@ -101,10 +101,34 @@ pub const DEFAULT_TOKENS_DIR: &str = "/var/lib/sentinel/api-tokens";
 /// Who is asking, and what they may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
-    /// The account name, or `None` for the machine token.
+    /// The account name, or `None` for the machine token and the peer.
     pub user: Option<String>,
     /// What this caller may do.
     pub permission: crate::config::Permission,
+    /// Which kind of bearer authenticated the caller.
+    pub credential: Credential,
+}
+
+/// The three kinds of bearer the API accepts.
+///
+/// They used to be two: when config-sync was configured, its operator-chosen
+/// secret was *written into* the machine token file, so the string an HA peer
+/// presents — and the key of the unauthenticated enrollment proof — was the
+/// full-access, never-expiring local credential (CTRL-01). It no longer is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// The local machine token (`/var/lib/sentinel/api-token`, root-only, or
+    /// `$SENTINEL_API_TOKEN`): full access. Random unless an operator replaced
+    /// it by hand, and never the config-sync secret.
+    Machine,
+    /// The `system config-sync secret`, presented by an HA / config-sync peer:
+    /// it may read what a read-only account reads (the stack view), and write
+    /// exactly the two synchronization routes ([`peer_may`]). What a push or a
+    /// pairing may change is fenced on the receiving side
+    /// ([`crate::configsync::keep_member_trust`]).
+    Peer,
+    /// A signed-in account's session ([`crate::api_session`]).
+    Session,
 }
 
 /// Serve the REST API until the process is stopped. Loads (or generates) the
@@ -299,9 +323,12 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/config/recovery/accept", post(post_accept_current))
         .route("/api/v1/ha/enrollment", get(ha_enrollment))
         .route("/api/v1/ha/pair", post(ha_pair))
-        // A config-sync peer is not a second administrator. Its document is
-        // shared policy, merged with the receiver's local identity before it
-        // can reach the normal apply path.
+        // A config-sync peer is not a second administrator: its credential
+        // reaches only this route and `ha/pair` besides reads ([`peer_may`]),
+        // and its document is shared policy, merged with the receiver's local
+        // identity and management trust before it reaches the apply path.
+        // It still sets the shared firewall, NAT and routing policy — that is
+        // what synchronization is for (see SECURITY.md).
         .route("/api/v1/config-sync", axum::routing::put(put_config_sync))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/system/health", get(get_system_health))
@@ -570,11 +597,32 @@ async fn security_headers(req: Request, next: Next) -> Response {
 /// Reject any request whose `Authorization: Bearer <token>` does not match the
 /// configured token. The comparison is constant-time so a wrong token leaks no
 /// timing signal about how many bytes were right.
+///
+/// Wrong bearers are counted per source (CTRL-01): a source that presented
+/// [`crate::api_throttle::BEARER_FAILURES`] invalid ones is refused with 429
+/// — before its bearer is even looked at, so a correct guess made while locked
+/// does not get through either. A request with no peer address (an
+/// in-process caller) is not counted. A request with no bearer at all is not a
+/// guess and is not counted.
 async fn require_token(
     State(state): State<Arc<ApiState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
+    let source = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| crate::api_throttle::source(ci.0.ip()));
+    let failures = &crate::api_throttle::tables().bearer_failures;
+    if let Some(source) = &source
+        && let Err(refusal) = failures.check(source)
+    {
+        return too_many(
+            &refusal,
+            "too many failed authentications from your address; try again later".into(),
+        )
+        .into_response();
+    }
     let provided = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -584,29 +632,96 @@ async fn require_token(
         return unauthorised();
     };
     let Some(caller) = resolve_caller(&state, token) else {
+        if let Some(source) = &source {
+            let _ = failures.count(source);
+        }
         return unauthorised();
     };
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     // A read-only caller may read anything and change nothing. The split is by
     // **method**, not by path: every endpoint that changes something is a POST
     // or a PUT, and enumerating paths instead would leave the next endpoint
-    // added silently writable by everyone.
-    if !caller.permission.may_write() && req.method() != axum::http::Method::GET {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": format!(
-                    "{} is read-only",
-                    caller.user.as_deref().unwrap_or("this token"),
-                ),
-            })),
-        )
-            .into_response();
+    // added silently writable by everyone. The peer is the one exception, and
+    // it is an allow-list, so a new endpoint is closed to it by default.
+    let allowed = match caller.credential {
+        Credential::Peer => peer_may(&method, &path),
+        Credential::Machine | Credential::Session => {
+            caller.permission.may_write() || method == axum::http::Method::GET
+        }
+    };
+    if !allowed {
+        let error = match caller.credential {
+            Credential::Peer => "the config-sync credential may read, push config-sync and \
+                                 complete HA pairing, nothing else"
+                .to_string(),
+            _ => format!(
+                "{} is read-only",
+                caller.user.as_deref().unwrap_or("this token"),
+            ),
+        };
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": error }))).into_response();
     }
+    note_machine_use(caller.credential, source, &method, &path);
     // Handlers get to know who is asking. A console that has been reloaded
     // holds a token and nothing else — it has to be able to ask the appliance
     // whose it is, or it cannot say who is signed in or what they may do.
     req.extensions_mut().insert(caller);
     next.run(req).await
+}
+
+/// What the config-sync credential may do besides reading (CTRL-09): push a
+/// configuration and complete a pairing. Everything an HA peer calls — the
+/// stack view's `status`, `show`, `telemetry/snapshot` and `system/health`,
+/// enrollment's `GET /api/v1/ha/enrollment` — is a read. A peer can no longer
+/// `PUT /api/v1/config`, post `configure` lines, stage updates or end
+/// commit-confirm windows; those are an administrator's.
+fn peer_may(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    *method == Method::GET
+        || (*method == Method::PUT && path == "/api/v1/config-sync")
+        || (*method == Method::POST && path == "/api/v1/ha/pair")
+}
+
+/// Write one journal line when the machine token or the peer credential is
+/// used (CTRL-01, CTRL-07): those bearers have no account behind them, so the
+/// journal is the only record of who used them. Every change is logged; a read
+/// is logged once per source and credential every ten minutes, because the
+/// stack view polls its peer every few seconds.
+fn note_machine_use(
+    credential: Credential,
+    source: Option<std::net::IpAddr>,
+    method: &axum::http::Method,
+    path: &str,
+) {
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(600);
+    let kind = match credential {
+        Credential::Machine => "machine token",
+        Credential::Peer => "config-sync credential",
+        Credential::Session => return,
+    };
+    let from = source.map_or_else(|| "a local caller".to_string(), |ip| ip.to_string());
+    if *method != axum::http::Method::GET {
+        eprintln!("api: {kind} used from {from}: {method} {path}");
+        return;
+    }
+    static SEEN: OnceLock<std::sync::Mutex<HashMap<(&'static str, String), std::time::Instant>>> =
+        OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (kind, from.clone());
+    if seen.get(&key).is_some_and(|at| at.elapsed() < QUIET) {
+        return;
+    }
+    if seen.len() >= 1024 {
+        seen.retain(|_, at| at.elapsed() < QUIET);
+    }
+    seen.insert(key, std::time::Instant::now());
+    eprintln!(
+        "api: {kind} used from {from} (reads; further reads from there are not logged for ten minutes): {method} {path}"
+    );
 }
 
 /// The 401 every failed authentication gets, worded the same way whether the
@@ -622,12 +737,15 @@ fn unauthorised() -> Response {
 
 /// Resolve a presented token to who is asking and what they may do.
 ///
-/// The **machine token** is full access and has no account behind it: it is what
-/// a peer firewall presents when config-sync pushes a commit, and what an
-/// operator uses before any account exists. It is not a session and never
-/// expires; it is rotated, not signed out. Everything else is a signed-in
-/// session (see [`crate::api_session`]), which resolves only while it is inside
-/// its time limits and the configuration still grants what it was opened with.
+/// The **machine token** is full access and has no account behind it: what an
+/// operator on the box uses before any account exists. It is not a session
+/// and never expires; it is rotated, not signed out. The **config-sync
+/// secret** is the peer's credential ([`Credential::Peer`]), checked first: a
+/// machine token file that still holds the secret (written by an earlier
+/// release, until the next apply mints a new one) must not make the shared
+/// secret full access. Everything else is a signed-in session (see
+/// [`crate::api_session`]), which resolves only while it is inside its time
+/// limits and the configuration still grants what it was opened with.
 pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
     resolve_caller_at(state, presented, crate::aaa::unix_now())
 }
@@ -643,19 +761,46 @@ fn resolve_caller_at(state: &ApiState, presented: &str, now: u64) -> Option<Call
     if presented.is_empty() {
         return None;
     }
-    if machine_token(state).is_ok_and(|token| ct_eq(presented.as_bytes(), token.as_bytes())) {
+    let machine =
+        machine_token(state).is_ok_and(|token| ct_eq(presented.as_bytes(), token.as_bytes()));
+    // The configuration is read even for the machine token, to tell it from
+    // the peer secret; a configuration that cannot be read never locks the
+    // machine token out, it only means there is no peer credential.
+    let appliance = state.appliance().ok();
+    if appliance
+        .as_ref()
+        .and_then(peer_secret)
+        .is_some_and(|secret| ct_eq(presented.as_bytes(), secret.as_bytes()))
+    {
+        return Some(Caller {
+            user: None,
+            permission: Permission::ReadOnly,
+            credential: Credential::Peer,
+        });
+    }
+    if machine {
         return Some(Caller {
             user: None,
             permission: Permission::ReadWrite,
+            credential: Credential::Machine,
         });
     }
-    let appliance = state.appliance().ok()?;
     let (user, permission) =
-        crate::api_session::resolve(&state.tokens_dir, &appliance, presented, now)?;
+        crate::api_session::resolve(&state.tokens_dir, appliance.as_ref()?, presented, now)?;
     Some(Caller {
         user: Some(user),
         permission,
+        credential: Credential::Session,
     })
+}
+
+/// The peer credential `a` configures: its non-empty config-sync secret.
+fn peer_secret(a: &Appliance) -> Option<&str> {
+    a.system
+        .config_sync
+        .secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
 }
 
 /// Remove every session that has expired or that the configuration no longer
@@ -962,8 +1107,8 @@ async fn post_sign_out(
     let outcome = tokio::task::spawn_blocking(move || {
         if crate::api_session::close(&state.tokens_dir, &presented) {
             Some(true)
-        } else if machine_token(&state)
-            .is_ok_and(|token| ct_eq(presented.as_bytes(), token.as_bytes()))
+        } else if resolve_caller(&state, &presented)
+            .is_some_and(|caller| caller.credential != Credential::Session)
         {
             Some(false)
         } else {
@@ -974,7 +1119,7 @@ async fn post_sign_out(
     match outcome {
         Ok(Some(true)) => Json(json!({ "signed_out": true })).into_response(),
         Ok(Some(false)) => ApiError::bad_request(anyhow!(
-            "the machine token is not a session; rotate it instead of signing it out"
+            "the machine token and the config-sync credential are not sessions; rotate them instead of signing them out"
         ))
         .into_response(),
         Ok(None) => unauthorised(),
@@ -1284,8 +1429,8 @@ async fn health() -> Json<Value> {
 
 /// `GET /api/v1/config` — the running appliance config as JSON (the same
 /// [`Appliance`] the CLI edits), with every secret redacted. A read-only token
-/// can reach this endpoint, so the config-sync bearer secret (which is the
-/// machine's full-access API token), WireGuard private keys, IPsec PSKs, RADIUS
+/// can reach this endpoint, so the config-sync secret (the peer credential every
+/// member of the pair accepts), WireGuard private keys, IPsec PSKs, RADIUS
 /// and TACACS+ secrets, the SNMP community and login password hashes / TOTP
 /// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 /// Reload rotated machine credentials without restarting management. Never use
@@ -1319,30 +1464,66 @@ fn machine_token(state: &ApiState) -> Result<String> {
 }
 
 fn require_ha_machine(state: &ApiState, caller: &Caller) -> Result<(), ApiError> {
-    if state.tls_pin.is_none() || caller.user.is_some() {
+    if state.tls_pin.is_none() || caller.credential == Credential::Session {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            anyhow!("HA enrollment and config-sync require TLS and the machine credential"),
+            anyhow!(
+                "HA enrollment and config-sync require TLS and the config-sync or machine credential"
+            ),
         ));
     }
     Ok(())
 }
 
+/// `GET /api/v1/ha/proof/<nonce>` — prove, without sending it, that this member
+/// holds the enrollment credential, bound to a fresh nonce and this listener's
+/// TLS key (so it cannot be relayed to another endpoint).
+///
+/// It is unauthenticated by design — the peer has nothing else to show yet —
+/// so it is an oracle anybody can query, and the key is what an offline guess
+/// targets (CTRL-01). Three things now hold that down: the key is the
+/// config-sync secret, which must be strong to be admitted; it is no longer
+/// the full-access machine token; and each source gets
+/// [`crate::api_throttle::HA_PROOFS`] proofs per window. A box with no
+/// config-sync secret keys the proof with its random machine token, which
+/// nobody can guess. The HMAC itself is unchanged so a member that has not
+/// been updated yet can still pair with one that has.
 async fn ha_proof(
     State(state): State<Arc<ApiState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     UrlPath(nonce): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     let pin = state
         .tls_pin
-        .as_deref()
+        .clone()
         .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, anyhow!("HA proof requires TLS")))?;
-    let proof = crate::ha::enrollment_proof(
-        &machine_token(&state).map_err(ApiError::internal)?,
-        &nonce,
-        pin,
-    )
-    .map_err(ApiError::bad_request)?;
+    if let Some(ConnectInfo(peer)) = connect_info {
+        let source = crate::api_throttle::source(peer.ip());
+        crate::api_throttle::tables()
+            .ha_proofs
+            .count(&source)
+            .map_err(|refusal| {
+                too_many(
+                    &refusal,
+                    "too many HA enrollment proofs requested from your address; try again later"
+                        .into(),
+                )
+            })?;
+        eprintln!("api: HA enrollment proof requested from {source}");
+    }
+    let key = enrollment_key(&state).map_err(ApiError::internal)?;
+    let proof = crate::ha::enrollment_proof(&key, &nonce, &pin).map_err(ApiError::bad_request)?;
     Ok(Json(json!({"proof": proof})))
+}
+
+/// The credential the enrollment proof is keyed with: the one a pairing peer
+/// will present next — the config-sync secret when one is configured, else
+/// the machine token.
+fn enrollment_key(state: &ApiState) -> Result<String> {
+    if let Some(secret) = state.appliance().ok().as_ref().and_then(peer_secret) {
+        return Ok(secret.to_string());
+    }
+    machine_token(state)
 }
 
 async fn ha_enrollment(
@@ -1388,9 +1569,14 @@ async fn ha_pair(
         .map_err(|e| ApiError::internal(anyhow!("pairing task: {e}")))?
 }
 
-fn receive_pairing(state: &ApiState, request: PairRequest) -> Result<Json<Value>, ApiError> {
+fn receive_pairing(state: &ApiState, mut request: PairRequest) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let local = state.appliance().map_err(ApiError::internal)?;
+    // A pairing is not a way to replace who manages this member (CTRL-09):
+    // its accounts, AAA, update trust, SSH server and console stay its own.
+    // Applied before the revision comparison, so a retried pairing whose
+    // acknowledgement was lost is still recognised as already applied.
+    crate::configsync::keep_member_trust(&mut request.appliance, &local);
     request
         .appliance
         .validate()
@@ -1769,9 +1955,10 @@ fn restore_withheld_credential(text: &str, current: &Appliance) -> Result<String
 /// What decides who holds the machine credential and where it is sent, by the
 /// name the CLI gives it and its path in a serialised [`Appliance`].
 ///
-/// The credential itself first — the config-sync secret is written to this
-/// box's API token file, so whoever chooses it holds a full-access token that
-/// no account change can withdraw; the witness secret is the same pairing
+/// The credential itself first — the config-sync secret is the peer credential
+/// every member accepts for config-sync and pairing, so whoever chooses it can
+/// push shared policy to the pair and no account change can withdraw it (it is
+/// no longer also the full-access machine token, CTRL-01); the witness secret is the same pairing
 /// credential and the witness key is derived from it. Then the places it is
 /// sent: the config-sync push and the stack view present it to every
 /// `config-sync peer`, verified against `peer-fingerprint` — set, it pins the
@@ -1996,6 +2183,8 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
                 .entry(name.clone())
                 .or_insert_with(|| facts.clone());
         }
+        // Who manages this member, and how, is this member's (CTRL-09).
+        crate::configsync::keep_member_trust(&mut adjusted, local);
         adjusted.validate()?;
         return Ok(adjusted);
     }
@@ -2003,6 +2192,11 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
         local.system.ha.as_ref().is_none_or(|h| !h.enabled),
         "cannot remove paired HA through legacy config-sync"
     );
+    // Who manages this member, and how — accounts, AAA, update channels and
+    // keys, the SSH server (its listen address included, CTRL-10) and the
+    // console — is this member's, never the sender's (CTRL-09).
+    crate::configsync::keep_member_trust(&mut incoming, local);
+    keep_member_session_sources(&mut incoming, local);
     incoming.system.hostname = local.system.hostname.clone();
     incoming.system.config_sync = local.system.config_sync.clone();
     incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
@@ -2042,6 +2236,30 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
     }
     incoming.validate()?;
     Ok(incoming)
+}
+
+/// Addresses a legacy push carries that name the *sender's* own end of a
+/// session (CTRL-10): a BGP neighbour's `update-source` and the PPPoE server's
+/// `local-address`. Importing them left the receiver binding an address it
+/// does not have. For a neighbour, or a PPPoE server, the receiver already
+/// has, the receiver's own value is kept; a new one arrives as sent (it may
+/// be a shared VRRP address), and the receiver's validation decides.
+fn keep_member_session_sources(incoming: &mut Appliance, local: &Appliance) {
+    if let (Some(theirs), Some(ours)) = (&mut incoming.protocols.bgp, &local.protocols.bgp) {
+        for neighbor in &mut theirs.neighbors {
+            if let Some(own) = ours
+                .neighbors
+                .iter()
+                .find(|n| n.address == neighbor.address)
+            {
+                neighbor.update_source = own.update_source.clone();
+            }
+        }
+    }
+    if local.services.pppoe_server.local_address.is_some() {
+        incoming.services.pppoe_server.local_address =
+            local.services.pppoe_server.local_address.clone();
+    }
 }
 
 /// Caller holds apply.lock; ordinary writes never accept a CLI trial implicitly.
@@ -2248,7 +2466,8 @@ const REDACT_HEADER: &str = "x-sentinel-redact";
 /// The rule this enforces, for every door the configuration is read through:
 /// a read-only account sees no secret at all, and no account — read-write
 /// included — ever sees the machine credential, because that credential is
-/// the peer's full-access token and has no account to withdraw. The method
+/// what the pair's members accept from each other and has no account to
+/// withdraw. The method
 /// gate in [`require_token`] cannot express either half: both are GETs.
 fn show_disclosure(caller: &Caller, headers: &axum::http::HeaderMap) -> Disclosure {
     let own = Disclosure::for_caller(caller.user.as_deref(), caller.permission);
@@ -2751,7 +2970,7 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
             return Ok(existing.to_string());
         }
     }
-    let token = generate_token()?;
+    let token = generate_machine_token()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -2773,10 +2992,29 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
 
 /// A fresh 256-bit token, URL-safe base64 (no padding) — plenty of entropy for a
 /// bearer secret, and safe to paste into an `Authorization` header.
-fn generate_token() -> Result<String> {
+pub(crate) fn generate_machine_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("generating a token: {e}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Whether the machine token file's content `current` is one this release
+/// would keep, given the configured config-sync `secret` (CTRL-01, CTRL-07).
+///
+/// Earlier releases *wrote the config-sync secret into the machine token
+/// file*, so the operator-chosen shared string was the full-access local
+/// bearer, and deleting the secret later left it there, still valid. A token
+/// is kept only if it has the shape [`generate_machine_token`] mints (43
+/// URL-safe base64 characters, which [`crate::config::generate_sync_secret`]'s
+/// 64 hex digits never have) and is not the configured secret. Anything else
+/// is a secret an earlier release installed — current or since removed — and
+/// is replaced by a fresh random token.
+pub(crate) fn machine_token_is_independent(current: &str, secret: Option<&str>) -> bool {
+    let generated = current.len() == 43
+        && current
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    generated && secret.is_none_or(|secret| !ct_eq(current.as_bytes(), secret.as_bytes()))
 }
 
 /// Whether `name` is a valid account name — the same POSIX-ish shape a
@@ -3669,6 +3907,58 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// CTRL-09: a pairing used to replace the member's whole configuration,
+    /// its accounts included. The member keeps who manages it, and a retried
+    /// pairing whose acknowledgement was lost is still recognised as applied.
+    #[tokio::test]
+    async fn a_pairing_cannot_change_who_manages_the_member() {
+        let path = seed("unpaired-fence");
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let expected = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let mut desired = crate::ha::paired_fixture();
+        desired.system.logins = Appliance::from_toml(
+            "[system]\nhostname = \"x\"\n[[system.login]]\nusername = \"mallory\"\n",
+        )
+        .unwrap()
+        .system
+        .logins;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ha/pair")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&PairRequest {
+                        expected_revision: expected.clone(),
+                        appliance: desired.clone(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        let saved = Appliance::load(&path).unwrap();
+        assert!(
+            saved.system.ha.is_some(),
+            "the pairing itself did not apply"
+        );
+        assert!(
+            saved.system.logins.is_empty(),
+            "a pairing added an account to the member"
+        );
+        let retry = app.oneshot(request()).await.unwrap();
+        assert_eq!(
+            retry.status(),
+            StatusCode::OK,
+            "lost-ack retry must stay idempotent"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn enrollment_requires_tls_machine_credential_and_revision_match() {
         let path = seed("unpaired");
@@ -3742,12 +4032,50 @@ mod tests {
         assert_eq!(proof.status(), StatusCode::OK);
         let proof: Value =
             serde_json::from_slice(&to_bytes(proof.into_body(), 8192).await.unwrap()).unwrap();
+        // Keyed by the configured config-sync secret — the credential the
+        // pairing peer presents next — not by the full-access machine token.
+        let secret = Appliance::load(&path)
+            .unwrap()
+            .system
+            .config_sync
+            .secret
+            .unwrap();
         assert_eq!(
+            proof["proof"],
+            crate::ha::enrollment_proof(&secret, &"a".repeat(64), "test-pin").unwrap()
+        );
+        assert_ne!(
             proof["proof"],
             crate::ha::enrollment_proof(TOKEN, &"a".repeat(64), "test-pin").unwrap()
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
+    /// CTRL-07: an earlier release wrote the config-sync secret into the
+    /// machine token file and nothing ever took it out again — not removing the
+    /// secret, not unpairing. A token the API minted itself is kept; one that
+    /// is the configured secret, or has any other shape (a secret since
+    /// removed), is to be replaced at the next apply.
+    #[test]
+    fn a_machine_token_that_holds_a_config_sync_secret_is_retired() {
+        let minted = generate_machine_token().unwrap();
+        assert!(machine_token_is_independent(&minted, None));
+        assert!(machine_token_is_independent(&minted, Some(PEER_SECRET)));
+        // The current secret, installed by an earlier release.
+        assert!(!machine_token_is_independent(
+            PEER_SECRET,
+            Some(PEER_SECRET)
+        ));
+        // A secret since removed from the configuration: still retired.
+        assert!(!machine_token_is_independent(PEER_SECRET, None));
+        assert!(!machine_token_is_independent("summer2026", None));
+        // A generated config-sync secret can never pass for a machine token.
+        let secret = crate::config::generate_sync_secret().unwrap();
+        assert!(!machine_token_is_independent(&secret, None));
+        // Even a secret that happens to have the minted shape is retired while
+        // it is the configured secret.
+        assert!(!machine_token_is_independent(&minted, Some(&minted)));
+    }
+
     #[test]
     fn machine_credential_rotation_is_immediate_and_fails_closed() {
         let path = seed("rotation");
@@ -6134,6 +6462,269 @@ action="reject"
             None => "/api/v1/config-sync".to_string(),
         };
         put(&uri, token, &serde_json::to_string(a).unwrap())
+    }
+
+    /// `request` as if it came over the network from `from`.
+    fn from_source(mut request: Request<Body>, from: [u8; 4]) -> Request<Body> {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((from, 4000))));
+        request
+    }
+
+    /// CTRL-01 / CTRL-09: an earlier release wrote the config-sync secret into
+    /// the machine token file, so the string an HA peer presents was the
+    /// full-access local credential — `PUT /api/v1/config`, `configure`, all
+    /// of it. Even while such a file is still in place, the secret is now only
+    /// the peer credential: it reads, it pushes config-sync, nothing else.
+    #[tokio::test]
+    async fn the_config_sync_secret_is_not_a_full_access_bearer() {
+        let (a, b) = legacy_pair();
+        let mut configured = Arc::try_unwrap(sync_state(&b)).ok().unwrap();
+        configured.token = PEER_SECRET.into();
+        let st = Arc::new(configured);
+        let app = router(st.clone());
+        let status = app
+            .clone()
+            .oneshot(get("/api/v1/status", Some(PEER_SECRET)))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the stack view's read must keep working"
+        );
+        let mut replaced = b.clone();
+        replaced.system.hostname = "taken-over".into();
+        let resp = app
+            .clone()
+            .oneshot(put(
+                "/api/v1/config",
+                PEER_SECRET,
+                &serde_json::to_string(&replaced).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the config-sync secret replaced the whole configuration: {}",
+            body_string(resp).await
+        );
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                "POST",
+                "/api/v1/configure",
+                PEER_SECRET,
+                "set system hostname taken-over\ncommit\n".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            Appliance::load(&st.config_path).unwrap().system.hostname,
+            "sentinel-b"
+        );
+        // Synchronization itself still works with it.
+        let base = crate::configsync::shared_revision(&a).unwrap();
+        let mut changed = a.clone();
+        changed.firewall.stateful = false;
+        let resp = app
+            .oneshot(push(Some(&base), PEER_SECRET, &changed))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+    }
+
+    /// CTRL-01: thirty wrong bearers in a row used to be thirty 401s, never a
+    /// 429 — online guessing ran at full speed. A source that keeps failing
+    /// is now refused before its bearer is even looked at; another source is
+    /// unaffected.
+    #[tokio::test]
+    async fn wrong_bearers_from_one_source_are_throttled() {
+        let app = router(state(seed("bearer-throttle")));
+        let guesser = [198, 18, 1, 1];
+        for n in 0..30 {
+            let status = app
+                .clone()
+                .oneshot(from_source(
+                    get("/api/v1/status", Some(&format!("guess-{n}"))),
+                    guesser,
+                ))
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let resp = app
+            .clone()
+            .oneshot(from_source(get("/api/v1/status", Some(TOKEN)), guesser))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a source that guessed thirty bearers was not throttled"
+        );
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        let other = app
+            .oneshot(from_source(
+                get("/api/v1/status", Some(TOKEN)),
+                [198, 18, 1, 2],
+            ))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(other, StatusCode::OK);
+    }
+
+    /// CTRL-01: the unauthenticated HA proof is an oracle keyed by the
+    /// enrollment credential. One source may ask a handful of times (a pairing
+    /// asks once per attempt), not harvest proofs without limit.
+    #[tokio::test]
+    async fn the_ha_proof_is_rate_limited_per_source() {
+        let mut configured = Arc::try_unwrap(state(seed("proof-throttle"))).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let proof = |from: [u8; 4]| {
+            let app = app.clone();
+            async move {
+                app.oneshot(from_source(
+                    get(&format!("/api/v1/ha/proof/{}", "b".repeat(64)), None),
+                    from,
+                ))
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        let harvester = [198, 18, 2, 1];
+        for _ in 0..10 {
+            assert_eq!(proof(harvester).await, StatusCode::OK);
+        }
+        assert_eq!(
+            proof(harvester).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "one source harvested more than ten enrollment proofs"
+        );
+        assert_eq!(proof([198, 18, 2, 2]).await, StatusCode::OK);
+    }
+
+    /// CTRL-01: the config-sync secret only had to be non-empty.
+    #[tokio::test]
+    async fn a_weak_config_sync_secret_is_refused_at_admission() {
+        let path = seed("weak-secret");
+        let mut candidate = Appliance::load(&path).unwrap();
+        candidate.system.config_sync.secret = Some("summer2026".into());
+        candidate.system.config_sync.peers = vec!["192.0.2.2".into()];
+        let resp = router(state(path.clone()))
+            .oneshot(put(
+                "/api/v1/config",
+                TOKEN,
+                &serde_json::to_string(&candidate).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_string(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a weak secret was admitted: {body}"
+        );
+        assert!(body.contains("sentinel ha secret generate"), "{body}");
+        assert!(
+            !body.contains("summer2026"),
+            "the refusal echoed the secret: {body}"
+        );
+        assert!(
+            Appliance::load(&path)
+                .unwrap()
+                .system
+                .config_sync
+                .secret
+                .is_none()
+        );
+    }
+
+    /// CTRL-09: a config-sync push could replace who manages the receiver —
+    /// add an account with its own SSH key, point AAA at the sender's server,
+    /// swap the update channel and its signing key, turn on SSH password
+    /// authentication. The receiver now keeps all of that; the shared policy in
+    /// the same push still applies.
+    #[tokio::test]
+    async fn a_config_sync_push_cannot_change_who_manages_the_receiver() {
+        let (a, b) = legacy_pair();
+        let st = sync_state(&b);
+        let base = crate::configsync::shared_revision(&a).unwrap();
+        let hostile = Appliance::from_toml(&format!(
+            "{}\n[[system.login]]\nusername = \"mallory\"\ngroup = \"ops\"\n\
+             ssh-key = [\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl mallory\"]\n\
+             [services.ssh]\npassword-authentication = true\n",
+            a.to_toml().unwrap()
+        ));
+        let mut incoming = match hostile {
+            Ok(incoming) => incoming,
+            Err(e) => panic!("fixture: {e:#}"),
+        };
+        incoming.firewall.stateful = false;
+        let resp = router(st.clone())
+            .oneshot(push(Some(&base), TOKEN, &incoming))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        let saved = Appliance::load(&st.config_path).unwrap();
+        assert!(
+            !saved.firewall.stateful,
+            "the shared policy change did not apply"
+        );
+        let users: Vec<_> = saved
+            .system
+            .logins
+            .iter()
+            .map(|l| l.username.as_str())
+            .collect();
+        assert_eq!(users, ["vera"], "a config-sync peer added an account");
+        assert!(!saved.services.ssh.password_authentication);
+    }
+
+    /// CTRL-10: the legacy merge kept the web listener but imported the
+    /// sender's SSH listen address and BGP update-source, so the receiver's
+    /// sshd could not bind (its next trial boot was never blessed) and its BGP
+    /// session sourced an address it does not have.
+    #[test]
+    fn legacy_config_sync_keeps_the_receivers_session_sources() {
+        let (a, b) = legacy_pair();
+        let with_sources = |mut m: Appliance, own: &str| {
+            m.services.ssh.listen_address = Some(own.into());
+            m.protocols.bgp = Some(
+                Appliance::from_toml(&format!(
+                    "[system]\nhostname = \"x\"\n[protocols.bgp]\nlocal-as = 65001\n\
+                     [[protocols.bgp.neighbor]]\naddress = \"10.43.0.1\"\nremote-as = 65000\n\
+                     update-source = \"{own}\"\n"
+                ))
+                .unwrap()
+                .protocols
+                .bgp
+                .unwrap(),
+            );
+            m
+        };
+        let a = with_sources(a, "10.43.0.40");
+        let b = with_sources(b, "10.43.0.41");
+        let merged = merge_synced_config(a, &b).unwrap();
+        assert_eq!(
+            merged.services.ssh.listen_address.as_deref(),
+            Some("10.43.0.41")
+        );
+        assert_eq!(
+            merged.protocols.bgp.unwrap().neighbors[0]
+                .update_source
+                .as_deref(),
+            Some("10.43.0.41")
+        );
     }
 
     /// MEDIUM #7: an account token, even a read-write one, cannot push a

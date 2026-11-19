@@ -48,6 +48,7 @@ fn failed_show_preserves_full_machine_diagnostics_only_without_effective_narrowi
     let caller = Caller {
         user: None,
         permission: crate::config::Permission::ReadWrite,
+        credential: Credential::Machine,
     };
     let mut headers = axum::http::HeaderMap::new();
     assert_eq!(show_disclosure(&caller, &headers), Disclosure::Full);
@@ -68,6 +69,7 @@ fn failed_show_preserves_full_machine_diagnostics_only_without_effective_narrowi
     let account = Caller {
         user: Some("operator".into()),
         permission: crate::config::Permission::ReadWrite,
+        credential: Credential::Session,
     };
     assert_eq!(show_disclosure(&account, &headers), Disclosure::NoSecrets);
     assert!(

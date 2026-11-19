@@ -467,7 +467,10 @@ async fn guessing_an_account_elsewhere_does_not_lock_out_its_known_origin() {
         StatusCode::OK,
         "guesses from four other addresses locked the account out for its own workstation"
     );
-    assert_eq!(refused, 0, "a guess below every per-origin budget was throttled");
+    assert_eq!(
+        refused, 0,
+        "a guess below every per-origin budget was throttled"
+    );
 }
 
 // ---- uniform refusals (LOW) ------------------------------------------------

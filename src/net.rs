@@ -2449,15 +2449,73 @@ const API_UNIT: &str = "sentinel-api.service";
 const API_LISTENER: &str = "/run/sentinel/api-listener.json";
 
 /// Reconcile the receiving side of HA config sync to `[system.config-sync]`: a
-/// configured `secret` becomes the API's bearer token and starts the API at its
-/// configured management bind; it never widens an address. Live only
+/// configured `secret` starts the API at its configured management bind (the
+/// API accepts it as the peer credential); it never widens an address. Live only
 /// touches the unit; at boot the API starts on its own with the files in place.
+/// The receiving side of config-sync: start the API listener when a secret is
+/// set (see [`apply_api`]).
+///
+/// The secret is **not** written into the machine token file any more
+/// (CTRL-01): the API reads it from the active configuration and accepts it as
+/// the peer credential, which may only read and synchronize. A token file an
+/// earlier release filled with the secret — current, or since removed
+/// (CTRL-07) — is replaced by a fresh random token here, at the first apply
+/// after the upgrade and at every apply after.
 fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let cs = &appliance.system.config_sync;
-    if let Some(secret) = &cs.secret {
-        system::install_token(Path::new(API_TOKEN), secret)?;
+    retire_shared_machine_token(Path::new(API_TOKEN), cs.secret.as_deref());
+    if let Some(why) = cs
+        .secret
+        .as_deref()
+        .and_then(crate::config::sync_secret_weakness)
+    {
+        eprintln!(
+            "{}",
+            crate::ui::yellow(&format!(
+                "warning: system config-sync secret {why}. Anybody who can reach the management \
+                 port can test guesses against it offline. No configuration change is accepted \
+                 until it is rotated: run `sentinel ha secret generate` and set the result on \
+                 both members."
+            ))
+        );
     }
     apply_api(appliance, mode)
+}
+
+/// Replace the machine token when it is not one this release would keep
+/// ([`crate::api::machine_token_is_independent`]). Best effort: the API keeps
+/// serving either way, and a token that cannot be read or replaced is said so
+/// in the journal rather than failing the whole apply.
+fn retire_shared_machine_token(path: &Path, secret: Option<&str>) {
+    let current = match system::read_owned_private(path, 4096) {
+        Ok(Some(current)) => current,
+        // Absent: the API mints a random one when it starts.
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!(
+                "warning: could not check the API machine token {}: {error:#}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if crate::api::machine_token_is_independent(current.trim(), secret) {
+        return;
+    }
+    match crate::api::generate_machine_token().and_then(|token| system::install_token(path, &token))
+    {
+        Ok(()) => eprintln!(
+            "config-sync: the API machine token held a config-sync secret (an earlier release \
+             installed it there); replaced it with a new random token in {}. The secret now only \
+             authenticates config-sync and HA pairing.",
+            path.display()
+        ),
+        Err(error) => eprintln!(
+            "warning: the API machine token {} still holds a config-sync secret and could not be \
+             replaced: {error:#}",
+            path.display()
+        ),
+    }
 }
 
 /// Reconcile the one HTTP server the box runs: the web console and the REST API
@@ -4301,7 +4359,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     apply_metrics(appliance, mode)?;
     apply_dnsproxy(appliance, mode)?;
     apply_policy_routes(appliance, mode)?;
-    // HA config sync (roadmap C21): the receiving side — share the token + widen
+    // HA config sync (roadmap C21): the receiving side — retire a shared machine token + start
     // the API when a secret is set. The sending side (push) is driven from commit.
     apply_agent_iface(appliance, mode)?;
     apply_configsync(appliance, mode)?;
