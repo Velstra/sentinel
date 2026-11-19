@@ -11769,12 +11769,16 @@
             client.wait_for_unit("multi-user.target")
             client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.2", timeout=20)
 
-            # Zone the WAN nic and reject udp/9999.
+            # Zone the WAN nic and reject udp/9999 to the firewall itself. The
+            # box's own address is the local zone, not `wan`: a deny `to wan`
+            # matches traffic routed out of wan, which this probe never is, and
+            # destination-zone admission refuses it for that reason.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
+                "'set firewall zone firewall local true' "
                 "'set firewall rule refuse-udp from wan' "
-                "'set firewall rule refuse-udp to wan' "
+                "'set firewall rule refuse-udp to firewall' "
                 "'set firewall rule refuse-udp action reject' "
                 "'set firewall rule refuse-udp proto udp' "
                 "'set firewall rule refuse-udp port 9999' "
