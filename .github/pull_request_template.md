@@ -19,4 +19,5 @@ evidence. Distinguish executed passes from evaluation, skipped or pending tests.
 
 For a security-sensitive fix, follow [SECURITY.md](../SECURITY.md) before opening
 a public PR. Contribution terms are in [CONTRIBUTING.md](../CONTRIBUTING.md);
-there is no separate administered CLA.
+every author signs the [Contributor License Agreement](../CLA.md) once before
+the first merge.
