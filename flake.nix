@@ -1930,6 +1930,9 @@
         # DP-15 blocklist half: blocklists name sources; the LAN reaches a
         # listed address and a listed address still cannot start a connection.
         blocklist-direction = import ./nix/blocklist-direction-test.nix { inherit pkgs self; };
+        # IPv6 parity: the MSS clamp, and ICMPv6 errors behind NPTv6 / quoting
+        # extension headers reach the host that has to act on them.
+        v6-mss-npt-related = import ./nix/v6-mss-npt-related-test.nix { inherit pkgs self; };
         install-boot-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; };
         install-boot-luks-retry = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; invalidAttempts = 2; };
         install-boot-raid1 = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1"; };

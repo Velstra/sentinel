@@ -180,6 +180,7 @@ This catalog preserves the existing task lookup for protocol and service fixture
 | `masq` | masquerade SNATs a private LAN client out of the WAN address |
 | `hairpin` | an internal client reaches a port-forwarded service via the box's **own** public IP |
 | `npt66` | stateless, checksum-neutral IPv6 prefix translation (RFC 6296) |
+| `v6-mss-npt-related` | an IPv6 SYN is MSS-clamped like IPv4; a Packet Too Big behind NPTv6, or quoting an extension header, reaches the inside host's socket; the inside host's port-unreachable names its external address |
 | `nat64` | an IPv6-only client reaches an IPv4-only server through the box, DNS64 included |
 | `conntracksync` | checks replicated conntrack state; use the causal HA flow fixtures to prove actual connection continuity |
 
