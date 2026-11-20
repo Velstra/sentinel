@@ -951,6 +951,27 @@ trait ServiceControl: Clone + 'static {
 #[derive(Clone, Copy)]
 struct SystemServiceControl;
 
+/// The agent's launch settings for the firewall stage of an apply.
+///
+/// That stage runs before the broad network apply creates this commit's
+/// links. When the uplink the new settings name is not there yet — a VLAN,
+/// bridge or other virtual link this very commit adds — restarting the agent
+/// onto it makes the agent exit (`--iface` must exist), and the commit fails
+/// with an unready data plane. So the firewall stage keeps the running
+/// settings and reloads the policy live; the agent hooks config-named links
+/// as they appear, and `net::apply_agent_iface` switches the uplink, with one
+/// restart, once the network apply has created it.
+fn launch_environment(
+    next: Option<Vec<u8>>,
+    previous: Option<&[u8]>,
+    uplink_present: bool,
+) -> Option<Vec<u8>> {
+    match next {
+        Some(_) if !uplink_present => previous.map(<[u8]>::to_vec),
+        next => next,
+    }
+}
+
 #[derive(Clone)]
 struct DataplaneServiceControl {
     environment: Option<Vec<u8>>,
@@ -1872,7 +1893,11 @@ fn apply_live_as(
     let wren_prev = read_previous_file(&act.wren_out)?;
     let previous_environment = read_previous_file(Path::new(crate::net::AGENT_ENV))?;
     let dataplane_control = DataplaneServiceControl {
-        environment: crate::net::agent_environment(appliance).map(String::into_bytes),
+        environment: launch_environment(
+            crate::net::agent_environment(appliance).map(String::into_bytes),
+            previous_environment.as_deref(),
+            crate::net::agent_uplink_present(appliance),
+        ),
         previous_environment,
     };
     let old_host = system::current_hostname();
@@ -6459,6 +6484,22 @@ impl Completer for ConfigCompleter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// reconciliation: a commit whose only zoned link is a VLAN it creates
+    /// must not restart the agent onto that link before it exists.
+    #[test]
+    fn launch_settings_wait_for_an_uplink_the_commit_still_has_to_create() {
+        let next = Some(b"VELSTRA_IFACE=tenant0\n".to_vec());
+        let running: Option<&[u8]> = Some(b"VELSTRA_IFACE=eth2\n");
+        assert_eq!(
+            launch_environment(next.clone(), running, false).as_deref(),
+            running
+        );
+        assert_eq!(launch_environment(next.clone(), None, false), None);
+        assert_eq!(launch_environment(next.clone(), running, true), next);
+        // No zoned link at all: the settings go, as before.
+        assert_eq!(launch_environment(None, running, false), None);
+    }
 
     type ReloadHook = Box<dyn FnMut(&str, Option<&[u8]>, &[u8]) -> Result<()>>;
     type ReadyHook = Box<dyn FnMut(&str) -> Result<()>>;

@@ -3958,6 +3958,12 @@ fn agent_uplink(appliance: &Appliance) -> Option<String> {
         .map(|n| n.to_string())
 }
 
+/// Whether the link [`agent_uplink`] picks exists on the box right now. It may
+/// not when the only zoned links are ones the current apply is about to create.
+pub(crate) fn agent_uplink_present(appliance: &Appliance) -> bool {
+    agent_uplink(appliance).is_some_and(|iface| system::discover_interfaces().contains(&iface))
+}
+
 /// Tell the agent's unit which link to attach to, and restart it when that
 /// changes. Without this the choice was a build-time constant.
 fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
