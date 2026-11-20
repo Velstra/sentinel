@@ -28,7 +28,7 @@
     # Reviewed public integrations; update these URLs and the lock together.
     # The former appliance backports are now included upstream.
     fabric = {
-      url = "github:Velstra/fabric/9168f8512f1e72bbef84de56683025c3076ccd0f";
+      url = "github:Velstra/fabric/055867da1cd19968178e33eaeede6c8e8f3a1296";
       flake = false;
     };
     # Test-only deployed allocator. Never advance this with the production pin:
@@ -40,7 +40,7 @@
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
     wren = {
-      url = "github:Velstra/wren/e61062454b692e70622199c284e88278b5025f6d";
+      url = "github:Velstra/wren/ba95bca0e3d5618f2c117a97302b4af27a87d654";
       flake = false;
     };
   };
