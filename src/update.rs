@@ -1495,6 +1495,20 @@ mod tests {
         std::fs::remove_file(dir.join("timestamp.json")).unwrap();
         let error = check(&pinned).unwrap_err().to_string();
         assert!(error.contains("publishes no timestamp"), "{error}");
+        // The clock is read again after the timestamp fetch: one that lapses
+        // while it downloads is refused, not judged by the earlier reading.
+        publish("ts.key", &|_| {});
+        let late = std::cell::Cell::new(false);
+        let error = check_offer_using(&chan, |offer| {
+            freshness::observe_test_with_clock(&chan, offer, &trust, &pinned, || {
+                Ok(if late.replace(true) { now + 3600 } else { now })
+            })
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("channel timestamp expired too"),
+            "{error:#}"
+        );
         // A current manifest never needs (or fetches) a timestamp.
         let fresh = serde_json::to_vec(&serde_json::json!({
             "version": "9.1.0", "image": "image.raw",

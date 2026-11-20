@@ -162,6 +162,42 @@ fn verify(
     window(&document, manifest, &offer.manifest_sha256, channel, now)
 }
 
+/// The pinned timestamp key, or `None` when the image pins none. Opened
+/// non-blocking and accepted only as a bounded regular file, so a FIFO or a
+/// device at the path refuses instead of hanging the update check.
+fn read_pinned_key(path: &Path) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("reading the pinned channel timestamp key");
+        }
+    };
+    ensure!(
+        file.metadata()
+            .context("reading the pinned channel timestamp key")?
+            .is_file(),
+        "the pinned channel timestamp key must be a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .context("reading the pinned channel timestamp key")?;
+    ensure!(
+        bytes.len() <= 4096,
+        "the pinned channel timestamp key is oversized"
+    );
+    String::from_utf8(bytes)
+        .context("the pinned channel timestamp key is not text")
+        .map(Some)
+}
+
 /// The verified timestamp expiry that extends `offer`, if one is needed and
 /// the image pins a timestamp key at `key_path`. `Ok(None)` means the
 /// manifest's own freshness decides (current, not merely expired, or no key).
@@ -176,16 +212,8 @@ pub(super) fn extension(
     if !manifest.expired_only(chan.label(), now) {
         return Ok(None);
     }
-    let key = match super::read_small(key_path, 4096) {
-        Ok(bytes) => String::from_utf8(bytes).context("the pinned channel timestamp key")?,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error.context("reading the pinned channel timestamp key")),
+    let Some(key) = read_pinned_key(key_path)? else {
+        return Ok(None);
     };
     let refused = |error: anyhow::Error| {
         error.context("signed update metadata expired and its channel timestamp was refused")
@@ -321,6 +349,35 @@ mod tests {
         assert_eq!(check(&at(ceiling), now).unwrap(), ceiling);
         let error = check(&at(ceiling + 1), now).unwrap_err().to_string();
         assert!(error.contains("90 days"), "{error}");
+    }
+
+    #[test]
+    fn the_pinned_key_must_be_a_regular_file_and_never_blocks() {
+        let dir = Scratch::new().unwrap();
+        assert!(read_pinned_key(&dir.join("absent.pem")).unwrap().is_none());
+        let fifo = dir.join("fifo.pem");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // A FIFO with no writer would block a plain open forever.
+        let (done, wait) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || done.send(read_pinned_key(&path).is_err()).unwrap());
+        assert!(
+            wait.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("reading a FIFO key blocked"),
+            "a FIFO is not a pinned key"
+        );
+        assert!(
+            read_pinned_key(&dir.0).is_err(),
+            "a directory is not a pinned key"
+        );
+        std::fs::write(dir.join("big.pem"), vec![b'x'; 4097]).unwrap();
+        assert!(read_pinned_key(&dir.join("big.pem")).is_err());
+        std::fs::write(dir.join("key.pem"), b"pem").unwrap();
+        assert_eq!(
+            read_pinned_key(&dir.join("key.pem")).unwrap().as_deref(),
+            Some("pem")
+        );
     }
 
     #[test]

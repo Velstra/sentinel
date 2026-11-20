@@ -440,6 +440,7 @@ pub(super) fn observe(
         Path::new(DIRECTORY),
         0,
         Path::new(super::timestamp::KEY_PATH),
+        system_clock,
     )
 }
 
@@ -452,15 +453,14 @@ fn observe_with(
     directory: &Path,
     owner: u32,
     timestamp_key: &Path,
+    clock: impl Fn() -> Result<u64>,
 ) -> Result<()> {
     let f = offer.manifest.freshness.as_ref().context(
         "signed update metadata has no freshness policy; request a current signed release",
     )?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock precedes Unix epoch")?
-        .as_secs();
-    let extended = super::timestamp::extension(chan, offer, f, timestamp_key, now)?;
+    let extended = super::timestamp::extension(chan, offer, f, timestamp_key, clock()?)?;
+    // Read the clock again: the timestamp fetch can take up to a minute, and
+    // the decision must hold at the moment the ledger records it.
     observe_at(
         directory,
         owner,
@@ -468,9 +468,16 @@ fn observe_with(
         chan.label(),
         &offer.manifest_sha256,
         &offer.public_key_sha256,
-        now,
+        clock()?,
         extended,
     )
+}
+
+fn system_clock() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_secs())
 }
 
 #[cfg(test)]
@@ -494,12 +501,24 @@ pub(super) fn observe_test_with_key(
     directory: &Path,
     timestamp_key: &Path,
 ) -> Result<()> {
+    observe_test_with_clock(chan, offer, directory, timestamp_key, system_clock)
+}
+
+#[cfg(test)]
+pub(super) fn observe_test_with_clock(
+    chan: &crate::config::UpdateChannel,
+    offer: &super::VerifiedOffer,
+    directory: &Path,
+    timestamp_key: &Path,
+    clock: impl Fn() -> Result<u64>,
+) -> Result<()> {
     observe_with(
         chan,
         offer,
         directory,
         unsafe { libc::geteuid() },
         timestamp_key,
+        clock,
     )
 }
 
