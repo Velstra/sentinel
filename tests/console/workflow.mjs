@@ -372,7 +372,14 @@ export async function workflowTests(){
       scope:root.querySelector('#traffic-scope').getAttribute('aria-label'),periods:[...root.querySelectorAll('.range button')].map(b=>b.textContent),
       panels:[...root.querySelectorAll('.dash-grid .management-panel h3')].map(h=>h.textContent),
       fits:document.documentElement.scrollWidth<=innerWidth,units:root.querySelector('.overview-metric strong').textContent.includes('bit/s')};})()`);
-    check(view.tiles===6&&!view.healthCard&&view.fits&&view.units,'dashboard shape: '+JSON.stringify(view));
+    // The traffic tile is a sum over the box's links. A build sandbox has
+    // none besides loopback, and an empty sum is not a measurement: the tile
+    // must then keep saying it is sampling rather than invent 0 bit/s. With a
+    // link, it must carry a unit.
+    const links=await page.evaluate(`(management.getSnapshot().frame.interfaces||[]).filter(l=>l.name!=='lo').map(l=>({name:l.name,rated:!!l.rates}))`);
+    const traffic=await page.evaluate(`document.querySelector('#react-dashboard [data-react-view=dashboard] .overview-metric strong').textContent`);
+    const honest=links.length?view.units:traffic==='Sampling…';
+    check(view.tiles===6&&!view.healthCard&&view.fits&&honest,'dashboard shape: '+JSON.stringify(view)+' traffic: '+JSON.stringify(traffic)+' links: '+JSON.stringify(links));
     equal(view.healthActions,['Retry health check','Open system health','Configure NTP'],'health line actions');
     check(view.cpu!==null&&view.memory!==null,'vitals were not drawn: '+JSON.stringify(view));
     equal(view.periods,['Live','1 h','24 h'],'chart periods');
