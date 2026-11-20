@@ -14,6 +14,11 @@ import urllib.request
 import uuid
 
 
+# Signed release metadata carries a freshness policy (scope, sequence, a
+# lifetime of at most 14 days); an offer without one is refused.
+FRESHNESS = {"schema": 1, "channel": "default", "arch": "x86_64", "sequence": 1,
+             "issued_at": int(time.time()), "expires_at": int(time.time()) + 86400}
+
 def run(args, *, timeout=15):
     value = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     if value.returncode:
@@ -108,10 +113,26 @@ def main(sentinel, publication_failure=False):
 
     body = {"version": "3.0.0", "image": "sentinel_3.0.0.raw", "sha256": proof["sha256"],
             "product": "velstra-sentinel"}
-    normal = json.dumps(body, separators=(",", ":")).encode()
-    envelopes = {"valid": envelope(normal), "invalid-signature": envelope(normal, corrupt=True),
-                 "changed": envelope(json.dumps(body, indent=2).encode()),
-                 "wrong-digest": envelope(json.dumps({**body, "sha256": "0" * 64}).encode())}
+    # The channel behaves like a publisher: every time it starts serving
+    # different metadata it signs it with the next sequence number, because the
+    # appliance refuses a sequence reused for other bytes and any sequence
+    # below one it has seen. A corrupt signature never reaches that ledger.
+    published = {"kind": None, "sequence": 0, "data": b""}
+    publish_lock = threading.Lock()
+
+    def served(kind):
+        with publish_lock:
+            content = "valid" if kind in ("valid", "invalid-signature") else kind
+            if (content, kind) != published["kind"]:
+                if content != (published["kind"] or (None,))[0]:
+                    published["sequence"] += 1
+                doc = {**body, "freshness": {**FRESHNESS, "sequence": published["sequence"]}}
+                if content == "wrong-digest":
+                    doc["sha256"] = "0" * 64
+                text = json.dumps(doc, indent=2) if content == "changed" else json.dumps(doc, separators=(",", ":"))
+                published.update(kind=(content, kind),
+                                 data=envelope(text.encode(), corrupt=kind == "invalid-signature"))
+            return published["data"]
     mode = {"value": "valid", "download_complete": False, "pause": False}
     entered, release = threading.Event(), threading.Event()
     release.set()
@@ -129,7 +150,7 @@ def main(sentinel, publication_failure=False):
             paths.append(self.path)
             if self.path == "/current/release.json":
                 selected = "changed" if mode["value"] == "metadata-change" and mode["download_complete"] else mode["value"]
-                data = envelopes.get(selected, envelopes["valid"])
+                data = served(selected if selected in ("valid", "invalid-signature", "changed", "wrong-digest") else "valid")
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()

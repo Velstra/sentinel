@@ -22,6 +22,11 @@ import urllib.request
 import uuid
 
 
+# Signed release metadata carries a freshness policy (scope, sequence, a
+# lifetime of at most 14 days); an offer without one is refused.
+FRESHNESS = {"schema": 1, "channel": "default", "arch": "x86_64", "sequence": 1,
+             "issued_at": int(time.time()), "expires_at": int(time.time()) + 86400}
+
 def until(callback, seconds=20):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -86,7 +91,8 @@ def main():
         return value if value["phase"] in ("checked", "failed", "interrupted", "write-outcome-unknown") else None
 
     manifest = json.dumps({"version": "3.0.0", "image": "sentinel_3.0.0.raw",
-                           "sha256": "0" * 64, "product": "velstra-sentinel"}, separators=(",", ":")).encode()
+                           "sha256": "0" * 64, "product": "velstra-sentinel",
+                           "freshness": FRESHNESS}, separators=(",", ":")).encode()
     scratch = Path("/run/qa-mutation-fixture")
     scratch.mkdir(mode=0o700)
     (scratch / "manifest").write_bytes(manifest)
