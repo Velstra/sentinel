@@ -139,7 +139,12 @@ in pkgs.testers.runNixOSTest {
                             fragment = installed.get_console_log()[baseline:]
                             refusal = f"attempt {attempt}/3 failed"
                             assert "data volume unlocked" not in fragment, fragment
-                            if refusal in fragment and "Unlock the Sentinel data volume" in fragment.split(refusal,1)[1]:
+                            # Two writers share the serial console: the password
+                            # agent prints the next prompt itself, journald forwards
+                            # the refusal line. Either can land first, so the fresh
+                            # prompt is any prompt after the wrong key was sent (the
+                            # previous one was already on screen at the baseline).
+                            if refusal in fragment and "Unlock the Sentinel data volume" in fragment:
                                 invalid_count += 1
                                 password_trace.append({"attempt":attempt,"explicit_refusal":True,"unlocked_before_correct_key":False})
                                 break
