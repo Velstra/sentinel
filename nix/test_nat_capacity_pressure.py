@@ -130,7 +130,10 @@ class Contracts(unittest.TestCase):
         metadata = fixture()[0]["maps"]["FW_FLOWS"]["metadata"]
         P.validate_metadata(metadata)
         for field, value in (("id", True), ("type", "hash"), ("bytes_key", 20),
-                             ("bytes_value", 32), ("max_entries", (1 << 24) + 1), ("name", "foreign")):
+                             ("bytes_value", 32), ("max_entries", 0),
+                             # The agent sizes state maps at load (DP-06), up to
+                             # 6 x 4,194,304; the probe accepts up to 1 << 25.
+                             ("max_entries", (1 << 25) + 1), ("name", "foreign")):
             with self.assertRaises(RuntimeError):
                 P.validate_metadata(dict(metadata, **{field: value}))
 
