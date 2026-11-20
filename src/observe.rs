@@ -83,7 +83,7 @@ pub fn needs_capability(config: &Path) -> bool {
 // A forged USER/LOGNAME/SUDO_USER cannot change kernel group membership. A
 // non-wheel caller who bypasses this routing still cannot read protected files
 // or reach the root-only sockets without passing the typed helper's grant.
-fn existing_administrator() -> bool {
+pub(crate) fn existing_administrator() -> bool {
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     if count < 0 {
         return false;

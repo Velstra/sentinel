@@ -13347,6 +13347,7 @@
         quickstart = import ./nix/quickstart-test.nix { inherit pkgs self; };
         reconciliation = import ./nix/reconciliation-test.nix { inherit pkgs self; };
         phase2-dataplane = import ./nix/phase2-dataplane-test.nix { inherit pkgs self; };
+        commit-latency = import ./nix/commit-latency-test.nix { inherit pkgs self; };
 
         l2 = pkgs.testers.runNixOSTest {
           name = "sentinel-l2";
