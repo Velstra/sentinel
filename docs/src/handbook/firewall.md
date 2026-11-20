@@ -130,7 +130,7 @@ Country codes select prefixes in the GeoIP database included in the appliance im
 set firewall zone wan geoip-block CN,RU
 ```
 
-A zone's blocklist and GeoIP countries are enforced on traffic arriving on the zone and, in this release, also on traffic leaving through it: `zone wan geoip-block XX` also stops LAN hosts reaching addresses in XX. Every zone's policy carries its own copy of the global blocklist and global GeoIP countries, so a global entry costs one data-plane entry per zone plus one; `config check` refuses a configuration whose total exceeds the data plane's 262,144 entries per address family.
+A zone's blocklist and GeoIP countries name **sources**: they refuse what a listed address sends in through the zone, and nothing else. `zone wan geoip-block XX` stops hosts in XX connecting in, and stops their packets to connections they started; it does not stop LAN hosts reaching addresses in XX, and the answers to those connections are let back in. An address added to a blocklist loses the connections it opened at once, but keeps answering ones that were opened towards it. On a zone with `stateful false` there is no connection to answer, so a listed address cannot answer anything either. There is no outbound blocklist in this release: to keep the inside from reaching listed addresses, write `direction out` rules for the protocols and ports concerned. The global blocklist (`set firewall blocklist`) works the same way on every zone. Every zone's policy carries its own copy of the global blocklist and global GeoIP countries, so a global entry costs one data-plane entry per zone plus one; `config check` refuses a configuration whose total exceeds the data plane's 262,144 entries per address family.
 
 ## Source validation (anti-spoofing)
 

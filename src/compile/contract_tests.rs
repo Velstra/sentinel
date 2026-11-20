@@ -553,6 +553,52 @@ fn dp31_syn_protect_says_it_applies_to_every_zone() {
     assert!(w.contains("syn-protect") && w.contains("any zone"), "{w}");
 }
 
+// ---- DP-15: blocklists and GeoIP name sources only -------------------------
+
+#[test]
+fn dp15_a_zone_blocklist_is_emitted_as_source_only() {
+    let text = with("").replace(
+        "[zone.wan]\ndefault_action = \"drop\"\n",
+        "[zone.wan]\ndefault_action = \"drop\"\nblocklist = [\"203.0.113.0/24\"]\n",
+    );
+    assert!(
+        text.contains("blocklist"),
+        "the fixture gained its blocklist"
+    );
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let wan = policy(&cfg, "wan");
+    assert_eq!(
+        wan.get("blocklist_ingress_only")
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "{wan:?}"
+    );
+    // A policy without a blocklist has nothing to scope and carries no key, so
+    // an unchanged configuration's emitted policy is unchanged.
+    assert!(policy(&cfg, "lan").get("blocklist_ingress_only").is_none());
+}
+
+#[test]
+fn dp15_the_global_blocklist_is_source_only_for_every_policy() {
+    let text = format!("[firewall]\nblocklist = [\"203.0.113.7\"]\n{}", with(""));
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    assert_eq!(
+        cfg.get("blocklist_ingress_only")
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "{cfg:?}"
+    );
+    for zone in ["wan", "lan"] {
+        assert_eq!(
+            policy(&cfg, zone)
+                .get("blocklist_ingress_only")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "{zone}"
+        );
+    }
+}
+
 #[test]
 fn img10_to_an_undeclared_firewall_zone_explains_local() {
     let text = with(

@@ -1927,6 +1927,9 @@
         dhcp-late-client = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; };
         dhcp-late-client-stateless = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; stateful = false; };
         local-destination = import ./nix/local-destination-test.nix { inherit pkgs self; };
+        # DP-15 blocklist half: blocklists name sources; the LAN reaches a
+        # listed address and a listed address still cannot start a connection.
+        blocklist-direction = import ./nix/blocklist-direction-test.nix { inherit pkgs self; };
         install-boot-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; };
         install-boot-luks-retry = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; invalidAttempts = 2; };
         install-boot-raid1 = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1"; };

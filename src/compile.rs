@@ -124,6 +124,10 @@ pub struct VelstraConfig {
     // precede the `[[policy]]`/`[[interface]]` tables below.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) blocklist: Vec<String>,
+    /// The blocklist names sources only (audit DP-15): see
+    /// [`Policy::blocklist_ingress_only`]. Emitted with a blocklist only.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) blocklist_ingress_only: bool,
     conntrack: ConntrackOut,
     state: StateOut,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +328,14 @@ pub(crate) struct Policy {
     // Scalars above, the array-of-tables below (TOML requires this order).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) blocklist: Vec<String>,
+    /// Sentinel's blocklists and GeoIP countries name **sources** — what may
+    /// not reach in through the zone — so the data plane must neither match
+    /// them against the destination of traffic leaving through the zone nor
+    /// refuse a listed address's answers to a connection opened towards it
+    /// (audit DP-15: `zone wan geoip-block XX` also cut the LAN off from XX).
+    /// Emitted with a blocklist only; without one there is nothing to scope.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) blocklist_ingress_only: bool,
     /// C20: the captive-portal gate for this zone. A sub-table, so it comes
     /// after the scalars and before the `[[policy.port_rule]]` array.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1044,6 +1056,7 @@ fn compile_noted(
                 drop_icmp: posture.block_icmp,
                 log: posture.log,
                 source_validation: posture.source_validation.as_str(),
+                blocklist_ingress_only: !geo_blocklist(&posture).is_empty(),
                 blocklist: geo_blocklist(&posture),
                 portal: portal_gate(appliance, zone),
                 port_rules,
@@ -1308,6 +1321,7 @@ fn compile_noted(
         source_validation: fw.source_validation.as_str(),
         fail_closed: fw.fail_closed,
         blocklist: fw.blocklist.clone(),
+        blocklist_ingress_only: !fw.blocklist.is_empty(),
         policies,
         interfaces,
         port_forwards,

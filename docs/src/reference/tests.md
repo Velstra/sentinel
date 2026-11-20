@@ -169,6 +169,7 @@ This catalog preserves the existing task lookup for protocol and service fixture
 | `egress` | Applies the policy in the intended egress direction. |
 | `srcprefix` | every source-prefix **length** matches, not just the convenient ones |
 | `v6rules` | a rule scoped to IPv6 lands in its own trie and does not open the v4 one |
+| `blocklist-direction` | a zone blocklist refuses what a listed address starts, both families, while the LAN still reaches it and gets its answers |
 
 ## NAT
 
