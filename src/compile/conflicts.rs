@@ -103,18 +103,19 @@ fn family(r: &PortRule) -> Option<&str> {
     }
 }
 
-/// Everything but the key: two entries that agree on all of it are the same
-/// entry written twice (overlapping groups do this), not a conflict.
-fn verdict(
-    r: &PortRule,
-) -> (
+/// action, log, limit, burst, family scope, direction.
+type Verdict<'a> = (
     &'static str,
     bool,
     Option<u32>,
     Option<u32>,
-    Option<&str>,
-    &Option<String>,
-) {
+    Option<&'a str>,
+    &'a Option<String>,
+);
+
+/// Everything but the key: two entries that agree on all of it are the same
+/// entry written twice (overlapping groups do this), not a conflict.
+fn verdict(r: &PortRule) -> Verdict<'_> {
     (r.action, r.log, r.limit, r.burst, family(r), &r.direction)
 }
 
