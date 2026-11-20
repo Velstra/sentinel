@@ -7,6 +7,7 @@ hostname = "edge-a"
 [zone.wan]
 default_action = "drop"
 [zone.lan]
+# LAN may initiate traffic to all destinations, not only the WAN zone.
 default_action = "accept"
 
 [[interface]]
@@ -30,12 +31,6 @@ name = "wan-dhcp"
 from = "wan"
 proto = "udp"
 port = "68"
-action = "accept"
-
-[[rule]]
-name = "lan-outbound"
-from = "lan"
-to = "wan"
 action = "accept"
 
 [[nat.source]]

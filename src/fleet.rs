@@ -595,6 +595,24 @@ fn request_controller(f: &Fleet, body: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config-sync fence is a subset of this one: anything a peer may not
+    /// change on its own receiver, a fleet controller may not change either.
+    #[test]
+    fn the_config_sync_fence_is_part_of_the_fleet_fence() {
+        let a = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        let fenced: Vec<&str> = local_only_sections(&a)
+            .unwrap()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        for section in crate::configsync::MEMBER_TRUST_SECTIONS {
+            assert!(
+                fenced.contains(&section),
+                "{section} is not fenced from fleet"
+            );
+        }
+    }
     use ring::signature::KeyPair;
     fn identity() -> Fleet {
         Fleet {
@@ -1099,7 +1117,7 @@ mod tests {
         let commands = crate::session::flatten_config(&crate::session::render_appliance(&a));
         let mut session = crate::session::Session::load(&path).unwrap();
         for command in commands {
-            let words = crate::repl::split_line(&command);
+            let words = crate::repl::split_line(&command).unwrap();
             let refs: Vec<_> = words.iter().skip(1).map(String::as_str).collect();
             session.set(&refs).unwrap();
         }

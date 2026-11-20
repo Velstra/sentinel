@@ -9,7 +9,7 @@ let
   # Transient services do not inherit a login shell's system-package PATH.
   # These are the complete external dependencies of the read-only collector.
   observerPath = lib.makeBinPath [ pkgs.bpftools pkgs.iproute2 pkgs.systemd ];
-  secret = "ha-vm-test-credential-at-least-32-bytes";
+  secret = "3495f763f76345f694398991ac86dc4f1b6c48ab2334e10f5b4a3ddd1fc4bd50";
   cluster = "vm-cluster-0123456789";
   appliance = node: (pkgs.formats.toml {}).generate "ha-rejoin-${toString node}.toml" {
     system = {
@@ -77,7 +77,7 @@ in pkgs.testers.runNixOSTest {
           hostname = "rejoin-witness";
           ha-witness = {
             listen = "10.3.0.3:5440";
-            key = "c0b85d40a476e906218005259304678cbafc193059b70394a58334edfb13882b";
+            key = "ede32ebbc01f514a3c8bde6847eea86ad380a43132139a495002b91c52d0ac1a";
             inherit cluster;
             member = [ "10.3.0.1" "10.3.0.2" ];
           };

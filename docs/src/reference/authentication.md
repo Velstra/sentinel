@@ -144,8 +144,56 @@ in `system.ha.peer-identity` rather than an inferred address.
 | Field | Meaning |
 |---|---|
 | `peer` | Receiver endpoint, `host` or `host:port` (default port 8080). Leased HA uses exactly one peer. |
-| `secret` | Shared machine enrollment credential. It also enables the receiving HTTPS API. |
+| `secret` | Shared enrollment and config-sync credential (the *peer credential*). At least 32 random bytes; generate it with `sentinel ha secret generate`. It also enables the receiving HTTPS API. |
 | `peer-fingerprint` | Base64 SHA-256 management TLS public-key pin. Pairing records the authenticated peer pin. |
+
+### What the peer credential may do
+
+The config-sync secret is **not** the machine token. The API accepts it as the
+peer credential, which may read what a read-only account reads (the stack view
+uses `status`, `show`, `telemetry/snapshot` and `system/health`; pairing uses
+`GET /api/v1/ha/enrollment`), push `PUT /api/v1/config-sync` and complete
+`POST /api/v1/ha/pair`. It cannot `PUT /api/v1/config`, post `configure` lines,
+stage updates or end a commit-confirm window. On a member that is already
+paired it cannot post a *different* pairing (a repeat of the applied one is
+answered as applied); and enrollment hands it the member's configuration
+without accounts, AAA servers and update channels, so no password hash or
+TOTP secret reaches a peer. The root-only machine token in
+`/var/lib/sentinel/api-token` stays the local full-access credential. Sentinel
+records the digest of every token it mints beside it (`api-token.minted`).
+Releases before this one wrote the secret into the token file; at the first
+apply after the upgrade a token that is the configured secret, or that any
+archived configuration names (a secret since removed), is replaced by a fresh
+random token. Any other unrecorded token — an earlier release's own, or one an
+operator placed there — is kept and recorded.
+
+A received push or pairing never changes who manages the receiver: its
+accounts (`system login`, with their keys, hashes and TOTP), `system group`,
+`system aaa`, `update` channels and keys, `services ssh` and `system console`
+stay the receiver's own. Configure them on each member. Everything else a push
+carries is shared policy, applied as sent: **a peer that holds the secret can
+set the pair's firewall, NAT, routing and VPN policy**, and through pairing its
+HA identity. Treat the secret as the authority to change the traffic policy of
+every member, and keep it to the members.
+
+The secret must be at least 32 bytes and estimate at 128 bits or more. The
+estimate is deliberately pessimistic about anything composed: words, runs of
+one letter case, sequences (`abcd`, `1234`) and repeats count for little, so a
+long passphrase is refused; 64 random hex digits (what `sentinel ha secret
+generate` prints) or 32 random bytes in base64 pass. The reason:
+the unauthenticated HA proof lets anybody who can reach the management port
+test guesses against it offline, so a dictionary word is a lost pair. A weak
+secret is refused when a configuration is admitted (commit, API, received push
+or pairing, `config check`). A box upgraded with one still boots and keeps its
+pairing, warns at every apply, hands out no enrollment proof (`409`), and
+accepts no change until the secret is rotated on both members. The proof is
+limited to ten per source address per ten minutes. After thirty invalid
+bearers from one source in ten minutes, that source's further invalid ones
+get `429` (with `Retry-After`) for five minutes; a valid credential is still
+served, except the peer credential while the secret is weak. Sign-out answers
+every bearer that is not a session with the same `401` and counts it. Every
+non-read use of the machine token or the peer credential is logged with its
+source address.
 
 The receiving API always honors `services.web.listen-address` and `port`, even
 when `services.web.enable = false`. A secret alone leaves the default listener
@@ -155,11 +203,21 @@ Address binding is not ingress-interface isolation; apply the explicit
 management ACL above where required.
 
 Outside leased HA, legacy config sync can target multiple receivers. It preserves
-the receiver's web listen address/port and existing local address/identity facts;
-other web settings, including TLS, remain synchronized policy. A new static interface must
+the receiver's web listen address/port, existing local address/identity facts,
+router ID, VRRP priorities, the source address of each BGP neighbour it already
+has (`update-source`) and its PPPoE server `local-address`, as well as the
+management trust above; other web settings, including TLS, remain synchronized
+policy. A new static interface must
 already have its receiver facts declared. Drive changes from one node to avoid
 competing desired states. Legacy VRRP/config-sync alone does not provide the
 witness's split-brain fencing guarantees.
+
+During a rolling upgrade a push names each base revision in two forms, the
+current one and the one an older member computes, so a member that has not
+been updated yet and one that has keep synchronizing in both directions. Do
+not change accounts, AAA, update, SSH or console settings on the older member
+during that window: an older sender still pushes them, the updated receiver
+keeps its own, and the older sender's next push is then refused as a conflict.
 
 Before upgrading an existing legacy-sync pair, reconcile outstanding changes
 and verify delivery on both members, then upgrade both to the same reviewed
@@ -241,16 +299,40 @@ configuration, not here.
 
 ## Web sign-in limits
 
-Sign-in attempts share an origin budget: ten attempts in a ten-minute window
-trigger a 15-minute lockout for subsequent attempts. IPv6 addresses in the
-same /64 share that budget. A separate account
-budget permits 30 attempts in a ten-minute window, across origins.
+Sign-in attempts are budgeted three ways. Each origin has ten attempts in a
+ten-minute window over all accounts before a 15-minute lockout; IPv6 addresses
+in the same /64 share that budget. Each account has ten attempts per origin in
+the same window, also with a 15-minute lockout. And each account has a hundred
+attempts per ten minutes from origins that never signed it in, which bounds a
+guess distributed over many addresses.
 
-The account limit also blocks a correct password from another origin. Someone
-targeting a known account can therefore temporarily deny web access; keep an
-independent SSH or serial recovery path. Successful sign-in clears both budgets.
-These limits are held in memory and reset when the API restarts; they are not
-cluster-wide or persistent protection.
+An origin that has signed an account in before (in the last 30 days, while the
+API has been running) is exempt from that last budget: guessing `admin` from
+elsewhere locks the guessers' addresses, not the administrator's workstation.
+A new origin can still be refused while such a guess is running; keep an
+independent SSH or serial recovery path. When the table of tracked addresses
+is full of lockouts, new addresses share a small overflow budget instead of
+being refused outright. Successful sign-in clears its origin's and its pair's
+counts. Throttled answers are `429` with `Retry-After`. These limits are held in
+memory and reset when the API restarts; they are not cluster-wide or persistent
+protection.
+
+### Sessions and connections
+
+A session lasts 30 idle minutes and 12 hours in all. A session stamped more
+than five minutes in the future (minted while the clock was wrong) is not
+trusted once the clock is corrected. Each account keeps at most 16 sessions —
+signing in again ends the least recently used one — and the appliance at most
+1024. Responses carry `Strict-Transport-Security` (browsers ignore it over
+plaintext and over a certificate they warned about).
+
+Before any request is read, the listener caps open connections at 32 per
+source address (IPv6 /64), 256 per network (IPv4 /24, IPv6 /48) and 4096 in
+all, and a request head must arrive whole within ten seconds; HTTP/2
+connections are pinged and closed when the peer stops answering. A connection
+over a cap is closed as soon as it is accepted. After authentication (and for
+the sign-in form), a request body must arrive within 30 seconds or the request
+is answered `408`.
 
 ## Where a password is checked
 

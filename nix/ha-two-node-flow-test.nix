@@ -1,7 +1,36 @@
 { pkgs, self, legacyPackage ? null }:
 let
-  legacyPath = if legacyPackage == null then "" else toString legacyPackage;
-  secret = "two-node-flow-vm-only-credential-at-least-32-bytes";
+  # Test-only. On a real box Sentinel and the agent ship in one image (and an
+  # A/B rollback boots both old); only this fixture pairs the CURRENT compiler
+  # with an OLDER agent. The legacy agent refuses unknown keys, so it is handed
+  # velstra.toml minus exactly the top-level tables named here, each introduced
+  # after the legacy revision, and with every `dst-local` rule (DP-16) rewritten
+  # into the per-address form the old agent understood — never just the key
+  # removed, which would widen the rule to any destination. The list is
+  # explicit on purpose: anything else the legacy agent rejects still
+  # crash-loops it and fails this check. See nix/legacy-velstra-filter.py.
+  legacyUnknownTables = [
+    "state" # [state] persist/connections (agent stream, DP-12/DP-27)
+  ];
+  legacyFilter = ./legacy-velstra-filter.py;
+  legacyAgent = if legacyPackage == null then null else pkgs.writeShellScriptBin "velstra" ''
+    set -euo pipefail
+    args=()
+    while [ $# -gt 0 ]; do
+      if [ "$1" = --config ]; then
+        ${pkgs.iproute2}/bin/ip -j address show > /run/velstra/legacy-addresses.json
+        ${pkgs.python3}/bin/python3 -I ${legacyFilter} "$2" /run/velstra/legacy-velstra.toml /run/velstra/legacy-addresses.json ${pkgs.lib.escapeShellArgs legacyUnknownTables}
+        args+=(--config /run/velstra/legacy-velstra.toml)
+        shift 2
+      else
+        args+=("$1")
+        shift
+      fi
+    done
+    exec ${legacyPackage}/bin/velstra "''${args[@]}"
+  '';
+  legacyPath = if legacyPackage == null then "" else toString legacyAgent;
+  secret = "3fc09889bc23d47751124c1e3841bd6140e4a4759d174eb8922ae47746b67f1a";
   cluster = "two-node-flow-cluster-0123456789";
   appliance = node: (pkgs.formats.toml {}).generate "two-node-flow-member.toml" {
     system = {
@@ -36,7 +65,10 @@ let
       lan.default_action = "drop";
       control.default_action = "accept";
     };
-    rule = [ { name = "single-echo"; from = "lan"; proto = "tcp"; port = 8443; action = "accept"; } ];
+    rule = [ { name = "single-echo"; from = "lan"; proto = "tcp"; port = 8443; action = "accept"; }
+      # A constant-rate UDP probe measures the forwarding gap itself; a TCP
+      # stream's retransmission backoff would add to whatever it measures.
+      { name = "gap-probe"; from = "lan"; proto = "udp"; port = 8444; action = "accept"; } ];
     nat.source = [ { name = "shared-snat"; zone = "wan"; to = "10.1.0.100"; } ];
     protocols.vrrp = map (vip: {
       inherit (vip) name vrid;
@@ -60,7 +92,7 @@ let
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance node);
     services.velstra.package = lib.mkIf (node == 1 && legacyPackage != null)
-      (lib.mkForce legacyPackage);
+      (lib.mkForce legacyAgent);
     environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.tcpdump ];
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
     systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
@@ -99,6 +131,10 @@ let
     connection.connect(("10.1.0.10", 8443))
     status = {"count": 0, "maximum_gap": 0.0, "completed": False,
               "local": connection.getsockname(), "remote": connection.getpeername()}
+    # One line per echoed reply, stamped with the client's own monotonic
+    # clock: the forwarding gap across a fault is measured from these, inside
+    # the guest, not from host-side command timing.
+    replies = open("/tmp/stream-replies", "w", buffering=1)
     with connection, connection.makefile("rb") as reader:
         last = time.monotonic()
         while not os.path.exists("/tmp/stream-stop"):
@@ -109,12 +145,45 @@ let
             status["maximum_gap"] = max(status["maximum_gap"], now - last)
             assert status["maximum_gap"] < 3.0, status
             last = now
+            replies.write(f"{status['count']} {now:.6f}\n")
             status["count"] += 1
             publish(status)
             time.sleep(0.02)
     assert status["count"] >= 100, status
     status["completed"] = True
     publish(status)
+  '';
+  udpEcho = pkgs.writeText "two-node-udp-echo.py" ''
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", 8444))
+    while True:
+        data, peer = s.recvfrom(64)
+        s.sendto(data, peer)
+  '';
+  # Sends a datagram every 10 ms through the VIP and records, on the client's
+  # own monotonic clock, when each echo returns.
+  gapProbe = pkgs.writeText "two-node-gap-probe.py" ''
+    import os, socket, time
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("10.2.0.10", 41002))
+    s.setblocking(False)
+    out = open("/tmp/udp-replies", "w", buffering=1)
+    sequence = 0
+    next_send = time.monotonic()
+    while not os.path.exists("/tmp/udp-stop"):
+        now = time.monotonic()
+        if now >= next_send:
+            s.sendto(str(sequence).encode(), ("10.1.0.10", 8444))
+            sequence += 1
+            next_send = now + 0.01
+        try:
+            while True:
+                data, _ = s.recvfrom(64)
+                out.write(f"{int(data)} {time.monotonic():.6f}\n")
+        except BlockingIOError:
+            pass
+        time.sleep(0.001)
   '';
   oldMacProbe = pkgs.writeText "two-node-old-mac-syn.py" ''
     import socket, struct, sys, time
@@ -163,6 +232,11 @@ in pkgs.testers.runNixOSTest {
       networking.interfaces.eth1.ipv4.addresses = [ { address = "10.1.0.10"; prefixLength = 24; } ];
       networking.interfaces.eth1.ipv4.routes = [ { address = "10.2.0.0"; prefixLength = 24; via = "10.1.0.100"; } ];
       environment.systemPackages = [ pkgs.python3 pkgs.tcpdump ];
+      systemd.services.ha-flow-udp-echo = {
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" ];
+        serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${udpEcho}";
+      };
       systemd.services.ha-flow-echo = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" ];
@@ -190,6 +264,25 @@ in pkgs.testers.runNixOSTest {
                 return current
             time.sleep(0.02)
         raise AssertionError("same established socket made no bounded progress: " + label)
+
+    def probe_replies():
+        return int(client.succeed("wc -l < /tmp/udp-replies").strip())
+
+    def probe_gap(first):
+        # Largest interval between consecutive UDP echoes from echo `first`
+        # (the last one received before the fault) on: the forwarding outage
+        # at 10 ms resolution.
+        times = [float(line.split()[1]) for line in client.succeed("cat /tmp/udp-replies").splitlines()][first:]
+        assert len(times) >= 2, times
+        return max(b - a for a, b in zip(times, times[1:]))
+
+    def reply_gap(first):
+        # Largest interval between consecutive echoed replies from reply
+        # `first` on: the last reply before the fault to the first after it.
+        stamps = [tuple(map(float, line.split())) for line in client.succeed("cat /tmp/stream-replies").splitlines()]
+        times = [t for count, t in stamps if count >= first]
+        assert len(times) >= 2, stamps[-5:]
+        return max(b - a for a, b in zip(times, times[1:]))
 
     def diagnostic():
         for node in ((primary, secondary) if primary_alive else (secondary,)):
@@ -242,19 +335,41 @@ in pkgs.testers.runNixOSTest {
         # already exist on the real standby before disrupting its owner.
         secondary.wait_until_succeeds("sentinel show firewall flows | grep '10.2.0.10:41000' | grep '10.1.0.10:8443' | grep -q tcp", timeout=15)
         secondary.wait_until_succeeds(py('import json,time; r=json.load(open("/run/velstra/ha/role.json")); a=json.load(open("/run/velstra/ha/agent.json")); assert a["eligible"] and a["ready_term"]==r["authority"]["term"]>0 and a["policy"]==r["authority"]["policy"] and a["forwarding_term"]==0 and time.clock_gettime_ns(time.CLOCK_BOOTTIME)-a["updated_ns"]<100_000_000'), timeout=15)
+        server.wait_for_unit("ha-flow-udp-echo.service")
+        client.succeed("systemd-run --unit=ha-flow-gap-probe ${pkgs.python3}/bin/python3 ${gapProbe}")
+        client.wait_until_succeeds("test $(wc -l < /tmp/udp-replies) -ge 20", timeout=10)
+        probe_before = probe_replies()
         before = status()["count"]
         started = time.monotonic()
         primary.succeed("systemctl kill --kill-who=main --signal=SIGSTOP wren.service")
         # Both VIPs and actual data-plane acknowledgement, not desired election
         # state alone. The 1500ms ceiling follows the real replica freshness
         # budget; the 1000ms peer timeout cannot satisfy a 1-second assertion.
-        while True:
-            code, _ = secondary.execute(py('import json,time,subprocess; r=json.load(open("/run/velstra/ha/role.json")); a=json.load(open("/run/velstra/ha/agent.json")); assert r["authority"]["owner"]==2 and a["forwarding_term"]==r["authority"]["term"]>0 and r["vips_ready"] and r["deadline_ns"]>time.clock_gettime_ns(time.CLOCK_BOOTTIME); assert "10.1.0.100/24" in subprocess.check_output(["ip","-o","address","show","eth1"],text=True); assert "10.2.0.100/24" in subprocess.check_output(["ip","-o","address","show","eth2"],text=True)'))
-            elapsed = time.monotonic() - started
-            assert elapsed <= 1.5, f"warm two-node promotion exceeded replica budget: {elapsed:.3f}s"
-            if code == 0:
-                break
-            time.sleep(0.005)
+        # Observe in one guest process instead of starting a Python interpreter
+        # and crossing the driver channel on every failed poll. Keep the HOST
+        # deadline measured from before SIGSTOP, including command/return costs:
+        # this changes observation overhead, not the allowed failover budget.
+        probe = "\n".join([
+            "import json,time,subprocess",
+            "deadline=time.monotonic()+1.5",
+            "while time.monotonic()<deadline:",
+            "    r=json.load(open('/run/velstra/ha/role.json'))",
+            "    a=json.load(open('/run/velstra/ha/agent.json'))",
+            "    if r['authority']['owner']==2 and a['forwarding_term']==r['authority']['term']>0 and r['vips_ready'] and r['deadline_ns']>time.clock_gettime_ns(time.CLOCK_BOOTTIME):",
+            "        wan=subprocess.check_output(['ip','-o','address','show','eth1'],text=True)",
+            "        lan=subprocess.check_output(['ip','-o','address','show','eth2'],text=True)",
+            "        if '10.1.0.100/24' in wan and '10.2.0.100/24' in lan:",
+            "            print(json.dumps({'role':r,'agent':a}))",
+            "            break",
+            "    time.sleep(0.005)",
+            "else:",
+            "    raise AssertionError('standby did not acknowledge forwarding and both VIPs')",
+        ])
+        code, observation = secondary.execute(py(probe))
+        elapsed = time.monotonic() - started
+        # Diagnostic only: host time includes driver command and return costs.
+        print("promotion observation", observation, "host elapsed", elapsed)
+        assert code == 0, observation
         successor = json.loads(secondary.succeed("cat /run/velstra/ha/role.json"))["authority"]
         assert successor["term"] > owner["term"] and successor["policy"] == owner["policy"], (owner, successor)
         primary.succeed(py('import json,time; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==1 and r["deadline_ns"]<time.clock_gettime_ns(time.CLOCK_BOOTTIME)'))
@@ -262,6 +377,15 @@ in pkgs.testers.runNixOSTest {
         # work independently of userspace removing those addresses.
         primary.succeed("ip -o address show eth2 | grep -q 10.2.0.100")
         after = progress(before, 15, "after SIGSTOP and expired old kernel lease")
+        # One second of echoes after the fault, so the outage is bracketed.
+        client.wait_until_succeeds(f"test $(wc -l < /tmp/udp-replies) -ge {probe_before + 100}", timeout=10)
+        client.succeed("touch /tmp/udp-stop")
+        # The replica freshness budget, judged on the client's own clock: the
+        # last probe echo before the fault to the first one after promotion.
+        gap = probe_gap(probe_before - 1)
+        stream_gap = reply_gap(before - 1)
+        print(f"in-guest forwarding gap across warm promotion {gap:.3f}s (TCP stream gap {stream_gap:.3f}s incl. retransmission backoff; host elapsed {elapsed:.3f}s)")
+        assert gap <= 1.5, f"warm two-node promotion exceeded replica budget: in-guest gap {gap:.3f}s"
         server.succeed("systemd-run --unit=old-mac-capture ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/old-mac.pcap -i eth1 'tcp src port 41001 and tcp dst port 8443'")
         server.wait_until_succeeds("journalctl -u old-mac-capture --no-pager | grep -q 'listening on eth1'", timeout=5)
         # Raw Ethernet targets the old MAC without changing the live stream's
@@ -290,7 +414,7 @@ in pkgs.testers.runNixOSTest {
         wire = server.succeed("${pkgs.tcpdump}/bin/tcpdump -nn -r /tmp/flow.pcap 'src host 10.1.0.100 and dst host 10.1.0.10 and tcp dst port 8443' 2>/dev/null")
         ports = {int(port) for port in re.findall(r"IP 10\.1\.0\.100\.(\d+) > 10\.1\.0\.10\.8443:", wire)}
         assert ports == {translated["port"]}, (ports, translated)
-        print(f"two-node warm promotion {elapsed:.3f}s; unchanged SNAT tuple {translated}; one TCP socket; final {final}")
+        print(f"two-node warm promotion: in-guest gap {gap:.3f}s, host elapsed {elapsed:.3f}s; unchanged SNAT tuple {translated}; one TCP socket; final {final}")
     except BaseException:
         # Do not let a stopped controller or a powered-off VM hide the original
         # assertion behind a diagnostic command that can no longer return.

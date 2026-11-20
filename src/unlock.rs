@@ -123,19 +123,21 @@ fn find_luks_data() -> Result<Option<String>> {
 }
 
 fn data_probe_command(partition: &str, is_root: bool) -> Command {
-    // Direct blkid probing needs permission to read the block device. lsblk
-    // can otherwise succeed but return null FSTYPE for an ordinary admin,
-    // making show version falsely report an unknown data format. Do not use
-    // cached labels as a substitute for checking the actual boot disk.
+    // Boot/unlock must read signatures directly, including before udev has
+    // populated its database. Read-only viewers cannot open block devices and
+    // must not receive arbitrary sudo/lsblk access. Use the kernel/udev inventory
+    // for their informational status; absent/unknown FSTYPE remains unknown in
+    // classify_data_tree, never evidence that encryption is disabled.
     let mut command = if is_root {
-        Command::new(system::bin("lsblk"))
+        let mut command = Command::new(system::bin("lsblk"));
+        command.arg("--properties-by=blkid");
+        command
     } else {
-        let mut command = Command::new("sudo");
-        command.args(["-n", &system::bin("lsblk")]);
+        let mut command = Command::new(system::bin("lsblk"));
+        command.arg("--properties-by=udev");
         command
     };
     command.args([
-        "--properties-by=blkid",
         "--json",
         "--list",
         "--paths",
@@ -257,7 +259,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn data_status_probes_real_signatures_with_noninteractive_read_privilege() {
+    fn boot_probes_signatures_but_viewer_status_never_escalates() {
         for root in [true, false] {
             let command = data_probe_command("/dev/vda6", root);
             let args: Vec<_> = command
@@ -265,16 +267,16 @@ mod tests {
                 .map(|value| value.to_string_lossy().into_owned())
                 .collect();
             assert_eq!(args.last().map(String::as_str), Some("/dev/vda6"));
-            assert!(args.iter().any(|arg| arg == "--properties-by=blkid"));
+            assert_eq!(
+                command.get_program(),
+                std::ffi::OsStr::new(&system::bin("lsblk"))
+            );
+            assert!(!args.iter().any(|arg| arg == "-n"));
             if root {
-                assert_eq!(
-                    command.get_program(),
-                    std::ffi::OsStr::new(&system::bin("lsblk"))
-                );
-                assert!(!args.iter().any(|arg| arg == "-n"));
+                assert!(args.iter().any(|arg| arg == "--properties-by=blkid"));
             } else {
-                assert_eq!(command.get_program(), "sudo");
-                assert_eq!(&args[..2], &["-n", &system::bin("lsblk")]);
+                assert!(args.iter().any(|arg| arg == "--properties-by=udev"));
+                assert!(!args.iter().any(|arg| arg == "--properties-by=blkid"));
             }
         }
     }

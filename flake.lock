@@ -3,17 +3,17 @@
     "fabric": {
       "flake": false,
       "locked": {
-        "lastModified": 1794508504,
-        "narHash": "sha256-uQxW9e6O35ibZrH+29WG8cnMOSgEhhxxtTQKhoKJvDE=",
+        "lastModified": 1795172351,
+        "narHash": "sha256-bKNoTxb3GNCHV3nMfqcYEwEhX1DsyiVrwuXaeu3LqpU=",
         "owner": "Velstra",
         "repo": "fabric",
-        "rev": "e0a802c43477fb43ef329717112867878faf12bf",
+        "rev": "698d66501c8f820d5e36f6386bb2105b306e32a3",
         "type": "github"
       },
       "original": {
         "owner": "Velstra",
         "repo": "fabric",
-        "rev": "e0a802c43477fb43ef329717112867878faf12bf",
+        "rev": "698d66501c8f820d5e36f6386bb2105b306e32a3",
         "type": "github"
       }
     },
@@ -37,7 +37,7 @@
     "fenix": {
       "inputs": {
         "nixpkgs": [
-          "nixpkgs"
+          "nixpkgs-ebpf"
         ],
         "rust-analyzer-src": "rust-analyzer-src"
       },
@@ -57,11 +57,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1792898606,
-        "narHash": "sha256-Mg3rRjsbMqhSMxop5PYMXos8SwAjejrxSgVThTvP9eg=",
+        "lastModified": 1794872590,
+        "narHash": "sha256-E+XLAfnC7+bdr4qlEgRv6cdGmiqTU5oeFNKCha7epqQ=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "1f607aa79b6356ed45d3cd3c8079c196e79efa2c",
+        "rev": "f68407657ad294471eb4b2e65d193df26edf729f",
         "type": "github"
       },
       "original": {
@@ -71,12 +71,29 @@
         "type": "github"
       }
     },
+    "nixpkgs-ebpf": {
+      "locked": {
+        "lastModified": 1792898606,
+        "narHash": "sha256-Mg3rRjsbMqhSMxop5PYMXos8SwAjejrxSgVThTvP9eg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "1f607aa79b6356ed45d3cd3c8079c196e79efa2c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "1f607aa79b6356ed45d3cd3c8079c196e79efa2c",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "fabric": "fabric",
         "fabric-legacy-napt": "fabric-legacy-napt",
         "fenix": "fenix",
         "nixpkgs": "nixpkgs",
+        "nixpkgs-ebpf": "nixpkgs-ebpf",
         "wren": "wren"
       }
     },
@@ -100,17 +117,17 @@
     "wren": {
       "flake": false,
       "locked": {
-        "lastModified": 1794502152,
-        "narHash": "sha256-9VMj780gnxhf8xjOTHuODB/0Zdc+T2ATVdl2IgSsYcU=",
+        "lastModified": 1795121280,
+        "narHash": "sha256-kAvsi1eR/5T5oRkCWKN1fAeonkZLIkR5BSjP82XCwLA=",
         "owner": "Velstra",
         "repo": "wren",
-        "rev": "53be10eca77aac36a88f9a53d6c08051d3050acd",
+        "rev": "ba95bca0e3d5618f2c117a97302b4af27a87d654",
         "type": "github"
       },
       "original": {
         "owner": "Velstra",
         "repo": "wren",
-        "rev": "53be10eca77aac36a88f9a53d6c08051d3050acd",
+        "rev": "ba95bca0e3d5618f2c117a97302b4af27a87d654",
         "type": "github"
       }
     }

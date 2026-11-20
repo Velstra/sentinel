@@ -26,16 +26,24 @@ import time
 
 FLOW_KEY = struct.Struct("<I4s4sHHB3x")
 FIREWALL_KEY = struct.Struct("<I16s16sHHBB2x")
-FIREWALL_VALUE = struct.Struct("<QQII")
+FIREWALL_VALUE = struct.Struct("<QQII16x")  # + node-local TCP tracking
 NAT_VALUE = struct.Struct("<4s4sHHHHQQQQ")
 MAP_LAYOUTS = {"CONNTRACK": (20, 48, "lru_hash"),
-               "FW_FLOWS": (44, 24, "lru_hash"),
+               "FW_FLOWS": (44, 40, "lru_hash"),
                "SYN_FLOWS": (20, 16, "lru_hash"),
                "IFACE_POLICY": (4, 4, "hash")}
 SOCKET = "/run/qa-nat-capacity.sock"
 FRAME_LIMIT = 4096
 REPLY_LIMIT = 64 * 1024 * 1024
 MAX_FLOWS = 20_000
+# Held echoes are sent in rounds of this many concurrent flows. 1024 lost
+# packets below every counter of the firewall VM: with all NAT/FW state
+# present and zero firewall softnet/link/qdisc/virtio-ring/IP drops, the
+# endpoints' own qdiscs dropped hundreds of segments and both endpoints took
+# ~38k RTOs, so later echoes missed the unchanged per-echo timeout. The
+# nftables reference shares this probe, so both lanes are paced identically;
+# totals, budgets and timeouts are unchanged.
+HELD_ECHO_BATCH = 512
 PROBE_REVISION = "prebound-endpoints-runtime-v3-echo-evidence"
 SERVER_METRICS = "/run/qa-nat-server-metrics.json"
 
@@ -343,13 +351,14 @@ class Client:
         started = time.monotonic()
         indices = sorted(self.streams)
         rows = []
-        for first in range(0, len(indices), 1024):
+        for first in range(0, len(indices), HELD_ECHO_BATCH):
             if time.monotonic() - started >= budget:
                 rows.extend(dict(id=i, verified=False, failure=dict(stage="probe-budget", kind="not-probed",
                                                                     detail="phase budget exhausted"))
                             for i in indices[first:])
                 break
-            rows.extend(await asyncio.gather(*(self.probe_one(i) for i in indices[first:first + 1024])))
+            rows.extend(await asyncio.gather(*(self.probe_one(i)
+                                               for i in indices[first:first + HELD_ECHO_BATCH])))
         return dict(version=1, probe_revision=PROBE_REVISION, event_loop=self.health.sample(),
                     round=self.round, rows=rows, seconds=time.monotonic() - started)
 
@@ -419,7 +428,8 @@ def validate_metadata(info):
     need(type(info.get("id")) is int and info["id"] > 0 and info.get("type") == kind,
          "unexpected kernel map identity/type")
     need(info.get("bytes_key") == key_size and info.get("bytes_value") == value_size
-         and type(info.get("max_entries")) is int and 1 <= info["max_entries"] <= 65536,
+         # The agent sizes the state maps at load (DP-06): up to 6 x 4,194,304.
+         and type(info.get("max_entries")) is int and 1 <= info["max_entries"] <= 1 << 25,
          "unexpected kernel map ABI/capacity")
     return info
 

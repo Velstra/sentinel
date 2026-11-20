@@ -88,19 +88,49 @@ in pkgs.testers.runNixOSTest {
         script = "printf '%s\\n' " + " ".join(shlex.quote(c) for c in list(commands) + tail) + " | sentinel configure"
         output = fw.succeed("su admin -c " + shlex.quote(script))
         assert "error:" not in output.lower() and "commit failed" not in output.lower(), output
+    inbound_seen = ""
+
     def unsolicited_from_wan():
         # Counted where it would land, on the LAN host's wire, so the answer
         # does not depend on whether anything there would have replied. Both
         # families, TCP and UDP, to ports no rule mentions.
-        client.succeed("rm -f /tmp/inbound.pcap; tcpdump -n -U -i eth1 -w /tmp/inbound.pcap "
-                       "'(tcp dst port 9092 or udp dst port 9093) and (src host 10.2.2.2 or src host 2001:db8:102::2)' "
-                       ">/dev/null 2>&1 & echo $! >/tmp/inbound.pid")
-        client.sleep(1)
+        # The capture must be running before the first probe and must hand
+        # over every packet before it stops. libpcap batches packets into
+        # ring blocks it retires only on a timeout (1 s by default), and a
+        # capture stopped sooner loses the unretired block: once the
+        # firewall delivered RELATED ICMP errors (DP-10), the UDP probes got
+        # their port-unreachable at once instead of waiting out `nc -w 1`,
+        # the capture stopped within that second and the step read "0
+        # admitted probes" although the client had answered every one.
+        # Hence --immediate-mode, and a wait for 'listening' before probing.
+        # Captured by port only and counted by source below, so a probe that
+        # arrives with a rewritten source shows up in the failure message
+        # instead of as an empty capture.
+        client.succeed("rm -f /tmp/inbound.pcap /tmp/inbound.err; tcpdump --immediate-mode -n -U -i eth1 -w /tmp/inbound.pcap "
+                       "'tcp dst port 9092 or udp dst port 9093' "
+                       ">/dev/null 2>/tmp/inbound.err & echo $! >/tmp/inbound.pid")
+        client.wait_until_succeeds("grep -q 'listening on eth1' /tmp/inbound.err", timeout=30)
+        # The sender's view (not the firewall's: a capture there changed the
+        # timing enough to hide the failure): who answers the probes, with
+        # which TTL and MAC.
+        server.succeed("rm -f /tmp/sent.pcap /tmp/sent.err; tcpdump --immediate-mode -n -U -i eth1 -w /tmp/sent.pcap "
+                       "'port 9092 or port 9093 or icmp or icmp6' >/dev/null 2>/tmp/sent.err & echo $! >/tmp/sent.pid")
+        server.wait_until_succeeds("grep -q 'listening on eth1' /tmp/sent.err", timeout=30)
+        sent = []
         for address in ("10.1.1.2", "2001:db8:101::2"):
-            server.execute(f"nc -z -w 2 {address} 9092")
-            server.execute(f"echo probe | nc -u -w 1 {address} 9093")
-        client.succeed("kill -INT $(cat /tmp/inbound.pid); sleep 1")
-        return int(client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null | wc -l").strip())
+            sent.append(server.execute(f"nc -v -z -w 2 {address} 9092 2>&1"))
+            sent.append(server.execute(f"echo probe | nc -v -u -w 1 {address} 9093 2>&1"))
+        client.succeed("pid=$(cat /tmp/inbound.pid); kill -INT $pid; "
+                       "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
+        server.succeed("pid=$(cat /tmp/sent.pid); kill -INT $pid; "
+                       "for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1")
+        arrived = client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null")
+        global inbound_seen
+        inbound_seen = (arrived + "probes: " + repr(sent) + "\nthe sender saw:\n"
+                        + server.succeed("tcpdump -n -e -v -r /tmp/sent.pcap 2>/dev/null"))
+        # Counted on the LAN host's capture only.
+        return sum(1 for line in arrived.splitlines()
+                   if " 10.2.2.2." in line or " 2001:db8:102::2." in line)
     lines = [
         "set interface eth1 zone lan", "set interface eth1 address 10.1.1.1/24",
         "set interface eth1 address6 2001:db8:101::1/64",
@@ -144,15 +174,20 @@ in pkgs.testers.runNixOSTest {
             persist=True,
         )
         crossed = unsolicited_from_wan()
-        assert crossed >= 4, f"only {crossed} admitted probes crossed: the path itself is broken"
+        assert crossed >= 4, f"only {crossed} admitted probes crossed: the path itself is broken; captured:\n{inbound_seen}"
         configure("delete firewall rule wan-probe-tcp", "delete firewall rule wan-probe-udp", persist=True)
         assert unsolicited_from_wan() == 0
 
     with subtest("TCP forwarding, checksums and static SNAT work across both families"):
         for address, result in [("10.2.2.2", "/tmp/tcp4"), ("2001:db8:102::2", "/tmp/tcp6")]:
+            # Held across the later subtests, which take well over 90 s, and
+            # patient enough to ride out the repair below: forwarding is off
+            # from the sysctl until the unchanged commit restores it (~12 s
+            # into a non-root commit), which TCP retransmission survives but a
+            # 5 s receive timeout did not.
             code = ("import socket,time; s=socket.create_connection((" + repr(address) + ",9090),5); "
-                    "f=open(" + repr(result) + ",'ab',buffering=0); "
-                    "exec(\"for i in range(90):\\n s.sendall(b'probe')\\n f.write(s.recv(200))\\n time.sleep(1)\")")
+                    "s.settimeout(60); f=open(" + repr(result) + ",'ab',buffering=0); "
+                    "exec(\"for i in range(300):\\n s.sendall(b'probe')\\n f.write(s.recv(200))\\n time.sleep(1)\")")
             client.succeed("python3 -c " + shlex.quote(code) + " >/tmp/tcp-probe.log 2>&1 &")
         client.wait_until_succeeds("grep -q 203.0.113.10 /tmp/tcp4", timeout=30)
         client.wait_until_succeeds("grep -q 2001:db8:101::2 /tmp/tcp6", timeout=30)
@@ -230,18 +265,37 @@ in pkgs.testers.runNixOSTest {
         assert counters["events_lost"] == 0, counters
         fw.fail("journalctl -b -u velstra --no-pager | grep -E 'Verifier error|BTF couldn.t be loaded'")
 
-    with subtest("reassigned zone policy IDs cannot inherit old conntrack sessions"):
+    with subtest("adding a zone keeps every other zone's policy ID and its connections"):
+        # Release audit 8b6181 DP-13: ids were the rank of the zone name, so a
+        # zone sorting first ("aaa") renumbered every other zone and the commit
+        # reset all connection state on the box. Ids are now a hash of the
+        # name; only a zone whose own id changed can lose state.
+        import tomllib
+        def ids():
+            compiled = tomllib.loads(fw.succeed("cat /run/sentinel/velstra.toml"))
+            return {p["name"]: p["id"] for p in compiled["policy"]}
+        before_ids = ids()
+        code = ("import socket,time; s=socket.create_connection(('10.2.2.2',9090),5); "
+                "f=open('/tmp/held','ab',buffering=0); "
+                "exec(\"for i in range(600):\\n s.sendall(b'held')\\n f.write(s.recv(200))\\n time.sleep(0.5)\")")
+        client.succeed("python3 -c " + shlex.quote(code) + " >/tmp/held.log 2>&1 &")
+        client.wait_until_succeeds("test -s /tmp/held", timeout=15)
         before = fw.succeed("systemctl show -p InvocationID --value velstra.service").strip()
         update = "printf '%s\\n' 'set interface guest0 type dummy' 'set interface guest0 zone aaa' commit save exit | sentinel configure"
         output = fw.succeed("su admin -c " + shlex.quote(update))
         assert "error:" not in output.lower() and "commit failed" not in output.lower(), output
         assert fw.succeed("systemctl show -p InvocationID --value velstra.service").strip() == before
-        # The long-lived sockets above still send ACK/data, but those packets
-        # must not recreate established state under another zone's numeric ID.
+        after_ids = ids()
+        assert "aaa" in after_ids, after_ids
+        for zone, policy in before_ids.items():
+            assert after_ids[zone] == policy, (before_ids, after_ids)
+        # The connection opened before the commit keeps being answered after it
+        # (it runs for five minutes; a commit takes tens of seconds here).
+        size = int(client.succeed("stat -c %s /tmp/held"))
+        time.sleep(3)
+        grown = int(client.succeed("stat -c %s /tmp/held"))
+        assert grown > size, "the held connection stopped at the zone commit: " + client.succeed("cat /tmp/held.log")
         states = json.loads(show("states"))
-        assert not any(s["protocol"] == 6 and s["dst_port"] == 9090 for s in states), states
-        for address in ("10.2.2.2", "2001:db8:102::2"):
-            python(client, "import socket; s=socket.create_connection((" + repr(address) + ",9090),5); "
-                   "s.settimeout(5); s.sendall(b'fresh-zone-state'); assert s.recv(200)")
+        assert any(s["protocol"] == 6 and s["dst_port"] == 9090 for s in states), states
   '';
 }

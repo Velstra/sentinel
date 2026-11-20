@@ -101,7 +101,7 @@ pkgs.testers.runNixOSTest {
           added = installer.send_monitor_command("device_add usb-storage,bus=update-usb.0,drive=install-update,id=install-update-stick")
           assert "Error" not in added, added
           installer.wait_until_succeeds("test -b /dev/sda3", timeout=30)
-          output = installer.succeed("sentinel update --commit --pubkey file:/etc/qa-install-update-proof/release-pub.pem "
+          output = installer.succeed("sentinel update --commit --allow-downgrade --pubkey file:/etc/qa-install-update-proof/release-pub.pem "
               "--signature /etc/qa-install-update-proof/candidate.raw.sha256.sig /dev/sda 2>&1")
           assert "signature verified" in output and "image SHA-256 verified" in output, output
           assert installer.succeed("sha256sum /dev/vda2 /dev/vda3") == original_A
@@ -166,6 +166,9 @@ pkgs.testers.runNixOSTest {
         key = installed.succeed("ssh-keygen -lf /var/lib/sentinel/ssh/ssh_host_ed25519_key.pub").split()[1]
         assert key != source_key, "installer copied a private source identity"
         version = installed.succeed("sentinel show version")
+        viewer_version = installed.succeed("su -s /bin/sh nobody -c 'sentinel show version'")
+        assert "not encrypted" in viewer_version, viewer_version
+        installed.fail("su -s /bin/sh nobody -c 'sudo -n id'")
         assert "release:    ${
           if withUpdate then "2.0.1" else "2.0.0"
         }-qa-install-boot" in version and "slot sentinel-${

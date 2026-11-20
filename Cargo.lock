@@ -2013,6 +2013,7 @@ dependencies = [
  "clap",
  "crossterm",
  "getrandom 0.2.17",
+ "hyper-util",
  "libc",
  "ratatui",
  "ring",

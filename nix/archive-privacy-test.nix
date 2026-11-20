@@ -6,7 +6,7 @@ let
     [system]
     hostname = "archive-fw"
     [system.config-sync]
-    secret = "public-qa-fixture-never-a-real-credential"
+    secret = "221cd8213283a459e692edb9baff99f32ec6f8a816ca22dd52332f7155d2d714"
     [[interface]]
     name = "eth1"
     zone = "lan"
@@ -38,7 +38,7 @@ let
         assert (info.st_uid, info.st_gid) == (0, gid)
     for path in revisions + [root / "appliance.toml"]:
         with path.open("rb") as stream: config = tomllib.load(stream)
-        assert config["system"]["config-sync"]["secret"] == "public-qa-fixture-never-a-real-credential"
+        assert config["system"]["config-sync"]["secret"] == "221cd8213283a459e692edb9baff99f32ec6f8a816ca22dd52332f7155d2d714"
     print(len(revisions))
   '';
   apiChange = pkgs.writeText "archive-api-change.py" ''

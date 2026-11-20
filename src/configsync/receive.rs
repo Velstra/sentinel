@@ -78,6 +78,9 @@ fn prepare_with(
     persist: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
     let held = super::shared_revision(local)?;
+    // What a sender that predates the management-trust fence computes for the
+    // same configuration (rolling upgrades; see `legacy_shared_revision`).
+    let held_legacy = super::legacy_shared_revision(local)?;
     let arriving = super::shared_revision(desired)?;
     let baseline = crate::ha::revision(local)?;
     let previous = system::read_owned_regular(marker, 1024)?;
@@ -96,7 +99,11 @@ fn prepare_with(
             fence.baseline == baseline && fence.desired == arriving && !local_pending
         }
     };
-    let based_on_held = bases.is_some_and(|bases| bases.split(',').any(|base| base == held));
+    let based_on_held = bases.is_some_and(|bases| {
+        bases
+            .split(',')
+            .any(|base| base == held || base == held_legacy)
+    });
     let first = previous.is_none() && !local_pending;
     if held != arriving && !based_on_held && !first && !interrupted {
         return Err(Conflict.into());

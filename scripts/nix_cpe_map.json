@@ -1,0 +1,738 @@
+{
+ "schema": "velstra-nix-cpe-map/1",
+ "description": "Nix package name (as syft's nix cataloger reports it) -> NVD CPE vendor/product. syft emits cpe:2.3:a:<name>:<name> for every Nix package, which grype matches for almost nothing (audit 8b6181 IMG-05). Shared with the enterprise pipeline: load with any JSON parser, never edit a copy.",
+ "critical": [
+  "linux-kernel",
+  "glibc",
+  "openssh",
+  "openssl",
+  "curl",
+  "systemd",
+  "sudo",
+  "dnsmasq",
+  "strongswan"
+ ],
+ "version-rules": {
+  "as-is": "the Nix version, unchanged (default)",
+  "strip-nix-revision": "drop a trailing -<digits> Nix release-branch revision (glibc 2.42-100 -> 2.42)"
+ },
+ "kernel": {
+  "note": "The kernel is never mapped from a Nix name: it must come from syft's linux-kernel cataloger (cpe:2.3:o:linux:linux_kernel:<version>), read from the bzImage. Nix packages named linux / linux-headers are not matched."
+ },
+ "first-party": [
+  "sentinel",
+  "sentinel-ui",
+  "velstra",
+  "velstra-ebpf",
+  "velstra-wren",
+  "wren"
+ ],
+ "first-party-note": "Velstra's own binaries: their dependencies are scanned through cargo-auditable data; a guessed CPE only matches unrelated products of the same name (the audit's two false 'wren' Highs).",
+ "aliases": {
+  "bash-interactive": "bash",
+  "coreutils-full": "coreutils",
+  "curl-minimal": "curl",
+  "curlMinimal": "curl",
+  "getent-glibc": "glibc",
+  "glibc-locales": "glibc",
+  "gmp-with-cxx": "gmp",
+  "libsodium-1.0.22": "libsodium",
+  "openssh_hpn": "openssh",
+  "openssl_3_6": "openssl",
+  "perl-minimal": "perl",
+  "python": "python3",
+  "python3-minimal": "python3",
+  "systemd-minimal": "systemd",
+  "systemd-minimal-libs": "systemd",
+  "util-linux-minimal": "util-linux",
+  "xz-minimal": "xz"
+ },
+ "packages": {
+  "avahi": {
+   "vendor": "avahi",
+   "product": "avahi"
+  },
+  "bash": {
+   "vendor": "gnu",
+   "product": "bash"
+  },
+  "bind": {
+   "vendor": "isc",
+   "product": "bind"
+  },
+  "binutils": {
+   "vendor": "gnu",
+   "product": "binutils"
+  },
+  "brotli": {
+   "vendor": "google",
+   "product": "brotli"
+  },
+  "bzip2": {
+   "vendor": "bzip",
+   "product": "bzip2"
+  },
+  "chrony": {
+   "vendor": "tuxfamily",
+   "product": "chrony"
+  },
+  "coreutils": {
+   "vendor": "gnu",
+   "product": "coreutils"
+  },
+  "cpio": {
+   "vendor": "gnu",
+   "product": "cpio"
+  },
+  "cracklib": {
+   "vendor": "cracklib_project",
+   "product": "cracklib"
+  },
+  "cryptsetup": {
+   "vendor": "cryptsetup_project",
+   "product": "cryptsetup"
+  },
+  "curl": {
+   "vendor": "haxx",
+   "product": "curl"
+  },
+  "cyrus-sasl": {
+   "vendor": "cyrusimap",
+   "product": "cyrus-sasl"
+  },
+  "dash": {
+   "vendor": "dash",
+   "product": "dash"
+  },
+  "db": {
+   "vendor": "oracle",
+   "product": "berkeley_db"
+  },
+  "dbus": {
+   "vendor": "freedesktop",
+   "product": "dbus"
+  },
+  "dhcpcd": {
+   "vendor": "roy_marples",
+   "product": "dhcpcd"
+  },
+  "diffutils": {
+   "vendor": "gnu",
+   "product": "diffutils"
+  },
+  "dnsmasq": {
+   "vendor": "thekelleys",
+   "product": "dnsmasq"
+  },
+  "dnsproxy": {
+   "vendor": "adguard",
+   "product": "dnsproxy",
+   "note": "Go binary; its stdlib/x-net/x-crypto modules are matched separately by syft's go-module cataloger."
+  },
+  "dosfstools": {
+   "vendor": "dosfstools_project",
+   "product": "dosfstools"
+  },
+  "duktape": {
+   "vendor": "duktape",
+   "product": "duktape"
+  },
+  "e2fsprogs": {
+   "vendor": "e2fsprogs_project",
+   "product": "e2fsprogs"
+  },
+  "elfutils": {
+   "vendor": "elfutils_project",
+   "product": "elfutils"
+  },
+  "ethtool": {
+   "vendor": "kernel",
+   "product": "ethtool"
+  },
+  "expat": {
+   "vendor": "libexpat_project",
+   "product": "libexpat"
+  },
+  "file": {
+   "vendor": "file_project",
+   "product": "file"
+  },
+  "findutils": {
+   "vendor": "gnu",
+   "product": "findutils"
+  },
+  "fontconfig": {
+   "vendor": "fontconfig_project",
+   "product": "fontconfig"
+  },
+  "freetype": {
+   "vendor": "freetype",
+   "product": "freetype"
+  },
+  "fuse": {
+   "vendor": "fuse_project",
+   "product": "fuse"
+  },
+  "gawk": {
+   "vendor": "gnu",
+   "product": "gawk"
+  },
+  "gcc": {
+   "vendor": "gnu",
+   "product": "gcc"
+  },
+  "gdbm": {
+   "vendor": "gnu",
+   "product": "gdbm"
+  },
+  "gdk-pixbuf": {
+   "vendor": "gnome",
+   "product": "gdk-pixbuf"
+  },
+  "giflib": {
+   "vendor": "giflib_project",
+   "product": "giflib"
+  },
+  "glib": {
+   "vendor": "gnome",
+   "product": "glib"
+  },
+  "glibc": {
+   "vendor": "gnu",
+   "product": "glibc",
+   "version": "strip-nix-revision",
+   "note": "Nix appends the release-branch commit count (2.42-100); NVD ranges use upstream 2.42. Branch backports are therefore NOT credited: review matches against the glibc 2.42 branch before waiving."
+  },
+  "gmp": {
+   "vendor": "gmplib",
+   "product": "gmp"
+  },
+  "gnugrep": {
+   "vendor": "gnu",
+   "product": "grep"
+  },
+  "gnupg": {
+   "vendor": "gnupg",
+   "product": "gnupg"
+  },
+  "gnused": {
+   "vendor": "gnu",
+   "product": "sed"
+  },
+  "gnutar": {
+   "vendor": "gnu",
+   "product": "tar"
+  },
+  "gnutls": {
+   "vendor": "gnu",
+   "product": "gnutls"
+  },
+  "groff": {
+   "vendor": "gnu",
+   "product": "groff"
+  },
+  "gsasl": {
+   "vendor": "gnu",
+   "product": "gsasl"
+  },
+  "gzip": {
+   "vendor": "gnu",
+   "product": "gzip"
+  },
+  "haproxy": {
+   "vendor": "haproxy",
+   "product": "haproxy"
+  },
+  "hiredis": {
+   "vendor": "redis",
+   "product": "hiredis"
+  },
+  "hostapd": {
+   "vendor": "w1.fi",
+   "product": "hostapd"
+  },
+  "iproute2": {
+   "vendor": "iproute2_project",
+   "product": "iproute2"
+  },
+  "iptables": {
+   "vendor": "netfilter",
+   "product": "iptables"
+  },
+  "iputils": {
+   "vendor": "iputils_project",
+   "product": "iputils"
+  },
+  "jansson": {
+   "vendor": "jansson_project",
+   "product": "jansson"
+  },
+  "jq": {
+   "vendor": "jqlang",
+   "product": "jq"
+  },
+  "json-c": {
+   "vendor": "json-c_project",
+   "product": "json-c"
+  },
+  "keyutils": {
+   "vendor": "keyutils_project",
+   "product": "keyutils"
+  },
+  "kmod": {
+   "vendor": "kernel",
+   "product": "kmod"
+  },
+  "krb5": {
+   "vendor": "mit",
+   "product": "kerberos_5"
+  },
+  "ldns": {
+   "vendor": "nlnetlabs",
+   "product": "ldns"
+  },
+  "lego": {
+   "vendor": "go-acme",
+   "product": "lego"
+  },
+  "less": {
+   "vendor": "gnu",
+   "product": "less"
+  },
+  "libarchive": {
+   "vendor": "libarchive",
+   "product": "libarchive"
+  },
+  "libassuan": {
+   "vendor": "gnupg",
+   "product": "libassuan"
+  },
+  "libbpf": {
+   "vendor": "libbpf_project",
+   "product": "libbpf"
+  },
+  "libbsd": {
+   "vendor": "freedesktop",
+   "product": "libbsd"
+  },
+  "libcap": {
+   "vendor": "libcap_project",
+   "product": "libcap"
+  },
+  "libcap-ng": {
+   "vendor": "libcap-ng_project",
+   "product": "libcap-ng"
+  },
+  "libevent": {
+   "vendor": "libevent_project",
+   "product": "libevent"
+  },
+  "libffi": {
+   "vendor": "libffi_project",
+   "product": "libffi"
+  },
+  "libfido2": {
+   "vendor": "yubico",
+   "product": "libfido2"
+  },
+  "libgcrypt": {
+   "vendor": "gnupg",
+   "product": "libgcrypt"
+  },
+  "libgpg-error": {
+   "vendor": "gnupg",
+   "product": "libgpg-error"
+  },
+  "libidn": {
+   "vendor": "gnu",
+   "product": "libidn"
+  },
+  "libidn2": {
+   "vendor": "gnu",
+   "product": "libidn2"
+  },
+  "libjpeg-turbo": {
+   "vendor": "libjpeg-turbo",
+   "product": "libjpeg-turbo"
+  },
+  "libksba": {
+   "vendor": "gnupg",
+   "product": "libksba"
+  },
+  "liblognorm": {
+   "vendor": "adiscon",
+   "product": "liblognorm"
+  },
+  "libmaxminddb": {
+   "vendor": "maxmind",
+   "product": "libmaxminddb"
+  },
+  "libmicrohttpd": {
+   "vendor": "gnu",
+   "product": "libmicrohttpd"
+  },
+  "libmnl": {
+   "vendor": "netfilter",
+   "product": "libmnl"
+  },
+  "libnetfilter_conntrack": {
+   "vendor": "netfilter",
+   "product": "libnetfilter_conntrack"
+  },
+  "libnetfilter_log": {
+   "vendor": "netfilter",
+   "product": "libnetfilter_log"
+  },
+  "libnetfilter_queue": {
+   "vendor": "netfilter",
+   "product": "libnetfilter_queue"
+  },
+  "libnftnl": {
+   "vendor": "netfilter",
+   "product": "libnftnl"
+  },
+  "libnl": {
+   "vendor": "libnl_project",
+   "product": "libnl"
+  },
+  "libpcap": {
+   "vendor": "tcpdump",
+   "product": "libpcap"
+  },
+  "libpng-apng": {
+   "vendor": "libpng",
+   "product": "libpng"
+  },
+  "libpq": {
+   "vendor": "postgresql",
+   "product": "postgresql"
+  },
+  "libpsl": {
+   "vendor": "rockdaboot",
+   "product": "libpsl"
+  },
+  "librelp": {
+   "vendor": "rsyslog",
+   "product": "librelp"
+  },
+  "libressl": {
+   "vendor": "openbsd",
+   "product": "libressl"
+  },
+  "libseccomp": {
+   "vendor": "libseccomp_project",
+   "product": "libseccomp"
+  },
+  "libsodium": {
+   "vendor": "libsodium_project",
+   "product": "libsodium"
+  },
+  "libssh": {
+   "vendor": "libssh",
+   "product": "libssh"
+  },
+  "libssh2": {
+   "vendor": "libssh2",
+   "product": "libssh2"
+  },
+  "libtasn1": {
+   "vendor": "gnu",
+   "product": "libtasn1"
+  },
+  "libtiff": {
+   "vendor": "libtiff",
+   "product": "libtiff"
+  },
+  "libtpms": {
+   "vendor": "libtpms_project",
+   "product": "libtpms"
+  },
+  "libunistring": {
+   "vendor": "gnu",
+   "product": "libunistring"
+  },
+  "libusb": {
+   "vendor": "libusb",
+   "product": "libusb"
+  },
+  "libuv": {
+   "vendor": "libuv",
+   "product": "libuv"
+  },
+  "libwebp": {
+   "vendor": "webmproject",
+   "product": "libwebp"
+  },
+  "libx11": {
+   "vendor": "x.org",
+   "product": "libx11"
+  },
+  "libxcb": {
+   "vendor": "x.org",
+   "product": "libxcb"
+  },
+  "libxcrypt": {
+   "vendor": "libxcrypt_project",
+   "product": "libxcrypt"
+  },
+  "libxml2": {
+   "vendor": "xmlsoft",
+   "product": "libxml2"
+  },
+  "libyaml": {
+   "vendor": "pyyaml",
+   "product": "libyaml"
+  },
+  "linux-pam": {
+   "vendor": "linux-pam",
+   "product": "linux-pam"
+  },
+  "lldpd": {
+   "vendor": "lldpd_project",
+   "product": "lldpd"
+  },
+  "logrotate": {
+   "vendor": "logrotate_project",
+   "product": "logrotate"
+  },
+  "lua": {
+   "vendor": "lua",
+   "product": "lua"
+  },
+  "lz4": {
+   "vendor": "lz4_project",
+   "product": "lz4"
+  },
+  "modemmanager": {
+   "vendor": "freedesktop",
+   "product": "modemmanager"
+  },
+  "mongoc": {
+   "vendor": "mongodb",
+   "product": "c_driver"
+  },
+  "mpfr": {
+   "vendor": "gnu",
+   "product": "mpfr"
+  },
+  "msmtp": {
+   "vendor": "marlam",
+   "product": "msmtp"
+  },
+  "mtools": {
+   "vendor": "gnu",
+   "product": "mtools"
+  },
+  "nano": {
+   "vendor": "gnu",
+   "product": "nano"
+  },
+  "ncurses": {
+   "vendor": "gnu",
+   "product": "ncurses"
+  },
+  "net-snmp": {
+   "vendor": "net-snmp",
+   "product": "net-snmp"
+  },
+  "nettle": {
+   "vendor": "nettle_project",
+   "product": "nettle"
+  },
+  "nftables": {
+   "vendor": "netfilter",
+   "product": "nftables"
+  },
+  "nghttp2": {
+   "vendor": "nghttp2",
+   "product": "nghttp2"
+  },
+  "nghttp3": {
+   "vendor": "ngtcp2",
+   "product": "nghttp3"
+  },
+  "ngtcp2": {
+   "vendor": "ngtcp2",
+   "product": "ngtcp2"
+  },
+  "nodejs": {
+   "vendor": "nodejs",
+   "product": "node.js"
+  },
+  "nss": {
+   "vendor": "mozilla",
+   "product": "nss"
+  },
+  "oath-toolkit": {
+   "vendor": "nongnu",
+   "product": "oath_toolkit"
+  },
+  "ocserv": {
+   "vendor": "infradead",
+   "product": "ocserv"
+  },
+  "oniguruma": {
+   "vendor": "oniguruma_project",
+   "product": "oniguruma"
+  },
+  "openldap": {
+   "vendor": "openldap",
+   "product": "openldap"
+  },
+  "openssh": {
+   "vendor": "openbsd",
+   "product": "openssh",
+   "note": "Portable suffix kept in the version (10.5p1), as the audit's corrected scan did; grype compares 10.5p1 < 10.6 correctly."
+  },
+  "openssl": {
+   "vendor": "openssl",
+   "product": "openssl"
+  },
+  "p11-kit": {
+   "vendor": "p11-kit_project",
+   "product": "p11-kit"
+  },
+  "parted": {
+   "vendor": "gnu",
+   "product": "parted"
+  },
+  "patch": {
+   "vendor": "gnu",
+   "product": "patch"
+  },
+  "pcre": {
+   "vendor": "pcre",
+   "product": "pcre"
+  },
+  "pcre2": {
+   "vendor": "pcre",
+   "product": "pcre2"
+  },
+  "pcsclite": {
+   "vendor": "pcsc-lite_project",
+   "product": "pcsc-lite"
+  },
+  "perl": {
+   "vendor": "perl",
+   "product": "perl"
+  },
+  "polkit": {
+   "vendor": "polkit_project",
+   "product": "polkit"
+  },
+  "ppp": {
+   "vendor": "point-to-point_protocol_project",
+   "product": "point-to-point_protocol"
+  },
+  "procps": {
+   "vendor": "procps-ng_project",
+   "product": "procps-ng"
+  },
+  "protobuf-c": {
+   "vendor": "protobuf-c_project",
+   "product": "protobuf-c"
+  },
+  "python3": {
+   "vendor": "python",
+   "product": "python"
+  },
+  "python3.13-pyyaml": {
+   "vendor": "pyyaml",
+   "product": "pyyaml"
+  },
+  "rabbitmq-c": {
+   "vendor": "rabbitmq",
+   "product": "rabbitmq-c"
+  },
+  "rdkafka": {
+   "vendor": "edenhill",
+   "product": "librdkafka"
+  },
+  "readline": {
+   "vendor": "gnu",
+   "product": "readline"
+  },
+  "rsyslog": {
+   "vendor": "rsyslog",
+   "product": "rsyslog"
+  },
+  "shadow": {
+   "vendor": "shadow-maint",
+   "product": "shadow"
+  },
+  "snappy": {
+   "vendor": "google",
+   "product": "snappy"
+  },
+  "sqlite": {
+   "vendor": "sqlite",
+   "product": "sqlite"
+  },
+  "strongswan": {
+   "vendor": "strongswan",
+   "product": "strongswan"
+  },
+  "sudo": {
+   "vendor": "sudo_project",
+   "product": "sudo",
+   "note": "NVD writes 1.9.17:p2; the combined 1.9.17p2 version is what grype's fuzzy comparison orders correctly."
+  },
+  "suricata": {
+   "vendor": "oisf",
+   "product": "suricata"
+  },
+  "systemd": {
+   "vendor": "systemd_project",
+   "product": "systemd"
+  },
+  "tcpdump": {
+   "vendor": "tcpdump",
+   "product": "tcpdump"
+  },
+  "tpm2-tss": {
+   "vendor": "tpm2_software_stack_project",
+   "product": "tpm2_software_stack"
+  },
+  "unbound": {
+   "vendor": "nlnetlabs",
+   "product": "unbound"
+  },
+  "util-linux": {
+   "vendor": "kernel",
+   "product": "util-linux"
+  },
+  "which": {
+   "vendor": "gnu",
+   "product": "which"
+  },
+  "wireguard-tools": {
+   "vendor": "wireguard",
+   "product": "wireguard-tools"
+  },
+  "wpa_supplicant": {
+   "vendor": "w1.fi",
+   "product": "wpa_supplicant"
+  },
+  "xz": {
+   "vendor": "tukaani",
+   "product": "xz"
+  },
+  "zeromq": {
+   "vendor": "zeromq",
+   "product": "libzmq"
+  },
+  "zlib": {
+   "vendor": "zlib",
+   "product": "zlib"
+  },
+  "zstd": {
+   "vendor": "facebook",
+   "product": "zstandard"
+  }
+ },
+ "generated": [
+  "dbus-1",
+  "polkit-1.pam"
+ ],
+ "generated-note": "Store names NixOS generates for configuration (the D-Bus config directory, polkit's PAM file) that parse as <package>-<version> but are not that package. Their CPEs are cleared and vulnix entries for them ignored. Additive key: loaders that ignore it keep reporting them."
+}

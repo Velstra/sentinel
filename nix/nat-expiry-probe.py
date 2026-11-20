@@ -51,7 +51,7 @@ def values(case, now):
 
 
 def firewall_shadow(support, seed):
-    key_format, value_format = struct.Struct("<I16s16sHHBB2x"), struct.Struct("<QQII")
+    key_format, value_format = struct.Struct("<I16s16sHHBB2x"), struct.Struct("<QQII16x")
     info = support.selected("FW_FLOWS")
     support.need(info.get("type") == "lru_hash" and info.get("bytes_key") == key_format.size
                  and info.get("bytes_value") == value_format.size and info.get("max_entries") == 65536,

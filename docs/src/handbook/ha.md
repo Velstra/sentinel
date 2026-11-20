@@ -8,7 +8,7 @@ HA qualification or a rolling-upgrade guarantee.
 
 | Mode | Authority | Important limitation |
 | --- | --- | --- |
-| `witness` | An independent witness grants short forwarding leases to one member. | Loss of witness authority can stop forwarding even when both appliances are healthy. An authenticated witness preflight and outage-continuity qualification remain open. |
+| `witness` | An independent witness grants short forwarding leases to one member. | The witness is a single point of failure for forwarding: losing it stops forwarding on both members within one lease, even when both appliances are healthy (see [Witness loss](#witness-loss-is-a-single-point-of-failure)). |
 | `two-node` | Two appliances exchange authenticated heartbeats without a witness. | A total partition can promote both members. Independent heartbeat paths reduce, but do not remove, that risk. |
 | Legacy VRRP and sync | VRRP election and separately configured synchronization. | Not equivalent to fenced pairing; do not infer split-brain protection from a shared VIP. |
 
@@ -34,7 +34,10 @@ release acceptance and open HA failure cases remain unresolved.
 5. On **each member**, explicitly bind `services web listen-address` to that
    member's static control address (`10.3.0.1` / `10.3.0.2` here), and keep TLS
    enabled. Set the secondary's `system config-sync secret` to a private, random
-   enrollment credential of 32–1024 non-control bytes. The credential starts its
+   enrollment credential: generate one with `sentinel ha secret generate` (32
+   random bytes as 64 hex digits). A short or patterned secret is refused at
+   commit, because the enrollment proof lets anybody who can reach the
+   management port test guesses against it offline. The credential starts its
    HTTPS machine API even with the web console disabled, but never widens its
    listener: an unset address remains `127.0.0.1`, including when web and sync
    are both enabled. Save both configurations and verify the actual endpoints
@@ -85,6 +88,12 @@ Then pair on the primary:
 sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440
 ```
 
+Members that compute the shared policy differently — an image whose compiler
+numbers zones or encodes rules differently — never agree on the readiness
+digest. During a rolling upgrade across such a change the standby stays not
+ready and no state crosses; the switch-over to the upgraded member is an outage
+with connection loss, not a warm failover.
+
 A reachable TCP port does not prove that the witness will authorize the correct
 cluster/key/member pair. Verify authority, standby readiness and actual traffic
 before considering the lab operational. Do not deploy witness or member upgrades
@@ -122,6 +131,131 @@ lease and an 80 ms exchange budget; the lease must cover
 changing them. A larger lease also lengthens the time an old owner can retain
 authority. Do not tune away a failure by making the guard less conservative.
 
+## What a member trusts its peer with
+
+The shared secret is the **peer credential**, not an administrator login and
+not the member's machine token. A peer holding it can:
+
+- read what a read-only account reads (the stack view, enrollment);
+- push the shared configuration (`PUT /api/v1/config-sync`) and complete a
+  pairing (`POST /api/v1/ha/pair`).
+
+It cannot replace a member's whole configuration through the ordinary API,
+post `configure` lines, stage updates or confirm or revert a commit-confirm
+window, and it cannot post a different pairing to a member that is already
+paired (re-pairing a paired member needs that member's machine token, or
+unpairing it first; repeating the applied pairing works). Neither a push nor a
+pairing changes who manages the receiver: its
+accounts (with their SSH keys, password hashes and TOTP secrets), groups, AAA
+servers, update channels and keys, SSH server and serial console stay its own,
+so configure them on **each** member.
+
+What the peer *can* change is the shared policy — firewall, NAT, routing, VPN,
+services — and, through pairing, the HA identity. That is the point of
+synchronization, and it means the secret is the authority to change the
+traffic policy of both members: anybody who obtains it, or controls a member,
+controls what both members forward. Keep the secret to the two members,
+rotate it if either is suspect (set a new generated value on both; the outbox
+delivers the rotation with the old credential), and treat a compromised
+member as a compromised pair. Enrollment hands the peer the receiver's
+configuration without its accounts, AAA servers and update channels; the
+shared policy secrets in it (VPN keys, PSKs) are the pair's anyway.
+
+Each source address may request ten enrollment proofs per ten minutes (a
+flood of fresh addresses can delay a pairing; retry), thirty invalid bearers
+make a source's further invalid ones `429` for five minutes, and every
+non-read use of the peer credential or the machine token is logged with its
+source address (`journalctl -u sentinel-api`).
+
+### Upgrading a pair with a weak secret
+
+An appliance upgraded with a secret that is now considered weak still boots,
+keeps its pairing and serves its API, prints a warning at every apply, hands
+out no enrollment proof, and refuses every configuration change until the
+secret is rotated. Descriptive strings such as `ha-test-credential-…` count
+as weak; use `sentinel ha secret generate`. Rotate it on
+both members, one commit each. The first boot of the new image also replaces
+`/var/lib/sentinel/api-token` when an earlier release had written the secret
+(current or since removed) into it; read the new machine token from that
+file. A token you placed there yourself is kept.
+
+### Mixed versions during an upgrade
+
+Pairing and config-sync keep working between a member that has been updated
+and one that has not: the proof, the bearer and the base revisions a push
+names are understood by both. While the members run different versions, do
+not change accounts, AAA, update, SSH, console, BGP update-source or PPPoE
+local-address settings on either member: the updated member keeps its own, the
+older one still sends and adopts them, and the two then disagree on their
+shared revision, so the next push is held as a conflict (resolve it as any
+conflict). Pushes from the updated member still replace these settings on
+the older one, as before the upgrade. Finish the upgrade promptly.
+## Standby readiness
+
+`sentinel show ha` on the standby must read plain `HA Backup`. A reason in
+parentheses means the witness would refuse it authority right now, and a
+failure of the active member would not fail over. The readiness digest covers
+the shared policy only: a rule `to firewall` is written symbolically (each
+member's agent expands it to that member's own addresses, DHCP leases and the
+VRRP addresses it holds) and a captive-portal gate names each member's own
+address, and those addresses are deliberately left out of it, so two members
+with the same shared configuration agree. A standby that stays
+"policy differs from the owner's" after configuration sync has delivered means
+the shared policy really differs; inspect both members' configurations. A
+state-sync refusal for that reason is logged as a warning (once a minute).
+
+| Reason | Meaning |
+| --- | --- |
+| `policy differs from the owner's; awaiting configuration sync` | A commit has not reached this member, or the shared policy differs. |
+| `fresh agent has no state snapshot yet` | The agent just started. It imports the owner's state within a second. |
+| `no complete state snapshot from the owner` / `state snapshot is stale` | State sync from the owner is not arriving. |
+| `stale state discarded; awaiting a state snapshot` | State stayed unusable for 5 s and was dropped, see below. |
+
+A standby whose replicated state stays unusable for 5 s (stale, or imported
+under a policy it no longer holds) discards it and votes as an empty member.
+This removes a deadlock: if the active member's agent crashed meanwhile, it
+restarts empty too, and two empty members let the witness open a new epoch.
+Established connections do not survive that path; new ones do.
+
+## Failure behaviour (witness mode)
+
+These cases are exercised by `checks.ha-witness-failover`:
+
+- **Data-plane agent crash on the active member** (`velstra` killed, OOM): the
+  kernel fence closes the old member at once; the ready standby takes over and
+  established flows continue (the check bounds the gap at 3 s; about 1 s was
+  measured in the VM check). The crashed
+  member restarts empty, imports the new owner's state and rejoins.
+- **Routing daemon crash** (`wren` killed): the lease lapses and the standby
+  takes over the same way.
+- **VM pause, suspend or live migration**: a resumed member catches up from the
+  current owner by itself and is eligible again; the next failure still fails
+  over. A paused VM's clock stops with it, so for up to one lease (250 ms by
+  default) after it resumes, its data plane can still consider its old lease
+  valid while the witness has already granted the peer. Drain or demote an
+  active member before migrating or suspending it.
+- **Agent crash while the witness is away**: both members end up unable to use
+  their state; once the witness returns, the pair opens a new epoch on its own
+  (see Standby readiness). Expect a short outage and new connections.
+
+### Witness loss is a single point of failure
+
+Losing the witness stops forwarding on both members within one lease. This is
+the price of split-brain protection, not a defect that a setting can tune away:
+the active member cannot tell "the witness is down" from "I am cut off from the
+witness and the peer is not". In the second case the witness grants the peer
+when the lease runs out, so a member that kept forwarding on its own would
+forward alongside its successor. When the witness returns, the previous owner
+is granted again from its retained state and forwarding resumes.
+
+Continuing through a witness outage would be safe only with the peer as a
+second vote: the active member keeps forwarding only on the peer's fresh,
+authenticated promise not to seek authority itself, and a returning witness
+waits out every such promise. Sentinel does not implement that protocol. Until
+it does, run the witness on independent power and network, monitor it, and
+prefer `two-node` mode only if availability through a witness outage matters
+more than exclusive ownership through a partition.
+
 ## Configuration writes on either member
 
 Master/Backup describes forwarding ownership, not configuration permissions.
@@ -130,8 +264,11 @@ commit made on Backup. Use one management session at a time for shared policy;
 do not treat the standby as a private configuration sandbox. Conflicting
 concurrent revisions are rejected and remain pending for operator resolution.
 
-The CLI currently does not warn specifically about a Backup-originated commit.
-Check the member role and pending synchronization state before changing policy.
+A CLI `commit` on a member that is not the forwarding owner (HA Backup or
+Fenced) ends with a warning that names this member, the current owner and the
+term; the commit still applies here and replicates. If the role cannot be read
+before the commit, the warning says so instead. Check the member role and
+pending synchronization state before changing policy.
 
 ## Regression entry points
 
@@ -139,6 +276,8 @@ Check the member role and pending synchronization state before changing policy.
 nix build .#checks.x86_64-linux.ha-pair -L
 nix build .#checks.x86_64-linux.ha-two-node -L
 nix build .#checks.x86_64-linux.ha-two-node-flow -L
+nix build .#checks.x86_64-linux.ha-witness-failover -L
+nix build .#checks.x86_64-linux.ha-napt-mixed-version -L
 nix build .#checks.x86_64-linux.configsync -L
 ```
 

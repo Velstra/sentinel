@@ -35,7 +35,7 @@ pub struct Apply {
     /// The systemd unit running the routing daemon (reloaded after writing).
     pub wren_unit: String,
     /// Whether to actually touch the live system. Off-box / in tests this is
-    /// false: `commit` validates + saves only.
+    /// false: `commit` validates only; `save` persists without live apply.
     pub enabled: bool,
 }
 
@@ -73,13 +73,26 @@ impl Apply {
 /// one inside quotes is text. The reason for the rule: a password may contain
 /// `#` and must survive, while a pasted block of documented commands — or a
 /// saved `.cli` file with a header — must not fail on its own explanation.
-pub(crate) fn split_line(line: &str) -> Vec<String> {
+///
+/// A control character can never be part of a word (audit 8b6181, CTRL-08):
+/// systemd reads a lone CR as a line break, so a CR kept inside a quoted value
+/// became a second directive in whichever unit the value reached. Outside a
+/// word, whitespace control characters (a tab, the CR of a CRLF file) still
+/// only separate words; anything else is refused with the line, naming the
+/// character and never the value, which may be a password.
+pub(crate) fn split_line(line: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut have_word = false;
     let mut quoted = false;
     let mut escape = false;
     for c in line.chars() {
+        if crate::textcheck::is_forbidden(c) && (quoted || escape || !c.is_whitespace()) {
+            anyhow::bail!(
+                "the line contains the control character U+{:04X}, which no value may hold",
+                c as u32
+            );
+        }
         if escape {
             word.push(c);
             escape = false;
@@ -103,7 +116,7 @@ pub(crate) fn split_line(line: &str) -> Vec<String> {
                     have_word = false;
                 }
             }
-            '#' if !quoted && !have_word => return out, // a comment starts here
+            '#' if !quoted && !have_word => return Ok(out), // a comment starts here
             c => {
                 word.push(c);
                 have_word = true;
@@ -113,11 +126,18 @@ pub(crate) fn split_line(line: &str) -> Vec<String> {
     if have_word {
         out.push(word);
     }
-    out
+    Ok(out)
 }
 
 pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line: &str) -> bool {
-    let owned = split_line(line);
+    let owned = match split_line(line) {
+        Ok(words) => words,
+        Err(e) => {
+            eprintln!("{} {e}", ui::red("error:"));
+            note_refusal();
+            return false;
+        }
+    };
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     // `service` is what VyOS calls this subtree and what people type; the config
@@ -158,12 +178,12 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             let view: Vec<&str> = full.iter().map(String::as_str).collect();
             session.delete(&view)
         }
-        "show" => {
+        "show" => (|| -> Result<()> {
             // What you are looking at is *your* candidate. If somebody else has
             // committed since you started, say so here — this is where an
             // operator looks to find out what the box is doing, and letting them
             // read a stale answer is how two people undo each other's work.
-            if session.committed_elsewhere().is_some() {
+            if session.committed_elsewhere()?.is_some() {
                 eprintln!(
                     "{}",
                     ui::yellow(
@@ -176,10 +196,10 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             let full = with_ctx(rest);
             match full.first() {
                 None => print!("{}", session.show()),
-                Some(section) => print!("{}", session.show_only(section)),
+                Some(section) => print!("{}", session.show_checked(section)?),
             }
             Ok(())
-        }
+        })(),
         "edit" => {
             if rest.is_empty() {
                 Err(anyhow!("edit needs a path, e.g. `edit firewall rule web`"))
@@ -215,7 +235,8 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             Ok(exe) => {
                 let status = std::process::Command::new(exe).args(rest).status();
                 match status {
-                    Ok(_) => Ok(()),
+                    Ok(status) if status.success() => Ok(()),
+                    Ok(status) => Err(anyhow!("operational command failed: {status}")),
                     Err(e) => Err(anyhow!("running operational command: {e}")),
                 }
             }
@@ -236,7 +257,18 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                 session.ensure_current()?;
             }
             let to = rest.first().map(Path::new);
-            session.save(to).map(|p| {
+            // On the appliance `save` writes what is running (CTRL-14); off-box
+            // there is no running system and the file being edited is the
+            // whole point, so the candidate is written.
+            let saved = if act.enabled {
+                session.save_running(to)
+            } else {
+                session.save_offline(to)
+            };
+            saved.map(|p| {
+                if act.enabled && to.is_none() {
+                    crate::boot_fallback::clear_status();
+                }
                 eprintln!(
                     "{} saved {} (persists across reboot)",
                     ui::green("✔"),
@@ -493,15 +525,65 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // moves: the saved file is what the next boot loads, and the running
     // snapshot is what an *earlier* commit applied — which this commit is about
     // to overwrite with its own.
-    let saved_before = crate::config::Appliance::load(session.config_path()).ok();
-    let running_before = Session::running_snapshot()
-        .and_then(|toml| crate::config::Appliance::from_toml(&toml).ok());
-    // Whether the console note further down applies: a `commit` applies live but
-    // does not save, so the console (which reads the saved file) lags only when
-    // this commit actually changed something. `session.commit()` clears the dirty
-    // flag, so it must be read here, before the commit — reading it afterwards
-    // (as the note used to) always saw `false`, so the note never printed.
-    let had_uncommitted_edits = session.dirty();
+    let baselines = (|| -> Result<_> {
+        if act.enabled {
+            // Do not turn a root-only recovery baseline into None. The session
+            // reader and its rollback reader need the same privilege boundary.
+            Ok((
+                Session::read_saved_at(session.config_path())?,
+                Session::read_running_at(Path::new(Session::RUNNING))?
+                    .map(|text| crate::config::Appliance::from_toml(&text))
+                    .transpose()?,
+            ))
+        } else {
+            Ok((
+                crate::config::Appliance::load(session.config_path()).ok(),
+                Session::running_snapshot()
+                    .and_then(|text| crate::config::Appliance::from_toml(&text).ok()),
+            ))
+        }
+    })();
+    let (saved_before, running_before) = match baselines {
+        Ok(baselines) => baselines,
+        Err(error) => {
+            eprintln!("error: reading recovery configuration: {error:#}");
+            note_refusal();
+            return false;
+        }
+    };
+    // From here to the recorded RUNNING the commit must finish or roll back,
+    // whatever happens to the terminal (CTRL-15).
+    // Off-box nothing live is touched and there is nothing to protect.
+    let guard = act.enabled.then(crate::commit_guard::Guard::enter);
+    let committed = commit_admitted(session, act, saved_before, running_before);
+    let deferred = guard
+        .as_ref()
+        .and_then(crate::commit_guard::Guard::deferred);
+    drop(guard);
+    if let Some(signal) = deferred {
+        eprintln!(
+            "{}",
+            ui::yellow(&format!(
+                "note: signal {signal} arrived during the commit and was deferred until it finished"
+            ))
+        );
+    }
+    committed
+}
+
+/// The part of `commit` after admission: validate, activate, record.
+fn commit_admitted(
+    session: &mut Session,
+    act: &Apply,
+    saved_before: Option<crate::config::Appliance>,
+    running_before: Option<crate::config::Appliance>,
+) -> bool {
+    // T4.8-bkcommit: which HA role this commit is made under, read before it
+    // applies (the apply itself may restart the agent).
+    let ha_role = act
+        .enabled
+        .then(|| crate::ha::role_before_commit(running_before.as_ref().or(saved_before.as_ref())))
+        .flatten();
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -539,19 +621,6 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // persist — `save` writes the boot config so a change survives reboot.
     let old_host = system::current_hostname();
     eprintln!("commit: {summary}; applying to the running system…");
-    // The console and the REST API read the *saved* file, so a commit alone
-    // never reaches them: an account granted management access with `commit`
-    // still cannot sign in, and the console keeps showing the configuration
-    // before the change. Say so rather than let it be discovered.
-    if appliance.services.web.enable && had_uncommitted_edits {
-        eprintln!(
-            "{}",
-            ui::yellow(
-                "note: the web console reads the saved configuration, so it still shows \
-                 the previous one — `save` to make them match"
-            )
-        );
-    }
     // The reconcile target for a failed broad apply: the config the box was
     // running before this commit (the live snapshot, or the saved file if there
     // is no snapshot yet). `net::apply` is level-triggered, so re-applying it
@@ -569,6 +638,15 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             .flatten(),
         );
         eprintln!("{} applying config: {message}", ui::red("error:"));
+        // The refusal was only ever on this terminal (PERF-06); the next person
+        // to look at the box must be able to find it.
+        crate::journal::note(
+            crate::journal::Severity::Error,
+            "sentinel-commit",
+            &format!("commit refused while applying: {message}"),
+        );
+        // Admitted but not applied: the candidate is not what runs.
+        session.mark_uncommitted();
         note_refusal();
         return false;
     }
@@ -602,6 +680,14 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
         ui::green("✔"),
         ui::dim("(not persisted — `save` to keep across reboot)")
     );
+    if let Some(status) = ha_role
+        && let Some(w) = crate::ha::commit_role_warning(
+            appliance.system.ha.as_ref().is_some_and(|h| h.enabled),
+            status.as_ref(),
+        )
+    {
+        eprintln!("{} {w}", ui::yellow("warning:"));
+    }
     // Last, and only when this commit really changed the way in: the line above
     // says "not persisted" about every commit, which is exactly why it stops
     // being read. `commit-confirm` deliberately does not do this — its whole
@@ -684,6 +770,8 @@ fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
         if act.enabled {
             session.ensure_current()?;
         }
+        // Like commit: finish or roll back whatever happens to the terminal.
+        let _guard = act.enabled.then(crate::commit_guard::Guard::enter);
         crate::archive::rollback(session, act, n)
     })();
     match restored {
@@ -715,17 +803,35 @@ impl Rollback {
         self.steps.push((what, Box::new(undo)));
     }
 
+    /// The apply completed: nothing is left to undo.
+    fn disarm(&mut self) {
+        self.steps.clear();
+    }
+
     /// Run every recorded undo in reverse order. Returns the names of any that
     /// themselves failed, so the operator learns exactly what is left
     /// inconsistent (rather than a bare "commit failed").
-    fn unwind(self) -> Vec<String> {
+    fn unwind(mut self) -> Vec<String> {
         let mut failures = Vec::new();
-        for (what, undo) in self.steps.into_iter().rev() {
+        for (what, undo) in std::mem::take(&mut self.steps).into_iter().rev() {
             if let Err(e) = undo() {
                 failures.push(format!("{what} ({e})"));
             }
         }
         failures
+    }
+}
+
+/// A rollback stack dropped while still armed — the apply was abandoned by a
+/// panic between two stages — undoes what it recorded rather than leaving the
+/// earlier stages live over a later one that never ran (CTRL-15).
+impl Drop for Rollback {
+    fn drop(&mut self) {
+        for (what, undo) in std::mem::take(&mut self.steps).into_iter().rev() {
+            if let Err(error) = undo() {
+                eprintln!("warning: undoing {what} after an abandoned apply: {error:#}");
+            }
+        }
     }
 }
 
@@ -826,6 +932,12 @@ impl std::error::Error for ServiceApplyFailure {
 /// Private dependency injection: production always uses the fixed system
 /// adapter; tests supply replies without replacing binaries or environment.
 trait ServiceControl: Clone + 'static {
+    fn launch_changed(&self) -> bool {
+        false
+    }
+    fn restore_launch(&self) -> Result<()> {
+        Ok(())
+    }
     fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()>;
     fn restore(&self, unit: &str, installed: &[u8], previous: &[u8]) -> Result<()> {
         self.reload(unit, Some(installed), previous)
@@ -838,6 +950,53 @@ trait ServiceControl: Clone + 'static {
 
 #[derive(Clone, Copy)]
 struct SystemServiceControl;
+
+#[derive(Clone)]
+struct DataplaneServiceControl {
+    environment: Option<Vec<u8>>,
+    previous_environment: Option<Vec<u8>>,
+}
+
+impl ServiceControl for DataplaneServiceControl {
+    fn launch_changed(&self) -> bool {
+        self.environment != self.previous_environment
+    }
+
+    fn restore_launch(&self) -> Result<()> {
+        restore_file(
+            Path::new(crate::net::AGENT_ENV),
+            self.previous_environment.as_deref(),
+        )
+    }
+
+    fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+        restore_file(
+            Path::new(crate::net::AGENT_ENV),
+            self.environment.as_deref(),
+        )?;
+        if self.launch_changed() && system::compiled_dataplane_enabled(next)? {
+            system::service_restart(unit)
+        } else {
+            SystemServiceControl.reload(unit, previous, next)
+        }
+    }
+
+    fn restore(&self, unit: &str, installed: &[u8], previous: &[u8]) -> Result<()> {
+        if self.launch_changed() && system::compiled_dataplane_enabled(previous)? {
+            system::service_restart(unit)
+        } else {
+            SystemServiceControl.restore(unit, installed, previous)
+        }
+    }
+
+    fn ready(&self, unit: &str) -> Result<()> {
+        SystemServiceControl.ready(unit)
+    }
+
+    fn wait_ready(&self, unit: &str) -> Result<()> {
+        SystemServiceControl.wait_ready(unit)
+    }
+}
 
 impl ServiceControl for SystemServiceControl {
     fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
@@ -972,6 +1131,13 @@ fn service_ready(unit: &str) -> Result<()> {
     }
 }
 
+/// The data plane's readiness, judged exactly as a commit judges it: the unit
+/// is active and the agent answers `Ready` (or, with no interface selected,
+/// the unit is deliberately inactive). Used by the boot verifier.
+pub(crate) fn dataplane_ready() -> Result<()> {
+    service_ready(DEFAULT_UNIT)
+}
+
 /// Fixed read-only privilege boundary, with no caller-supplied socket or verb.
 /// Only a small status token crosses stdout, never daemon/config diagnostics.
 pub(crate) fn service_readiness(unit: &str) -> Result<()> {
@@ -990,6 +1156,24 @@ pub(crate) fn service_readiness(unit: &str) -> Result<()> {
 
 fn service_ready_root(service: ReadinessService) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    if matches!(service, ReadinessService::Dataplane) {
+        let compiled = read_previous_file(Path::new(DEFAULT_VELSTRA_OUT))?
+            .context("compiled dataplane configuration is missing")?;
+        if !system::compiled_dataplane_enabled(&compiled)? {
+            // Factory intent deliberately selects no NIC. Success means that
+            // the service is actually inactive, not failed/starting or still
+            // running an obsolete attachment. Never waive readiness for a
+            // configured interface, even if it is missing or has no carrier.
+            let mut command = std::process::Command::new(system::bin("systemctl"));
+            command.args(["show", "--property=ActiveState", "--value", service.unit()]);
+            let state = readiness_process(&mut command, deadline)?;
+            anyhow::ensure!(
+                inactive_dataplane_ready(&state),
+                "unconfigured dataplane service is not inactive"
+            );
+            return Ok(());
+        }
+    }
     let mut command = std::process::Command::new(system::bin("systemctl"));
     command.args(["is-active", "--quiet", service.unit()]);
     readiness_process(&mut command, deadline).context("checking service active state")?;
@@ -1010,6 +1194,10 @@ fn service_ready_root(service: ReadinessService) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn inactive_dataplane_ready(state: &[u8]) -> bool {
+    state == b"inactive\n"
 }
 
 /// Private runner used only for the two fixed readiness commands above. The
@@ -1254,6 +1442,9 @@ fn restore_service<C: ServiceControl>(
     previous: Option<&[u8]>,
     control: &C,
 ) -> Result<()> {
+    control
+        .restore_launch()
+        .context("restoring previous service launch settings")?;
     restore_file(out, previous).context("restoring previous compiled file")?;
     let previous = previous.context(
         "candidate file removed, but no previous compiled configuration exists; daemon state is unknown",
@@ -1292,7 +1483,7 @@ fn apply_service_with<C: ServiceControl>(
 ) -> Result<Box<dyn FnOnce() -> Result<()>>> {
     ReadinessService::from_unit(unit)?;
     // This is a readiness snapshot, not a promise of ongoing cluster authority.
-    if prev == Some(new) && control.ready(unit).is_ok() {
+    if prev == Some(new) && !control.launch_changed() && control.ready(unit).is_ok() {
         let out = out.to_path_buf();
         let unit = unit.to_owned();
         let previous = new.to_vec();
@@ -1416,7 +1607,7 @@ fn diagnostic_chain(error: &anyhow::Error, configurations: &[&crate::config::App
 
 /// Diagnostics are not a credential export. Reuse the configuration secret
 /// inventory for both new and old credentials, including quoted spellings.
-fn apply_error_message<'a>(
+pub(crate) fn apply_error_message<'a>(
     error: &anyhow::Error,
     configurations: impl IntoIterator<Item = &'a crate::config::Appliance>,
 ) -> String {
@@ -1475,7 +1666,7 @@ fn scrub_diagnostic_secrets(text: &str, secrets: &[String]) -> String {
     scrubbed
 }
 
-/// Report a failure of the final, broad `net::apply` stage honestly.
+/// Report a failure after broad `net::apply` began, without a last-good target.
 ///
 /// That stage reconciles roughly thirty sub-systems — DNS, NTP, PKI, sshd, the
 /// login passwords, IPsec, the VPNs, the reverse proxy, IDS and the box services
@@ -1600,11 +1791,12 @@ fn mixed_or_rolled_message(
 
 /// Apply a validated appliance config to the running system: compile
 /// **everything** first (so a bad config is rejected before any live change),
-/// then apply firewall, routing and hostname in order — each of those three
-/// stages recording how to undo itself — and finally the broad `net::apply`.
+/// then apply firewall and hostname, reconcile network addresses/co-services,
+/// and finally routing. Firewall protection precedes link activation; new
+/// routes may depend on addresses from this same transaction.
 ///
-/// The atomic-rollback guarantee covers the first three stages directly (their
-/// undo stack), and — when `rollback_to` names the config the box was running
+/// The rollback stack covers firewall launch/configuration, hostname and
+/// routing directly. When `rollback_to` names the config the box was running
 /// before this commit — the broad `net::apply` too, by reconciling it back to
 /// that last-good config on failure (a level-triggered rollback, see
 /// [`unwind_to_last_good`]): most partial failures then become a TRUE rollback
@@ -1657,9 +1849,20 @@ fn apply_live_as(
     let appliance = &crate::identity::with_resolved(&crate::feed::with_fetched(
         &crate::domain::with_resolved(appliance),
     ));
+    // Validation saw these groups empty; a fetched feed can carry thousands of
+    // prefixes, so the data-plane budget is checked again on what is applied.
+    compile::check_capacity(appliance).context("feed, domain and user groups as resolved")?;
     let rendered = compile::compile(appliance)
         .to_toml()
         .context("compiling firewall config")?;
+    // Ask the agent's own parser before anything live moves (DP-01 class). A
+    // refusal here costs nothing; a refusal by the running agent closes the
+    // packet gate for the failed reload and again for its rollback. A restore
+    // puts back a configuration the agent was running, and must not be
+    // blocked by a check of it.
+    if act.enabled && verify == crate::net::Verify::Forward {
+        crate::agent_contract::check_rendered(&rendered, &[appliance])?;
+    }
     let wren_rendered = crate::wren::compile_wren(appliance)
         .to_toml()
         .context("compiling routing config")?;
@@ -1667,6 +1870,11 @@ fn apply_live_as(
     // them (None ⇒ there was no file, so rollback removes ours).
     let velstra_prev = read_previous_file(&act.velstra_out)?;
     let wren_prev = read_previous_file(&act.wren_out)?;
+    let previous_environment = read_previous_file(Path::new(crate::net::AGENT_ENV))?;
+    let dataplane_control = DataplaneServiceControl {
+        environment: crate::net::agent_environment(appliance).map(String::into_bytes),
+        previous_environment,
+    };
     let old_host = system::current_hostname();
 
     // ---- Phase 2: apply, each stage undoable on a later failure ----
@@ -1696,12 +1904,17 @@ fn apply_live_as(
             ));
         }
     }
+    // If routing later fails, its final recovery must follow the firewall undo:
+    // restoring the old hooks can itself raise a previously held-down uplink.
+    // Keep the HA guard earlier in the stack so it is still restored last.
+    let routing_recovery_slot = rb.steps.len();
     // Firewall install/reload may now have an earlier guard to unwind.
-    let undo = match apply_service(
+    let undo = match apply_service_with(
         &act.velstra_out,
         &act.unit,
         rendered.as_bytes(),
         velstra_prev.as_deref(),
+        dataplane_control,
     ) {
         Ok(undo) => undo,
         Err(error) => {
@@ -1714,24 +1927,6 @@ fn apply_live_as(
         }
     };
     rb.push("firewall", undo);
-
-    // Routing: install + reload the Wren daemon.
-    match apply_service(
-        &act.wren_out,
-        &act.wren_unit,
-        wren_rendered.as_bytes(),
-        wren_prev.as_deref(),
-    ) {
-        Ok(undo) => rb.push("routing", undo),
-        Err(e) => {
-            return Err(unwind_err(
-                rb,
-                e,
-                "routing",
-                [Some(appliance), rollback_to].into_iter().flatten(),
-            ));
-        }
-    }
 
     // Hostname: set it live.
     if let Err(e) = system::set_hostname(&appliance.system.hostname) {
@@ -1758,6 +1953,43 @@ fn apply_live_as(
             None => unwind_err_mixed(rb, e),
         });
     }
+    // Synchronous FIB convergence needs the newly reconciled interface addresses.
+    // On failure the broad network changes must also be undone, not just the
+    // compiled files. Keep the same last-good recovery path as net::apply.
+    if let Err(error) = apply_service(
+        &act.wren_out,
+        &act.wren_unit,
+        wren_rendered.as_bytes(),
+        wren_prev.as_deref(),
+    ) {
+        // The immediate service-local recovery may have encountered the new
+        // network (the old gateway can be unreachable there). Retry restoring
+        // Wren AFTER last-good network reconciliation AND firewall recovery,
+        // which restores the old uplink's hooks and can bring that link up.
+        let out = act.wren_out.clone();
+        let unit = act.wren_unit.clone();
+        let installed = wren_rendered.into_bytes();
+        rb.steps.insert(
+            routing_recovery_slot,
+            (
+                "routing",
+                Box::new(move || {
+                    restore_service(
+                        &out,
+                        &unit,
+                        &installed,
+                        wren_prev.as_deref(),
+                        &SystemServiceControl,
+                    )
+                }),
+            ),
+        );
+        return Err(match rollback_to {
+            Some(prev) => unwind_to_last_good(rb, error, prev),
+            None => unwind_err_mixed(rb, error),
+        });
+    }
+    rb.disarm();
     Ok(())
 }
 
@@ -1904,8 +2136,10 @@ const CMD_HELP: &[CmdHelp] = &[
         name: "save",
         usage: "save [path]",
         summary: "persist the configuration across reboot",
-        detail: "Writes the committed config to the boot location (or to <path> for a \
-                 backup copy).",
+        detail: "Writes the committed (running) config to the boot location (or to <path> \
+                 for a backup copy). Refused while the candidate has uncommitted edits: \
+                 `commit` them first, or `discard` them. Off-box (--no-apply) it writes \
+                 the file being edited.",
         examples: &[],
     },
     CmdHelp {
@@ -2627,18 +2861,12 @@ const SERVICES_NODES: &[Cand] = &[
         "syslog",
         "ship the journal to remote collectors (rsyslog, RFC 5424)",
     ),
-    (
-        "alerts",
-        "notify on a failed unit: webhook and/or mail (roadmap C23)",
-    ),
+    ("alerts", "notify on a failed unit: webhook and/or mail"),
     (
         "flow-export",
         "ship flow records to an IPFIX collector (RFC 7011)",
     ),
-    (
-        "ids",
-        "intrusion detection: watch links with suricata (roadmap C11)",
-    ),
+    ("ids", "intrusion detection: watch links with suricata"),
 ];
 // `services portal <Tab>`: which zone is gated, and what a visitor has to do.
 const PORTAL_FIELDS: &[Cand] = &[
@@ -3696,7 +3924,10 @@ const GLOBAL_FIELDS: &[Cand] = &[
         "stateful",
         "track flows so return traffic is allowed (true|false)",
     ),
-    ("block-icmp", "drop inbound ICMP by default (true|false)"),
+    (
+        "block-icmp",
+        "drop new inbound ICMP by default; replies, errors and ND still pass (true|false)",
+    ),
     (
         "default-action",
         "default ingress action (accept|drop|reject)",
@@ -3723,7 +3954,10 @@ const ZONE_FIELDS: &[Cand] = &[
     ),
     ("description", "free-text label for this zone"),
     ("stateful", "stateful inspection for this zone (true|false)"),
-    ("block-icmp", "drop inbound ICMP on this zone (true|false)"),
+    (
+        "block-icmp",
+        "drop new inbound ICMP on this zone; replies, errors and ND still pass (true|false)",
+    ),
     (
         "default-action",
         "ingress action for this zone (accept|drop|reject)",
@@ -4524,6 +4758,7 @@ const RULE_DIRECTIONS: &[Cand] = &[
         "out",
         "traffic leaving them, including what this box originates (IPv4 only)",
     ),
+    ("both", "arriving and leaving traffic alike"),
 ];
 /// `firewall rule <n> icmp-type <Tab>` — the names worth offering, both families.
 /// A number is accepted too; the registry is longer than any list worth shipping.
@@ -6232,6 +6467,8 @@ mod tests {
     struct TestServiceControl {
         reload: std::rc::Rc<std::cell::RefCell<ReloadHook>>,
         ready: std::rc::Rc<std::cell::RefCell<ReadyHook>>,
+        launch_changed: bool,
+        restore_launch: std::rc::Rc<dyn Fn() -> Result<()>>,
     }
 
     impl TestServiceControl {
@@ -6242,11 +6479,21 @@ mod tests {
             Self {
                 reload: std::rc::Rc::new(std::cell::RefCell::new(Box::new(reload))),
                 ready: std::rc::Rc::new(std::cell::RefCell::new(Box::new(ready))),
+                launch_changed: false,
+                restore_launch: std::rc::Rc::new(|| Ok(())),
             }
         }
     }
 
     impl ServiceControl for TestServiceControl {
+        fn launch_changed(&self) -> bool {
+            self.launch_changed
+        }
+
+        fn restore_launch(&self) -> Result<()> {
+            (self.restore_launch)()
+        }
+
         fn reload(&self, unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
             self.reload.borrow_mut()(unit, previous, next)
         }
@@ -6279,6 +6526,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn changed_launch_settings_force_reload_and_restore_before_the_old_daemon() {
+        let dir = ServiceTestDir::new();
+        let path = dir.config();
+        std::fs::write(&path, b"unchanged-policy").unwrap();
+        let restored = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = restored.clone();
+        let mut calls = 0;
+        let mut control = TestServiceControl::new(
+            move |_, _, _| {
+                calls += 1;
+                if calls == 1 {
+                    assert!(!observed.get());
+                    anyhow::bail!("new interface could not start");
+                }
+                assert!(observed.get(), "old launch settings must precede recovery");
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        control.launch_changed = true;
+        let flag = restored.clone();
+        control.restore_launch = std::rc::Rc::new(move || {
+            flag.set(true);
+            Ok(())
+        });
+        assert!(
+            apply_service_with(
+                &path,
+                "velstra.service",
+                b"unchanged-policy",
+                Some(b"unchanged-policy"),
+                control
+            )
+            .is_err()
+        );
+        assert!(restored.get());
+        assert_eq!(std::fs::read(path).unwrap(), b"unchanged-policy");
+    }
+
+    #[test]
+    fn first_failed_service_restores_launch_settings_even_without_a_previous_config() {
+        let dir = ServiceTestDir::new();
+        let restored = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = restored.clone();
+        let mut control =
+            TestServiceControl::new(|_, _, _| anyhow::bail!("startup failed"), |_| Ok(()));
+        control.restore_launch = std::rc::Rc::new(move || {
+            flag.set(true);
+            Ok(())
+        });
+        assert!(
+            apply_service_with(&dir.config(), "velstra.service", b"new", None, control).is_err()
+        );
+        assert!(restored.get());
+        assert!(!dir.config().exists());
     }
 
     #[test]
@@ -6387,6 +6692,23 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("ROLLBACK INCOMPLETE"), "{message}");
+    }
+
+    #[test]
+    fn unconfigured_dataplane_readiness_is_not_a_waiver_for_failed_services() {
+        assert!(inactive_dataplane_ready(b"inactive\n"));
+        for state in [
+            b"active\n".as_slice(),
+            b"failed\n",
+            b"activating\n",
+            b"deactivating\n",
+            b"",
+            b"inactive",
+            b"unknown\n",
+            b"inactive\nfailed\n",
+        ] {
+            assert!(!inactive_dataplane_ready(state));
+        }
     }
 
     #[test]
@@ -7091,13 +7413,37 @@ mod tests {
         assert_eq!(kw(&["delete", "firewall", "syn-protect", "443"]), ["mss"]);
     }
 
+    fn words(line: &str) -> Vec<String> {
+        split_line(line).unwrap()
+    }
+
+    #[test]
+    fn a_control_character_is_never_part_of_a_word() {
+        // CTRL-08: the CR a quoted value used to keep was a line break to
+        // systemd, and a second directive in the unit the value reached.
+        for line in [
+            "set services snmp location \"rack\r4\"",
+            "set services snmp location \"rack\n4\"",
+            "set services snmp location \"rack\\\r4\"",
+            "set services snmp location rack\u{0}4",
+            "set services snmp location rack\u{1b}4",
+            "set services snmp location \"rack\u{2028}4\"",
+            "set services snmp location \"rack\t4\"",
+        ] {
+            let error = split_line(line).expect_err(line);
+            assert!(error.to_string().contains("control character"), "{error}");
+        }
+        // Outside a word a tab or a CRLF's CR still only separates.
+        assert_eq!(words("set\ta b\r"), ["set", "a", "b"]);
+    }
+
     #[test]
     fn a_quoted_value_keeps_its_spaces_and_loses_its_quotes() {
         // Every free-text field — a certificate subject, a description, a portal
         // message — was unreachable before this: the words arrived separately and
         // the quotes ended up inside the value.
         assert_eq!(
-            split_line(r#"set pki ca house common-name "Velstra Test CA""#),
+            words(r#"set pki ca house common-name "Velstra Test CA""#),
             [
                 "set",
                 "pki",
@@ -7109,7 +7455,7 @@ mod tests {
         );
         // A quote inside a quoted value, and an empty value.
         assert_eq!(
-            split_line(r#"set x y "a \"b\" c""#),
+            words(r#"set x y "a \"b\" c""#),
             ["set", "x", "y", r#"a "b" c"#]
         );
         // A quote that does NOT begin a word is an ordinary character. This is
@@ -7118,7 +7464,7 @@ mod tests {
         // exactly as written, quotes included, or the rule that gets loaded is
         // not the rule that was typed.
         assert_eq!(
-            split_line(
+            words(
                 r#"set services ids rule alert icmp any any -> any any (msg:"an echo"; itype:8;)"#
             ),
             [
@@ -7138,18 +7484,18 @@ mod tests {
                 "itype:8;)"
             ]
         );
-        assert_eq!(split_line(r#"set x y """#), ["set", "x", "y", ""]);
+        assert_eq!(words(r#"set x y """#), ["set", "x", "y", ""]);
         // Unquoted behaviour is unchanged, comment rule included.
-        assert_eq!(split_line("  set  a   b  "), ["set", "a", "b"]);
-        assert_eq!(split_line("set a b # why"), ["set", "a", "b"]);
+        assert_eq!(words("  set  a   b  "), ["set", "a", "b"]);
+        assert_eq!(words("set a b # why"), ["set", "a", "b"]);
         assert_eq!(
-            split_line("set system login bob password corr#ect"),
+            words("set system login bob password corr#ect"),
             ["set", "system", "login", "bob", "password", "corr#ect"]
         );
         // A `#` inside quotes is text, not a comment.
-        assert_eq!(split_line(r#"set x y "a # b""#), ["set", "x", "y", "a # b"]);
-        assert_eq!(split_line("# whole line"), Vec::<String>::new());
-        assert_eq!(split_line(""), Vec::<String>::new());
+        assert_eq!(words(r#"set x y "a # b""#), ["set", "x", "y", "a # b"]);
+        assert_eq!(words("# whole line"), Vec::<String>::new());
+        assert_eq!(words(""), Vec::<String>::new());
     }
 
     #[test]
@@ -8114,6 +8460,56 @@ mod tests {
     }
 
     #[test]
+    fn invalid_show_sections_are_counted_as_command_failures() {
+        // The REPL counter is process-wide; isolate from parallel refusal tests.
+        use std::os::unix::process::CommandExt;
+        if std::env::args().next().as_deref() != Some("sentinel-show-errors-child") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg0("sentinel-show-errors-child")
+                .args([
+                    "--exact",
+                    "repl::tests::invalid_show_sections_are_counted_as_command_failures",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut session = Session::empty();
+        let act = Apply::off();
+        let mut context = Vec::new();
+        let before = failed_lines();
+        assert!(!exec_line(
+            &mut session,
+            &act,
+            &mut context,
+            "show configuration"
+        ));
+        assert_eq!(failed_lines(), before + 1);
+        assert!(!exec_line(
+            &mut session,
+            &act,
+            &mut context,
+            "show nonsense"
+        ));
+        assert_eq!(failed_lines(), before + 2);
+        assert!(!exec_line(&mut session, &act, &mut context, "show system"));
+        assert_eq!(failed_lines(), before + 2);
+        let error = session
+            .show_checked("configuration")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("run show config"));
+    }
+
+    #[test]
     fn exec_line_runs_commands_and_signals_exit() {
         // A throwaway session via a temp file so save/load work.
         let dir = std::env::temp_dir().join(format!("sentinel-repl-{}", std::process::id()));
@@ -8587,6 +8983,76 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("second"), "{:?}", failures);
         assert!(failures[0].contains("boom"), "{:?}", failures);
+    }
+
+    #[test]
+    fn an_abandoned_apply_undoes_its_stages_and_a_finished_one_does_not() {
+        // CTRL-15: a panic between two stages dropped the stack and left the
+        // earlier stages live. An armed stack now undoes itself on drop.
+        let undone = std::rc::Rc::new(std::cell::Cell::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut rb = Rollback::new();
+            let seen = undone.clone();
+            rb.push("firewall", move || {
+                seen.set(seen.get() + 1);
+                Ok(())
+            });
+            panic!("EIO while reporting progress");
+        }));
+        assert!(result.is_err());
+        assert_eq!(undone.get(), 1, "the abandoned stage was not undone");
+        let mut rb = Rollback::new();
+        let seen = undone.clone();
+        rb.push("firewall", move || {
+            seen.set(seen.get() + 1);
+            Ok(())
+        });
+        rb.disarm();
+        drop(rb);
+        assert_eq!(undone.get(), 1, "a finished apply was undone");
+    }
+
+    #[test]
+    fn routing_recovery_follows_old_packet_hooks_but_precedes_guard_restore() {
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut rb = Rollback::new();
+        let seen = order.clone();
+        rb.push("HA fence", move || {
+            seen.borrow_mut().push("guard");
+            Ok(())
+        });
+        let routing_recovery_slot = rb.steps.len();
+        for name in ["firewall", "hostname"] {
+            let seen = order.clone();
+            rb.push(name, move || {
+                seen.borrow_mut().push(name);
+                Ok(())
+            });
+        }
+        let seen = order.clone();
+        rb.steps.insert(
+            routing_recovery_slot,
+            (
+                "routing",
+                Box::new(move || {
+                    assert!(
+                        seen.borrow().contains(&"firewall"),
+                        "old hooks must be ready"
+                    );
+                    assert!(
+                        !seen.borrow().contains(&"guard"),
+                        "guard recovery stays last"
+                    );
+                    seen.borrow_mut().push("routing");
+                    Ok(())
+                }),
+            ),
+        );
+        assert!(rb.unwind().is_empty());
+        assert_eq!(
+            *order.borrow(),
+            ["hostname", "firewall", "routing", "guard"]
+        );
     }
 
     #[test]

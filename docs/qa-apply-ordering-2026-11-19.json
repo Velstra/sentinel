@@ -1,0 +1,42 @@
+{
+  "scope": "Targeted component regressions, not signed-image certification",
+  "release_approval": false,
+  "source": "/nix/store/c0ncyq0wih9z76w9h2cshdwxh6r8vlnl-source",
+  "passed_checks": {
+    "apply-ordering": {
+      "derivation": "/nix/store/jwv5sqk0q6dq3iq702nsdc252grhi9xm-vm-test-run-sentinel-apply-ordering.drv",
+      "script_seconds": 232.32,
+      "log_sha256": "47d551771489181b4ddb7badab72994f8e0f5449660ea237c5d50425a7993f3b"
+    },
+    "data-status-readonly": {
+      "derivation": "/nix/store/k7v4gdmqhb6m91dymp7kv23551bcjcxb-vm-test-run-sentinel-data-status-readonly.drv",
+      "script_seconds": 56.09,
+      "log_sha256": "b5d4296ac6ddab6bb04f5221c2d123ce9edd8476f765479b975f3b2d221cd298"
+    },
+    "wren-static-reload": {
+      "derivation": "/nix/store/pmn8j1asnv47aahncghx974hdpf74czk-vm-test-run-sentinel-wren-acknowledged-static-reload.drv",
+      "script_seconds": 227.42,
+      "log_sha256": "6cd53223a412fcca32110e0a04564da53afd93009a1af31135873916a9659ff4"
+    },
+    "boothealth": {
+      "derivation": "/nix/store/g3jb4qdk5qwbvbpcj01d2dvj9piza322-vm-test-run-sentinel-boot-health.drv",
+      "script_seconds": 177.38,
+      "log_sha256": "c2d8861fa191b3880b1f48e31c039094c859a01753826d90805355ebf4722a7c"
+    },
+    "commit": {
+      "derivation": "/nix/store/0ih4a2gvsn8580clx3jjkianjq0rh7sn-vm-test-run-sentinel-commit.drv",
+      "script_seconds": 225.87,
+      "log_sha256": "3095ae149b157cbe6e3b00dd887b2aef9f881cd4df072d93a4b8b1e7b4fb712b"
+    },
+    "ipsec": {
+      "derivation": "/nix/store/qnr7qh4mjx1w1v9mpg5r8axqhpnmph52-vm-test-run-sentinel-ipsec.drv",
+      "script_seconds": 134.23,
+      "log_sha256": "690a8c7c6939dea87ceda8759cf11738e4b3231d9bbdec30f364b1cad0cf7134"
+    },
+    "vti": {
+      "derivation": "/nix/store/916vfr3d505l9adgc5q7gd2q2l9ka71x-vm-test-run-sentinel-vti.drv",
+      "script_seconds": 212.58,
+      "log_sha256": "66219f998d8e8f6a05f2f82bf58109f0e2b324063f09d8c786cc293465abf653"
+    }
+  }
+}

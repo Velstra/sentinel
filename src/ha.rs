@@ -459,8 +459,8 @@ pub fn witness_warnings(a: &Appliance) -> Vec<String> {
     let mut out = Vec::new();
     if !w.secret.is_empty() {
         out.push(
-            "system ha-witness secret is the members' enrollment credential and API machine \
-             token; replace it with the derived key from `sentinel ha witness-key`"
+            "system ha-witness secret is the members' enrollment and config-sync credential; \
+             replace it with the derived key from `sentinel ha witness-key`"
                 .into(),
         );
     }
@@ -1712,6 +1712,61 @@ pub fn render_status(status: &serde_json::Value) -> String {
     out
 }
 
+/// The warning a commit on a member that is not the forwarding owner carries
+/// (T4.8-bkcommit). `status` is the agent's `ha-status` report taken before the
+/// commit applied, or `None` when it could not be read; `ha_enabled` is whether
+/// the committed configuration pairs this member at all.
+///
+/// Master/Backup is forwarding ownership, not a configuration permission, so
+/// the commit is not refused: config sync delivers it to the active member,
+/// which applies it too. What the operator needs is to know that this is the
+/// member they changed.
+pub fn commit_role_warning(ha_enabled: bool, status: Option<&serde_json::Value>) -> Option<String> {
+    if !ha_enabled {
+        return None;
+    }
+    commit_role_text(status)
+}
+
+/// The data plane's HA role ahead of a commit, for [`commit_role_warning`].
+/// Outer `None`: the running configuration is not paired, so nothing is asked
+/// (and no privileged query is made). Inner `None`: paired, but unreadable.
+pub fn role_before_commit(running: Option<&Appliance>) -> Option<Option<serde_json::Value>> {
+    running
+        .and_then(|a| a.system.ha.as_ref())
+        .filter(|ha| ha.enabled)?;
+    Some(
+        crate::velstra::query("ha-status")
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok()),
+    )
+}
+
+fn commit_role_text(status: Option<&serde_json::Value>) -> Option<String> {
+    let Some(status) = status else {
+        return Some(
+            "could not read this member's HA role before the commit. If it is the Backup, \
+             config sync still delivers this change to the active member; check \
+             `sentinel show ha` on both members."
+                .into(),
+        );
+    };
+    let role = status["role"].as_str().unwrap_or("unknown");
+    if matches!(role, "Master" | "standalone") {
+        return None;
+    }
+    let number = |key: &str| status[key].as_u64().map_or("-".into(), |v| v.to_string());
+    Some(format!(
+        "this commit was made on HA {role} member node {}, not on the forwarding owner \
+         (node {}, term {}). It is live here now, and config sync delivers it to the active \
+         member, which applies it too. Make shared policy changes on one member at a time \
+         and check `sentinel show ha` on both.",
+        number("node"),
+        number("owner"),
+        number("term"),
+    ))
+}
+
 /// How long a standby may be unable to take over before somebody is told.
 /// Long enough to cover an ordinary configuration-sync delivery after a
 /// commit, short enough that the gap is not discovered by the next outage.
@@ -1787,7 +1842,7 @@ pub(crate) fn paired_fixture() -> Appliance {
 hostname="primary"
 [system.config-sync]
 peer=["10.20.0.2:8080"]
-secret="abcdefghijklmnopqrstuvwxyz0123456789"
+secret="011fc2994e39d251141540f87a69092b3f22a86767f7283de7eeedb3897bedf6"
 [system.conntrack-sync]
 listen="10.20.0.1:5429"
 peer=["10.20.0.2:5429"]
@@ -2906,7 +2961,7 @@ mod tests {
     #[test]
     fn a_legacy_credential_witness_keeps_its_pair_but_is_told_to_migrate() {
         let witness = witness_appliance(
-            "secret=\"abcdefghijklmnopqrstuvwxyz0123456789\"\ncluster=\"test-cluster-0123456789\"\n",
+            "secret=\"011fc2994e39d251141540f87a69092b3f22a86767f7283de7eeedb3897bedf6\"\ncluster=\"test-cluster-0123456789\"\n",
         )
         .unwrap();
         let runtime = witness_runtime(witness.system.ha_witness.as_ref().unwrap()).unwrap();
@@ -2933,7 +2988,7 @@ mod tests {
         for bad in [
             format!("key=\"{key}\"\n"),
             format!(
-                "key=\"{key}\"\nsecret=\"abcdefghijklmnopqrstuvwxyz0123456789\"\ncluster=\"test-cluster-0123456789\"\n"
+                "key=\"{key}\"\nsecret=\"011fc2994e39d251141540f87a69092b3f22a86767f7283de7eeedb3897bedf6\"\ncluster=\"test-cluster-0123456789\"\n"
             ),
             "key=\"short\"\ncluster=\"test-cluster-0123456789\"\n".into(),
             format!("key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"10.20.0.1\"]\n"),
@@ -3061,6 +3116,33 @@ mod tests {
         let master = serde_json::json!({"role":"Master","node":1,"term":5,"owner":1,"lease_remaining_ms":180,"not_ready":null});
         assert!(render_status(&master).starts_with("HA Master\n"));
         assert!(render_status(&serde_json::json!({"role":"standalone"})).contains("standalone"));
+    }
+    /// T4.8-bkcommit: a commit on the Backup member was accepted with only the
+    /// generic management-access warning. The operator must be told which
+    /// member they changed and that the change reaches the active one too.
+    #[test]
+    fn a_commit_on_a_standby_member_is_named_as_such() {
+        let backup = serde_json::json!({"role":"Backup","node":2,"owner":1,"term":5});
+        let warning = commit_role_warning(true, Some(&backup)).expect("Backup must warn");
+        assert!(
+            warning.contains("HA Backup")
+                && warning.contains("node 2")
+                && warning.contains("node 1")
+                && warning.contains("config sync"),
+            "{warning}"
+        );
+        let fenced = serde_json::json!({"role":"Fenced","node":1,"owner":2,"term":9});
+        assert!(commit_role_warning(true, Some(&fenced)).is_some_and(|w| w.contains("HA Fenced")));
+        let master = serde_json::json!({"role":"Master","node":1,"owner":1,"term":5});
+        assert_eq!(commit_role_warning(true, Some(&master)), None);
+        let standalone = serde_json::json!({"role":"standalone"});
+        assert_eq!(commit_role_warning(true, Some(&standalone)), None);
+        // No HA configured: nothing to say, whatever the agent reports.
+        assert_eq!(commit_role_warning(false, Some(&backup)), None);
+        assert_eq!(commit_role_warning(false, None), None);
+        // HA configured but the role is unreadable: say so rather than imply
+        // this is the active member.
+        assert!(commit_role_warning(true, None).is_some_and(|w| w.contains("could not read")));
     }
     #[test]
     fn an_unready_standby_alerts_once_after_the_threshold_and_once_on_recovery() {
@@ -3334,7 +3416,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let mut session = crate::session::Session::load(&directory.join("empty.toml")).unwrap();
         for command in crate::session::flatten_config(&crate::session::render_appliance(&a)) {
-            let args = crate::repl::split_line(&command);
+            let args = crate::repl::split_line(&command).unwrap();
             let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
             session
                 .set(&words)

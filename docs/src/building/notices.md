@@ -47,6 +47,54 @@ matching source access information alongside the artifacts. Test access as an
 ordinary operator on the built image and verify the bundle's hash after extraction.
 Those image/UI delivery hooks and their regression tests are still outstanding.
 
+## Licences of the first-party components
+
+The image combines three first-party projects, each under its own licence, with
+NixOS packages under theirs:
+
+| Component | What ships in the image | Licence |
+|---|---|---|
+| Sentinel | the `sentinel` CLI, API and embedded console | AGPL-3.0-or-later |
+| Fabric | the `velstra` data-plane agent | AGPL-3.0-or-later |
+| Fabric eBPF object (`velstra-ebpf`) | the XDP/TC programs loaded into the kernel | GPL-2.0-or-later OR MIT |
+| Wren | the `wren` routing daemon | GPL-2.0-or-later (its `wren-core` crate is Apache-2.0) |
+| NixOS packages | kernel, systemd, OpenSSH, strongSwan, dnsmasq and the rest of the closure | each package's own licence, as recorded in its nixpkgs `meta.license` |
+
+The Rust crates compiled into the three binaries were checked at the 8b6181 audit
+and carry only permissive licences; no SSPL, BUSL, GPL-2.0-only or unknown licence
+was found in the shipped dependency graphs.
+
+## What a distributor must ship
+
+Anyone who distributes the image, including a derived or commercial edition,
+distributes all of the above and must meet each licence's terms. At least:
+
+1. The licence texts of every component, including the AGPL-3.0, GPL-2.0, MIT,
+   Apache-2.0 texts for the first-party components and the texts for the NixOS
+   packages in the closure.
+2. The corresponding source of every GPL- or AGPL-licensed component, or a
+   written offer for it. For the first-party components that is the exact
+   revisions pinned in `flake.lock` (Sentinel itself, `fabric` and `wren`). For
+   NixOS packages it is the nixpkgs revision in `flake.lock` together with every
+   patch or override applied on top of it — the patch files in this repository
+   and any patches a derived edition adds (for example a security overlay).
+3. The build and install information the licences require, which for this
+   image is the flake and its lock file.
+4. Because Sentinel and Fabric are AGPL, users who interact with a modified
+   version over a network must be offered its corresponding source.
+
+## Open legal question (needs counsel)
+
+This page states licence facts, not legal advice. One question is unresolved and
+needs a lawyer before a proprietary edition ships: **whether a proprietary
+edition's additions constitute mere aggregation with Wren (GPL-2.0-or-later) and
+with Fabric and Sentinel (AGPL-3.0-or-later)**, and **whether any contributor
+agreement covers relicensing Wren's GPL code**. Wren and the agent run as
+separate executables, which supports the aggregation reading, but that has been
+checked only at the Nix packaging level, not by code review. Fabric commit
+`0012f81` removed CLA enforcement and relicensing claims from that project, so
+relicensing rights should not be assumed.
+
 Sentinel's own terms are in [LICENSE](https://github.com/Velstra/sentinel/blob/main/LICENSE)
 and [CONTRIBUTING.md](https://github.com/Velstra/sentinel/blob/main/CONTRIBUTING.md).
 No separate CLA is administered. These documents neither establish ownership of

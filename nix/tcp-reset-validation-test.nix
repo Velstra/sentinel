@@ -159,7 +159,8 @@ in pkgs.testers.runNixOSTest {
                                 ("198.19.10.254", "198.19.20.50", 18198, port)]:
                 continue
             value = bytes(int(part, 16) for part in item["value"])
-            _, _, phase, reply = struct.unpack("<QQII", value)
+            # 40-byte FirewallState: four replicated fields, then local TCP tracking.
+            _, _, phase, reply = struct.unpack("<QQII16x", value)
             result.append({"key_hex": raw_key.hex(), "policy": policy, "tuple": identity,
                 "phase": phase, "reply": reply})
         return sorted(result, key=lambda row: row["key_hex"])

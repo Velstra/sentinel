@@ -238,9 +238,11 @@ async fn a_read_only_session_can_sign_out() {
 async fn the_machine_token_cannot_be_signed_out() {
     let st = bench(&local_config(hash(), ""), Arc::new(ConfiguredServers));
     let machine = st.token.clone();
+    // The same 401 an unknown bearer gets: a distinct answer for "valid, but
+    // not a session" made sign-out a guessing oracle (review of CTRL-01).
     assert_eq!(
         status_of(&st, bearer("POST", "/api/v1/sign-out", &machine, "")).await,
-        StatusCode::BAD_REQUEST
+        StatusCode::UNAUTHORIZED
     );
     assert!(resolve_caller(&st, &machine).is_some());
     // …and it never idles out.
@@ -382,7 +384,8 @@ fn per_account_token_files_from_before_are_withdrawn() {
 #[tokio::test]
 async fn parallel_guesses_from_one_address_are_bounded() {
     let ip: std::net::IpAddr = "203.0.113.60".parse().unwrap();
-    ip_throttle().forget(ip);
+    let sources = &crate::api_throttle::tables().sign_in_sources;
+    sources.forget(&ip);
     let directory = FakeDirectory::new(None);
     let st = bench(&directory_config(Some("viewers")), directory.clone());
     const GUESSES: usize = 40;
@@ -410,52 +413,66 @@ async fn parallel_guesses_from_one_address_are_bounded() {
         }
     }
     let checked = directory.calls.load(Ordering::SeqCst);
-    ip_throttle().forget(ip);
+    sources.forget(&ip);
+    let limit = crate::api_throttle::SIGN_IN_PER_SOURCE.max as usize;
     assert!(
-        checked <= IP_MAX_FAILURES as usize,
-        "{checked} passwords were checked for one address (limit {IP_MAX_FAILURES})"
+        checked <= limit,
+        "{checked} passwords were checked for one address (limit {limit})"
     );
     assert_eq!(throttled + checked, GUESSES);
 }
 
-/// A full table must not make room by forgetting a lockout — that was a way to
-/// unlock yourself by spraying from other addresses. When nothing but locks
-/// is left, a new address is refused rather than one of them released.
-#[test]
-fn a_locked_address_survives_eviction_pressure() {
-    let throttle = IpThrottle::new(4);
-    let locked: std::net::IpAddr = "198.51.100.1".parse().unwrap();
-    for _ in 0..IP_MAX_FAILURES {
-        throttle.reserve(locked).unwrap();
-    }
-    for n in 2..40u8 {
-        assert_eq!(
-            throttle.reserve(std::net::IpAddr::from([198, 51, 100, n])),
-            Ok(())
-        );
-    }
-    assert!(
-        matches!(throttle.reserve(locked), Err(IpRefusal::Locked(_))),
-        "eviction released a locked address"
-    );
-
-    // Fill the table with locks: the next newcomer is turned away.
-    let throttle = IpThrottle::new(2);
-    for n in 1..=2u8 {
-        for _ in 0..IP_MAX_FAILURES {
-            throttle
-                .reserve(std::net::IpAddr::from([198, 51, 100, n]))
+/// CTRL-27: the account budget used to count guesses from every origin, so
+/// anybody could lock `admin` out by guessing its password thirty times from
+/// anywhere — nine guesses each from four addresses, all below the per-address
+/// lockout, and the administrator's own workstation got 429 with the right
+/// password. The budget is now per (account, origin), and the distributed one
+/// never applies to an origin that signed the account in before.
+#[tokio::test]
+async fn guessing_an_account_elsewhere_does_not_lock_out_its_known_origin() {
+    const VICTIM: &str = "ctrl27-victim";
+    const RIGHT: &str = "ctrl27-right-password";
+    let directory = FakeDirectory::new(Some((VICTIM, RIGHT)));
+    let st = bench(&directory_config(Some("ops")), directory.clone());
+    let attempt = |from: [u8; 4], password: &'static str| {
+        let st = st.clone();
+        async move {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"username": VICTIM, "password": password}).to_string(),
+                ))
                 .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from((from, 4000))));
+            router(st).oneshot(req).await.unwrap().status()
+        }
+    };
+    let workstation = [198, 18, 27, 1];
+    assert_eq!(attempt(workstation, RIGHT).await, StatusCode::OK);
+    let mut guesses = Vec::new();
+    for host in 10..14u8 {
+        for _ in 0..9 {
+            guesses.push(tokio::spawn(attempt([198, 18, 27, host], "wrong")));
+        }
+    }
+    let mut refused = 0;
+    for guess in guesses {
+        if guess.await.unwrap() != StatusCode::UNAUTHORIZED {
+            refused += 1;
         }
     }
     assert_eq!(
-        throttle.reserve("198.51.100.3".parse().unwrap()),
-        Err(IpRefusal::Full)
+        attempt(workstation, RIGHT).await,
+        StatusCode::OK,
+        "guesses from four other addresses locked the account out for its own workstation"
     );
-    assert!(matches!(
-        throttle.reserve("198.51.100.1".parse().unwrap()),
-        Err(IpRefusal::Locked(_))
-    ));
+    assert_eq!(
+        refused, 0,
+        "a guess below every per-origin budget was throttled"
+    );
 }
 
 // ---- uniform refusals (LOW) ------------------------------------------------

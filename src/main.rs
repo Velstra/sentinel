@@ -12,13 +12,19 @@
 mod aaa;
 mod acme;
 mod admission;
+mod agent_contract;
 mod alert;
 mod api;
+mod api_listener;
 mod api_session;
+mod api_throttle;
 mod archive;
 mod boot_entry;
+mod boot_fallback;
+mod build_info;
 mod capture;
 mod clock;
+mod commit_guard;
 mod compile;
 mod config;
 mod configsync;
@@ -26,6 +32,7 @@ mod confirm;
 mod diff;
 mod domain;
 mod feed;
+mod fieldcheck;
 mod fleet;
 mod grammar_walk;
 mod ha;
@@ -34,10 +41,13 @@ mod held_links;
 mod identity;
 mod ids;
 mod image;
+#[cfg(test)]
+mod injection_regress;
 mod install;
 mod installer_tui;
 mod ipsec;
 mod ipsec_guards;
+mod journal;
 mod lockout;
 mod lookup;
 mod metrics;
@@ -49,6 +59,7 @@ mod network_reconcile;
 mod observe;
 mod openapi;
 mod openconnect;
+mod opwords;
 mod passwd;
 mod pki;
 mod portal;
@@ -64,6 +75,7 @@ mod safe_apply;
 mod session;
 mod system;
 mod telemetry;
+mod textcheck;
 mod trace;
 mod ui;
 mod unlock;
@@ -161,7 +173,7 @@ impl From<RaidArg> for install::Raid {
 }
 
 #[derive(Parser)]
-#[command(name = "sentinel", version, about, long_about = None)]
+#[command(name = "sentinel", version = build_info::version(), about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -169,17 +181,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum HaCommand {
-    /// Pair this primary with a secondary using its bootstrap machine token.
+    /// Pair this primary with a secondary using its enrollment credential.
     ///
-    /// The token is read from standard input (`--secret-stdin`), or prompted
-    /// for without echo on a terminal. It is the secondary's API machine token:
-    /// on a command line it would sit in the process list and shell history.
+    /// The credential is the secondary's `system config-sync secret` (generate
+    /// one with `sentinel ha secret generate`). It is read from standard input
+    /// (`--secret-stdin`), or prompted for without echo on a terminal: on a
+    /// command line it would sit in the process list and shell history.
     Pair {
         peer: String,
         /// Refused: a token in argv is visible to every local user.
         #[arg(long, hide = true, conflicts_with = "secret_stdin")]
         secret: Option<String>,
-        /// Read the machine token from standard input.
+        /// Read the enrollment credential from standard input.
         #[arg(long)]
         secret_stdin: bool,
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -201,9 +214,14 @@ enum HaCommand {
         /// The pair's cluster identifier, when one was set explicitly.
         #[arg(long)]
         cluster: Option<String>,
-        /// Read the machine token from standard input.
+        /// Read the enrollment credential from standard input.
         #[arg(long)]
         secret_stdin: bool,
+    },
+    /// Config-sync / HA enrollment secrets.
+    Secret {
+        #[command(subcommand)]
+        command: HaSecretCommand,
     },
     /// Alert when a standby stays unable to take over (systemd worker).
     #[command(hide = true)]
@@ -213,13 +231,24 @@ enum HaCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum HaSecretCommand {
+    /// Print a fresh random secret for `system config-sync secret`.
+    ///
+    /// 32 random bytes as 64 hex digits on standard output, nothing else, so
+    /// it can be piped. Set the same value on both members; a weak secret is
+    /// refused at commit because the HA enrollment proof lets anybody who can
+    /// reach the management port test guesses against it offline.
+    Generate,
+}
+
 /// The pair token, from standard input or a no-echo prompt. One trailing line
 /// ending is the terminator `echo` or a here-string adds, not part of the token.
 fn read_pair_token(from_stdin: bool, argv: Option<String>) -> Result<String> {
     use std::io::{IsTerminal, Read};
     anyhow::ensure!(
         argv.is_none(),
-        "--secret puts the machine token in the process list and shell history; \
+        "--secret puts the enrollment credential in the process list and shell history; \
          pipe it with --secret-stdin, or omit both to be prompted"
     );
     let mut value = if !from_stdin && std::io::stdin().is_terminal() {
@@ -501,8 +530,8 @@ enum Command {
     /// it next (auto-rollback to the current slot if it fails).
     ///
     /// `<target>` is either a local image/block-device path (written directly —
-    /// the trusted-image form), or one of the signed-channel keywords (roadmap
-    /// C13, using the saved `[update]` channel):
+    /// the trusted-image form), or one of the signed-channel keywords (using
+    /// the saved `[update]` channel):
     ///
     /// * `check` — fetch + verify the signed release manifest and print the
     ///   available version (needs neither root nor the disk);
@@ -549,6 +578,15 @@ enum Command {
         #[arg(long)]
         id: String,
     },
+    /// After the data plane has started at boot: if it never becomes ready on
+    /// the configuration it was given, fall back to one it accepts; if it does,
+    /// remember that configuration as the last-known-good. Run by
+    /// `sentinel-boot-verify.service`, not by hand.
+    #[command(hide = true)]
+    BootVerify {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Recover an expired management transaction (independent systemd watchdog).
     ApplyRecovery {
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -567,7 +605,7 @@ enum Command {
         #[arg(long, hide = true)]
         original_config: Option<PathBuf>,
     },
-    /// Deliver an alert for a failed unit (roadmap C23). Invoked by systemd's
+    /// Deliver an alert for a failed unit. Invoked by systemd's
     /// `OnFailure=` on the units Sentinel owns, not by hand — it reads the saved
     /// config's `[services.alerts]` and notifies every configured target.
     Alert {
@@ -577,14 +615,14 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Serve NAT-PMP (roadmap C18). Run by `sentinel-portmap.service` from the
+    /// Serve NAT-PMP. Run by `sentinel-portmap.service` from the
     /// settings an apply rendered, not by hand.
     PortMap {
         /// The resolved settings the last apply rendered.
         #[arg(long, default_value = portmap::STATE_FILE)]
         state: PathBuf,
     },
-    /// Serve the captive portal (roadmap C20). Run by
+    /// Serve the captive portal. Run by
     /// `sentinel-portal.service` from the saved config, not by hand: it binds
     /// the appliance's own address in the gated zone, and the address only
     /// exists once the network is up.
@@ -593,7 +631,7 @@ enum Command {
         #[arg(long, default_value = portal::STATE_FILE)]
         state: PathBuf,
     },
-    /// Follow the detector's alerts and block what they name (roadmap C11).
+    /// Follow the detector's alerts and block what they name.
     /// Run by `sentinel-ids-watch.service` while `block-on-alert` is set, not by
     /// hand. Every block it asks for expires, and none survive an agent restart.
     IdsWatch,
@@ -614,11 +652,11 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Carry UDP broadcasts between segments (roadmap C18). Run by
+    /// Carry UDP broadcasts between segments. Run by
     /// `sentinel-broadcast-relay.service` from the config an apply rendered, not
     /// by hand.
     BroadcastRelay,
-    /// Obtain or renew the ACME certificates the config declares (roadmap C19).
+    /// Obtain or renew the ACME certificates the config declares.
     /// Run by `sentinel-acme.service` from its timer, not by hand.
     AcmeRenew,
     /// List the ports a Velstra controller currently knows about.
@@ -627,7 +665,7 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:50052")]
         controller: String,
     },
-    /// Serve the REST management API (roadmap C12) over the same config model the
+    /// Serve the REST management API over the same config model the
     /// CLI edits: `GET/PUT /api/v1/config`, `GET /api/v1/status`,
     /// `GET /api/v1/show/*`. Bearer-token auth; binds localhost by default (widen
     /// with `--listen 0.0.0.0:<port>`). A `PUT` validates + applies live + saves
@@ -762,6 +800,15 @@ async fn main() -> Result<()> {
             println!("[system.ha-witness]");
             println!("cluster = \"{cluster}\"");
             println!("key = \"{}\"", ha::witness_key(&token, &cluster));
+            Ok(())
+        }
+        Command::Ha {
+            command:
+                HaCommand::Secret {
+                    command: HaSecretCommand::Generate,
+                },
+        } => {
+            println!("{}", config::generate_sync_secret()?);
             Ok(())
         }
         Command::Ha {
@@ -909,6 +956,7 @@ async fn main() -> Result<()> {
         Command::ApplyPending { config, id } => {
             safe_apply::apply_pending(&config, &id, &live_apply(true))
         }
+        Command::BootVerify { config } => boot_fallback::verify(&config, &live_apply(true)),
         Command::ApplyRecovery { config } => {
             match safe_apply::recover(&config, &live_apply(true), false, false) {
                 // One failed attempt on the way to the bound is logged, not a
@@ -1113,6 +1161,11 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
     // Apply on commit unless told not to (off-box editing). The live apply uses
     // hostnamectl/systemctl, which only work on the box.
     let act = live_apply(!no_apply);
+    if act.enabled
+        && let Some(status) = boot_fallback::read_status()
+    {
+        eprintln!("{}", ui::red(&status.describe()));
+    }
 
     if std::io::stdin().is_terminal() {
         eprintln!("{}", ui::bold("Sentinel configuration mode"));
@@ -1126,7 +1179,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         if !act.enabled {
             eprintln!(
                 "{}",
-                ui::yellow("  (off-box: commit validates + saves only; not applying)")
+                ui::yellow("  (off-box: commit validates; save writes the file; no live apply)")
             );
         }
         // `List` completion shows all candidates at once (like bash) instead of
@@ -1288,6 +1341,10 @@ fn apply_candidate(
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(candidate)));
+    // Validation saw feed groups empty. A refresh whose fetched feed no longer
+    // fits the data plane leaves the running policy in force and says why.
+    compile::check_capacity(&appliance)
+        .context("feed, domain and user groups as resolved; the running policy is unchanged")?;
     // This is the path `sentinel-fwsched.service` runs at every window
     // boundary, so it is where a schedule is decided by the clock. Saying so
     // here puts it in the journal beside the re-apply that acted on it, which
@@ -1341,9 +1398,31 @@ fn apply_boot(
     // rollback to an older image whose saved config carries a newer field would
     // otherwise boot unconfigured. `config check` and every interactive path
     // stay strict — see Appliance::load_lenient.
-    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
-        &Appliance::load_lenient(config)?,
-    )));
+    //
+    // Before anything is rendered, ask the data plane whether it will load the
+    // result (DP-01 class): a saved configuration it refuses would otherwise
+    // crash-loop the agent and keep every zoned link, management included,
+    // held down. A refusal boots the last-known-good or a management-only
+    // policy instead, and says so (see boot_fallback).
+    let resolve = |candidate: &Appliance| {
+        identity::with_resolved(&feed::with_fetched(&domain::with_resolved(candidate)))
+    };
+    let (selected, fallback) = boot_fallback::select_seed(
+        Appliance::load_lenient(config),
+        boot_fallback::read_last_good(config),
+        |candidate| {
+            // Every refusal of the boot configuration lands here, including
+            // Sentinel-side capacity checks of the RESOLVED config (a feed that
+            // grew), so each one takes the fallback rather than failing boot.
+            let resolved = resolve(candidate);
+            compile::check_capacity(&resolved)?;
+            let rendered = compile::compile(&resolved)
+                .to_toml()
+                .context("compiling firewall config")?;
+            agent_contract::check_rendered(&rendered, &[candidate]).map(drop)
+        },
+    )?;
+    let appliance = resolve(&selected);
 
     // Compile BOTH configs before writing either, so a compile error can't leave
     // a half-seeded system (velstra written, wren missing). Rendering is pure and
@@ -1380,6 +1459,10 @@ fn apply_boot(
     // SAs) — which a file can't express — is deferred to `apply-boot-late`, run
     // after networkd has brought the links up.
     net::apply_persistent(&appliance, net::ApplyMode::Boot)?;
+    if let Some(status) = fallback {
+        let running = (status.applied != boot_fallback::Applied::Nothing).then_some(&selected);
+        boot_fallback::publish(running, &status)?;
+    }
     Ok(())
 }
 
@@ -1648,22 +1731,16 @@ fn update_local(path: &str, flags: &UpdateFlags) -> Result<()> {
     })?;
     let proof = update::verify_local_image(image, flags.signature, &key)?;
     eprintln!("signature verified against the pinned release key");
-    match &proof.version {
-        Some(version) => {
-            eprintln!("signed release {version}");
-            update::refuse_downgrade(version, flags.allow_downgrade)?;
-        }
-        // A digest or raw signature vouches for bytes, not for a release, so
-        // there is no version to hold against the running one. The input here
-        // is chosen by root at the console, not served by a mirror, which is
-        // why this is said rather than refused; a signed manifest closes it.
-        None => eprintln!(
-            "note: this proof states no release version, so it cannot be checked against \
-             the running {} — use the release's signed manifest (--signature \
-             …/manifest.json.sig) for downgrade protection",
-            update::running_version().unwrap_or_else(|_| "unidentified image release".to_string())
-        ),
+    if let Some(version) = &proof.version {
+        eprintln!("signed release {version}");
     }
+    // A digest or raw signature vouches for bytes, not for a release, so it
+    // cannot rule out a downgrade: refused unless --allow-downgrade (CTRL-26).
+    update::refuse_unversioned_or_downgrade(
+        proof.version.as_deref(),
+        &update::running_version()?,
+        flags.allow_downgrade,
+    )?;
     install::update_verified(&proof.source, &proof.sha256, flags.commit)
 }
 
@@ -2220,7 +2297,9 @@ fn wizard_config(lines: &[String]) -> Result<String> {
     // and returns only an exit flag: it is not a transactional parser result.
     let mut session = session::Session::empty();
     for (index, line) in lines.iter().enumerate() {
-        let words = repl::split_line(line);
+        // Never include the generated line in an error: it may carry a password.
+        let words = repl::split_line(line)
+            .with_context(|| format!("invalid installer command at step {}", index + 1))?;
         let args: Vec<&str> = words.iter().map(String::as_str).collect();
         anyhow::ensure!(
             args.first() == Some(&"set"),
@@ -2682,6 +2761,9 @@ fn show_held_links() {
 }
 
 fn show_op(args: &[String]) -> Result<()> {
+    // Before anything else reads them: these words may be percent-decoded URL
+    // segments, and several of them go on into an argv or a socket line.
+    opwords::check_all(args)?;
     if observe::needs_capability(&saved_config_path())
         && let Some(operation) = observe::operation_for_show(args)
     {
@@ -2693,6 +2775,9 @@ fn show_op(args: &[String]) -> Result<()> {
         // System status (the bare default).
         [] | ["system"] | ["status"] => {
             println!("hostname:   {}", system::current_hostname());
+            if let Some(status) = boot_fallback::read_status() {
+                println!("config:     {}", ui::red(&status.describe()));
+            }
             print!("firewall:   ");
             run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
             print!("routing:    ");
@@ -2724,7 +2809,9 @@ fn show_op(args: &[String]) -> Result<()> {
         ["system", "commit", n] => show_revision(n),
         ["interfaces", rest @ ..] => {
             let mut a = vec!["-brief", "address", "show"];
-            a.extend(rest);
+            for word in rest {
+                a.push(opwords::ip_word(word)?);
+            }
             run_show(&ip, &a)?;
             if rest.is_empty() {
                 show_held_links();
@@ -2734,7 +2821,7 @@ fn show_op(args: &[String]) -> Result<()> {
         ["arp", rest @ ..] | ["neighbors", rest @ ..] => {
             let mut a = vec!["neighbor", "show"];
             if let Some(dev) = rest.first() {
-                a.extend(["dev", dev]);
+                a.extend(["dev", opwords::iface_word(dev)?]);
             }
             run_show(&ip, &a)
         }
@@ -2742,7 +2829,9 @@ fn show_op(args: &[String]) -> Result<()> {
         // IPv4/IPv6 routing — served by Wren's RIB; the kernel FIB is the
         // fallback when the daemon isn't reachable.
         ["ip", "route"] => run_show(&ip, &["route", "show"]),
-        ["ip", "route", proto] => run_show(&ip, &["route", "show", "proto", proto]),
+        ["ip", "route", proto] => {
+            run_show(&ip, &["route", "show", "proto", opwords::ip_word(proto)?])
+        }
         ["ipv6", "route"] => run_show(&ip, &["-6", "route", "show"]),
 
         // BGP: vtysh-flavoured spellings on top of wren's tree.
@@ -3005,6 +3094,7 @@ fn show_op(args: &[String]) -> Result<()> {
         ["subscription"] => show_subscription(),
         ["version"] => {
             println!("sentinel:   {}", env!("CARGO_PKG_VERSION"));
+            println!("revision:   {}", build_info::revision());
             print!("wren:       ");
             if run_checked(&system::bin("wren"), &["--version"]).is_err() {
                 println!("(not available)");
@@ -3070,6 +3160,24 @@ fn show_op(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod ha_cli_tests {
     use super::*;
+    #[test]
+    fn ha_secret_generate_parses_and_produces_an_admissible_secret() {
+        let cli = Cli::try_parse_from(["sentinel", "ha", "secret", "generate"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ha {
+                command: HaCommand::Secret {
+                    command: HaSecretCommand::Generate
+                }
+            }
+        ));
+        let a = config::generate_sync_secret().unwrap();
+        let b = config::generate_sync_secret().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(config::sync_secret_weakness(&a), None);
+    }
     #[test]
     fn pair_modes_parse_without_putting_the_token_in_arguments() {
         let cli = Cli::try_parse_from([
@@ -3510,6 +3618,7 @@ fn show_cgnat(addr: &str) -> Result<()> {
 /// Deliberately a separate verb from `show`: this changes what the box is doing,
 /// and `show` must stay something an operator can run without thinking.
 fn clear_op(args: &[String]) -> Result<()> {
+    opwords::check_all(args)?;
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
     match path.as_slice() {
         ["ids", "block", addr] => {
@@ -3524,13 +3633,16 @@ fn clear_op(args: &[String]) -> Result<()> {
         // C20: throw one device — or everybody — off the guest network without
         // waiting for a session to expire. Named by MAC because that is what a
         // session *is* and what `show portal sessions` lists.
-        ["portal", "session", mac] => clear_portal(&format!("revoke {mac} any")),
+        ["portal", "session", mac] => {
+            clear_portal(&format!("revoke {} any", opwords::mac_word(mac)?))
+        }
         ["portal", "sessions"] => clear_portal("revoke all"),
         // C18: close every port a host on the inside opened. One at a time is
         // `clear port-mapping <tcp|udp> <port>` — but the case that actually
         // happens is wanting them all gone at once.
         ["port-mapping", "mappings"] | ["port-mapping"] => clear_mapping("unmap all"),
         ["port-mapping", proto, port] => {
+            let (proto, port) = opwords::mapping_words(proto, port)?;
             let Ok(state) = portmap::load(std::path::Path::new(portmap::STATE_FILE)) else {
                 println!("no port mapping is configured");
                 return Ok(());
@@ -3841,10 +3953,12 @@ fn show_firewall_log(depth: &str, window: Option<&str>) -> Result<()> {
 
 /// The argument list, worked out and bounded, without running anything.
 ///
-/// Separate from the call so the bounds are testable: this is the only place
-/// where a word from a management request becomes an argument to another
-/// program, and a test that has to spawn `journalctl` to check it is a test
-/// nobody runs.
+/// Separate from the call so the bounds are testable: a word from a management
+/// request becomes an argument to another program here, and a test that has to
+/// spawn `journalctl` to check it is a test nobody runs. (It is not the only
+/// such place: `show interfaces`, `show arp` and `show ip route <proto>` pass
+/// words to `ip`, routing views to `wren`, and `clear` to the agent sockets;
+/// every one of those goes through [`opwords`] first.)
 fn firewall_log_args(depth: &str, window: Option<&str>) -> Result<Vec<String>> {
     const MAX_LINES: u32 = 5000;
     const WINDOWS: [&str; 5] = ["15m", "1h", "6h", "24h", "7d"];
@@ -3892,6 +4006,17 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
         }
         ConfigAction::Check { file, live } => {
             let appliance = Appliance::load(&file)?;
+            compile::check_capacity(&appliance)?;
+            // The same verdict commit, save and the boot seed ask for.
+            match agent_contract::check(&appliance)? {
+                agent_contract::Verdict::Accepted => {
+                    println!("{}: the data plane's validator accepts it", file.display())
+                }
+                agent_contract::Verdict::Unavailable => println!(
+                    "{}: data-plane contract not checked (no agent on this host)",
+                    file.display()
+                ),
+            }
             if live {
                 net::validate_present_interfaces(&appliance, &system::discover_interfaces())?;
                 println!("{} is valid for this host", file.display());
@@ -3901,7 +4026,11 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
                     file.display()
                 );
             }
-            for warning in appliance.warnings() {
+            for warning in appliance
+                .warnings()
+                .into_iter()
+                .chain(appliance.interface_identity_warnings())
+            {
                 eprintln!("warning: {warning}");
             }
             Ok(())
@@ -4204,10 +4333,16 @@ mod tests {
             "#comment",
             "a\\b",
             "\"quoted\"",
-            "tab\t文字",
+            "wide 文字",
         ] {
-            assert_eq!(super::repl::split_line(&super::wizard_word(word)), [word]);
+            assert_eq!(
+                super::repl::split_line(&super::wizard_word(word)).unwrap(),
+                [word]
+            );
         }
+        // No value may hold a control character (audit 8b6181, CTRL-08), so a
+        // tab collected by the installer is refused rather than smuggled.
+        assert!(super::repl::split_line(&super::wizard_word("tab\t")).is_err());
     }
 
     #[test]
@@ -4346,6 +4481,24 @@ mod tests {
         assert!(super::firewall_refresh_source(&saved, &running).is_err());
         // ENOTDIR is not absence and must never quietly choose saved policy.
         assert!(super::firewall_refresh_source(&saved, &saved.join("running")).is_err());
+    }
+
+    /// STATIC-13: operator-facing help must not leak internal planning codes
+    /// ("roadmap C12"). Every subcommand's long help is rendered and searched.
+    #[test]
+    fn cli_help_names_no_internal_roadmap_codes() {
+        use clap::CommandFactory;
+        let mut root = super::Cli::command();
+        let mut pages = vec![root.render_long_help().to_string()];
+        for sub in root.get_subcommands_mut() {
+            pages.push(sub.render_long_help().to_string());
+        }
+        for page in pages {
+            assert!(
+                !page.contains("roadmap"),
+                "help leaks a roadmap code:\n{page}"
+            );
+        }
     }
 
     #[test]

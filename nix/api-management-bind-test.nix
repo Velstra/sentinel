@@ -4,7 +4,7 @@
 { pkgs, self }:
 let
   lib = pkgs.lib;
-  token = "api-management-bind-disposable-vm-credential";
+  token = "c07f0b5ea57c0a711eb3008f1bc45ef0ece8a758d5e8cb7c54c6573aad543b79";
 in
 pkgs.testers.runNixOSTest {
   name = "sentinel-api-explicit-management-bind";

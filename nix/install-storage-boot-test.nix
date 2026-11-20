@@ -197,6 +197,11 @@ in pkgs.testers.runNixOSTest {
         key = installed.succeed("ssh-keygen -lf /var/lib/sentinel/ssh/ssh_host_ed25519_key.pub").split()[1]
         assert key != source_key, "installer copied a private source identity"
         version = installed.succeed("sentinel show version")
+        viewer_version = installed.succeed("su -s /bin/sh nobody -c 'sentinel show version'")
+        expected_data = "LUKS2 encrypted" if encrypted else "not encrypted"
+        assert expected_data in viewer_version, viewer_version
+        assert "data:       unknown" not in viewer_version, viewer_version
+        installed.fail("su -s /bin/sh nobody -c 'sudo -n id'")
         assert "release:    2.0.0-qa-install-boot" in version and "slot sentinel-a" in version, version
         installed.succeed("printf installed-marker > /var/lib/sentinel/qa-installed-proof")
         saved_config = installed.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]

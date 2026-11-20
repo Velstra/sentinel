@@ -92,6 +92,11 @@ pub(crate) fn check(previous: Option<&Appliance>, candidate: &Appliance) -> Resu
             names
         );
     }
+    // CTRL-01: a weak config-sync secret is an offline-guessable credential.
+    // Refused for every admitted change, not grandfathered: the box still
+    // boots and pairs with it (boot does not use this gate), but no change is
+    // accepted until it is rotated.
+    candidate.refuse_weak_sync_secret()?;
     Ok(())
 }
 
@@ -124,17 +129,16 @@ fn baseline(saved: &Path, running: Option<&Path>) -> Result<Option<Appliance>> {
     else {
         return Ok(None);
     };
-    if saved.extension().and_then(|value| value.to_str()) == Some("json") {
-        Appliance::from_json(&text)
-    } else {
-        Appliance::from_toml(&text)
-    }
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "admission saved intent is invalid; inspect the protected saved configuration locally"
-        )
-    })
-    .map(Some)
+    // The box's own saved file, read the way boot and `configure` read it: a
+    // value an update has since refused is neutralised (with a warning), not a
+    // reason to refuse every commit that would fix it (audit 8b6181, CTRL-08).
+    Appliance::saved_lenient(saved, &text)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "admission saved intent is invalid; inspect the protected saved configuration locally"
+            )
+        })
+        .map(Some)
 }
 
 #[cfg(test)]

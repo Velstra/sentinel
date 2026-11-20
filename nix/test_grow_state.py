@@ -27,6 +27,17 @@ def fixture():
             'id':str(uuid.UUID(int=100)),'partitions':parts}
 
 
+def superblock(block_size, blocks, wide=True):
+    data = bytearray(1024)
+    data[0x38:0x3A] = (0xEF53).to_bytes(2, 'little')
+    data[0x18:0x1C] = ((block_size // 1024).bit_length() - 1).to_bytes(4, 'little')
+    data[0x04:0x08] = (blocks & 0xFFFFFFFF).to_bytes(4, 'little')
+    if wide:
+        data[0x60:0x64] = (0x80).to_bytes(4, 'little')
+        data[0x150:0x154] = (blocks >> 32).to_bytes(4, 'little')
+    return bytes(data)
+
+
 def plan_for(table):
     return [{'partno':i,'label':p['name'],'uuid':p['uuid'],'offset':p['start']*512,
              'old_size':p['size']*512,'raw_size':p['size']*512,
@@ -194,7 +205,7 @@ class ExecutionGuards(unittest.TestCase):
                 assert layout['disk'] == disk and identity == 123
                 return self.repart(disk,directory,False)
 
-            def run(self, tool, *args):
+            def run(self, tool, *args, **options):
                 owner.events.append((tool, *args))
 
         self.fake = FakeCommands
@@ -218,6 +229,10 @@ class ExecutionGuards(unittest.TestCase):
             return original_read(path, *args, **kwargs)
 
         patch.object(Path, 'read_text', read).start()
+        # A filesystem that already fills its partition needs no growth.
+        self.superblocks = [superblock(4096, wanted//4096)]
+        patch.object(grow, 'read_superblock',
+                     side_effect=lambda device: self.superblocks.pop(0) if len(self.superblocks) > 1 else self.superblocks[0]).start()
 
     def test_dry_run_has_no_mutating_command(self):
         report = grow.run(SimpleNamespace(apply=False))
@@ -310,6 +325,63 @@ class ExecutionGuards(unittest.TestCase):
         self.assertEqual(report['status'],'unchanged')
         self.assertFalse(report['writes'])
         self.assertEqual(self.events,[('filesystem','/dev/vda6'),('table','/dev/vda')])
+
+    def test_seeded_small_filesystem_is_checked_then_grown_offline_before_mount(self):
+        wanted = int(Path('/sys/class/block/vda6/size').read_text())*512
+        self.superblocks = [superblock(4096, 1024), superblock(4096, wanted//4096)]
+        report = grow.run(SimpleNamespace(apply=True))
+        self.assertEqual(report['status'], 'partition-grown')
+        self.assertEqual(report['filesystem_growth'], 'grown')
+        tools = [v[0] for v in self.events]
+        # The forced check precedes the resize, and both follow the GPT write.
+        self.assertLess(tools.index('udevadm'), tools.index('e2fsck'))
+        self.assertLess(tools.index('e2fsck'), tools.index('resize2fs'))
+        self.assertIn(('e2fsck','-f','-p','/dev/vda6'), self.events)
+        self.assertIn(('resize2fs','/dev/vda6'), self.events)
+
+    def test_filesystem_growth_failure_is_reported_and_never_fatal(self):
+        self.superblocks = [superblock(4096, 1024)]
+        original = self.fake.run
+        def failing(fake, tool, *args, **options):
+            original(fake, tool, *args, **options)
+            if tool == 'resize2fs':
+                raise ValueError('resize2fs refused the verified boot-disk operation: simulated')
+        with patch.object(self.fake, 'run', failing):
+            report = grow.run(SimpleNamespace(apply=True))
+        self.assertEqual(report['status'], 'partition-grown')
+        self.assertEqual(report['filesystem_growth'], 'failed')
+        self.assertIn('simulated', report['filesystem_error'])
+
+    def test_filesystem_that_did_not_grow_is_a_reported_failure(self):
+        self.superblocks = [superblock(4096, 1024), superblock(4096, 1024)]
+        report = grow.run(SimpleNamespace(apply=True))
+        self.assertEqual(report['filesystem_growth'], 'failed')
+        self.assertIn('did not grow', report['filesystem_error'])
+
+    def test_mounted_data_is_never_resized(self):
+        self.superblocks = [superblock(4096, 1024)]
+        with patch.object(grow, 'mounted_device', side_effect=[False, False, True]):
+            report = grow.run(SimpleNamespace(apply=True))
+        self.assertEqual(report['filesystem_growth'], 'failed')
+        self.assertNotIn('resize2fs', [v[0] for v in self.events])
+
+    def test_dry_run_never_checks_or_resizes_the_filesystem(self):
+        self.superblocks = [superblock(4096, 1024)]
+        report = grow.run(SimpleNamespace(apply=False))
+        self.assertEqual(report['filesystem_growth'], 'not-applied')
+        self.assertFalse({'e2fsck','resize2fs'} & {v[0] for v in self.events})
+
+
+class Ext4Geometry(unittest.TestCase):
+    def test_reads_32_and_64_bit_block_counts(self):
+        self.assertEqual(grow.ext4_geometry(superblock(4096, 32768, wide=False)), (4096, 32768))
+        self.assertEqual(grow.ext4_geometry(superblock(1024, 131072)), (1024, 131072))
+        self.assertEqual(grow.ext4_geometry(superblock(4096, (1 << 33) + 5)), (4096, (1 << 33) + 5))
+
+    def test_foreign_or_short_superblock_refused(self):
+        for bad in (b'', b'\0'*1024, superblock(4096, 0)):
+            with self.assertRaises(ValueError):
+                grow.ext4_geometry(bad)
 
 
 if __name__=='__main__':

@@ -149,11 +149,17 @@
   # Live declarative apply needs privileged service/network operations. OS
   # updates remain signed immutable A/B swaps, never runtime Nix rebuilds.
 
-  # Test-VM convenience: a console login (SSH is key-only, so the QEMU console
-  # would otherwise be a dead end). The flashable appliance image overrides
-  # both settings in image.nix; do not rely on these defaults in production.
-  users.users.admin.initialPassword = lib.mkDefault "sentinel";
-  services.getty.autologinUser = lib.mkDefault "admin";
+  # polkit stays because ModemManager is built with strict polkit authorization
+  # and the cellular uplinks drive it over D-Bus. Its setuid pkexec has no user
+  # here: Sentinel and its units run as root and never escalate through polkit
+  # (CVE-2021-4034 was exactly this binary). Keep the wrapper, drop the setuid bit.
+  security.wrappers.pkexec.setuid = lib.mkForce false;
+
+  # No factory password and no console autologin (STATIC-11). This module is
+  # exported for reuse (`nixosModules.sentinel`, the image factories), so the
+  # safe setting is the default; only the throwaway development VM
+  # (`nixosConfigurations.appliance`, `nix run .#vm`) opts into a known console
+  # login, in flake.nix. image.nix still asserts both stay unset.
 
   # VyOS-like operational shell: after login you type `configure` directly —
   # no `sentinel` prefix needed.

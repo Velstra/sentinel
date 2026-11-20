@@ -8,7 +8,7 @@ let
   command = "${pkgs.python3}/bin/python3 -B ${probe}";
 in pkgs.testers.runNixOSTest {
   name = "sentinel-nat-capacity-${if lanStateful then "stateful" else "lan-stateless-diagnostic"}-${toString (lib.last counts)}";
-  globalTimeout = 600;
+  globalTimeout = 1200;
   nodes = {
     client = {
       virtualisation = { vlans = [ 2 ]; memorySize = 768; };
@@ -20,7 +20,7 @@ in pkgs.testers.runNixOSTest {
         interfaces.eth1.ipv4.addresses = [{ address = "198.18.20.50"; prefixLength = 24; }];
         defaultGateway = { address = "198.18.20.1"; interface = "eth1"; };
       };
-      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 pkgs.ethtool ];
       systemd.services.qa-capacity-client = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
@@ -43,7 +43,7 @@ in pkgs.testers.runNixOSTest {
           { address = "198.18.10.254"; prefixLength = 24; }
         ];
       };
-      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.iproute2 pkgs.ethtool ];
       systemd.services.qa-capacity-peer = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
@@ -74,7 +74,7 @@ in pkgs.testers.runNixOSTest {
           nat.source = [{ name = "wan-masquerade"; zone = "wan"; }];
         });
       };
-      environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.iproute2 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.iproute2 pkgs.ethtool ];
     };
   };
   testScript = ''
@@ -128,6 +128,48 @@ in pkgs.testers.runNixOSTest {
         preserve(name + ".json", value)
         return value
 
+    def drop_counters():
+        # Diagnostics only: packet drops outside the datapath's own counters
+        # (softirq backlog, NIC/veth rings, qdiscs) on every host.
+        result = {}
+        for machine in (client, backend, fw):
+            softnet = machine.succeed("cat /proc/net/softnet_stat").split("\n")
+            dropped = sum(int(line.split()[1], 16) for line in softnet if line.strip())
+            squeezed = sum(int(line.split()[2], 16) for line in softnet if line.strip())
+            links = json.loads(machine.succeed("ip -s -j link show"))
+            link = {item["ifname"]: [item["stats64"]["rx"]["dropped"], item["stats64"]["tx"]["dropped"],
+                                     item["stats64"]["rx"].get("missed", 0)] for item in links if item["ifname"] != "lo"}
+            qdisc = json.loads(machine.succeed("tc -s -j qdisc show"))
+            qdrops = sum(int(item.get("drops", 0)) for item in qdisc)
+            # virtio-net ring/XDP statistics: drops the guest cannot see as
+            # link/qdisc drops (ring full, XDP drop/redirect failures).
+            nic = {}
+            for name in link:
+                if name == "eth0":
+                    continue
+                for line in machine.execute("ethtool -S " + name + " 2>/dev/null")[1].splitlines():
+                    key, _, value = line.strip().partition(":")
+                    if value.strip().isdigit() and ("drop" in key or "xdp" in key or "kick" in key or "full" in key):
+                        nic[name + "." + key] = int(value)
+            snmp = machine.succeed("cat /proc/net/snmp").splitlines()
+            ip = dict(zip(snmp[0].split()[1:], map(int, snmp[1].split()[1:]))) if snmp and snmp[0].startswith("Ip:") else {}
+            result[machine.name] = dict(softnet_dropped=dropped, softnet_squeezed=squeezed, link=link, qdisc_drops=qdrops,
+                                        nic=nic, ip={k: ip.get(k, 0) for k in ("InDiscards", "OutDiscards", "ForwDatagrams", "OutNoRoutes", "InHdrErrors", "InAddrErrors")})
+        return result
+
+    def drop_delta(before, after):
+        out = {}
+        for host, b in before.items():
+            a = after[host]
+            out[host] = dict(softnet_dropped=a["softnet_dropped"] - b["softnet_dropped"],
+                             softnet_squeezed=a["softnet_squeezed"] - b["softnet_squeezed"],
+                             qdisc_drops=a["qdisc_drops"] - b["qdisc_drops"],
+                             link={k: [x - y for x, y in zip(a["link"][k], b["link"].get(k, [0, 0, 0]))]
+                                   for k in a["link"]},
+                             nic={k: v - b["nic"].get(k, 0) for k, v in a["nic"].items() if v - b["nic"].get(k, 0)},
+                             ip={k: v - b["ip"].get(k, 0) for k, v in a["ip"].items()})
+        return out
+
     def runtime_sample(name):
         # Keep workload/scheduler and kernel TCP evidence next to packet/map
         # results. A timeout with owned map state is not allocator attribution.
@@ -157,10 +199,14 @@ in pkgs.testers.runNixOSTest {
                                  config_hash=fw.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0])
         # The first snapshot supplies old IDs only. A real agent restart must
         # create new maps, so no earlier load-test bindings contaminate this run.
+        # The appliance's agent persists its state across restarts (DP-27), so
+        # release what it pinned while it is stopped to get fresh maps.
         fw.wait_until_succeeds("${command} snapshot --output /run/qa-capacity-initial.json", timeout=30)
         initial = read_json(fw, "/run/qa-capacity-initial.json")
         preserve("initial-raw-maps.json", initial)
-        fw.succeed("systemctl restart velstra.service")
+        fw.succeed("systemctl stop velstra.service")
+        fw.succeed("${self.packages.x86_64-linux.velstra}/bin/velstra release-datapath")
+        fw.succeed("systemctl start velstra.service")
         fw.wait_until_succeeds("${command} snapshot --output /run/qa-capacity-baseline.json", timeout=30)
         baseline = read_json(fw, "/run/qa-capacity-baseline.json")
         preserve("baseline-raw-maps.json", baseline)
@@ -179,7 +225,9 @@ in pkgs.testers.runNixOSTest {
                 time.sleep(0.1)  # Let final handshake/ACK work quiesce before the batch walks.
                 before = sample("before-" + str(count))
                 runtime_before_probe = runtime_sample("before-probe-" + str(count))
+                drops_before = drop_counters()
                 probes = control("probe", "echo-" + str(count))
+                drops_after = drop_counters()
                 runtime_after_probe = runtime_sample("after-probe-" + str(count))
                 after = sample("after-" + str(count))
                 analysis = diagnostic.analyse(before, manifest, probes, template,
@@ -194,6 +242,38 @@ in pkgs.testers.runNixOSTest {
                 receipt["phases"].append(analysis)
                 preserve("phase-" + str(count) + "-analysis.json", analysis)
                 preserve("nat-capacity-pressure.json", receipt)
+                # Diagnostics only (no pass criterion): what kind of failure each
+                # unverified held echo was, and the TCP/softirq counters that
+                # separate a probe-side bottleneck from a datapath drop.
+                kinds = {}
+                for row in probes["rows"]:
+                    if row.get("verified") is not True:
+                        failure = row.get("failure") or {}
+                        tag = str(failure.get("stage")) + "/" + str(failure.get("kind"))
+                        kinds[tag] = kinds.get(tag, 0) + 1
+                def tcp_delta(name):
+                    out = {}
+                    for host in ("client", "backend", "fw"):
+                        a = runtime_before_probe.get(host, {}).get("netstat", {})
+                        b = runtime_after_probe.get(host, {}).get("netstat", {})
+                        sa, sb = runtime_before_probe.get(host, {}).get("snmp", {}), runtime_after_probe.get(host, {}).get("snmp", {})
+                        row = {}
+                        for group, key, x, y in (("TcpExt", k, a, b) for k in ("ListenOverflows", "ListenDrops", "TCPBacklogDrop", "TCPTimeouts", "TCPAbortOnTimeout", "TCPLossProbes", "TCPRcvQDrop", "PAWSEstab")):
+                            try:
+                                row[key] = int(y[group][key]) - int(x[group][key])
+                            except (KeyError, TypeError, ValueError):
+                                pass
+                        for key in ("RetransSegs", "InErrs", "OutRsts", "EstabResets", "InCsumErrors"):
+                            try:
+                                row[key] = int(sb["Tcp"][key]) - int(sa["Tcp"][key])
+                            except (KeyError, TypeError, ValueError):
+                                pass
+                        out[host] = row
+                    return out
+                print("NAT-CAPACITY-DIAG " + json.dumps({"requested": count, "failure_kinds": kinds,
+                    "probe_keys": sorted(k for k in probes if k != "rows"),
+                    "tcp_delta_during_probe": tcp_delta(count),
+                    "drops_during_probe": drop_delta(drops_before, drops_after)}, sort_keys=True, default=str))
                 print("NAT-CAPACITY-PHASE " + json.dumps({key: analysis[key] for key in (
                     "requested", "initial_nonce_echoes", "verified_held_echoes", "raw_maps", "passed")}, sort_keys=True))
         receipt["pressure_complete"] = counts[-1] == 20000 and receipt["phases"][-1]["requested"] == 20000

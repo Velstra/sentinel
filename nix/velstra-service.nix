@@ -97,6 +97,32 @@ in
       '';
     };
 
+    # Never boot dark (DP-01 class). sentinel-boot already refuses to render a
+    # saved config the agent's validator rejects; a refusal only the kernel load
+    # shows (a map that fills, DP-17) appears as an agent that never becomes
+    # ready. This waits for it and, if it does not, applies the last-known-good
+    # or a management-only policy live, and says so on the console. When the
+    # agent is ready it records the booted config as the last-known-good.
+    # multi-user.target (and so boot-health) is ordered after it.
+    systemd.services.sentinel-boot-verify = {
+      description = "Fall back to a configuration the data plane accepts";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "sentinel-boot.service"
+        "velstra.service"
+      ];
+      requires = [ "sentinel-boot.service" ];
+      unitConfig.RequiresMountsFor = [ "/var/lib/sentinel" ];
+      onFailure = [ "sentinel-alert@%n.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        TimeoutStartSec = 300;
+        StandardError = "journal+console";
+        ExecStart = "${cfg.sentinel}/bin/sentinel boot-verify --config /var/lib/sentinel/appliance.toml";
+      };
+    };
+
     # Unlock the encrypted data partition before /var/lib/sentinel is mounted.
     #
     # Conditional by design: the SAME image serves plaintext and encrypted
@@ -150,7 +176,7 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecStart = "${cfg.sentinel}/bin/sentinel apply-console --config /var/lib/sentinel/appliance.toml";
+        ExecStart = "${cfg.sentinel}/bin/sentinel apply-console";
       };
     };
 

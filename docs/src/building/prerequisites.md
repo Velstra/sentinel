@@ -15,6 +15,34 @@ nix flake show --no-write-lock-file
 
 Run the second command from the checked-out Sentinel repository. If flakes are disabled, enable `experimental-features = nix-command flakes` in the Nix configuration. Initial builds need their pinned sources or a populated cache.
 
+## Allow unprivileged user namespaces
+
+The image build runs `systemd-repart` inside an unprivileged user namespace to assemble the partitions. A host that forbids those namespaces stops the build in the repart step with:
+
+```text
+unshare: write failed /proc/self/uid_map: Operation not permitted
+```
+
+Ubuntu 24.04 and later forbid them by default through AppArmor (`kernel.apparmor_restrict_unprivileged_userns = 1`). Check the host first:
+
+```sh
+unshare -Ur true && echo "user namespaces available"
+sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null
+```
+
+If `unshare` fails, either allow unprivileged user namespaces on the build host:
+
+```sh
+echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/90-nix-userns.conf
+sudo sysctl --system
+```
+
+or keep the restriction and give the Nix daemon and its build users an AppArmor profile that permits `userns`. The sysctl is host-wide, so prefer the profile on a shared machine. Re-run `unshare -Ur true` to confirm.
+
+## Size the build host
+
+Measured on a 16 vCPU / 32 GB builder: a cold `nix build .#sentinel-image` takes about 10 minutes, a rebuild with cached dependencies about 8 minutes (the Rust unit tests run inside the build). The appliance closure is about 1.5 GiB and must fit the 2.5 GiB store slot; the raw image is about 5.6 GiB apparent (1.7 GiB allocated). Allow tens of GiB of free disk for the Nix store, and more for the VM checks.
+
 ## Check VM support
 
 ```sh

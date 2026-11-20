@@ -101,10 +101,34 @@ pub const DEFAULT_TOKENS_DIR: &str = "/var/lib/sentinel/api-tokens";
 /// Who is asking, and what they may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
-    /// The account name, or `None` for the machine token.
+    /// The account name, or `None` for the machine token and the peer.
     pub user: Option<String>,
     /// What this caller may do.
     pub permission: crate::config::Permission,
+    /// Which kind of bearer authenticated the caller.
+    pub credential: Credential,
+}
+
+/// The three kinds of bearer the API accepts.
+///
+/// They used to be two: when config-sync was configured, its operator-chosen
+/// secret was *written into* the machine token file, so the string an HA peer
+/// presents — and the key of the unauthenticated enrollment proof — was the
+/// full-access, never-expiring local credential (CTRL-01). It no longer is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// The local machine token (`/var/lib/sentinel/api-token`, root-only, or
+    /// `$SENTINEL_API_TOKEN`): full access. Random unless an operator replaced
+    /// it by hand, and never the config-sync secret.
+    Machine,
+    /// The `system config-sync secret`, presented by an HA / config-sync peer:
+    /// it may read what a read-only account reads (the stack view), and write
+    /// exactly the two synchronization routes ([`peer_may`]). What a push or a
+    /// pairing may change is fenced on the receiving side
+    /// ([`crate::configsync::keep_member_trust`]).
+    Peer,
+    /// A signed-in account's session ([`crate::api_session`]).
+    Session,
 }
 
 /// Serve the REST API until the process is stopped. Loads (or generates) the
@@ -196,13 +220,16 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
                         key.display()
                     )
                 })?;
-            // `into_make_service_with_connect_info::<SocketAddr>` so the login
-            // handler can see the peer address and apply a per-IP lockout —
-            // without it every request would look like it came from nowhere.
-            axum_server::bind_rustls(addr, tls)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .context("serving the management API over HTTPS")?;
+            // The connection budget (CTRL-05) and the peer address the sign-in
+            // and bearer budgets count both come from the limited listener.
+            crate::api_listener::serve(
+                crate::api_listener::Listen::Bind(addr),
+                app,
+                Some(tls),
+                crate::api_listener::LIMITS,
+            )
+            .await
+            .context("serving the management API over HTTPS")?;
         }
         // Opt-in plaintext (`[services.web] tls = false`): loopback/dev, or behind
         // an external TLS terminator. Say plainly that it is unencrypted.
@@ -212,15 +239,14 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
                  PLAINTEXT: tls is disabled, so use this only on a trusted or loopback network",
                 token_file.display()
             );
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("binding {addr}"))?;
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
+            crate::api_listener::serve(
+                crate::api_listener::Listen::Bind(addr),
+                app,
+                None,
+                crate::api_listener::LIMITS,
             )
             .await
-            .context("serving the REST API")?;
+            .with_context(|| format!("serving the REST API on {addr}"))?;
         }
     }
     Ok(())
@@ -297,9 +323,12 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/config/recovery/accept", post(post_accept_current))
         .route("/api/v1/ha/enrollment", get(ha_enrollment))
         .route("/api/v1/ha/pair", post(ha_pair))
-        // A config-sync peer is not a second administrator. Its document is
-        // shared policy, merged with the receiver's local identity before it
-        // can reach the normal apply path.
+        // A config-sync peer is not a second administrator: its credential
+        // reaches only this route and `ha/pair` besides reads ([`peer_may`]),
+        // and its document is shared policy, merged with the receiver's local
+        // identity and management trust before it reaches the apply path.
+        // It still sets the shared firewall, NAT and routing policy — that is
+        // what synchronization is for (see SECURITY.md).
         .route("/api/v1/config-sync", axum::routing::put(put_config_sync))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/system/health", get(get_system_health))
@@ -339,6 +368,12 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
         .route("/api/v1/stack/:member/telemetry", get(get_stack_telemetry))
         .route("/api/v1/stack/:member/system/health", get(get_stack_health))
+        // A request body must arrive within its deadline (CTRL-05). Inside
+        // the token check, so only an authenticated caller is buffered.
+        .route_layer(middleware::from_fn_with_state(
+            crate::api_listener::AUTHENTICATED_BODY,
+            crate::api_listener::bounded_body,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
@@ -348,7 +383,13 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/openapi.json", get(get_openapi))
         // Signing in cannot require being signed in. The account's password is
         // checked here and a new session's token is handed back.
-        .route("/api/v1/login", post(post_login))
+        .route(
+            "/api/v1/login",
+            post(post_login).layer(middleware::from_fn_with_state(
+                crate::api_listener::SIGN_IN_BODY,
+                crate::api_listener::bounded_body,
+            )),
+        )
         // Signing out is open to every session, read-only ones included, so it
         // sits outside the middleware that refuses a read-only caller every
         // POST; the handler resolves the bearer itself, and a bearer that is
@@ -544,6 +585,16 @@ async fn security_headers(req: Request, next: Next) -> Response {
         header::REFERRER_POLICY,
         header::HeaderValue::from_static("no-referrer"),
     );
+    // CTRL-29: once a browser has reached the console over HTTPS it must not
+    // be talked down to plaintext by somebody on the path. Browsers ignore
+    // this header over plaintext and over a connection with certificate
+    // errors, so a self-signed console the operator clicked through is not
+    // pinned by it; `includeSubDomains` is left out because the appliance's
+    // name may sit inside a domain the operator does not own.
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        header::HeaderValue::from_static("max-age=31536000"),
+    );
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(
             header::CACHE_CONTROL,
@@ -558,11 +609,26 @@ async fn security_headers(req: Request, next: Next) -> Response {
 /// Reject any request whose `Authorization: Bearer <token>` does not match the
 /// configured token. The comparison is constant-time so a wrong token leaks no
 /// timing signal about how many bytes were right.
+///
+/// Wrong bearers are counted per source (CTRL-01): once a source has
+/// presented [`crate::api_throttle::BEARER_FAILURES`] invalid ones, its
+/// further invalid ones get 429. A **valid** credential is never refused for
+/// its source's failures — a flood from a shared NAT, or a table of locked
+/// addresses, must not lock out the operator or the HA peer — with one
+/// exception: the peer credential while the configured secret is weak. Such a
+/// secret is guessable online, so a locked source cannot keep trying it; the
+/// strong secrets admission requires and the 256-bit session and machine
+/// tokens are not. A request with no peer address (an in-process caller), or
+/// no bearer at all, is not counted.
 async fn require_token(
     State(state): State<Arc<ApiState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
+    let source = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| crate::api_throttle::source(ci.0.ip()));
     let provided = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -572,29 +638,104 @@ async fn require_token(
         return unauthorised();
     };
     let Some(caller) = resolve_caller(&state, token) else {
-        return unauthorised();
+        return bearer_failure(source);
     };
+    if caller.credential == Credential::Peer
+        && let Some(source) = &source
+        && peer_secret_is_weak(&state)
+        && let Err(refusal) = crate::api_throttle::tables().bearer_failures.check(source)
+    {
+        return too_many(
+            &refusal,
+            "too many failed authentications from your address; try again later".into(),
+        )
+        .into_response();
+    }
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     // A read-only caller may read anything and change nothing. The split is by
     // **method**, not by path: every endpoint that changes something is a POST
     // or a PUT, and enumerating paths instead would leave the next endpoint
-    // added silently writable by everyone.
-    if !caller.permission.may_write() && req.method() != axum::http::Method::GET {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": format!(
-                    "{} is read-only",
-                    caller.user.as_deref().unwrap_or("this token"),
-                ),
-            })),
-        )
-            .into_response();
+    // added silently writable by everyone. The peer is the one exception, and
+    // it is an allow-list, so a new endpoint is closed to it by default.
+    let allowed = match caller.credential {
+        Credential::Peer => peer_may(&method, &path),
+        Credential::Machine | Credential::Session => {
+            caller.permission.may_write() || method == axum::http::Method::GET
+        }
+    };
+    if !allowed {
+        let error = match caller.credential {
+            Credential::Peer => "the config-sync credential may read, push config-sync and \
+                                 complete HA pairing, nothing else"
+                .to_string(),
+            _ => format!(
+                "{} is read-only",
+                caller.user.as_deref().unwrap_or("this token"),
+            ),
+        };
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": error }))).into_response();
     }
+    note_machine_use(caller.credential, source, &method, &path);
     // Handlers get to know who is asking. A console that has been reloaded
     // holds a token and nothing else — it has to be able to ask the appliance
     // whose it is, or it cannot say who is signed in or what they may do.
     req.extensions_mut().insert(caller);
     next.run(req).await
+}
+
+/// What the config-sync credential may do besides reading (CTRL-09): push a
+/// configuration and complete a pairing. Everything an HA peer calls — the
+/// stack view's `status`, `show`, `telemetry/snapshot` and `system/health`,
+/// enrollment's `GET /api/v1/ha/enrollment` — is a read. A peer can no longer
+/// `PUT /api/v1/config`, post `configure` lines, stage updates or end
+/// commit-confirm windows; those are an administrator's.
+fn peer_may(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    *method == Method::GET
+        || (*method == Method::PUT && path == "/api/v1/config-sync")
+        || (*method == Method::POST && path == "/api/v1/ha/pair")
+}
+
+/// Write one journal line when the machine token or the peer credential is
+/// used (CTRL-01, CTRL-07): those bearers have no account behind them, so the
+/// journal is the only record of who used them. Every change is logged; a read
+/// is logged once per source and credential every ten minutes, because the
+/// stack view polls its peer every few seconds.
+fn note_machine_use(
+    credential: Credential,
+    source: Option<std::net::IpAddr>,
+    method: &axum::http::Method,
+    path: &str,
+) {
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(600);
+    let kind = match credential {
+        Credential::Machine => "machine token",
+        Credential::Peer => "config-sync credential",
+        Credential::Session => return,
+    };
+    let from = source.map_or_else(|| "a local caller".to_string(), |ip| ip.to_string());
+    if *method != axum::http::Method::GET {
+        eprintln!("api: {kind} used from {from}: {method} {path}");
+        return;
+    }
+    static SEEN: OnceLock<std::sync::Mutex<HashMap<(&'static str, String), std::time::Instant>>> =
+        OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (kind, from.clone());
+    if seen.get(&key).is_some_and(|at| at.elapsed() < QUIET) {
+        return;
+    }
+    if seen.len() >= 1024 {
+        seen.retain(|_, at| at.elapsed() < QUIET);
+    }
+    seen.insert(key, std::time::Instant::now());
+    eprintln!(
+        "api: {kind} used from {from} (reads; further reads from there are not logged for ten minutes): {method} {path}"
+    );
 }
 
 /// The 401 every failed authentication gets, worded the same way whether the
@@ -610,12 +751,15 @@ fn unauthorised() -> Response {
 
 /// Resolve a presented token to who is asking and what they may do.
 ///
-/// The **machine token** is full access and has no account behind it: it is what
-/// a peer firewall presents when config-sync pushes a commit, and what an
-/// operator uses before any account exists. It is not a session and never
-/// expires; it is rotated, not signed out. Everything else is a signed-in
-/// session (see [`crate::api_session`]), which resolves only while it is inside
-/// its time limits and the configuration still grants what it was opened with.
+/// The **machine token** is full access and has no account behind it: what an
+/// operator on the box uses before any account exists. It is not a session
+/// and never expires; it is rotated, not signed out. The **config-sync
+/// secret** is the peer's credential ([`Credential::Peer`]), checked first: a
+/// machine token file that still holds the secret (written by an earlier
+/// release, until the next apply mints a new one) must not make the shared
+/// secret full access. Everything else is a signed-in session (see
+/// [`crate::api_session`]), which resolves only while it is inside its time
+/// limits and the configuration still grants what it was opened with.
 pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
     resolve_caller_at(state, presented, crate::aaa::unix_now())
 }
@@ -631,19 +775,56 @@ fn resolve_caller_at(state: &ApiState, presented: &str, now: u64) -> Option<Call
     if presented.is_empty() {
         return None;
     }
-    if machine_token(state).is_ok_and(|token| ct_eq(presented.as_bytes(), token.as_bytes())) {
+    let machine =
+        machine_token(state).is_ok_and(|token| ct_eq(presented.as_bytes(), token.as_bytes()));
+    // The configuration is read even for the machine token, to tell it from
+    // the peer secret; a configuration that cannot be read never locks the
+    // machine token out, it only means there is no peer credential.
+    let appliance = state.appliance().ok();
+    if appliance
+        .as_ref()
+        .and_then(peer_secret)
+        .is_some_and(|secret| ct_eq(presented.as_bytes(), secret.as_bytes()))
+    {
+        return Some(Caller {
+            user: None,
+            permission: Permission::ReadOnly,
+            credential: Credential::Peer,
+        });
+    }
+    if machine {
         return Some(Caller {
             user: None,
             permission: Permission::ReadWrite,
+            credential: Credential::Machine,
         });
     }
-    let appliance = state.appliance().ok()?;
     let (user, permission) =
-        crate::api_session::resolve(&state.tokens_dir, &appliance, presented, now)?;
+        crate::api_session::resolve(&state.tokens_dir, appliance.as_ref()?, presented, now)?;
     Some(Caller {
         user: Some(user),
         permission,
+        credential: Credential::Session,
     })
+}
+
+/// Whether the configured config-sync secret is one admission would refuse.
+fn peer_secret_is_weak(state: &ApiState) -> bool {
+    state
+        .appliance()
+        .ok()
+        .as_ref()
+        .and_then(peer_secret)
+        .is_some_and(|secret| crate::config::sync_secret_weakness(secret).is_some())
+}
+
+/// The peer credential `a` configures: its non-empty config-sync secret.
+fn peer_secret(a: &Appliance) -> Option<&str> {
+    a.system
+        .config_sync
+        .secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
 }
 
 /// Remove every session that has expired or that the configuration no longer
@@ -818,52 +999,33 @@ async fn get_metrics(
 /// ungrouped accounts get no API grant; the explicitly configured, ungrouped
 /// bootstrap `admin` retains its recovery administrator grant.
 ///
-/// Attempts are budgeted two ways: 30 per account in ten minutes, across all
-/// origins, and ten per origin before a fifteen-minute origin lockout. Both
-/// refuse even correct credentials while exhausted. The cross-origin account
-/// limit bounds distributed guessing but permits targeted account denial of
-/// service; it does not promise that another source bypasses the account limit.
-/// Successful sign-in clears both budgets. They are in memory, so an API
-/// restart clears them too.
+/// Attempts are budgeted three ways (see [`crate::api_throttle`]): ten per
+/// origin over all accounts, ten per (account, origin), and a hundred per
+/// account from origins that never signed it in. Each refuses even correct
+/// credentials while exhausted. Guessing `admin` from one place therefore
+/// locks that place, not the account: the administrator's own workstation —
+/// an origin that signed `admin` in before — keeps its own budget even while a
+/// distributed guess has exhausted the new-origins one. A good sign-in clears
+/// the origin's and the pair's counts. All of it is in memory, so an API
+/// restart clears it too.
 ///
-/// The address's attempt is counted when it is *let through*, not when it has
+/// Attempts are counted when they are *let through*, not when they have
 /// failed. Counting afterwards let a burst of parallel guesses all pass the
 /// check before the first of them had finished hashing; counting first means
 /// the threshold bounds the password checks one address can cause, however
-/// many it sends at once. A good sign-in then clears the count.
+/// many it sends at once.
 ///
 /// The peer address comes from `ConnectInfo`, which the server wires in via
-/// `into_make_service_with_connect_info`. When it is absent (an in-process test,
-/// or a transport with no peer address) the per-IP limiter is simply skipped and
-/// the per-account throttle still applies.
+/// `into_make_service_with_connect_info`. When it is absent (an in-process
+/// test, or a transport with no peer address) the per-origin limiter is
+/// skipped and the account is counted against one unknown origin.
 async fn post_login(
     State(state): State<Arc<ApiState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let peer_ip = connect_info.map(|ci| ci.0.ip());
-    // A locked address is refused up front — cheaply, before the password hash
-    // that a guesser is really trying to spend the box's CPU on — and an
-    // address that is let through has already spent one of its attempts.
-    if let Some(ip) = peer_ip {
-        match ip_throttle().reserve(ip) {
-            Ok(()) => {}
-            Err(IpRefusal::Locked(remaining)) => {
-                return Err(ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    anyhow!(
-                        "too many failed sign-ins from your address; locked for another {remaining}s"
-                    ),
-                ));
-            }
-            Err(IpRefusal::Full) => {
-                return Err(ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    anyhow!("too many sign-in attempts from too many addresses; try again later"),
-                ));
-            }
-        }
-    }
+    let tables = crate::api_throttle::tables();
+    let peer_ip = connect_info.map(|ci| crate::api_throttle::source(ci.0.ip()));
     let username = body
         .get("username")
         .and_then(|v| v.as_str())
@@ -889,23 +1051,51 @@ async fn post_login(
             "use a valid username (at most 32 characters), a password of at most 4096 bytes and a valid one-time code"
         )));
     }
+    let origin = peer_ip.unwrap_or(crate::api_throttle::UNKNOWN_SOURCE);
+    // A locked address is refused up front — cheaply, before the password hash
+    // that a guesser is really trying to spend the box's CPU on — and an
+    // address that is let through has already spent one of its attempts. The
+    // one exception is the shared overflow budget of a table full of locked
+    // addresses: an origin that signed this account in before is not turned
+    // away because strangers exhausted it (its own pair budget still applies).
+    if let Some(ip) = peer_ip {
+        match tables.sign_in_sources.count(&ip) {
+            Ok(_) => {}
+            Err(crate::api_throttle::Refusal::Busy(_))
+                if tables.sign_in.is_trusted(&username, ip) => {}
+            Err(refusal) => {
+                return Err(too_many(
+                    &refusal,
+                    "too many sign-in attempts from your address; try again later".into(),
+                ));
+            }
+        }
+    }
+    let attempts = tables
+        .sign_in
+        .begin(&username, origin)
+        .map_err(|refusal| match refusal {
+            crate::api_throttle::SignInRefusal::Origin(r) => too_many(
+                &r,
+                "too many sign-in attempts for this account from your address; try again later"
+                    .into(),
+            ),
+            crate::api_throttle::SignInRefusal::NewOrigins(r) => too_many(
+                &r,
+                "too many sign-in attempts for this account from new addresses; sign in from an \
+                 address that signed this account in before, or try again later"
+                    .into(),
+            ),
+        })?;
     // Guessing costs time whether or not the account exists, so a wrong username
     // and a wrong password look the same from outside. The delay is AWAITED, not
     // slept on a thread: earlier it was a blocking sleep inside `spawn_blocking`,
     // so a couple of hundred concurrent guesses pinned every blocking thread (up
     // to 2 s each) and the API — and the console behind it — went dark.
-    let attempts = note_attempt(&username);
-    if attempts > MAX_ACCOUNT_ATTEMPTS {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            anyhow!(
-                "too many sign-in attempts for this account; try again after the ten-minute window"
-            ),
-        ));
-    }
     tokio::time::sleep(attempt_delay(attempts)).await;
 
     let state = state.clone();
+    let account = username.clone();
     // Off the runtime: hashing is deliberately slow, and a login must not stall
     // the executor that is serving everybody else.
     let outcome = tokio::task::spawn_blocking(move || sign_in(&state, &username, &password, &code))
@@ -913,11 +1103,13 @@ async fn post_login(
         .map_err(|e| ApiError::internal(anyhow!("login task: {e}")))?;
     match outcome {
         Ok(session) => {
-            // A good sign-in clears the address: an operator who mistyped twice
-            // and then got it right is not one attempt away from a lockout.
+            // A good sign-in clears the address and the pair, and trusts the
+            // origin for this account: an operator who mistyped twice and then
+            // got it right is not one attempt away from a lockout.
             if let Some(ip) = peer_ip {
-                ip_throttle().forget(ip);
+                tables.sign_in_sources.forget(&ip);
             }
+            tables.sign_in.succeeded(&account, origin);
             Ok(Json(session))
         }
         // The failure was already counted when the attempt was let through.
@@ -933,8 +1125,10 @@ async fn post_login(
 /// else is the same 401 every unknown bearer gets.
 async fn post_sign_out(
     State(state): State<Arc<ApiState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    let source = connect_info.map(|ci| crate::api_throttle::source(ci.0.ip()));
     let Some(presented) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -945,25 +1139,37 @@ async fn post_sign_out(
         return unauthorised();
     };
     let outcome = tokio::task::spawn_blocking(move || {
-        if crate::api_session::close(&state.tokens_dir, &presented) {
-            Some(true)
-        } else if machine_token(&state)
-            .is_ok_and(|token| ct_eq(presented.as_bytes(), token.as_bytes()))
-        {
-            Some(false)
-        } else {
-            None
-        }
+        crate::api_session::close(&state.tokens_dir, &presented)
     })
     .await;
     match outcome {
-        Ok(Some(true)) => Json(json!({ "signed_out": true })).into_response(),
-        Ok(Some(false)) => ApiError::bad_request(anyhow!(
-            "the machine token is not a session; rotate it instead of signing it out"
-        ))
-        .into_response(),
-        Ok(None) => unauthorised(),
+        Ok(true) => Json(json!({ "signed_out": true })).into_response(),
+        // Anything that is not a session — the machine token and the peer
+        // credential included — gets the one refusal every unknown bearer
+        // gets, and counts as a failed authentication. A distinct answer for
+        // "valid, but not a session" made this unthrottled route a guessing
+        // oracle for the config-sync secret (CTRL-01).
+        Ok(false) => bearer_failure(source),
         Err(e) => ApiError::internal(anyhow!("sign-out task: {e}")).into_response(),
+    }
+}
+
+/// The answer to a bearer that authenticated nothing: 429 when its source has
+/// used up [`crate::api_throttle::BEARER_FAILURES`], else the uniform 401 —
+/// counted either way. Only a *failed* bearer is ever throttled here; a valid
+/// one is never refused for its source's failures (see [`require_token`]).
+fn bearer_failure(source: Option<std::net::IpAddr>) -> Response {
+    let Some(source) = source else {
+        return unauthorised();
+    };
+    let failures = &crate::api_throttle::tables().bearer_failures;
+    match failures.count(&source) {
+        Ok(_) => unauthorised(),
+        Err(refusal) => too_many(
+            &refusal,
+            "too many failed authentications from your address; try again later".into(),
+        )
+        .into_response(),
     }
 }
 
@@ -1228,7 +1434,6 @@ fn sign_in(
         crate::aaa::unix_now(),
     )
     .map_err(|e| ApiError::internal(anyhow!("opening a session: {e:#}")))?;
-    forget_attempts(username);
     Ok(json!({
         "token": token,
         "user": username,
@@ -1239,213 +1444,18 @@ fn sign_in(
     }))
 }
 
-/// Failed sign-ins per account, and when they started.
-///
-/// In memory on purpose: a restart clears it, and an operator who has locked
-/// themselves out by fat-fingering a password should not have to find a file to
-/// get back in.
-fn attempts() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>> {
-    static ATTEMPTS: OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>> =
-        OnceLock::new();
-    ATTEMPTS.get_or_init(Default::default)
-}
-
-/// The most accounts whose failed attempts we track at once. A cap, not a tuning
-/// knob: the map is a throttle, and an attacker spraying distinct usernames must
-/// not be able to grow it without bound. When it is full and a new account
-/// appears, quiet entries are forgotten first and, if that is not enough, the
-/// least-recently-active entry is dropped.
-const MAX_TRACKED_ACCOUNTS: usize = 4096;
-
-/// How long the ten-minute forgiveness window lasts.
-const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
-const MAX_ACCOUNT_ATTEMPTS: u32 = 30;
-
-/// How long to slow a failed sign-in: 250 ms per attempt in the current window,
-/// capped at 2 s. Awaited asynchronously by [`post_login`], never slept on a
-/// thread, so it costs a guesser time without costing the server a worker.
+/// How long to slow a failed sign-in: 250 ms per attempt this (account,
+/// origin) made in its window, capped at 2 s. Awaited asynchronously by
+/// [`post_login`], never slept on a thread, so it costs a guesser time without
+/// costing the server a worker.
 fn attempt_delay(attempts: u32) -> std::time::Duration {
     std::time::Duration::from_millis(250 * attempts.min(8) as u64)
 }
 
-fn note_attempt(username: &str) -> u32 {
-    let mut map = attempts().lock().unwrap();
-    // Keep the map bounded before inserting a not-yet-seen account: forget the
-    // quiet entries, then, if still at the cap, evict the least-recently-active
-    // one. An account mid-attack has a recent entry and is never the victim.
-    if map.len() >= MAX_TRACKED_ACCOUNTS && !map.contains_key(username) {
-        map.retain(|_, (started, _)| started.elapsed() <= ATTEMPT_WINDOW);
-        if map.len() >= MAX_TRACKED_ACCOUNTS
-            && let Some(oldest) = map
-                .iter()
-                .max_by_key(|(_, (started, _))| started.elapsed())
-                .map(|(k, _)| k.clone())
-        {
-            map.remove(&oldest);
-        }
-    }
-    let entry = map
-        .entry(username.to_string())
-        .or_insert((std::time::Instant::now(), 0));
-    // A quiet ten minutes forgives everything: the delay is meant to stop a
-    // machine grinding through a wordlist, not to punish a person.
-    if entry.0.elapsed() > ATTEMPT_WINDOW {
-        *entry = (std::time::Instant::now(), 0);
-    }
-    entry.1 = entry.1.saturating_add(1);
-    entry.1
-}
-
-fn forget_attempts(username: &str) {
-    attempts().lock().unwrap().remove(username);
-}
-
-// ---- per-IP lockout -------------------------------------------------------
-//
-// The per-account budget is cross-origin; this separate peer-address budget
-// also stops a single source spraying many accounts. An exhausted source is
-// refused before expensive password hashing. Another source is still subject
-// to the shared account budget, not guaranteed independent access.
-
-/// One address's recent attempts: when the current window opened, how many
-/// attempts not yet followed by a good sign-in have landed in it, and, once
-/// tripped, until when the address is locked out.
-#[derive(Clone, Copy)]
-struct IpRecord {
-    window_started: std::time::Instant,
-    failures: u32,
-    locked_until: Option<std::time::Instant>,
-}
-
-/// Sign-in attempts per source address, in memory (a restart clears it, like the
-/// per-account map), bounded by `capacity`. A value rather than bare functions
-/// over one global so a test can fill a small one to its cap without starving
-/// every other test in the process of sign-in attempts.
-struct IpThrottle {
-    records: std::sync::Mutex<HashMap<std::net::IpAddr, IpRecord>>,
-    capacity: usize,
-}
-
-/// Why an address may not try now.
-#[derive(Debug, PartialEq, Eq)]
-enum IpRefusal {
-    /// Locked out, for this many more seconds.
-    Locked(u64),
-    /// The table is full of locked addresses and this one is new. Refusing it
-    /// is the fail-closed answer; making room would release a lock.
-    Full,
-}
-
-/// The throttle the server uses.
-fn ip_throttle() -> &'static IpThrottle {
-    static IPS: OnceLock<IpThrottle> = OnceLock::new();
-    IPS.get_or_init(|| IpThrottle::new(MAX_TRACKED_IPS))
-}
-
-/// The most source addresses whose failures we track at once. A cap, not a
-/// tuning knob: a spray from many spoofable-looking addresses must not grow the
-/// map without bound. Quiet entries are forgotten first, then the
-/// least-recently-active unlocked one; a lock is never forgotten early.
-const MAX_TRACKED_IPS: usize = 4096;
-
-/// Attempts within one window — counted as they start, cleared by a good
-/// sign-in — before an address is locked out.
-const IP_MAX_FAILURES: u32 = 10;
-
-/// How long an address stays locked once it trips the threshold.
-const IP_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(900);
-
-/// How long a quiet address is forgiven — the counting window. A stray failure an
-/// hour ago is not evidence of an attack now.
-const IP_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
-
-impl IpThrottle {
-    fn new(capacity: usize) -> Self {
-        Self {
-            records: Default::default(),
-            capacity,
-        }
-    }
-
-    /// Let one sign-in attempt from `ip` through, counting it now — or refuse
-    /// it. Counted *before* the password is checked, under the same lock as the
-    /// check, so parallel guesses cannot all slip past a count that has not
-    /// caught up yet: the threshold is the most password checks one address can
-    /// cause per window, however many requests it has in flight.
-    fn reserve(&self, ip: std::net::IpAddr) -> Result<(), IpRefusal> {
-        let ip = throttle_source(ip);
-        let mut map = self.records.lock().unwrap();
-        let now = std::time::Instant::now();
-        if let Some(until) = map.get(&ip).and_then(|r| r.locked_until) {
-            if until > now {
-                return Err(IpRefusal::Locked((until - now).as_secs().max(1)));
-            }
-            // The lock has run out: forgive, and start this address afresh.
-            map.remove(&ip);
-        }
-        // Bound the map before inserting a not-yet-seen address: forget lapsed
-        // windows and expired locks, then, if still full, the least-recently-
-        // active address that is NOT locked. A lock is never evicted — that
-        // was a way to unlock yourself by spraying from other addresses — so
-        // a table full of locks refuses newcomers rather than forgetting one.
-        if map.len() >= self.capacity && !map.contains_key(&ip) {
-            map.retain(|_, r| match r.locked_until {
-                Some(until) => until > now,
-                None => r.window_started.elapsed() <= IP_WINDOW,
-            });
-            if map.len() >= self.capacity {
-                let oldest = map
-                    .iter()
-                    .filter(|(_, r)| r.locked_until.is_none())
-                    .max_by_key(|(_, r)| r.window_started.elapsed())
-                    .map(|(k, _)| *k);
-                match oldest {
-                    Some(oldest) => {
-                        map.remove(&oldest);
-                    }
-                    None => return Err(IpRefusal::Full),
-                }
-            }
-        }
-        let rec = map.entry(ip).or_insert(IpRecord {
-            window_started: now,
-            failures: 0,
-            locked_until: None,
-        });
-        // A quiet window forgives: reopen it rather than carrying an old count.
-        if rec.window_started.elapsed() > IP_WINDOW {
-            rec.window_started = now;
-            rec.failures = 0;
-        }
-        rec.failures += 1;
-        if rec.failures >= IP_MAX_FAILURES {
-            rec.locked_until = Some(now + IP_LOCKOUT);
-        }
-        Ok(())
-    }
-
-    /// Clear an address after a good sign-in from it.
-    fn forget(&self, ip: std::net::IpAddr) {
-        self.records.lock().unwrap().remove(&throttle_source(ip));
-    }
-}
-
-/// Privacy addresses within one IPv6 /64 are one source for brute-force
-/// protection. Canonicalize mapped IPv4 too, so ::ffff:x cannot get a second
-/// budget. This never trusts forwarding headers supplied by the caller.
-fn throttle_source(ip: std::net::IpAddr) -> std::net::IpAddr {
-    use std::net::{IpAddr, Ipv6Addr};
-    match ip {
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return IpAddr::V4(v4);
-            }
-            let mut bytes = v6.octets();
-            bytes[8..].fill(0);
-            IpAddr::V6(Ipv6Addr::from(bytes))
-        }
-        v4 => v4,
-    }
+/// A 429 that says when to come back.
+fn too_many(refusal: &crate::api_throttle::Refusal, message: String) -> ApiError {
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, anyhow!(message))
+        .with_retry_after(refusal.retry_after())
 }
 
 /// `GET /api/v1/health` — liveness, no auth.
@@ -1463,12 +1473,6 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// `GET /api/v1/config` — the running appliance config as JSON (the same
-/// [`Appliance`] the CLI edits), with every secret redacted. A read-only token
-/// can reach this endpoint, so the config-sync bearer secret (which is the
-/// machine's full-access API token), WireGuard private keys, IPsec PSKs, RADIUS
-/// and TACACS+ secrets, the SNMP community and login password hashes / TOTP
-/// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 /// Reload rotated machine credentials without restarting management. Never use
 /// a cached credential after its persistent source becomes unreadable.
 fn machine_token(state: &ApiState) -> Result<String> {
@@ -1500,30 +1504,78 @@ fn machine_token(state: &ApiState) -> Result<String> {
 }
 
 fn require_ha_machine(state: &ApiState, caller: &Caller) -> Result<(), ApiError> {
-    if state.tls_pin.is_none() || caller.user.is_some() {
+    if state.tls_pin.is_none() || caller.credential == Credential::Session {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            anyhow!("HA enrollment and config-sync require TLS and the machine credential"),
+            anyhow!(
+                "HA enrollment and config-sync require TLS and the config-sync or machine credential"
+            ),
         ));
     }
     Ok(())
 }
 
+/// `GET /api/v1/ha/proof/<nonce>` — prove, without sending it, that this member
+/// holds the enrollment credential, bound to a fresh nonce and this listener's
+/// TLS key (so it cannot be relayed to another endpoint).
+///
+/// It is unauthenticated by design — the peer has nothing else to show yet —
+/// so it is an oracle anybody can query, and the key is what an offline guess
+/// targets (CTRL-01). Three things now hold that down: the key is the
+/// config-sync secret, which must be strong to be admitted; it is no longer
+/// the full-access machine token; and each source gets
+/// [`crate::api_throttle::HA_PROOFS`] proofs per window. A box with no
+/// config-sync secret keys the proof with its random machine token, which
+/// nobody can guess. The HMAC itself is unchanged so a member that has not
+/// been updated yet can still pair with one that has.
 async fn ha_proof(
     State(state): State<Arc<ApiState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     UrlPath(nonce): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     let pin = state
         .tls_pin
-        .as_deref()
+        .clone()
         .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, anyhow!("HA proof requires TLS")))?;
-    let proof = crate::ha::enrollment_proof(
-        &machine_token(&state).map_err(ApiError::internal)?,
-        &nonce,
-        pin,
-    )
-    .map_err(ApiError::bad_request)?;
+    if let Some(ConnectInfo(peer)) = connect_info {
+        let source = crate::api_throttle::source(peer.ip());
+        crate::api_throttle::tables()
+            .ha_proofs
+            .count(&source)
+            .map_err(|refusal| {
+                too_many(
+                    &refusal,
+                    "too many HA enrollment proofs requested from your address; try again later"
+                        .into(),
+                )
+            })?;
+        eprintln!("api: HA enrollment proof requested from {source}");
+    }
+    let key = enrollment_key(&state).map_err(ApiError::internal)?;
+    // A weak secret is what an offline guess is after; an upgraded box that
+    // still holds one keeps its pairing but hands out no proof of it until
+    // the secret is rotated (pairing with it is refused at admission anyway).
+    if peer_secret_is_weak(&state) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            anyhow!(
+                "this member's config-sync secret is too weak to prove; rotate it with \
+                 `sentinel ha secret generate` before pairing"
+            ),
+        ));
+    }
+    let proof = crate::ha::enrollment_proof(&key, &nonce, &pin).map_err(ApiError::bad_request)?;
     Ok(Json(json!({"proof": proof})))
+}
+
+/// The credential the enrollment proof is keyed with: the one a pairing peer
+/// will present next — the config-sync secret when one is configured, else
+/// the machine token.
+fn enrollment_key(state: &ApiState) -> Result<String> {
+    if let Some(secret) = state.appliance().ok().as_ref().and_then(peer_secret) {
+        return Ok(secret.to_string());
+    }
+    machine_token(state)
 }
 
 async fn ha_enrollment(
@@ -1531,14 +1583,47 @@ async fn ha_enrollment(
     axum::Extension(caller): axum::Extension<Caller>,
 ) -> Result<Response, ApiError> {
     require_ha_machine(&state, &caller)?;
+    let peer = caller.credential == Credential::Peer;
+    // The apply lock can be held for minutes by a provisional worker; waiting
+    // for it on an async worker parked that worker (CTRL-06).
+    tokio::task::spawn_blocking(move || enrollment_document(&state, peer))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("enrollment task: {e}")))?
+}
+
+/// The member's configuration for the pairing peer, and its revision.
+///
+/// To the peer credential the document is handed without the sections the
+/// receiver never takes from a pairing anyway ([`enrollment_view`]): it used
+/// to carry every account's password hash and TOTP secret and the AAA
+/// servers' secrets, an offline crack away from an administrator login
+/// (CTRL-09). The revision is the view's own, so a pairing client — this
+/// release's or an older one — finds the document consistent, and
+/// [`receive_pairing`] accepts that revision as the baseline.
+fn enrollment_document(state: &ApiState, peer: bool) -> Result<Response, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
-    let appliance = state.appliance().map_err(ApiError::internal)?;
+    let mut appliance = state.appliance().map_err(ApiError::internal)?;
+    if peer {
+        appliance = enrollment_view(appliance);
+    }
     let revision = crate::ha::revision(&appliance).map_err(ApiError::internal)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({"appliance": appliance, "revision": revision})),
     )
         .into_response())
+}
+
+/// `a` without its account list, AAA servers and update channels — the
+/// secret-bearing parts of the management trust a pairing never changes
+/// ([`crate::configsync::keep_member_trust`]). SSH, groups and the console
+/// carry no secret and stay: the pairing peer captures the SSH binding as
+/// this member's identity.
+fn enrollment_view(mut a: Appliance) -> Appliance {
+    a.system.logins = Vec::new();
+    a.system.aaa = Default::default();
+    a.update = None;
+    a
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1554,8 +1639,27 @@ async fn ha_pair(
     Json(request): Json<PairRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_ha_machine(&state, &caller)?;
+    let peer = caller.credential == Credential::Peer;
+    // A flock and a full live apply (systemctl, link waits): never on an async
+    // worker (CTRL-06), like every other mutating handler.
+    tokio::task::spawn_blocking(move || receive_pairing(&state, request, peer))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("pairing task: {e}")))?
+}
+
+fn receive_pairing(
+    state: &ApiState,
+    mut request: PairRequest,
+    peer: bool,
+) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let local = state.appliance().map_err(ApiError::internal)?;
+    // A pairing is not a way to replace who manages this member (CTRL-09):
+    // its accounts, AAA, update trust, SSH server and console stay its own.
+    // Applied before the revision comparison, so a retried pairing whose
+    // acknowledgement was lost is still recognised as already applied.
+    crate::configsync::keep_member_trust(&mut request.appliance, &local);
+    crate::configsync::keep_member_session_sources(&mut request.appliance, &local);
     request
         .appliance
         .validate()
@@ -1571,10 +1675,28 @@ async fn ha_pair(
     if desired == current {
         return Ok(Json(json!({"saved": true, "revision": desired})));
     }
-    if current != request.expected_revision {
+    // The peer read the enrollment view, not the full document.
+    let viewed =
+        crate::ha::revision(&enrollment_view(local.clone())).map_err(ApiError::internal)?;
+    if current != request.expected_revision && viewed != request.expected_revision {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             anyhow!("configuration changed during enrollment; reload and retry"),
+        ));
+    }
+    // Enrollment is how an unpaired member gets its pair; it is not a way for
+    // the peer credential to rewrite a member that is already paired — its
+    // addresses, listeners, secret and peer identity (CTRL-09). Repeating a
+    // completed pairing is answered above as already applied; anything else
+    // on a paired member needs the member's own machine credential, or
+    // unpairing it first.
+    if peer && local.system.ha.as_ref().is_some_and(|h| h.enabled) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!(
+                "this member is already paired; the config-sync credential cannot re-pair it \
+                 with a different configuration"
+            ),
         ));
     }
     let next = request
@@ -1595,9 +1717,15 @@ async fn ha_pair(
         ));
     }
     // Received enrollment must not enqueue a reverse configuration push.
-    replace_config(&state, request.appliance)
+    replace_config(state, request.appliance)
 }
 
+/// `GET /api/v1/config` — the running appliance config as JSON (the same
+/// [`Appliance`] the CLI edits), with every secret redacted. A read-only token
+/// can reach this endpoint, so the config-sync secret (the peer credential every
+/// member of the pair accepts), WireGuard private keys, IPsec PSKs, RADIUS
+/// and TACACS+ secrets, the SNMP community and login password hashes / TOTP
+/// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let appliance = state.appliance().map_err(ApiError::internal)?;
     let mut value = serde_json::to_value(&appliance)
@@ -1934,9 +2062,10 @@ fn restore_withheld_credential(text: &str, current: &Appliance) -> Result<String
 /// What decides who holds the machine credential and where it is sent, by the
 /// name the CLI gives it and its path in a serialised [`Appliance`].
 ///
-/// The credential itself first — the config-sync secret is written to this
-/// box's API token file, so whoever chooses it holds a full-access token that
-/// no account change can withdraw; the witness secret is the same pairing
+/// The credential itself first — the config-sync secret is the peer credential
+/// every member accepts for config-sync and pairing, so whoever chooses it can
+/// push shared policy to the pair and no account change can withdraw it (it is
+/// no longer also the full-access machine token, CTRL-01); the witness secret is the same pairing
 /// credential and the witness key is derived from it. Then the places it is
 /// sent: the config-sync push and the stack view present it to every
 /// `config-sync peer`, verified against `peer-fingerprint` — set, it pins the
@@ -2161,6 +2290,10 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
                 .entry(name.clone())
                 .or_insert_with(|| facts.clone());
         }
+        // Who manages this member, and how, is this member's (CTRL-09), and
+        // so are the addresses it sources its own sessions from (CTRL-10).
+        crate::configsync::keep_member_trust(&mut adjusted, local);
+        crate::configsync::keep_member_session_sources(&mut adjusted, local);
         adjusted.validate()?;
         return Ok(adjusted);
     }
@@ -2168,6 +2301,11 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
         local.system.ha.as_ref().is_none_or(|h| !h.enabled),
         "cannot remove paired HA through legacy config-sync"
     );
+    // Who manages this member, and how — accounts, AAA, update channels and
+    // keys, the SSH server (its listen address included, CTRL-10) and the
+    // console — is this member's, never the sender's (CTRL-09).
+    crate::configsync::keep_member_trust(&mut incoming, local);
+    crate::configsync::keep_member_session_sources(&mut incoming, local);
     incoming.system.hostname = local.system.hostname.clone();
     incoming.system.config_sync = local.system.config_sync.clone();
     incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
@@ -2413,7 +2551,8 @@ const REDACT_HEADER: &str = "x-sentinel-redact";
 /// The rule this enforces, for every door the configuration is read through:
 /// a read-only account sees no secret at all, and no account — read-write
 /// included — ever sees the machine credential, because that credential is
-/// the peer's full-access token and has no account to withdraw. The method
+/// what the pair's members accept from each other and has no account to
+/// withdraw. The method
 /// gate in [`require_token`] cannot express either half: both are GETs.
 fn show_disclosure(caller: &Caller, headers: &axum::http::HeaderMap) -> Disclosure {
     let own = Disclosure::for_caller(caller.user.as_deref(), caller.permission);
@@ -2483,7 +2622,10 @@ async fn post_configure(
         }.map_err(ApiError::internal)?;
         let mut commit = false;
         for (index, line) in body.lines().enumerate() {
-            let words = repl::split_line(line);
+            let words = match repl::split_line(line) {
+                Ok(words) => words,
+                Err(error) => return Err(ApiError::bad_request(anyhow!("line {} refused: {error:#}", index + 1))),
+            };
             let args: Vec<&str> = words.iter().map(String::as_str).collect();
             let result = match args.as_slice() {
                 [] => Ok(()),
@@ -2916,7 +3058,7 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
             return Ok(existing.to_string());
         }
     }
-    let token = generate_token()?;
+    let token = generate_machine_token()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -2933,15 +3075,83 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
     use std::io::Write;
     f.write_all(token.as_bytes())
         .with_context(|| format!("writing the API token {}", path.display()))?;
+    // Record that this token is Sentinel's own (see machine_token_disposition).
+    let marker = minted_marker(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&marker)
+        .and_then(|mut m| m.write_all(minted_digest(&token).as_bytes()))
+        .with_context(|| format!("recording the API token {}", marker.display()))?;
     Ok(token)
 }
 
 /// A fresh 256-bit token, URL-safe base64 (no padding) — plenty of entropy for a
 /// bearer secret, and safe to paste into an `Authorization` header.
-fn generate_token() -> Result<String> {
+pub(crate) fn generate_machine_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("generating a token: {e}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Where Sentinel records that it minted the machine token at `token`: the
+/// SHA-256 of the token it wrote, beside it, root-only.
+pub(crate) fn minted_marker(token: &Path) -> PathBuf {
+    token.with_extension("minted")
+}
+
+/// The marker's content for `token`.
+pub(crate) fn minted_digest(token: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// What to do with the machine token file (CTRL-01, CTRL-07).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TokenDisposition {
+    /// Minted by Sentinel and recorded so: keep it.
+    Keep,
+    /// Not recorded (minted by an earlier release, or placed by hand) and not
+    /// a config-sync secret: keep it and record it.
+    Adopt,
+    /// A config-sync secret an earlier release installed — the current one, or
+    /// one any archived configuration names: replace it with a fresh token.
+    Replace,
+}
+
+/// Decide what to do with machine token `current`.
+///
+/// Earlier releases *wrote the config-sync secret into the machine token
+/// file*, so the operator-chosen shared string was the full-access local
+/// bearer, and deleting or changing the secret later left it there, still
+/// valid. Provenance is tracked explicitly: Sentinel records the digest of
+/// every token it mints ([`minted_marker`]). A token that matches its record
+/// is kept. One that does not is replaced if it is the configured secret or
+/// appears in an archived configuration (`mentioned`, asked only then) — a
+/// secret, current or removed — and otherwise adopted: an earlier release
+/// minted it, or an operator put it there, and neither is a reason to break
+/// the automation that uses it.
+pub(crate) fn machine_token_disposition(
+    current: &str,
+    configured: Option<&str>,
+    minted: Option<&str>,
+    mentioned: impl FnOnce() -> bool,
+) -> TokenDisposition {
+    if configured.is_some_and(|secret| ct_eq(current.as_bytes(), secret.as_bytes())) {
+        return TokenDisposition::Replace;
+    }
+    if minted.is_some_and(|digest| ct_eq(digest.as_bytes(), minted_digest(current).as_bytes())) {
+        return TokenDisposition::Keep;
+    }
+    if mentioned() {
+        return TokenDisposition::Replace;
+    }
+    TokenDisposition::Adopt
 }
 
 /// Whether `name` is a valid account name — the same POSIX-ish shape a
@@ -2988,6 +3198,7 @@ fn update_error(error: crate::update_jobs::Error) -> ApiError {
     ApiError {
         status,
         message: error.0.message().into(),
+        retry_after: None,
     }
 }
 
@@ -3239,6 +3450,8 @@ async fn post_update(
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// Seconds a throttled client should wait (`Retry-After`).
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -3246,6 +3459,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: format!("{e:#}"),
+            retry_after: None,
         }
     }
 
@@ -3253,6 +3467,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("{e:#}"),
+            retry_after: None,
         }
     }
 
@@ -3264,13 +3479,25 @@ impl ApiError {
         Self {
             status,
             message: format!("{e:#}"),
+            retry_after: None,
         }
+    }
+
+    fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds);
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -3282,6 +3509,8 @@ mod tests {
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-token-abc123";
+    /// The config-sync secret of the test pairs: strong enough to be admitted.
+    const PEER_SECRET: &str = "67d0a04c9e6010954873106342dc89c03a00430a29f5eb5295e33894d03ab07d";
 
     // Dedicated failed-show disclosure regressions reuse this module's real
     // account/HTTPS fixtures rather than introducing a second auth setup.
@@ -3763,6 +3992,173 @@ mod tests {
         );
     }
 
+    /// Review of CTRL-09: on a member that is already paired, the peer
+    /// credential could POST a different pairing and rewrite its addresses,
+    /// listeners, secret and peer identity. A repeat of the applied pairing
+    /// is still answered as applied; a different one needs the machine token.
+    #[tokio::test]
+    async fn the_peer_credential_cannot_re_pair_a_paired_member() {
+        let path = seed("paired-member");
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let desired = crate::ha::paired_fixture();
+        let secret = desired.system.config_sync.secret.clone().unwrap();
+        let pair = |token: &str, expected: String, a: &Appliance| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ha/pair")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&PairRequest {
+                        expected_revision: expected,
+                        appliance: a.clone(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        // First enrollment, as a pairing client does it: the expected revision
+        // is the one the enrollment view carried.
+        let viewed =
+            crate::ha::revision(&enrollment_view(Appliance::load(&path).unwrap())).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(pair(TOKEN, viewed, &desired))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        let paired = Appliance::load(&path).unwrap();
+        let current = crate::ha::revision(&paired).unwrap();
+        // A repeat is idempotent for the peer credential too.
+        let resp = app
+            .clone()
+            .oneshot(pair(&secret, current.clone(), &desired))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        // A different document is refused to it and changes nothing.
+        let mut hostile = desired.clone();
+        hostile.system.hostname = "taken-over".into();
+        let resp = app.oneshot(pair(&secret, current, &hostile)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{}",
+            body_string(resp).await
+        );
+        assert_eq!(
+            Appliance::load(&path).unwrap().system.hostname,
+            paired.system.hostname
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// CTRL-06: `ha_pair` took the configuration's transaction lock and ran
+    /// the live apply on the async worker itself. While another transaction
+    /// held the lock, every such request parked a worker; on a two-core box
+    /// two of them wedged the whole API, sign-in included. On a one-thread
+    /// runtime the symptom is direct: nothing else runs until the lock is free.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pairing_waiting_for_the_transaction_lock_does_not_hold_the_runtime() {
+        let path = seed("unpaired-blocking");
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let expected = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/ha/pair")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&PairRequest {
+                    expected_revision: expected,
+                    appliance: crate::ha::paired_fixture(),
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let lock_path = path.with_extension("transaction.lock");
+        let (held, release) = (
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+            std::time::Duration::from_millis(1500),
+        );
+        let holder = {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                let _lock = system::lock_config_at(&lock_path).unwrap();
+                held.wait();
+                std::thread::sleep(release);
+            })
+        };
+        held.wait();
+        let pairing = tokio::spawn(app.oneshot(request));
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waited = started.elapsed();
+        holder.join().unwrap();
+        let _ = pairing.await;
+        assert!(
+            waited < std::time::Duration::from_millis(1000),
+            "a 50 ms timer took {waited:?}: the pairing blocked the runtime on the lock"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// CTRL-09: a pairing used to replace the member's whole configuration,
+    /// its accounts included. The member keeps who manages it, and a retried
+    /// pairing whose acknowledgement was lost is still recognised as applied.
+    #[tokio::test]
+    async fn a_pairing_cannot_change_who_manages_the_member() {
+        let path = seed("unpaired-fence");
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let expected = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let mut desired = crate::ha::paired_fixture();
+        desired.system.logins = Appliance::from_toml(
+            "[system]\nhostname = \"x\"\n[[system.login]]\nusername = \"mallory\"\n",
+        )
+        .unwrap()
+        .system
+        .logins;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ha/pair")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&PairRequest {
+                        expected_revision: expected.clone(),
+                        appliance: desired.clone(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        let saved = Appliance::load(&path).unwrap();
+        assert!(
+            saved.system.ha.is_some(),
+            "the pairing itself did not apply"
+        );
+        assert!(
+            saved.system.logins.is_empty(),
+            "a pairing added an account to the member"
+        );
+        let retry = app.oneshot(request()).await.unwrap();
+        assert_eq!(
+            retry.status(),
+            StatusCode::OK,
+            "lost-ack retry must stay idempotent"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn enrollment_requires_tls_machine_credential_and_revision_match() {
         let path = seed("unpaired");
@@ -3836,12 +4232,82 @@ mod tests {
         assert_eq!(proof.status(), StatusCode::OK);
         let proof: Value =
             serde_json::from_slice(&to_bytes(proof.into_body(), 8192).await.unwrap()).unwrap();
+        // Keyed by the configured config-sync secret — the credential the
+        // pairing peer presents next — not by the full-access machine token.
+        let secret = Appliance::load(&path)
+            .unwrap()
+            .system
+            .config_sync
+            .secret
+            .unwrap();
         assert_eq!(
+            proof["proof"],
+            crate::ha::enrollment_proof(&secret, &"a".repeat(64), "test-pin").unwrap()
+        );
+        assert_ne!(
             proof["proof"],
             crate::ha::enrollment_proof(TOKEN, &"a".repeat(64), "test-pin").unwrap()
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
+    /// CTRL-07: an earlier release wrote the config-sync secret into the
+    /// machine token file and nothing ever took it out again — not removing
+    /// the secret, not changing it. Provenance is recorded, not guessed from
+    /// the token's shape: a token Sentinel minted is kept; a configured secret
+    /// is replaced; so is one an archived configuration names (a secret since
+    /// removed), whatever its length; anything else is adopted, so an
+    /// operator's own token is not overwritten on every apply.
+    #[test]
+    fn a_machine_token_that_holds_a_config_sync_secret_is_retired() {
+        use TokenDisposition::*;
+        let minted = generate_machine_token().unwrap();
+        let record = minted_digest(&minted);
+        let never = || false;
+        assert_eq!(
+            machine_token_disposition(&minted, None, Some(&record), never),
+            Keep
+        );
+        assert_eq!(
+            machine_token_disposition(&minted, Some(PEER_SECRET), Some(&record), never),
+            Keep
+        );
+        // The current secret, installed by an earlier release.
+        assert_eq!(
+            machine_token_disposition(PEER_SECRET, Some(PEER_SECRET), None, never),
+            Replace
+        );
+        // Even recorded: a token that is the configured secret never stays.
+        assert_eq!(
+            machine_token_disposition(&minted, Some(&minted), Some(&record), never),
+            Replace
+        );
+        // A removed secret of any shape — the minted 43-character one too —
+        // is found in the archive and replaced.
+        assert_eq!(
+            machine_token_disposition(PEER_SECRET, None, None, || true),
+            Replace
+        );
+        assert_eq!(
+            machine_token_disposition(&minted, None, None, || true),
+            Replace
+        );
+        // An unrecorded token nobody configured: an earlier release's mint, or
+        // an operator's own. Kept, and recorded from now on.
+        assert_eq!(
+            machine_token_disposition("operator-chosen", None, None, never),
+            Adopt
+        );
+        assert_eq!(
+            machine_token_disposition(&minted, None, Some(&minted_digest("other")), never),
+            Adopt
+        );
+        // The archive is consulted only when the record does not decide.
+        assert_eq!(
+            machine_token_disposition(&minted, None, Some(&record), || panic!("asked")),
+            Keep
+        );
+    }
+
     #[test]
     fn machine_credential_rotation_is_immediate_and_fails_closed() {
         let path = seed("rotation");
@@ -4229,66 +4695,14 @@ virtual-address = ["10.43.0.253"]
         }
     }
 
-    /// The per-IP limiter counts within a window, trips a lockout at the
-    /// threshold, and forgets an address on demand. A throttle of the test's
-    /// own, so no other test sharing the process-global one is disturbed.
-    #[test]
-    fn the_per_ip_lockout_trips_at_the_threshold() {
-        let throttle = IpThrottle::new(MAX_TRACKED_IPS);
-        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
-        // Up to the threshold, every attempt is let through — the one that
-        // reaches it included, which is what locks the address.
-        for n in 0..IP_MAX_FAILURES {
-            assert_eq!(
-                throttle.reserve(ip),
-                Ok(()),
-                "attempt {} was refused",
-                n + 1
-            );
-        }
-        let Err(IpRefusal::Locked(remaining)) = throttle.reserve(ip) else {
-            panic!("the threshold must lock the address");
-        };
-        assert!(
-            remaining > 0 && remaining <= IP_LOCKOUT.as_secs(),
-            "a fresh lock counts down from the full window, got {remaining}"
-        );
-        // A neighbouring address is untouched — the lockout is per address.
-        let other: std::net::IpAddr = "203.0.113.99".parse().unwrap();
-        assert_eq!(throttle.reserve(other), Ok(()));
-        // Forgetting clears it.
-        throttle.forget(ip);
-        assert_eq!(throttle.reserve(ip), Ok(()));
-    }
-
-    #[test]
-    fn ipv6_privacy_addresses_and_ipv4_mapped_addresses_share_a_budget() {
-        let throttle = IpThrottle::new(16);
-        let first = "2001:db8:1:2::1".parse().unwrap();
-        let rotated = "2001:db8:1:2:abcd:1234:ffff:abcd".parse().unwrap();
-        for _ in 0..IP_MAX_FAILURES {
-            throttle.reserve(first).unwrap();
-        }
-        assert!(matches!(
-            throttle.reserve(rotated),
-            Err(IpRefusal::Locked(_))
-        ));
-        assert_eq!(throttle.reserve("2001:db8:1:3::1".parse().unwrap()), Ok(()));
-        throttle.forget(rotated);
-        assert_eq!(throttle.reserve(first), Ok(()));
-        assert_eq!(
-            throttle_source("::ffff:192.0.2.1".parse().unwrap()),
-            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
-        );
-    }
-
     #[tokio::test]
     async fn login_bounds_and_account_budget_are_enforced_before_password_work() {
         let app = router(state(seed("login-boundary")));
         let username = "audit-budget-user";
-        forget_attempts(username);
-        for _ in 0..MAX_ACCOUNT_ATTEMPTS {
-            note_attempt(username);
+        let unknown = crate::api_throttle::UNKNOWN_SOURCE;
+        let tables = crate::api_throttle::tables();
+        for _ in 0..crate::api_throttle::SIGN_IN_PER_ACCOUNT_ORIGIN.max {
+            tables.sign_in.begin(username, unknown).unwrap();
         }
         for (name, password, code, expected) in [
             (
@@ -4332,7 +4746,6 @@ virtual-address = ["10.43.0.253"]
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
-        forget_attempts(username);
     }
 
     /// The handler reads `ConnectInfo` and refuses a locked address up front — the
@@ -4342,9 +4755,10 @@ virtual-address = ["10.43.0.253"]
     #[tokio::test]
     async fn a_locked_address_is_refused_with_429() {
         let ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
-        ip_throttle().forget(ip);
-        for _ in 0..IP_MAX_FAILURES {
-            ip_throttle().reserve(ip).unwrap();
+        let sources = &crate::api_throttle::tables().sign_in_sources;
+        sources.forget(&ip);
+        for _ in 0..crate::api_throttle::SIGN_IN_PER_SOURCE.max {
+            sources.count(&ip).unwrap();
         }
 
         let mut req = Request::builder()
@@ -4362,7 +4776,8 @@ virtual-address = ["10.43.0.253"]
             StatusCode::TOO_MANY_REQUESTS,
             "a locked address must be refused before anything else"
         );
-        ip_throttle().forget(ip);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        sources.forget(&ip);
     }
 
     /// With no `ConnectInfo` at all — an in-process oneshot, a peer-less transport
@@ -4830,7 +5245,7 @@ action="reject"
 
     #[tokio::test]
     async fn destination_zone_admission_redacts_secrets_in_refused_rule_names() {
-        for secret in ["x", "admission-secret-\"quoted\\value\nend"] {
+        for secret in ["x", "admission-secret-\"quoted\\value-end"] {
             let path = seed("working");
             let original = std::fs::read(&path).unwrap();
             let mut candidate = advisory_candidate();
@@ -4873,11 +5288,21 @@ action="reject"
 
     #[tokio::test]
     async fn api_advisory_redacts_short_and_escaped_secrets_in_success_responses() {
-        for secret in ["x", "advisory-secret-\"quoted\\value\nend"] {
+        // A short secret in a field that may be short (the config-sync secret
+        // no longer may), and an escaped one in the free-form config-sync
+        // secret (which may hold quotes and backslashes, not control bytes).
+        for secret in [
+            "x",
+            "advisory\"quoted\\9f2c7a1eb84d5f0e3c6a29b17d4e8f05a3c6b2d9e1f7a4c8",
+        ] {
             let path = seed("working");
             let mut candidate = advisory_candidate();
             candidate.rules[0].action = crate::config::Action::Accept;
-            candidate.system.config_sync.secret = Some(secret.into());
+            if secret.len() == 1 {
+                candidate.services.snmp.community = Some(secret.into());
+            } else {
+                candidate.system.config_sync.secret = Some(secret.into());
+            }
             candidate.rules[0].name = format!("label-{secret}");
             candidate.validate().unwrap();
             let response = router(state(path))
@@ -5677,7 +6102,7 @@ action="reject"
     }
 
     const MACHINE_CREDENTIALS: [&str; 2] = [
-        "zq-machine-credential-0123456789abcdef",
+        "d5af4c516f58cbb252c954f76e2bbb2308dd6c689f562830ba1dbc967cb5313d",
         "zq-witness-credential-0123456789abcdefghij",
     ];
 
@@ -5863,7 +6288,7 @@ action="reject"
         // account's own choosing, a peer of its choosing behind the restored
         // marker, a fingerprint, and the witness credential.
         let marker = format!("\"{REDACTED}\"");
-        let chosen = "\"account-chosen-credential-0123456789\"";
+        let chosen = "\"80a3a4bc4f25e32f0d8a8eb1ab92f3812bf84ab88f86310fee7ff92e056a9ca5\"";
         // The marker's first occurrence after a section header: both withheld
         // credentials read the same.
         let choose_in = |section: &str| {
@@ -5913,7 +6338,7 @@ action="reject"
         // The CLI door the console uses: the same verbs, the same refusal.
         for (script, field) in [
             (
-                "set system config-sync secret account-chosen-credential-0123456789\ncommit\n",
+                "set system config-sync secret 80a3a4bc4f25e32f0d8a8eb1ab92f3812bf84ab88f86310fee7ff92e056a9ca5\ncommit\n",
                 "system config-sync secret",
             ),
             (
@@ -6001,7 +6426,7 @@ action="reject"
         let rotated = full
             .replace(
                 MACHINE_CREDENTIALS[0],
-                "rotated-machine-credential-0123456789",
+                "24b3d443718c37122b372f916339ac94013df25fe4bad9754dcd79cacd50d670",
             )
             .replace("\"10.0.0.2\"", "\"10.0.0.9\"");
         let resp = app
@@ -6031,7 +6456,7 @@ action="reject"
         assert_eq!(after.system.config_sync.peers, ["10.0.0.9"]);
         assert_eq!(
             after.system.config_sync.secret.as_deref(),
-            Some("rotated-machine-credential-0123456789")
+            Some("24b3d443718c37122b372f916339ac94013df25fe4bad9754dcd79cacd50d670")
         );
     }
 
@@ -6250,7 +6675,7 @@ action="reject"
         let member = |name: &str, own: &str, peer: &str, priority: u8| {
             Appliance::from_toml(&format!(
                 "[system]\nhostname = \"{name}\"\n\
-                 [system.config-sync]\npeer = [\"{peer}\"]\nsecret = \"shared-secret\"\n\
+                 [system.config-sync]\npeer = [\"{peer}\"]\nsecret = \"{PEER_SECRET}\"\n\
                  [[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n\
                  [[system.login]]\nusername = \"vera\"\ngroup = \"ops\"\n\
                  [[interface]]\nname = \"wan\"\naddress = \"{own}/24\"\nzone = \"wan\"\n\
@@ -6272,6 +6697,468 @@ action="reject"
             None => "/api/v1/config-sync".to_string(),
         };
         put(&uri, token, &serde_json::to_string(a).unwrap())
+    }
+
+    /// `request` as if it came over the network from `from`.
+    fn from_source(mut request: Request<Body>, from: [u8; 4]) -> Request<Body> {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((from, 4000))));
+        request
+    }
+
+    /// CTRL-01 / CTRL-09: an earlier release wrote the config-sync secret into
+    /// the machine token file, so the string an HA peer presents was the
+    /// full-access local credential — `PUT /api/v1/config`, `configure`, all
+    /// of it. Even while such a file is still in place, the secret is now only
+    /// the peer credential: it reads, it pushes config-sync, nothing else.
+    #[tokio::test]
+    async fn the_config_sync_secret_is_not_a_full_access_bearer() {
+        let (a, b) = legacy_pair();
+        let mut configured = Arc::try_unwrap(sync_state(&b)).ok().unwrap();
+        configured.token = PEER_SECRET.into();
+        let st = Arc::new(configured);
+        let app = router(st.clone());
+        let status = app
+            .clone()
+            .oneshot(get("/api/v1/status", Some(PEER_SECRET)))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the stack view's read must keep working"
+        );
+        let mut replaced = b.clone();
+        replaced.system.hostname = "taken-over".into();
+        let resp = app
+            .clone()
+            .oneshot(put(
+                "/api/v1/config",
+                PEER_SECRET,
+                &serde_json::to_string(&replaced).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the config-sync secret replaced the whole configuration: {}",
+            body_string(resp).await
+        );
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                "POST",
+                "/api/v1/configure",
+                PEER_SECRET,
+                "set system hostname taken-over\ncommit\n".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            Appliance::load(&st.config_path).unwrap().system.hostname,
+            "sentinel-b"
+        );
+        // Synchronization itself still works with it.
+        let base = crate::configsync::shared_revision(&a).unwrap();
+        let mut changed = a.clone();
+        changed.firewall.stateful = false;
+        let resp = app
+            .oneshot(push(Some(&base), PEER_SECRET, &changed))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+    }
+
+    /// CTRL-01: thirty wrong bearers in a row used to be thirty 401s, never a
+    /// 429 — online guessing ran at full speed. A source that keeps failing
+    /// now gets 429 for its further failures; a valid credential from the
+    /// same source is still served (a shared NAT or a flood must not lock out
+    /// the operator or the HA peer); another source is unaffected.
+    #[tokio::test]
+    async fn wrong_bearers_from_one_source_are_throttled() {
+        let app = router(state(seed("bearer-throttle")));
+        let guesser = [198, 18, 1, 1];
+        for n in 0..30 {
+            let status = app
+                .clone()
+                .oneshot(from_source(
+                    get("/api/v1/status", Some(&format!("guess-{n}"))),
+                    guesser,
+                ))
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let resp = app
+            .clone()
+            .oneshot(from_source(
+                get("/api/v1/status", Some("guess-30")),
+                guesser,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a source that guessed thirty bearers was not throttled"
+        );
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+        let valid = app
+            .clone()
+            .oneshot(from_source(get("/api/v1/status", Some(TOKEN)), guesser))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            valid,
+            StatusCode::OK,
+            "a valid credential was refused for its source's failures"
+        );
+        let other = app
+            .oneshot(from_source(
+                get("/api/v1/status", Some(TOKEN)),
+                [198, 18, 1, 2],
+            ))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(other, StatusCode::OK);
+    }
+
+    /// Review of CTRL-01: sign-out sits outside the token middleware, and it
+    /// used to tell "valid but not a session" (400) from "unknown" (401) and
+    /// never throttle — an oracle for the peer secret. Now one answer, counted.
+    #[tokio::test]
+    async fn sign_out_is_not_a_guessing_oracle() {
+        let (_, b) = legacy_pair();
+        let app = router(sync_state(&b));
+        let sign_out = |token: &str, from: [u8; 4]| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/sign-out")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let app = app.clone();
+            async move {
+                app.oneshot(from_source(request, from))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        let source = [198, 18, 3, 1];
+        assert_eq!(
+            sign_out(PEER_SECRET, source).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            sign_out("not-the-secret", source).await,
+            StatusCode::UNAUTHORIZED
+        );
+        for n in 0..30 {
+            let _ = sign_out(&format!("guess-{n}"), source).await;
+        }
+        assert_eq!(
+            sign_out("guess-again", source).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "sign-out guesses were not throttled"
+        );
+    }
+
+    /// Review of CTRL-01: a weak secret on an upgraded box is guessable
+    /// online, so for it alone the failure lock also applies to the correct
+    /// value — and the proof of it is not handed out at all.
+    #[tokio::test]
+    async fn a_weak_peer_secret_is_throttled_and_never_proved() {
+        let (_, mut b) = legacy_pair();
+        b.system.config_sync.secret = Some("summer2026".into());
+        let st = sync_state(&b);
+        let app = router(st.clone());
+        let source = [198, 18, 4, 1];
+        for n in 0..30 {
+            let _ = app
+                .clone()
+                .oneshot(from_source(
+                    get("/api/v1/status", Some(&format!("g{n}"))),
+                    source,
+                ))
+                .await;
+        }
+        let right = app
+            .clone()
+            .oneshot(from_source(
+                get("/api/v1/status", Some("summer2026")),
+                source,
+            ))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(right, StatusCode::TOO_MANY_REQUESTS);
+        let proof = app
+            .oneshot(get(&format!("/api/v1/ha/proof/{}", "c".repeat(64)), None))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            proof,
+            StatusCode::CONFLICT,
+            "a proof of a weak secret was handed out"
+        );
+    }
+
+    /// Review of CTRL-09: enrollment handed the peer credential the full
+    /// document — every account's password hash and TOTP secret, the AAA
+    /// secrets — an offline crack away from an administrator login. The peer
+    /// gets the enrollment view, whose revision a pairing then presents.
+    #[tokio::test]
+    async fn enrollment_withholds_account_and_directory_secrets_from_the_peer() {
+        let (_, mut b) = legacy_pair();
+        b.system.logins[0].hashed_password = Some(
+            "$6$saltsalt$OdRfXGmQ1yHEzqpO9yyU7nl0lDmy6cNKTRxkC1Yw8n0tXWJ1kPGePJ9qx4XJgZp5vSBiv5LG1oWLy5O3Ck5Ob1".into(),
+        );
+        let st = sync_state(&b);
+        let resp = router(st.clone())
+            .oneshot(get("/api/v1/ha/enrollment", Some(PEER_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("$6$saltsalt"),
+            "a password hash reached the peer"
+        );
+        let document: Value = serde_json::from_str(&body).unwrap();
+        let view: Appliance = serde_json::from_value(document["appliance"].clone()).unwrap();
+        assert_eq!(
+            document["revision"],
+            crate::ha::revision(&view).unwrap(),
+            "the view's own revision, so any pairing client finds it consistent"
+        );
+        // The machine token still sees the whole document.
+        let full = body_string(
+            router(st)
+                .oneshot(get("/api/v1/ha/enrollment", Some(TOKEN)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(full.contains("$6$saltsalt"));
+    }
+
+    /// CTRL-01: the unauthenticated HA proof is an oracle keyed by the
+    /// enrollment credential. One source may ask a handful of times (a pairing
+    /// asks once per attempt), not harvest proofs without limit.
+    #[tokio::test]
+    async fn the_ha_proof_is_rate_limited_per_source() {
+        let mut configured = Arc::try_unwrap(state(seed("proof-throttle"))).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let app = router(Arc::new(configured));
+        let proof = |from: [u8; 4]| {
+            let app = app.clone();
+            async move {
+                app.oneshot(from_source(
+                    get(&format!("/api/v1/ha/proof/{}", "b".repeat(64)), None),
+                    from,
+                ))
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        let harvester = [198, 18, 2, 1];
+        for _ in 0..10 {
+            assert_eq!(proof(harvester).await, StatusCode::OK);
+        }
+        assert_eq!(
+            proof(harvester).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "one source harvested more than ten enrollment proofs"
+        );
+        assert_eq!(proof([198, 18, 2, 2]).await, StatusCode::OK);
+    }
+
+    /// CTRL-01: the config-sync secret only had to be non-empty.
+    #[tokio::test]
+    async fn a_weak_config_sync_secret_is_refused_at_admission() {
+        let path = seed("weak-secret");
+        let mut candidate = Appliance::load(&path).unwrap();
+        candidate.system.config_sync.secret = Some("summer2026".into());
+        candidate.system.config_sync.peers = vec!["192.0.2.2".into()];
+        let resp = router(state(path.clone()))
+            .oneshot(put(
+                "/api/v1/config",
+                TOKEN,
+                &serde_json::to_string(&candidate).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_string(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a weak secret was admitted: {body}"
+        );
+        assert!(body.contains("sentinel ha secret generate"), "{body}");
+        assert!(
+            !body.contains("summer2026"),
+            "the refusal echoed the secret: {body}"
+        );
+        assert!(
+            Appliance::load(&path)
+                .unwrap()
+                .system
+                .config_sync
+                .secret
+                .is_none()
+        );
+    }
+
+    /// CTRL-09: a config-sync push could replace who manages the receiver —
+    /// add an account with its own SSH key, point AAA at the sender's server,
+    /// swap the update channel and its signing key, turn on SSH password
+    /// authentication. The receiver now keeps all of that; the shared policy in
+    /// the same push still applies.
+    #[tokio::test]
+    async fn a_config_sync_push_cannot_change_who_manages_the_receiver() {
+        let (a, b) = legacy_pair();
+        let st = sync_state(&b);
+        let base = crate::configsync::shared_revision(&a).unwrap();
+        let hostile = Appliance::from_toml(&format!(
+            "{}\n[[system.login]]\nusername = \"mallory\"\ngroup = \"ops\"\n\
+             ssh-key = [\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl mallory\"]\n\
+             [services.ssh]\npassword-authentication = true\n",
+            a.to_toml().unwrap()
+        ));
+        let mut incoming = match hostile {
+            Ok(incoming) => incoming,
+            Err(e) => panic!("fixture: {e:#}"),
+        };
+        incoming.firewall.stateful = false;
+        let resp = router(st.clone())
+            .oneshot(push(Some(&base), TOKEN, &incoming))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        let saved = Appliance::load(&st.config_path).unwrap();
+        assert!(
+            !saved.firewall.stateful,
+            "the shared policy change did not apply"
+        );
+        let users: Vec<_> = saved
+            .system
+            .logins
+            .iter()
+            .map(|l| l.username.as_str())
+            .collect();
+        assert_eq!(users, ["vera"], "a config-sync peer added an account");
+        assert!(!saved.services.ssh.password_authentication);
+    }
+
+    /// CTRL-10: the legacy merge kept the web listener but imported the
+    /// sender's SSH listen address and BGP update-source, so the receiver's
+    /// sshd could not bind (its next trial boot was never blessed) and its BGP
+    /// session sourced an address it does not have.
+    #[test]
+    fn legacy_config_sync_keeps_the_receivers_session_sources() {
+        let (a, b) = legacy_pair();
+        let with_sources = |mut m: Appliance, own: &str| {
+            m.services.ssh.listen_address = Some(own.into());
+            m.protocols.bgp = Some(
+                Appliance::from_toml(&format!(
+                    "[system]\nhostname = \"x\"\n[protocols.bgp]\nlocal-as = 65001\n\
+                     [[protocols.bgp.neighbor]]\naddress = \"10.43.0.1\"\nremote-as = 65000\n\
+                     update-source = \"{own}\"\n"
+                ))
+                .unwrap()
+                .protocols
+                .bgp
+                .unwrap(),
+            );
+            m
+        };
+        let a = with_sources(a, "10.43.0.40");
+        let b = with_sources(b, "10.43.0.41");
+        let merged = merge_synced_config(a, &b).unwrap();
+        assert_eq!(
+            merged.services.ssh.listen_address.as_deref(),
+            Some("10.43.0.41")
+        );
+        assert_eq!(
+            merged.protocols.bgp.unwrap().neighbors[0]
+                .update_source
+                .as_deref(),
+            Some("10.43.0.41")
+        );
+    }
+
+    /// What the receiver keeps of its own (CTRL-09, CTRL-10) must not count as
+    /// a difference: members whose accounts, SSH settings or BGP source
+    /// addresses differ keep synchronizing push after push, not only once —
+    /// a kept field that still entered the shared revision turned every
+    /// following push into a conflict.
+    #[tokio::test]
+    async fn members_that_keep_their_own_settings_keep_synchronizing() {
+        let (a, b) = legacy_pair();
+        let bgp = |own: &str| {
+            Appliance::from_toml(&format!(
+                "[system]\nhostname = \"x\"\n[protocols.bgp]\nlocal-as = 65001\n\
+                 [[protocols.bgp.neighbor]]\naddress = \"10.43.0.1\"\nremote-as = 65000\n\
+                 update-source = \"{own}\"\n"
+            ))
+            .unwrap()
+            .protocols
+            .bgp
+        };
+        let mut a = a;
+        a.protocols.bgp = bgp("10.43.0.40");
+        a.services.ssh.port = Some(2222);
+        let mut b = b;
+        b.protocols.bgp = bgp("10.43.0.41");
+        b.services.ssh.port = Some(22);
+        b.system.logins[0].ssh_keys = vec![
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl vera-on-b"
+                .into(),
+        ];
+        assert_eq!(
+            crate::configsync::shared_revision(&a).unwrap(),
+            crate::configsync::shared_revision(&b).unwrap()
+        );
+        let st = sync_state(&b);
+        let app = router(st.clone());
+        let mut previous = a.clone();
+        for step in 0..3 {
+            let mut next = previous.clone();
+            next.interfaces[0].mtu = Some(1400 + step);
+            let base = crate::configsync::shared_revision(&previous).unwrap();
+            let resp = app
+                .clone()
+                .oneshot(push(Some(&base), PEER_SECRET, &next))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "push {step}: {}",
+                body_string(resp).await
+            );
+            previous = next;
+        }
+        let saved = Appliance::load(&st.config_path).unwrap();
+        assert_eq!(saved.interfaces[0].mtu, Some(1402));
+        assert_eq!(saved.services.ssh.port, Some(22));
+        assert_eq!(
+            saved.protocols.bgp.unwrap().neighbors[0]
+                .update_source
+                .as_deref(),
+            Some("10.43.0.41")
+        );
     }
 
     /// MEDIUM #7: an account token, even a read-write one, cannot push a
@@ -6547,6 +7434,12 @@ action="reject"
             assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
             assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
             assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+            // CTRL-29: the console must not be downgradable to plaintext.
+            assert_eq!(
+                h.get(header::STRICT_TRANSPORT_SECURITY)
+                    .and_then(|v| v.to_str().ok()),
+                Some("max-age=31536000")
+            );
             let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
             assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
             assert!(csp.starts_with("default-src 'none'"), "{csp}");

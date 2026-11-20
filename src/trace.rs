@@ -111,6 +111,30 @@ pub fn trace(appliance: &Appliance, q: &Query) -> anyhow::Result<Trace> {
     Walk::new(appliance, &cfg, q)?.run()
 }
 
+/// Whether an ICMPv6 message of `kind` from `src` is link control the data
+/// plane admits before any policy (fabric `icmpv6_link_control`, DP-10): router
+/// and neighbour discovery (133-137) and MLD (130-132, 143). The data plane
+/// also requires code 0 and the link-scope hop limit, which a question to this
+/// walk cannot state, so a genuine on-link message is assumed.
+fn icmpv6_link_control(kind: u8, src: &IpAddr) -> bool {
+    let IpAddr::V6(src) = src else {
+        return false;
+    };
+    let link_local = src.segments()[0] & 0xffc0 == 0xfe80;
+    let unspecified = src.is_unspecified();
+    match kind {
+        // Router solicitation, MLD reports (v1, v2).
+        133 | 131 | 143 => link_local || unspecified,
+        // Router advertisement, redirect, MLD query and done.
+        134 | 137 | 130 | 132 => link_local,
+        // Neighbour solicitation (`::` is duplicate address detection).
+        135 => true,
+        // Neighbour advertisement.
+        136 => !unspecified,
+        _ => false,
+    }
+}
+
 /// The state of one walk. A struct rather than a long function so each stage
 /// reads on its own and the order they run in is one list at the bottom.
 struct Walk<'a> {
@@ -474,11 +498,25 @@ impl<'a> Walk<'a> {
             );
             return Outcome::Final("pass", "port-forward".into());
         }
+        if self.q.proto == "icmpv6"
+            && let Some(kind) = self.q.icmp_type
+            && icmpv6_link_control(kind, &self.q.src)
+        {
+            self.step(
+                "rules",
+                "ICMPv6 neighbour discovery and multicast listener messages are admitted \
+                 before any rule or block-icmp: IPv6 cannot work on the link without them, \
+                 and they create no connection state",
+            );
+            return Outcome::Final("pass", "ICMPv6 link control".into());
+        }
         if is_icmp && policy.drop_icmp {
             self.step(
                 "rules",
                 format!(
-                    "zone {} has block-icmp; every ICMP packet is dropped",
+                    "zone {} has block-icmp; new inbound ICMP is dropped (an answer to \
+                     something sent from here, such as an echo reply, and an error about a \
+                     tracked connection still pass)",
                     policy.name
                 ),
             );
@@ -513,6 +551,9 @@ impl<'a> Walk<'a> {
         }
         if let Some(d) = &r.dst {
             why.push(format!("destination {d}"));
+        }
+        if r.dst_local {
+            why.push(format!("destination {} is this box", self.dst));
         }
         if let Some(m) = &r.src_mac {
             why.push(format!("sender {m}"));
@@ -643,6 +684,15 @@ impl<'a> Walk<'a> {
                     let bits = match (&r.src, &r.dst) {
                         (Some(c), _) => contains(c, self.q.src).unwrap_or(0),
                         (_, Some(c)) => contains(c, self.dst).unwrap_or(0),
+                        // The agent installs a local rule as one host route
+                        // per box address.
+                        _ if r.dst_local => {
+                            if self.dst.is_ipv4() {
+                                32
+                            } else {
+                                128
+                            }
+                        }
                         _ => 0,
                     };
                     let key = (
@@ -708,7 +758,7 @@ impl<'a> Walk<'a> {
             return Some(format!("is for ICMP type {t}"));
         }
         if r.port != 0 && r.port != self.dst_port {
-            return Some(format!("is for port {}", r.port));
+            return Some(format!("is for port {}", self.ports_of(r)));
         }
         if let Some(i) = &r.in_interface
             && *i != self.q.in_interface
@@ -725,7 +775,40 @@ impl<'a> Walk<'a> {
         {
             return Some(format!("destination {} is not in {c}", self.dst));
         }
+        if r.dst_local && !self.is_local(self.dst) {
+            return Some(format!(
+                "destination {} is not one of this box's configured addresses (the data \
+                 plane also matches addresses learned at run time: DHCP, SLAAC, a held VRRP \
+                 address)",
+                self.dst
+            ));
+        }
         None
+    }
+
+    /// Whether `addr` is one of this box's own addresses, as far as the
+    /// configuration says. The agent matches what the box holds live.
+    fn is_local(&self, addr: IpAddr) -> bool {
+        self.cfg.local_hint.contains(&addr)
+    }
+
+    /// The ports the operator wrote for the rule a compiled entry came from —
+    /// `80-90`, not the `80` of whichever expansion was looked at first.
+    fn ports_of(&self, r: &PortRule) -> String {
+        let written = self
+            .appliance
+            .rules
+            .iter()
+            .find(|rule| rule.name == r.name)
+            .map(|rule| {
+                let mut specs: Vec<String> = rule.port.iter().map(ToString::to_string).collect();
+                if let Some(group) = &rule.port_group {
+                    specs.push(format!("port-group {group}"));
+                }
+                specs.join(",")
+            })
+            .filter(|s| !s.is_empty());
+        written.unwrap_or_else(|| r.port.to_string())
     }
 
     // ---- routing ------------------------------------------------------------
@@ -1140,6 +1223,47 @@ to = "10.9.0.10:80"
         assert_eq!(t.destination, "10.9.0.10:80");
         assert!(stage(&t, "dnat").contains("port-forward web"));
         assert_eq!(t.egress_interface.as_deref(), Some("dmz0"));
+    }
+
+    /// block-icmp refuses NEW inbound ICMP; ND/MLD is admitted before it and
+    /// before any rule, as the data plane does (fabric DP-10).
+    #[test]
+    fn block_icmp_spares_icmpv6_link_control_and_says_new_inbound() {
+        let text = BOX
+            .replace("[zone.wan]", "[zone.wan]\nblock_icmp = true")
+            .replace(
+                "address = \"198.51.100.2/24\"",
+                "address = \"198.51.100.2/24\"\naddress6 = \"2001:db8:1::2/64\"",
+            );
+        let appliance = Appliance::from_toml(&text).unwrap();
+        let q = |src: &str, icmp_type: u8| Query {
+            in_interface: "wan0".into(),
+            proto: "icmpv6".into(),
+            src: src.parse().unwrap(),
+            dst: "2001:db8:1::2".parse().unwrap(),
+            port: 0,
+            src_mac: None,
+            icmp_type: Some(icmp_type),
+        };
+        for (src, kind) in [
+            ("fe80::1", 135),
+            ("::", 135),
+            ("fe80::1", 136),
+            ("fe80::1", 134),
+        ] {
+            let t = trace(&appliance, &q(src, kind)).unwrap();
+            assert_eq!(
+                (t.verdict, t.decided_by.as_str()),
+                ("pass", "ICMPv6 link control"),
+                "{src} type {kind}: {t:?}"
+            );
+        }
+        // A router advertisement from a global source is not link control.
+        let t = trace(&appliance, &q("2001:db8::1", 134)).unwrap();
+        assert_eq!(t.decided_by, "block-icmp", "{t:?}");
+        let t = trace(&appliance, &q("fe80::1", 128)).unwrap();
+        assert_eq!(t.decided_by, "block-icmp", "{t:?}");
+        assert!(stage(&t, "rules").contains("new inbound ICMP"), "{t:?}");
     }
 
     #[test]

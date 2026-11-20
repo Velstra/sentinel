@@ -51,8 +51,21 @@ closed. Stage rechecks the exact offer before writing the inactive slot.
 
 Do not delete this directory to clear an error: that would discard rollback
 protection. Repair the clock or obtain fresh, correctly signed metadata instead.
-A missing or corrupt existing ledger requires investigated recovery, not an
-automatic reset. Signing-key rotation is not yet implemented by this ledger.
+A missing or corrupt ledger that was once published requires investigated
+recovery, not an automatic reset. A first check interrupted before its ledger
+was published (only the lock and staged files exist) is completed by the next
+check. Signing-key rotation is not yet implemented by this ledger.
+
+The key pin and the sequence floor are not per channel name. A channel label
+the appliance has not used before must be signed by a key already pinned for
+another label, and its sequence must not be lower than the highest sequence
+that key reached under any label: one signing key has one sequence space.
+Selecting a channel signed by a different key therefore needs the same
+investigated recovery as a key rotation.
+
+A slot write (CLI or UI, signed or `--allow-unsigned`) is refused while the
+running image is an unblessed counted trial or is not the next default:
+overwriting the other slot then would remove the only known-good fallback.
 Older appliance versions without this validation must first be upgraded; new
 metadata alone cannot protect an old reader. Offline media and automatic boot
 fallback use their separate policies below.
@@ -130,7 +143,8 @@ openssl pkeyutl -sign -inkey release-priv.pem -rawin \
 
 The updater verifies the signed digest, then hashes the entire image. A bad
 digest proof never falls back to a raw signature. Legacy direct image signatures
-are supported for regular files: a private copy is verified and installed.
+are supported for regular files up to 64 MiB: a private copy is verified and
+installed. Larger images need the signed digest.
 Signing belongs on the publisher's protected machine, not on customer nodes.
 
 ### USB sticks and other block devices
@@ -157,7 +171,8 @@ version check, but identical active partition GUIDs still cannot be staged.
 The reviewed CLI/UI workflow has no downgrade override. Only the legacy
 Community writer accepts `--allow-downgrade` as an explicit operator exception.
 A signed digest or raw signature contains no release version and therefore
-cannot enforce a version floor; use a signed manifest when that is required.
+cannot rule out a downgrade: such a proof is refused unless `--allow-downgrade`
+accepts it explicitly. Use a signed manifest for a normal offline update.
 Offline proofs do not consult the online expiry/sequence ledger. Online offers,
 including `file://` channel directories, must satisfy
 [expiry and replay protection](#expiry-and-replay-protection).

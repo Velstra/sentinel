@@ -112,7 +112,7 @@ in pkgs.testers.runNixOSTest {
         added = machine.send_monitor_command("device_add usb-storage,bus=update-usb.0,drive=candidate,id=qa-update-stick")
         assert "Error" not in added, added
         machine.wait_until_succeeds("test -b /dev/sda3", timeout=30)
-        output = machine.succeed("sentinel update --commit --pubkey file:/etc/qa-release-proof/release-pub.pem "
+        output = machine.succeed("sentinel update --commit --allow-downgrade --pubkey file:/etc/qa-release-proof/release-pub.pem "
                                  "--signature /etc/qa-release-proof/candidate.raw.sha256.sig /dev/sda 2>&1")
         assert "signature verified" in output and "image SHA-256 verified" in output, output
         assert machine.succeed(f"sha256sum {disk}3").split()[0] == original_a

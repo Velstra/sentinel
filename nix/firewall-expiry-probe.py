@@ -15,7 +15,9 @@ import time
 
 
 KEY = struct.Struct("<I16s16sHHBB2x")
-VALUE = struct.Struct("<QQII")
+# FirewallState: four replicated fields, then 16 bytes of node-local TCP
+# tracking (zero = sequence unknown).
+VALUE = struct.Struct("<QQII16x")
 SOURCE = "198.18.10.254"
 TARGET = "198.18.10.100"
 CASES = {"live": 45001, "expired": 45002, "absent": 45003}

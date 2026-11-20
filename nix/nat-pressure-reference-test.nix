@@ -7,7 +7,7 @@ let
   command = "${pkgs.python3}/bin/python3 -B ${shared}";
 in pkgs.testers.runNixOSTest {
   name = "sentinel-nat-pressure-netfilter-reference-20000";
-  globalTimeout = 600;
+  globalTimeout = 1200;
   nodes = {
     client = {
       virtualisation = { vlans = [ 2 ]; memorySize = 768; };

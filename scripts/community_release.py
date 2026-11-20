@@ -24,6 +24,20 @@ EFI = ["/EFI/BOOT/BOOTX64.EFI", "/EFI/systemd/systemd-bootx64.efi",
        "/EFI/Linux/sentinel-a+3.efi"]
 EXCLUSIONS = {"SHA256SUMS", "SHA256SUMS.gpg"}
 ASSET_LIMIT = 2 * 1024**3
+# Export discovery must not silently shrink away the known release blockers.
+# This is a floor, not the whole catalog: every other exported check still runs.
+REQUIRED_SAFETY_CHECKS = frozenset({
+    "dataplane-conformance", "nat-capacity-pressure", "tcp-reset-validation",
+    "ebpf-verifier-6-6", "ebpf-verifier-6-12", "ebpf-verifier-6-18",
+    "login-lifecycle", "auth-bounds", "observe-readonly", "wren-static-reload", "apply-ordering",
+    "nat", "hairpin", "reject", "commit", "ntp", "bootfallback", "boothealth",
+    "ipsec", "vti",
+    "ha-pair", "ha-two-node", "ha-two-node-flow", "ha-napt-mixed-version",
+    # Audit 8b6181: the seeded first boot, the shipped closure, the CVE gate's
+    # own tests and imported legacy password hashes.
+    "image-first-boot", "image-first-boot-mke2fs", "image-closure", "image-gate-unit",
+    "seed-image-unit", "legacy-hash-login",
+})
 
 
 def run(*args, capture=False, env=None):
@@ -358,9 +372,7 @@ def checks(args):
     sha = source()
     names = json.loads(run("nix", "eval", "--json", "--no-write-lock-file",
                            ".#checks.x86_64-linux", "--apply", "builtins.attrNames", capture=True))
-    if (not isinstance(names, list) or not 1 <= len(names) <= 256
-            or any(not re.fullmatch(r"[a-zA-Z0-9_-]+", n) for n in names)):
-        raise ValueError("invalid or oversized check catalog; review workflow sharding")
+    validate_catalog(names)
     if args.check:
         if args.check not in names:
             raise ValueError("unknown check")
@@ -376,11 +388,19 @@ def checks(args):
         print(json.dumps({"check": names}, separators=(",", ":")))
 
 
-def validate_checks(receipts, names, sha, nonce):
+def validate_catalog(names):
     if (not isinstance(names, list) or not 1 <= len(names) <= 256
             or any(not isinstance(n, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", n) for n in names)
-            or len(set(names)) != len(names)
-            or not isinstance(receipts, list) or len(receipts) != len(names)
+            or len(set(names)) != len(names)):
+        raise ValueError("invalid or oversized check catalog; review workflow sharding")
+    missing = REQUIRED_SAFETY_CHECKS - set(names)
+    if missing:
+        raise ValueError("release catalog omits mandatory safety checks: " + ", ".join(sorted(missing)))
+
+
+def validate_checks(receipts, names, sha, nonce):
+    validate_catalog(names)
+    if (not isinstance(receipts, list) or len(receipts) != len(names)
             or any(not isinstance(r, dict) for r in receipts)
             or sorted(r.get("check", "") for r in receipts) != sorted(names)
             or any(r.get("source") != sha or r.get("run") != nonce

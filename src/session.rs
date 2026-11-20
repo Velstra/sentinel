@@ -2817,14 +2817,18 @@ impl Session {
     }
 
     pub(crate) fn read_running_at(path: &Path) -> Result<Option<String>> {
-        match path.symlink_metadata() {
-            Ok(metadata) if metadata.is_file() => std::fs::read_to_string(path)
-                .map(Some)
-                .context("reading active configuration"),
-            Ok(_) => bail!("active configuration is not a regular file"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("inspecting active configuration"),
-        }
+        crate::system::read_owned_regular(path, 64 * 1024 * 1024)
+            .context("reading active configuration")
+    }
+
+    /// The box's saved configuration, read the way boot reads it: a value an
+    /// update has since refused is neutralised with a loud warning rather than
+    /// locking the operator out of `configure` (and out of the commit that
+    /// would fix it). The next commit saves the neutralised value.
+    pub(crate) fn read_saved_at(path: &Path) -> Result<Option<Appliance>> {
+        crate::system::read_owned_regular(path, 64 * 1024 * 1024)?
+            .map(|text| Appliance::saved_lenient(path, &text))
+            .transpose()
     }
 
     /// Compare-and-swap precondition. Call while holding apply.lock, before
@@ -2847,12 +2851,14 @@ impl Session {
         Self::load_live_at(path, Path::new(Self::RUNNING))
     }
 
-    fn load_live_at(path: &Path, running: &Path) -> Result<Self> {
+    pub(crate) fn load_live_at(path: &Path, running: &Path) -> Result<Self> {
         let snapshot = Self::read_running_at(running)?;
         let draft = match &snapshot {
             Some(text) => Draft::from_appliance(&Appliance::from_toml(text)?),
-            None if path.exists() => Draft::from_appliance(&Appliance::load(path)?),
-            None => Draft::default(),
+            None => match Self::read_saved_at(path)? {
+                Some(appliance) => Draft::from_appliance(&appliance),
+                None => Draft::default(),
+            },
         };
         Ok(Self {
             draft,
@@ -2865,13 +2871,23 @@ impl Session {
 
     /// What another session has committed since this one started, if anything.
     /// `None` when nothing has changed under us.
-    pub fn committed_elsewhere(&self) -> Option<String> {
-        let now = Self::running_snapshot()?;
-        match &self.seen_running {
+    fn current_snapshot(&self) -> Result<Option<String>> {
+        if matches!(self.admission_baseline, AdmissionBaseline::Live) {
+            Self::read_running_at(Path::new(Self::RUNNING))
+        } else {
+            Ok(Self::running_snapshot())
+        }
+    }
+
+    pub fn committed_elsewhere(&self) -> Result<Option<String>> {
+        let Some(now) = self.current_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(match &self.seen_running {
             Some(seen) if *seen == now => None,
             // No snapshot when we started and one now: somebody committed.
             _ => Some(now),
-        }
+        })
     }
 
     /// Record what we have just applied, so our own commit does not read as
@@ -2880,7 +2896,7 @@ impl Session {
         self.note_committed_at(Path::new(Self::RUNNING), toml)
     }
 
-    fn note_committed_at(&mut self, path: &Path, toml: &str) -> Result<()> {
+    pub(crate) fn note_committed_at(&mut self, path: &Path, toml: &str) -> Result<()> {
         crate::system::install_config_file(path, toml)?;
         self.seen_running = Some(toml.to_string());
         Ok(())
@@ -2888,8 +2904,10 @@ impl Session {
 
     /// Open a session, loading `path` as the candidate if it exists.
     pub fn load(path: &Path) -> Result<Self> {
+        // Lenient for the same reason as `read_saved_at`: this is a config the
+        // operator edits, not a document someone handed the appliance.
         let draft = if path.exists() {
-            Draft::from_appliance(&Appliance::load(path)?)
+            Draft::from_appliance(&Appliance::load_lenient(path)?)
         } else {
             Draft::default()
         };
@@ -3649,20 +3667,13 @@ impl Session {
                 self.draft.iface_mut(name).bridge_port.learning = Some(parse_bool(v)?);
             }
             ["interface", name, "bond", "hash-policy", v] => {
-                if !matches!(
-                    *v,
-                    "layer2" | "layer2+3" | "layer3+4" | "encap2+3" | "encap3+4"
-                ) {
-                    bail!(
-                        "interface {name} bond hash-policy {v:?}: layer2 | layer2+3 | layer3+4 | encap2+3 | encap3+4"
-                    );
-                }
+                crate::fieldcheck::bond_hash_policy(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).bond.hash_policy = Some((*v).to_string());
             }
             ["interface", name, "bond", "lacp-rate", v] => {
-                if !matches!(*v, "slow" | "fast") {
-                    bail!("interface {name} bond lacp-rate {v:?}: slow | fast");
-                }
+                crate::fieldcheck::bond_lacp_rate(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).bond.lacp_rate = Some((*v).to_string());
             }
             ["interface", name, "bond", "min-links", v] => {
@@ -3789,7 +3800,8 @@ impl Session {
                 self.draft.iface_mut(name).dhcp.duid = Some(v.to_ascii_lowercase());
             }
             ["interface", name, "dhcp", "host-name", v] => {
-                crate::config::validate_hostname(v)?;
+                crate::fieldcheck::dhcp_host_name(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).dhcp.host_name = Some((*v).to_string());
             }
             ["interface", name, "dhcp", "vendor-class-id", v] => {
@@ -3865,6 +3877,8 @@ impl Session {
                 self.draft.iface_mut(name).pppoe_mut().username = Some((*v).to_string());
             }
             ["interface", name, "pppoe", "password", v] => {
+                crate::fieldcheck::pppoe_client_password(v)
+                    .map_err(|e| anyhow::anyhow!("interface {name} {e}"))?;
                 self.draft.iface_mut(name).pppoe_mut().password = Some((*v).to_string());
             }
             ["interface", name, "pppoe", "service-name", v] => {
@@ -4411,10 +4425,9 @@ impl Session {
             // A TXT record whose value could not contain a space would be a TXT
             // record that cannot hold what people put in one.
             ["services", "dns", "txt-record", name, rest @ ..] if !rest.is_empty() => {
-                self.draft
-                    .dns
-                    .txt_record
-                    .insert((*name).to_string(), rest.join(" "));
+                let text = rest.join(" ");
+                crate::fieldcheck::dns_txt(&text)?;
+                self.draft.dns.txt_record.insert((*name).to_string(), text);
             }
             ["interface", name, "hw-id", v] => {
                 self.draft.iface_mut(name).hw_id = Some((*v).to_string());
@@ -4427,11 +4440,15 @@ impl Session {
                     .insert((*feature).to_string(), on);
             }
             ["system", "sysctl", key, "value", v] => {
+                crate::fieldcheck::sysctl_key(key)?;
                 self.draft
                     .sysctl
                     .insert((*key).to_string(), (*v).to_string());
             }
             ["services", "ntp", "allow-from", v] => {
+                for net in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    crate::fieldcheck::ntp_allow_from(net)?;
+                }
                 append_csv(&mut self.draft.ntp.allow_from, v);
             }
             ["services", "ntp", "serve-on", v] => {
@@ -4535,17 +4552,8 @@ impl Session {
                 self.draft.web.tls_key = Some((*v).to_string());
             }
             ["services", "ssh", "loglevel", v] => {
-                const LEVELS: [&str; 8] = [
-                    "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3",
-                ];
-                let want = v.to_ascii_uppercase();
-                if !LEVELS.contains(&want.as_str()) {
-                    bail!(
-                        "services ssh loglevel {v:?}: expected one of {}",
-                        LEVELS.join(", ")
-                    );
-                }
-                self.draft.ssh.loglevel = Some(want);
+                crate::fieldcheck::ssh_loglevel(v)?;
+                self.draft.ssh.loglevel = Some(v.to_ascii_uppercase());
             }
 
             // The serial console, and how far back the archive remembers.
@@ -4780,9 +4788,11 @@ impl Session {
                 self.draft.dyndns.hostname = Some((*v).to_string());
             }
             ["services", "dyndns", "login", v] => {
+                crate::fieldcheck::dyndns_login(v)?;
                 self.draft.dyndns.login = Some((*v).to_string());
             }
             ["services", "dyndns", "password", v] => {
+                crate::fieldcheck::dyndns_password(v)?;
                 self.draft.dyndns.password = Some((*v).to_string());
             }
             ["services", "dyndns", "interface", v] => {
@@ -5048,6 +5058,7 @@ impl Session {
                     Some(v.parse().with_context(|| format!("invalid mtu {v:?}"))?);
             }
             ["services", "pppoe-server", "user", name, "password", v] => {
+                crate::fieldcheck::pppoe_subscriber_password(name, v)?;
                 self.draft.pppoe_user_mut(name).password = (*v).to_string();
             }
             ["services", "pppoe-server", "user", name, "address", v] => {
@@ -6260,6 +6271,8 @@ impl Session {
                          `show configuration commands`, which carries it."
                     );
                 }
+                crate::fieldcheck::subscription_key(v)
+                    .map_err(|e| anyhow::anyhow!("update channel {name} {e}"))?;
                 self.draft.update_channel_mut(name).subscription_key = Some((*v).to_string());
             }
 
@@ -7423,6 +7436,7 @@ impl Session {
                     "enable" => s.enable = true,
                     "port" => s.port = None,
                     "listen-address" => s.listen_address = None,
+                    "loglevel" => s.loglevel = None,
                     "password-authentication" => s.password_authentication = false,
                     other => bail!("services ssh has no field {other:?}"),
                 }
@@ -8872,7 +8886,15 @@ impl Session {
 
     /// Render the candidate scoped to one top-level section — the VyOS
     /// `show <path>` view. Unknown sections yield an error line.
+    #[cfg(test)]
     pub fn show_only(&self, section: &str) -> String {
+        self.show_checked(section)
+            .unwrap_or_else(|error| format!("error: {error}\n"))
+    }
+
+    /// Interactive/batch commands must propagate a rejected section, not print
+    /// an error as a successful command. The string view remains for inventory.
+    pub fn show_checked(&self, section: &str) -> Result<String> {
         match section {
             // Every section the tree can configure. `load-balancer` and `evpn`
             // were missing here while being settable, committable and
@@ -8883,15 +8905,15 @@ impl Session {
             | "fleet" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
-                    format!("(no {section} configuration)\n")
+                    Ok(format!("(no {section} configuration)\n"))
                 } else {
-                    out
+                    Ok(out)
                 }
             }
-            other => format!(
-                "error: unknown section {other:?} (system | interfaces | firewall | nat | \
+            other => bail!(
+                "unknown section {other:?} (system | interfaces | firewall | nat | \
                  load-balancer | protocols | policy | services | multiwan | vpn | pki | evpn | \
-                 update | fleet)\n"
+                 update | fleet). Use `show` for the candidate or `run show config` for operational configuration"
             ),
         }
     }
@@ -8907,7 +8929,7 @@ impl Session {
     /// the normal way to try something out, and therefore the normal way for
     /// two sessions to end up looking at different boxes.
     pub fn compare_running(&self) -> Result<String> {
-        let Some(running) = Self::running_snapshot() else {
+        let Some(running) = self.current_snapshot()? else {
             bail!(
                 "nothing has been committed on this box since it booted, so there is \
                  no running configuration to compare against — `compare` uses the \
@@ -8924,8 +8946,12 @@ impl Session {
     }
 
     pub fn compare(&self) -> Result<String> {
-        let baseline = if self.path.exists() {
-            Draft::from_appliance(&Appliance::load(&self.path)?)
+        let baseline = if matches!(self.admission_baseline, AdmissionBaseline::Live) {
+            Self::read_saved_at(&self.path)?
+                .map(|appliance| Draft::from_appliance(&appliance))
+                .unwrap_or_default()
+        } else if self.path.exists() {
+            Draft::from_appliance(&Appliance::load_lenient(&self.path)?)
         } else {
             Draft::default()
         };
@@ -9845,6 +9871,9 @@ impl Session {
         // validating (mirrors `Appliance::from_toml`).
         appliance.normalize();
         appliance.validate()?;
+        // A candidate an operator is building must fit the data plane's maps
+        // (release audit DP-17); kept out of `validate` so boot never fails on it.
+        crate::compile::check_capacity(&appliance)?;
         Ok(appliance)
     }
 
@@ -9904,11 +9933,76 @@ impl Session {
     }
 
     /// Persist the (validated) candidate to disk. Writes to `path` or, if given,
-    /// `to`.
+    /// `to`. The appliance's own `save` is [`Self::save_running`]; this form is
+    /// the candidate writer the tests and the grammar walk build fixtures with.
+    #[cfg(test)]
     pub fn save(&mut self, to: Option<&Path>) -> Result<PathBuf> {
+        self.save_with_mode(to, false)
+    }
+
+    pub fn save_offline(&mut self, to: Option<&Path>) -> Result<PathBuf> {
+        self.save_with_mode(to, true)
+    }
+
+    /// A commit admitted this candidate but its activation failed and was rolled
+    /// back, so the candidate is not what runs. Keep it marked as an edit: an
+    /// `exit` must warn about it and an on-box `save` must not mistake it for
+    /// the committed configuration.
+    pub(crate) fn mark_uncommitted(&mut self) {
+        self.dirty = true;
+    }
+
+    /// `save` on the appliance: persist the configuration that is RUNNING — the
+    /// one the last commit applied, or, before any commit since boot, the one
+    /// the box booted — never the candidate (CTRL-14).
+    ///
+    /// Writing the candidate let an edit that was never applied, never
+    /// lockout-checked and never shown to the data plane become what the next
+    /// boot loads; that is how a port-forward the agent refused bricked a box at
+    /// boot (DP-01). With uncommitted edits this refuses rather than silently
+    /// saving the older running configuration under the operator's nose.
+    pub fn save_running(&mut self, to: Option<&Path>) -> Result<PathBuf> {
+        self.save_running_at(to, Path::new(Self::RUNNING))
+    }
+
+    pub(crate) fn save_running_at(&mut self, to: Option<&Path>, running: &Path) -> Result<PathBuf> {
+        let _lock = crate::system::apply_lock()?;
+        if self.dirty {
+            bail!(
+                "the candidate has uncommitted changes; `save` writes the committed (running) \
+                 configuration — `commit` them first, or `discard` them"
+            );
+        }
+        let appliance = match Self::read_running_at(running)? {
+            Some(text) => {
+                Appliance::from_toml(&text).context("reading the running configuration")?
+            }
+            None => match Self::read_saved_at(&self.path)? {
+                // Nothing committed since boot: the box runs what it booted.
+                Some(saved) => saved,
+                None => self.materialize()?,
+            },
+        };
+        self.persist_checked(&appliance, to, false)
+    }
+
+    fn save_with_mode(&mut self, to: Option<&Path>, offline: bool) -> Result<PathBuf> {
         let _lock = crate::system::apply_lock()?;
         let appliance = self.materialize()?;
+        self.persist_checked(&appliance, to, offline)
+    }
+
+    /// Admission, the data plane's own verdict, then persistence: a saved file
+    /// is one the next boot's agent will load, by the same check commit makes.
+    fn persist_checked(
+        &mut self,
+        appliance: &Appliance,
+        to: Option<&Path>,
+        offline: bool,
+    ) -> Result<PathBuf> {
+        let appliance = appliance.clone();
         self.admit(&appliance)?;
+        crate::agent_contract::check(&appliance)?;
         let path = to.unwrap_or(&self.path).to_path_buf();
         if path != self.path {
             // A legacy policy at the source is not authority to introduce it
@@ -9921,7 +10015,7 @@ impl Session {
         }
         // Archive only when saving the box's own config, not an ad-hoc
         // `save <path>` export.
-        let written = persist_appliance(&appliance, &path, to.is_none())?;
+        let written = persist_appliance_mode(&appliance, &path, to.is_none(), offline)?;
         self.dirty = false;
         Ok(written)
     }
@@ -9947,9 +10041,17 @@ impl Session {
 /// revision. Archiving is best-effort — a failed archive must never fail the
 /// save that already landed.
 pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> Result<PathBuf> {
-    // Serialise against a concurrent apply / another persist: `install_config_file`
-    // stages through a fixed temp name, so two writers at once could corrupt the
-    // saved config. Held only for this write; never nested inside an `apply_live`.
+    persist_appliance_mode(appliance, path, archive, false)
+}
+
+fn persist_appliance_mode(
+    appliance: &Appliance,
+    path: &Path,
+    archive: bool,
+    offline: bool,
+) -> Result<PathBuf> {
+    // Serialize admission, replacement and archival against other local writers.
+    // The writer itself uses an exclusive, private staging file and atomic rename.
     let _lock = crate::system::apply_lock()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -9958,7 +10060,11 @@ pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> R
     let _file = crate::system::lock_config_at(&path.with_extension("transaction.lock"))?;
     crate::safe_apply::ensure_writable(path)?;
     let toml = appliance.to_toml()?;
-    crate::system::install_config_file(path, &toml)?;
+    if offline {
+        crate::system::install_offline_config_file(path, &toml)?;
+    } else {
+        crate::system::install_config_file(path, &toml)?;
+    }
     if archive {
         // How far back an operator can roll is a policy, not a constant: a box
         // changed twice a year wants a longer memory than one changed twice a
@@ -11959,6 +12065,9 @@ fn render_draft_masked(
             if let Some(a) = &ssh.listen_address {
                 svc.push_str(&format!("        listen-address {a}\n"));
             }
+            if let Some(level) = &ssh.loglevel {
+                svc.push_str(&format!("        loglevel {level}\n"));
+            }
             if ssh.password_authentication {
                 svc.push_str("        password-authentication true\n");
             }
@@ -13477,6 +13586,68 @@ mod tests {
     }
 
     #[test]
+    fn an_on_box_save_writes_the_running_configuration_never_the_candidate() {
+        // CTRL-14: `set system hostname never-committed` + `save` wrote the
+        // draft into the boot config. On the appliance save writes RUNNING and
+        // refuses while the candidate has edits that were never applied.
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-save-running-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let saved = directory.join("appliance.toml");
+        let running = directory.join("running.toml");
+        let booted = Appliance::from_toml("[system]\nhostname = 'booted'\n")
+            .unwrap()
+            .to_toml()
+            .unwrap();
+        std::fs::write(&saved, &booted).unwrap();
+
+        let mut session = Session::load_live_at(&saved, &running).unwrap();
+        session
+            .set(&["system", "hostname", "never-committed"])
+            .unwrap();
+        let error = session.save_running_at(None, &running).unwrap_err();
+        assert!(format!("{error:#}").contains("uncommitted"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), booted);
+
+        // A commit that was admitted but whose activation was rolled back is
+        // still not what runs.
+        session.commit().unwrap();
+        session.mark_uncommitted();
+        assert!(session.save_running_at(None, &running).is_err());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), booted);
+
+        // What a successful commit published is what save persists.
+        let committed = Appliance::from_toml("[system]\nhostname = 'committed'\n")
+            .unwrap()
+            .to_toml()
+            .unwrap();
+        std::fs::write(&running, &committed).unwrap();
+        let mut session = Session::load_live_at(&saved, &running).unwrap();
+        session.save_running_at(None, &running).unwrap();
+        let persisted = Appliance::load(&saved).unwrap();
+        assert_eq!(persisted.system.hostname, "committed");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn live_session_accepts_protected_reader_json_and_refuses_saved_symlinks() {
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-live-json-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let saved = directory.join("saved.json");
+        let running = directory.join("running.toml");
+        let appliance = Appliance::from_toml("[system]\nhostname='json-live'\n").unwrap();
+        std::fs::write(&saved, serde_json::to_vec(&appliance).unwrap()).unwrap();
+        let session = Session::load_live_at(&saved, &running).unwrap();
+        assert_eq!(session.materialize().unwrap().system.hostname, "json-live");
+        let link = directory.join("linked.json");
+        std::os::unix::fs::symlink(&saved, &link).unwrap();
+        assert!(Session::load_live_at(&link, &running).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn fresh_sessions_inherit_unsaved_rules_and_stale_sessions_cannot_replace_them() {
         let directory =
             std::env::temp_dir().join(format!("sentinel-active-candidate-{}", std::process::id()));
@@ -13700,7 +13871,6 @@ mod tests {
             (r"/tmp/cert\literal.pem", r"/tmp/key\literal.pem"),
             ("# certificate.pem", "# private-key.pem"),
             ("  certificate.pem  ", "  private-key.pem  "),
-            ("/tmp/cert\tname.pem", "/tmp/key\tname.pem"),
             (
                 "/tmp/cert $(literal);`text`&|<>*.pem",
                 "/tmp/key $(literal);`text`&|<>*.pem",
@@ -13725,7 +13895,7 @@ mod tests {
                             .iter()
                             .map(|line| {
                                 assert!(!line.contains('\n') && !line.contains('\r'));
-                                crate::repl::split_line(line)
+                                crate::repl::split_line(line).unwrap()
                             })
                             .filter(|words| words.get(3).is_some_and(|name| name == field))
                             .collect();
@@ -13775,7 +13945,15 @@ mod tests {
             .unwrap();
         let baseline = session.commit().unwrap();
         for field in ["tls-cert", "tls-key"] {
-            for value in ["", "\0", "/tmp/one\ntwo.pem", "/tmp/one\rtwo.pem"] {
+            // A tab is a control character like the rest: the one rule every
+            // setting obeys (audit 8b6181, CTRL-08), not an exception for paths.
+            for value in [
+                "",
+                "\0",
+                "/tmp/one\ntwo.pem",
+                "/tmp/one\rtwo.pem",
+                "/tmp/one\ttwo.pem",
+            ] {
                 let dirty = session.dirty;
                 let error = session
                     .set(&["services", "web", field, value])
@@ -13843,8 +14021,10 @@ mod tests {
             ] {
                 let commands = flatten_config(&rendered);
                 assert!(
-                    commands.iter().any(|line| crate::repl::split_line(line)
-                        == ["set", "services", "web", field, expected]),
+                    commands
+                        .iter()
+                        .any(|line| crate::repl::split_line(line).unwrap()
+                            == ["set", "services", "web", field, expected]),
                     "{field}: {commands:?}"
                 );
             }
@@ -15343,7 +15523,7 @@ backends = ["10.0.0.11:8443"]
     // Representation regressions must use the shipped quote-aware REPL
     // lexer. split_whitespace deliberately cannot model quoted filenames.
     fn run_cli_tokens(session: &mut Session, line: &str) -> Result<()> {
-        let owned = crate::repl::split_line(line);
+        let owned = crate::repl::split_line(line)?;
         let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
         match parts[0] {
             "set" => session.set(&parts[1..]),
@@ -15420,7 +15600,7 @@ backends = ["10.0.0.11:8443"]
         let mut s = Session::empty();
         for line in [
             "set system hostname fw1",
-            "set system config-sync secret unit-test-credential-at-least-32-bytes",
+            "set system config-sync secret d706d87cff5f3a57df9482efec10cd52f21a76fd45c7ec1127f2979707d26c4c",
             "set system conntrack-sync listen 0.0.0.0:5429",
             "set system conntrack-sync peer 10.9.0.2",
             "set system conntrack-sync peer 10.9.0.3",
@@ -15472,7 +15652,7 @@ backends = ["10.0.0.11:8443"]
         assert!(s.commit().is_err());
         run(
             &mut s,
-            "set system config-sync secret unit-test-credential-at-least-32-bytes",
+            "set system config-sync secret d706d87cff5f3a57df9482efec10cd52f21a76fd45c7ec1127f2979707d26c4c",
         )
         .unwrap();
         assert!(s.commit().is_ok());

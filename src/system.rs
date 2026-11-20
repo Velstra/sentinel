@@ -218,6 +218,15 @@ fn locale_names() -> Vec<String> {
 
 /// Reload the velstra data plane so it picks up a freshly written config.
 pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+    if unit == "velstra.service" && !compiled_dataplane_enabled(next)? {
+        // An unprovisioned appliance has no selected interfaces. Stop an old
+        // attachment too when the last binding is removed; do not restart the
+        // agent onto its fallback NIC or treat a skipped ExecCondition as Ready.
+        service_stop(unit)?;
+        return release_pinned_dataplane(Path::new(PINNED_DATAPATH), |args| {
+            run_priv("velstra", args)
+        });
+    }
     if unit == "wren.service" {
         // Wren's SIGHUP handles static routes without disturbing adjacencies.
         // Other reload areas still have documented supervision limitations;
@@ -237,6 +246,50 @@ pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Resu
         "reload"
     };
     reload_agent(unit, command)
+}
+
+/// Where a persisting agent (`[state] persist = true`) pins its hooks, maps
+/// and connection state so a restart adopts them.
+const PINNED_DATAPATH: &str = "/sys/fs/bpf/velstra";
+
+/// Release the stopped agent's pinned data plane once no interface is bound.
+/// A persisting agent leaves its hooks attached when it stops, for the next
+/// agent to adopt. With the last binding removed no agent starts again, so
+/// the hooks would keep filtering the formerly zoned link with the last
+/// policy, and nothing would be left to change or remove them (DP-12).
+/// `release-datapath` must run with the agent stopped, which the caller does.
+fn release_pinned_dataplane(
+    root: &Path,
+    release: impl FnOnce(&[&str]) -> Result<()>,
+) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    release(&["release-datapath"]).context("releasing the stopped agent's pinned data plane")
+}
+
+/// The compiler always emits an explicit interface array, including `[]` for
+/// an unprovisioned appliance. Missing or malformed bindings are not permission
+/// to turn a configured firewall off. This is a presence check, not a substitute
+/// for full compiler/dataplane validation.
+pub(crate) fn compiled_dataplane_enabled(bytes: &[u8]) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Compiled {
+        interface: Vec<Binding>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Binding {
+        name: String,
+        policy: u32,
+    }
+    let compiled: Compiled = toml::from_str(std::str::from_utf8(bytes)?)
+        .context("reading compiled dataplane interface bindings")?;
+    for binding in &compiled.interface {
+        anyhow::ensure!(!binding.name.is_empty(), "empty compiled interface name");
+        // Deserializing the policy as u32 also rejects negative/noninteger IDs.
+        let _ = binding.policy;
+    }
+    Ok(!compiled.interface.is_empty())
 }
 
 fn static_routes_only_changed(previous: Option<&[u8]>, next: &[u8]) -> bool {
@@ -890,11 +943,7 @@ pub fn arm_confirm(minutes: u32, cfg: &Path, original: &Path) -> Result<()> {
         "--timer-property=AccuracySec=1s".into(),
         "--property=Type=exec".into(),
     ];
-    for (k, v) in std::env::vars() {
-        if k.starts_with("SENTINEL_") {
-            args.push(format!("--setenv={k}={v}"));
-        }
-    }
+    args.extend(confirm_setenv_args(std::env::vars()));
     // Everything after the options is the command to run when the timer fires.
     args.push(exe_s.to_string());
     args.push("confirm-rollback".into());
@@ -906,6 +955,39 @@ pub fn arm_confirm(minutes: u32, cfg: &Path, original: &Path) -> Result<()> {
     args.push(original_s.into());
     let argref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_priv("systemd-run", &argref)
+}
+
+/// The `--setenv` arguments the commit-confirm timer carries: the tool pins
+/// and data directories the rollback needs to resolve the same binaries and
+/// read the same data as the session that armed it — and nothing else.
+///
+/// Never a credential (CTRL-21): a `--setenv` sits in `systemd-run`'s argv in
+/// `/proc/*/cmdline` and in the unit's `Environment=`, which every local user
+/// can read with `systemctl show`. An allow-list, so a variable added later is
+/// not forwarded until somebody decides it should be: a `SENTINEL_*_BIN` pin
+/// whose value is an executable path in the Nix store (the shape the wrapper
+/// sets; the other `systemd-run` builders forward the same), and the named
+/// data directories the rollback's compile reads.
+fn confirm_setenv_args(vars: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+    const DATA: [&str; 4] = [
+        "SENTINEL_GEOIP_DIR",
+        "SENTINEL_FEED_CACHE",
+        "SENTINEL_METRICS_DIR",
+        "SENTINEL_SURICATA_SHARE",
+    ];
+    vars.into_iter()
+        .filter(|(key, value)| {
+            let pin = key.starts_with("SENTINEL_")
+                && key.ends_with("_BIN")
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                && value.starts_with("/nix/store/")
+                && !value.chars().any(char::is_control);
+            pin || DATA.contains(&key.as_str()) && !value.chars().any(char::is_control)
+        })
+        .map(|(key, value)| format!("--setenv={key}={value}"))
+        .collect()
 }
 
 /// Disarm the `commit-confirm` timer (best-effort). Only the **timer** is
@@ -1143,23 +1225,75 @@ fn read_regular_policy(path: &Path, limit: usize, private: bool) -> Result<Optio
     ))
 }
 
-/// Install file `contents` at a (root-owned) `path`. Tries a direct write first
-/// (works as root, e.g. the boot service) and falls back to staging in a
-/// wheel-writable temp and `sudo install`-ing it (the admin running `configure`).
+/// Install file `contents` at a (root-owned) `path`, mode 0644. Written directly
+/// when the caller owns the directory (root, e.g. the boot service), otherwise
+/// staged privately and installed through sudo (the admin running `configure`).
+///
+/// Always a replacement, never an in-place rewrite (CTRL-20): a daemon that
+/// (re)starts while the file is being written — velstra's `Restart=` reading
+/// `velstra.env`, networkd reading a unit — sees the old file or the new one,
+/// never a truncated one.
 pub fn install_file(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    if std::fs::write(path, contents).is_ok() {
+    install_runtime_atomic(path, contents, "0644", None)
+}
+
+/// Write `contents` beside `path`, flush it, and rename it into place. A caller
+/// that owns the parent directory does this directly, keeping ownership with the
+/// directory's owner. Anyone else, and every install that needs a group, stages
+/// privately in `/run/sentinel` and escalates `install` into a sibling followed
+/// by `mv`, so the escalated path is a rename too.
+fn install_runtime_atomic(
+    path: &Path,
+    contents: &str,
+    mode: &str,
+    group: Option<&str>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    ensure_dir(parent)?;
+    let owns_parent = std::fs::metadata(parent)?.uid() == unsafe { libc::geteuid() };
+    if owns_parent && group.is_none() {
+        let bits = u32::from_str_radix(mode, 8).context("file mode")?;
+        let mut stage = PrivateStage::create(parent, 0o600)?;
+        stage
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(bits))?;
+        stage.file.write_all(contents.as_bytes())?;
+        stage.file.sync_all()?;
+        std::fs::rename(&stage.path, path)
+            .with_context(|| format!("atomically replacing {}", path.display()))?;
+        std::fs::File::open(parent)?.sync_all()?;
         return Ok(());
     }
-    // Fall back to sudo: stage in /run/sentinel (wheel-writable) then install.
-    let tmp = Path::new("/run/sentinel").join(".net-unit.tmp");
-    stage_private(&tmp, contents)?;
-    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)
+        .with_context(|| format!("staging {} in /run/sentinel", path.display()))?;
+    staged.file.write_all(contents.as_bytes())?;
+    staged.file.sync_all()?;
+    let target = parent
+        .join(staged.path.file_name().context("staging filename")?)
+        .with_extension("install");
+    let (Some(source), Some(temporary), Some(destination)) =
+        (staged.path.to_str(), target.to_str(), path.to_str())
+    else {
         bail!("non-UTF-8 path");
     };
-    sudo("install", &["-m", "0644", tmp_s, dst_s])
+    let mut args = vec!["-m", mode];
+    if let Some(group) = group {
+        args.extend(["-g", group]);
+    }
+    args.extend([source, temporary]);
+    let result = (|| {
+        sudo("install", &args)?;
+        sudo("mv", &["-fT", "--", temporary, destination])
+    })();
+    if result.is_err() {
+        let _ = sudo("rm", &["-f", "--", temporary]);
+    }
+    result.with_context(|| format!("atomically installing {}", path.display()))
 }
 
 /// Install the appliance configuration at `path`, atomically, escalating when
@@ -1176,6 +1310,45 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 /// membership that lets them escalate here in the first place.
 pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
     install_owned_atomic(path, contents, false)
+}
+
+/// Off-box exports never invoke sudo or depend on appliance runtime paths.
+/// Stage beside the destination so replacement is atomic even in sticky /tmp.
+/// Do not replace another account's file or follow a destination symlink.
+pub fn install_offline_config_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _transaction = apply_lock()?;
+    if crate::mutation::intent_path(path) {
+        crate::mutation::advance()?;
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let write = || -> Result<()> {
+        match path.symlink_metadata() {
+            Ok(info) => anyhow::ensure!(
+                info.is_file() && info.uid() == unsafe { libc::geteuid() },
+                "offline destination must be a regular file owned by the current user"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut stage = PrivateStage::create(parent, 0o600)?;
+        stage
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        stage.file.write_all(contents.as_bytes())?;
+        stage.file.sync_all()?;
+        std::fs::rename(&stage.path, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    };
+    write().with_context(|| format!(
+        "saving offline configuration to {}: use a writable directory and a destination owned by your account; no privilege escalation was attempted",
+        path.display()
+    ))
 }
 /// Root-private atomic state for credentials and interrupted HA transactions.
 pub fn install_ha_secret(path: &Path, contents: &str) -> Result<()> {
@@ -1236,7 +1409,11 @@ fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()
     // Escalation must preserve atomic replacement too: install into a sibling,
     // flush it, then rename. Installing over the live path exposes a truncated
     // document to the peer/API and leaves it truncated if install is interrupted.
-    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
+    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)
+        .with_context(|| format!(
+            "staging configuration for {} in /run/sentinel; for off-box editing use configure --no-apply and save to a writable path",
+            path.display()
+        ))?;
     staged.file.write_all(contents.as_bytes())?;
     staged.file.sync_all()?;
     // The destination can itself be /run/sentinel (running.toml). A basename
@@ -1305,22 +1482,12 @@ impl Drop for PrivateStage {
 /// set in one atomic step in both the boot-service (root) and `configure`
 /// (admin) paths.
 pub fn install_secret_file(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    // Stage in /run/sentinel (wheel-writable) then install with the right
-    // mode+group. `install` resolves the group name and sets owner:group:mode
-    // atomically, so there is never a window where the private key is world- or
-    // wrong-group-readable.
-    let tmp = Path::new("/run/sentinel").join(".net-secret.tmp");
-    stage_private(&tmp, contents)?;
-    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
-        bail!("non-UTF-8 path");
-    };
-    sudo(
-        "install",
-        &["-m", "0640", "-g", "systemd-network", tmp_s, dst_s],
-    )
+    // Stage privately then install with the right mode+group into a sibling and
+    // rename it over the unit. `install` resolves the group name and sets
+    // owner:group:mode in one step, so there is never a window where the
+    // private key is world- or wrong-group-readable, and networkd never reads a
+    // half-written unit (CTRL-20).
+    install_runtime_atomic(path, contents, "0640", Some("systemd-network"))
 }
 
 /// Install a root-owned private file at `path`, mode **0600 root:root** —
@@ -2694,6 +2861,105 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// boothealth: removing the last zone binding stops a persisting agent;
+    /// its pinned hooks are released then, and only when there are pins.
+    #[test]
+    fn the_last_binding_removed_releases_a_pinned_dataplane() {
+        let dir = std::env::temp_dir().join(format!("sentinel-pinned-{}", std::process::id()));
+        let mut calls = Vec::new();
+        release_pinned_dataplane(&dir, |args| {
+            calls.push(args.join(" "));
+            Ok(())
+        })
+        .unwrap();
+        assert!(calls.is_empty(), "no pins, nothing to release");
+        std::fs::create_dir_all(&dir).unwrap();
+        release_pinned_dataplane(&dir, |args| {
+            calls.push(args.join(" "));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, ["release-datapath"]);
+        let failed = release_pinned_dataplane(&dir, |_| anyhow::bail!("busy"));
+        assert!(failed.is_err(), "a failed release is reported, not ignored");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// CTRL-21: a transient unit's `--setenv` lands in `/proc/*/cmdline` of
+    /// `systemd-run` and in the unit's `Environment=`, which any local user can
+    /// read with `systemctl show`. Tool pins and data directories are carried;
+    /// a credential never is.
+    #[test]
+    fn confirm_timer_forwards_tool_environment_but_never_a_credential() {
+        let vars = [
+            ("SENTINEL_IP_BIN", "/nix/store/x-iproute2/bin/ip"),
+            (
+                "SENTINEL_MKPASSWD_BIN",
+                "/nix/store/x-mkpasswd/bin/mkpasswd",
+            ),
+            ("SENTINEL_GEOIP_DIR", "/var/lib/sentinel/geoip"),
+            ("SENTINEL_API_TOKEN", "machine-token-must-not-leak"),
+            ("SENTINEL_LUKS_PASSPHRASE", "passphrase-must-not-leak"),
+            ("SENTINEL_UPDATE_SUBSCRIPTION_KEY", "key-must-not-leak"),
+            ("SENTINEL_PEER_SECRET", "secret-must-not-leak"),
+            ("SENTINEL_ADMIN_PASSWORD", "password-must-not-leak"),
+            ("SENTINEL_X_CREDENTIAL", "credential-must-not-leak"),
+            ("SENTINEL_PSK", "psk-must-not-leak"),
+            ("SENTINEL_SECRET_BIN", "secret-must-not-leak-as-a-bin-name"),
+            ("SENTINEL_NEW_FEATURE", "unknown-must-not-leak"),
+            ("PATH", "/run/current-system/sw/bin"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let args = confirm_setenv_args(vars);
+        assert_eq!(
+            args,
+            [
+                "--setenv=SENTINEL_IP_BIN=/nix/store/x-iproute2/bin/ip",
+                "--setenv=SENTINEL_MKPASSWD_BIN=/nix/store/x-mkpasswd/bin/mkpasswd",
+                "--setenv=SENTINEL_GEOIP_DIR=/var/lib/sentinel/geoip",
+            ]
+        );
+        assert!(!args.iter().any(|a| a.contains("must-not-leak")));
+    }
+
+    #[test]
+    fn a_runtime_file_is_replaced_never_rewritten_in_place() {
+        // CTRL-20: velstra (Restart=on-failure) and networkd may open the file
+        // while a commit writes it. An in-place truncate+write lets them read a
+        // partial file; a rename gives them the old or the new one, whole.
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "sentinel-install-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("velstra.env");
+        std::fs::write(&path, "VELSTRA_IFACE=old0\n").unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        install_file(&path, "VELSTRA_IFACE=new0\n").unwrap();
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, "VELSTRA_IFACE=old0\n",
+            "the open file was rewritten in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "VELSTRA_IFACE=new0\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from("velstra.env")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn privileged_mutations_run_exactly_once_for_each_actor_and_outcome() {
         use std::os::unix::process::ExitStatusExt;
@@ -2994,6 +3260,30 @@ mod tests {
         ));
         assert!(!static_routes_only_changed(None, after));
         assert!(!static_routes_only_changed(Some(b"not TOML"), after));
+    }
+
+    #[test]
+    fn only_explicit_empty_compiled_bindings_disable_the_dataplane() {
+        assert!(!compiled_dataplane_enabled(b"interface = []\n").unwrap());
+        assert!(compiled_dataplane_enabled(b"[[interface]]\nname='missing0'\npolicy=0\n").unwrap());
+        for invalid in [
+            "",
+            "policy=[]",
+            "interface=false",
+            "interface={}",
+            "[[interface]]\nname='eth0'",
+            "[[interface]]\npolicy=1",
+            "[[interface]]\nname=''\npolicy=1",
+            "[[interface]]\nname=3\npolicy=1",
+            "[[interface]]\nname='eth0'\npolicy=-1",
+            "[[interface]]\nname='eth0'\npolicy=true",
+        ] {
+            assert!(
+                compiled_dataplane_enabled(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(compiled_dataplane_enabled(&[255]).is_err());
     }
 
     #[test]
@@ -3331,6 +3621,49 @@ mod tests {
             b"public test fixture bytes\n"
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn offline_config_in_shared_tmp_is_private_and_atomic() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Directly under /tmp: a user-owned child directory would miss the bug.
+        let mut reservation = PrivateStage::create(Path::new("/tmp"), 0o600).unwrap();
+        use std::io::Write;
+        reservation.file.write_all(b"previous").unwrap();
+        for content in ["first offline config", "second offline config"] {
+            install_offline_config_file(&reservation.path, content).unwrap();
+            assert_eq!(std::fs::read_to_string(&reservation.path).unwrap(), content);
+            let metadata = std::fs::metadata(&reservation.path).unwrap();
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        // Atomic replacement must not truncate the originally opened inode.
+        use std::io::{Read, Seek};
+        // The reservation was opened write-only; inspect the old inode through
+        // a separate descriptor obtained before a subsequent replacement.
+        let mut old = std::fs::File::open(&reservation.path).unwrap();
+        install_offline_config_file(&reservation.path, "third").unwrap();
+        old.rewind().unwrap();
+        let mut bytes = String::new();
+        old.read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "second offline config");
+    }
+
+    #[test]
+    fn offline_config_refuses_symlinks_and_reports_the_destination() {
+        let victim = PrivateStage::create(Path::new("/tmp"), 0o600).unwrap();
+        std::fs::write(&victim.path, "preserve").unwrap();
+        let link = victim.path.with_extension("symlink");
+        std::os::unix::fs::symlink(&victim.path, &link).unwrap();
+        let error = install_offline_config_file(&link, "replacement").unwrap_err();
+        assert!(format!("{error:#}").contains("regular file owned"));
+        assert!(error.to_string().contains(&link.display().to_string()));
+        assert_eq!(std::fs::read_to_string(&victim.path).unwrap(), "preserve");
+        std::fs::remove_file(link).unwrap();
+        let missing = victim.path.join("missing-parent/config.toml");
+        let error = install_offline_config_file(&missing, "replacement").unwrap_err();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+        assert!(error.to_string().contains("no privilege escalation"));
     }
 
     #[test]
@@ -4317,10 +4650,23 @@ mod ha_curl_tests {
             std::env::set_var("HTTPS_PROXY", "http://proxy.attacker.example:3128");
             std::env::set_var("SSLKEYLOGFILE", "/tmp/stolen-keys");
         }
-        let out = curl_command_for(fake.to_str().unwrap())
-            .arg("https://peer.example")
-            .output()
-            .unwrap();
+        // Another test thread may fork while this one still holds the stub's
+        // write descriptor; the forked child keeps it until its own exec, and
+        // exec of a file open for writing fails with ETXTBSY. The window is
+        // that short, so retry rather than fail the release build on it.
+        let mut attempts = 0;
+        let out = loop {
+            match curl_command_for(fake.to_str().unwrap())
+                .arg("https://peer.example")
+                .output()
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => break other.unwrap(),
+            }
+        };
         unsafe {
             std::env::remove_var("HTTPS_PROXY");
             std::env::remove_var("SSLKEYLOGFILE");

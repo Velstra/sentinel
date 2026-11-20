@@ -104,7 +104,7 @@ pkgs.testers.runNixOSTest {
           before, after = first["before"], first["after"]
           assert before["layout"]["disk_bytes"] == 16 * 1024**3
           assert before["layout"]["parts"][5]["size"] * 512 == original_data_bytes
-          assert after["all_six_original_regions_unchanged"]
+          assert after["protected_regions_unchanged"]
           assert before["layout"]["parts"][:5] == after["layout"]["parts"][:5]
           data = after["layout"]["parts"][5]
           data_bytes = data["size"] * 512
@@ -135,7 +135,7 @@ pkgs.testers.runNixOSTest {
           retain("second-boot", second)
           assert second["before"]["boot_id"] != before["boot_id"]
           assert second["before"]["layout"] == after["layout"] == second["after"]["layout"]
-          assert second["after"]["all_six_original_regions_unchanged"]
+          assert second["after"]["protected_regions_unchanged"]
           assert machine.succeed("cat /var/lib/sentinel/qa-reboot-proof") == "reboot-persistence-proof"
           assert machine.succeed("cat /var/lib/sentinel/qa-existing-state-proof") == "existing data must survive first boot\n"
           assert machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == config_hash
