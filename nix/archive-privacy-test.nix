@@ -179,7 +179,10 @@ in pkgs.testers.runNixOSTest {
         machine.succeed("sentinel show configuration commands | grep -x 'set system hostname archive-cli'")
         # Rollback uses the existing default keep window; the next ordinary
         # save restores the configured retention, without deleting temp copies.
-        configure(["save"], no_apply=True)
+        # An on-box `save` writes the committed running configuration (CTRL-14);
+        # `--no-apply` is off-box editing, which never escalates and so cannot
+        # replace the root-owned appliance.toml.
+        configure(["save"])
         assert private() == 3
         machine.succeed("test -f " + directory + "/.config-2.toml.tmp")
 

@@ -2860,8 +2860,29 @@
           # A zone posture and a NAT entry, through the same command path the
           # console's forms use. These are the two surfaces most consoles get
           # wrong by growing a second config model beside the real one.
+          #
+          # The box still carries the PUT's broad `web` accept (no proto) from
+          # wan. Under an explicit `default-action drop` that rule opens
+          # nothing, and commit refuses the pair rather than keep an inert
+          # accept (DP-14) — on this path too: by name, with nothing applied.
           machine.succeed(
               "printf '%s\n' "
+              "'set firewall zone wan default-action drop' "
+              "commit save > /tmp/inert"
+          )
+          inert = machine.succeed(
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/inert https://127.0.0.1:8080/api/v1/configure"
+          )
+          assert "has no effect" in inert and "web" in inert, inert
+          assert json.loads(machine.succeed(
+              f"curl -fsSk -H 'Authorization: Bearer {token}' "
+              "https://127.0.0.1:8080/api/v1/config/transaction"
+          ))["pending"] is None, inert
+          # Retiring the inert accept in the same script admits the posture.
+          machine.succeed(
+              "printf '%s\n' "
+              "'delete firewall rule web' "
               "'set interface eth0 zone wan' "
               "'set firewall zone wan default-action drop' "
               "'set nat source console-masq zone wan' "
@@ -2871,6 +2892,9 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/zones https://127.0.0.1:8080/api/v1/configure"
           )
+          # A refusal would otherwise surface only as "expected a provisional
+          # API revision", with the reason this response carries lost.
+          assert '"pending"' in zones, zones
           confirm_pending()
           cfg = machine.succeed(
               "curl -fsSk -H 'Authorization: Bearer " + token + "' "
