@@ -7376,26 +7376,34 @@
                 ];
                 system.name = "machine";
                 # The release proof for the donor, as an operator would carry
-                # it on a second medium: the image's SHA-256 signed by a release
-                # key, and that key's public half to pin. Built from the donor's
-                # raw image, so it vouches for exactly the bytes on the stick.
+                # it on a second medium: the release's signed manifest (its
+                # version and the image's SHA-256) signed by a release key, and
+                # that key's public half to pin. Built from the donor's raw
+                # image, so it vouches for exactly the bytes on the stick. The
+                # bare signed digest stays as the unversioned proof a local
+                # update refuses without --allow-downgrade (CTRL-26).
                 environment.etc."sentinel-update-proof".source =
                   let
                     raw = "${nodes.donor.system.build.finalImage}/${nodes.donor.image.filePath}";
+                    version = lib.escapeShellArg nodes.donor.system.image.version;
                   in
                   pkgs.runCommand "sentinel-update-proof" { nativeBuildInputs = [ pkgs.openssl ]; } ''
                     mkdir -p $out
                     openssl genpkey -algorithm ed25519 -out release.pem
                     openssl pkey -in release.pem -pubout -out $out/release-pub.pem
-                    sha256sum ${raw} | cut -d ' ' -f 1 > $out/velstra-sentinel.raw.sha256
-                    openssl pkeyutl -sign -rawin -inkey release.pem \
-                      -in $out/velstra-sentinel.raw.sha256 -out $out/velstra-sentinel.raw.sha256.sig
+                    sha=$(sha256sum ${raw} | cut -d ' ' -f 1)
+                    manifest() {
+                      printf '{"version":"%s","image":"velstra-sentinel.raw","sha256":"%s","product":"velstra-sentinel"}' \
+                        ${version} "$2" > $out/$1.json
+                      openssl pkeyutl -sign -rawin -inkey release.pem -in $out/$1.json -out $out/$1.json.sig
+                    }
+                    manifest manifest "$sha"
                     # A proof for some OTHER image, to show a stick is held to
                     # its own digest and not to whatever proof is at hand.
-                    echo 0000000000000000000000000000000000000000000000000000000000000000 \
-                      > $out/other.raw.sha256
+                    manifest other 0000000000000000000000000000000000000000000000000000000000000000
+                    printf '%s\n' "$sha" > $out/velstra-sentinel.raw.sha256
                     openssl pkeyutl -sign -rawin -inkey release.pem \
-                      -in $out/other.raw.sha256 -out $out/other.raw.sha256.sig
+                      -in $out/velstra-sentinel.raw.sha256 -out $out/velstra-sentinel.raw.sha256.sig
                   '';
                 virtualisation = {
                   vlans = [ 1 ];
@@ -7525,19 +7533,24 @@
               with subtest("a USB stick is refused without a proof, and against another image's proof"):
                   status, out = machine.execute(f"sentinel update --commit {signed} {donor_disk} 2>&1")
                   assert status != 0 and "block device" in out, out
+                  # The donor's own signed digest is genuine but states no
+                  # release, so it cannot rule out a downgrade (CTRL-26).
                   status, out = machine.execute(
-                      f"sentinel update --commit {signed} --signature {proof}/other.raw.sha256.sig {donor_disk} 2>&1")
+                      f"sentinel update --commit {signed} --signature {proof}/velstra-sentinel.raw.sha256.sig {donor_disk} 2>&1")
+                  assert status != 0 and "states no release version" in out, out
+                  status, out = machine.execute(
+                      f"sentinel update --commit {signed} --signature {proof}/other.json.sig {donor_disk} 2>&1")
                   assert status != 0 and "does not match its signed SHA-256" in out, out
                   # Refused after hashing, before writing: slot B is untouched.
                   assert guid(disk, 4) != guid(donor_disk, 2), "a refused update stamped slot B"
 
               with subtest("update writes + verity-types the inactive slot B from the SIGNED donor"):
                   # The stick carries no signature of its own; the release's
-                  # signed digest comes from another medium via --signature.
+                  # signed manifest comes from another medium via --signature.
                   # The stick is hashed in full against it, then the slot is
                   # written from the same open device, re-hashed on the way.
                   out = machine.succeed(
-                      f"sentinel update --commit {signed} --signature {proof}/velstra-sentinel.raw.sha256.sig {donor_disk} 2>&1")
+                      f"sentinel update --commit {signed} --signature {proof}/manifest.json.sig {donor_disk} 2>&1")
                   assert "signature verified" in out and "image SHA-256 verified" in out, out
                   machine.succeed("udevadm settle")
                   usr = "8484680c-9521-48c6-9c11-b0720656f69e"
@@ -7627,6 +7640,9 @@
             ];
           };
           testScript = ''
+            import json
+            import shlex
+
             machine.wait_for_unit("multi-user.target")
             # Boot seeded the editable config, so `set update …` layers onto it.
             machine.wait_for_unit("sentinel-boot.service")
@@ -7647,12 +7663,28 @@
                     "openssl dgst -sha256 /tmp/chan/sentinel-99.0.0.img | awk '{print $NF}'"
                 ).strip()
 
+                # Signed online metadata carries a freshness policy (scope,
+                # sequence, a lifetime of at most 14 days); an offer without one
+                # is refused. Like a publisher, every publish signs the next
+                # sequence: the appliance refuses a sequence below one it has
+                # seen, or one reused for other bytes.
+                sequence = [0]
+
                 def publish(version, product="velstra-sentinel"):
+                    sequence[0] += 1
+                    now = int(machine.succeed("date +%s"))
+                    manifest = {
+                        "version": version, "image": "sentinel-99.0.0.img",
+                        "sha256": sha, "product": product,
+                        "freshness": {"schema": 1, "channel": "default",
+                                      "arch": machine.succeed("uname -m").strip(),
+                                      "sequence": sequence[0], "issued_at": now,
+                                      "expires_at": now + 86400},
+                    }
                     machine.succeed(
                         "printf '%s' "
-                        "'{\"version\":\"" + version + "\",\"image\":\"sentinel-99.0.0.img\","
-                        "\"sha256\":\"" + sha + "\",\"product\":\"" + product + "\"}' "
-                        "> /tmp/chan/manifest.json"
+                        + shlex.quote(json.dumps(manifest, separators=(",", ":")))
+                        + " > /tmp/chan/manifest.json"
                     )
                     # Detached Ed25519 signature over the EXACT manifest bytes.
                     machine.succeed(
@@ -7663,12 +7695,15 @@
                 publish("99.0.0")
 
             with subtest("pin the channel in the appliance config"):
+                # `--no-apply` saves offline and never escalates, so the file's
+                # owner (root) writes it; this check is about the update gate,
+                # not about live apply.
                 machine.succeed(
-                    "su admin -c \"printf '%s\\n' "
+                    "printf '%s\\n' "
                     "'set update url file:///tmp/chan' "
                     "'set update public-key file:/tmp/pub.pem' "
                     "commit save exit "
-                    "| sentinel configure --no-apply\""
+                    "| sentinel configure --no-apply"
                 )
                 machine.succeed("grep -q 'file:///tmp/chan' /var/lib/sentinel/appliance.toml")
 
@@ -7780,10 +7815,19 @@
                     "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
                     "-in /tmp/img.raw -out /tmp/img.raw.sig"
                 )
+                # A raw signature vouches for bytes, not for a release, so it
+                # cannot rule out a downgrade (CTRL-26): verified, then refused
+                # before the writer unless the operator accepts that.
+                status, out = machine.execute(
+                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem 2>&1"
+                )
+                assert status != 0 and "signature verified" in out.lower(), out
+                assert "states no release version" in out, out
+                assert "could not resolve the source disk" not in out, out
                 # No A/B disk here, so the writer fails at find_source_disk — but
                 # ONLY a signature-verified image gets that far, which is the proof.
                 status, out = machine.execute(
-                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem 2>&1"
+                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem --allow-downgrade 2>&1"
                 )
                 assert status != 0, f"expected the writer to fail without a disk: {out}"
                 assert "signature verified" in out.lower(), (
@@ -7823,12 +7867,14 @@
                     "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
                     "-in /tmp/img.raw -out /tmp/img.raw.sig"
                 )
+                # `--no-apply` saves offline and never escalates: the file's
+                # owner (root) writes it.
                 machine.succeed(
-                    "su admin -c \"printf '%s\\n' "
+                    "printf '%s\\n' "
                     "'set update url file:///tmp/chan' "
                     "'set update public-key file:/tmp/pub.pem' "
                     "commit save exit "
-                    "| sentinel configure --no-apply\""
+                    "| sentinel configure --no-apply"
                 )
                 status, out = machine.execute("sentinel update /tmp/img.raw 2>&1")
                 assert status != 0, out
@@ -7845,9 +7891,11 @@
                     "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
                     "-in /tmp/proof.sha256 -out /tmp/proof.sha256.sig"
                 )
-                status, out = machine.execute(
-                    f"sentinel update {dev} --pubkey file:/tmp/pub.pem --signature /tmp/proof.sha256.sig 2>&1"
-                )
+                digest = f"sentinel update {dev} --pubkey file:/tmp/pub.pem --signature /tmp/proof.sha256.sig"
+                # A signed digest is unversioned too (CTRL-26).
+                status, out = machine.execute(f"{digest} 2>&1")
+                assert status != 0 and "states no release version" in out, out
+                status, out = machine.execute(f"{digest} --allow-downgrade 2>&1")
                 assert "signature verified" in out.lower(), out
                 assert "could not resolve the source disk" in out, (
                     f"a signed device must reach the slot-writer: {out}"
@@ -7966,6 +8014,9 @@
               security.pki.certificateFiles = [ "${tls}/cert.pem" ];
             };
             testScript = ''
+              import json
+              import shlex
+
               machine.wait_for_unit("multi-user.target")
               machine.wait_for_unit("sentinel-boot.service")
               machine.succeed("test -f /var/lib/sentinel/appliance.toml")
@@ -7979,10 +8030,20 @@
                   sha = machine.succeed(
                       "openssl dgst -sha256 /tmp/chan/sentinel-99.0.0.img | awk '{print $NF}'"
                   ).strip()
+                  # Online metadata names the product and carries a freshness
+                  # policy scoped to the channel it is served on.
+                  now = int(machine.succeed("date +%s"))
+                  manifest = {
+                      "version": "99.0.0", "image": "sentinel-99.0.0.img", "sha256": sha,
+                      "product": "velstra-sentinel",
+                      "freshness": {"schema": 1, "channel": "enterprise",
+                                    "arch": machine.succeed("uname -m").strip(),
+                                    "sequence": 1, "issued_at": now, "expires_at": now + 86400},
+                  }
                   machine.succeed(
                       "printf '%s' "
-                      "'{\"version\":\"99.0.0\",\"image\":\"sentinel-99.0.0.img\",\"sha256\":\"'"
-                      + sha + "'\"}' > /tmp/chan/manifest.json"
+                      + shlex.quote(json.dumps(manifest, separators=(",", ":")))
+                      + " > /tmp/chan/manifest.json"
                   )
                   machine.succeed(
                       "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
@@ -7994,14 +8055,16 @@
                   machine.wait_for_open_port(8443)
 
               with subtest("pin the channel with a WRONG subscription key"):
+                  # `--no-apply` saves offline and never escalates: the file's
+                  # owner (root) writes it.
                   machine.succeed(
-                      "su admin -c \"printf '%s\\n' "
+                      "printf '%s\\n' "
                       "'set update channel enterprise url https://localhost:8443' "
                       "'set update channel enterprise public-key file:/tmp/pub.pem' "
                       "'set update channel enterprise subscription-key wrong-key-0000' "
                       "'set update channel enterprise' "
                       "commit save exit "
-                      "| sentinel configure --no-apply\""
+                      "| sentinel configure --no-apply"
                   )
                   machine.succeed(
                       "grep -q 'https://localhost:8443' /var/lib/sentinel/appliance.toml"
@@ -8042,10 +8105,10 @@
 
               with subtest("the RIGHT key is served the signed release"):
                   machine.succeed(
-                      "su admin -c \"printf '%s\\n' "
+                      "printf '%s\\n' "
                       "'set update channel enterprise subscription-key velstra-ent-a1b2c3d4' "
                       "commit save exit "
-                      "| sentinel configure --no-apply\""
+                      "| sentinel configure --no-apply"
                   )
                   out = machine.succeed("sentinel update check")
                   assert "99.0.0" in out, f"check should report the signed version: {out}"
