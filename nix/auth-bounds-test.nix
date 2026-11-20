@@ -105,8 +105,13 @@ let
             ({"username": "admin", "password": PASSWORD, "code": "0" * 65}, None, "application/json", 400),
             (None, b'{"username":', "application/json", 400),
             (None, b'{}', "text/plain", 415),
-            # Axum's JSON extractor limit; allocate only one small chunk beyond it.
-            (None, b' ' * (2 * 1024 * 1024 + 1024), "application/json", 413),
+            # The pre-authentication body bound (CTRL-05: 64 KiB for sign-in,
+            # api_listener SIGN_IN_BODY); one small chunk beyond it, so the
+            # client has finished sending when the 413 arrives. The old 2 MiB
+            # body was the JSON extractor's limit, which sign-in no longer
+            # reaches: the server answers at 64 KiB and closes while such a
+            # client is still writing.
+            (None, b' ' * (64 * 1024 + 1024), "application/json", 413),
         ]
         for index, (body, raw, content_type, status) in enumerate(cases):
             refused(request("10.1.0." + str(20 + index), "POST", "/api/v1/login",
