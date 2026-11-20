@@ -647,6 +647,62 @@ fn dp31_a_port_no_zone_admits_is_proxied_everywhere_and_says_so() {
     assert!(w.contains("syn-protect") && w.contains("any zone"), "{w}");
 }
 
+// ---- DP-35: the SYN proxy is IPv4 only, and says so where it matters --------
+
+fn with_v6_wan(extra: &str) -> String {
+    with(extra).replace(
+        "address = \"198.51.100.2/24\"\n",
+        "address = \"198.51.100.2/24\"\naddress6 = \"2001:db8:51::2/64\"\n",
+    )
+}
+
+const WEB_RULE: &str = r#"
+[[rule]]
+name = "web-in"
+from = "wan"
+proto = "tcp"
+port = 443
+action = "accept"
+[[firewall.syn-protect]]
+port = 443
+"#;
+
+#[test]
+fn dp35_a_protected_port_reachable_over_ipv6_says_ipv6_is_not_proxied() {
+    let text = with_v6_wan(WEB_RULE);
+    assert!(
+        text.contains("address6"),
+        "the fixture gained its IPv6 address"
+    );
+    let w = warnings(&text);
+    assert!(
+        w.contains("syn-protect 443: TCP 443 is reachable over IPv6 on zone wan")
+            && w.contains("IPv6 SYNs to it are not proxied"),
+        "{w}"
+    );
+}
+
+#[test]
+fn dp35_no_ipv6_note_where_the_port_cannot_be_reached_over_ipv6() {
+    // The zone has no IPv6 address.
+    let w = warnings(&with(WEB_RULE));
+    assert!(w.contains("syn-protect 443"), "{w}");
+    assert!(!w.contains("over IPv6"), "{w}");
+    // The zone has one, but the only rule admitting 443 is IPv4-only.
+    let v4_only = WEB_RULE.replace(
+        "action = \"accept\"\n",
+        "action = \"accept\"\nfamily = \"ipv4\"\n",
+    );
+    let w = warnings(&with_v6_wan(&v4_only));
+    assert!(!w.contains("over IPv6"), "{w}");
+}
+
+#[test]
+fn dp35_a_port_proxied_everywhere_names_the_ipv6_zones() {
+    let w = warnings(&with_v6_wan("[[firewall.syn-protect]]\nport = 443\n"));
+    assert!(w.contains("reachable over IPv6 on zone wan"), "{w}");
+}
+
 // ---- DP-15: blocklists and GeoIP name sources only -------------------------
 
 #[test]

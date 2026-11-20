@@ -40,7 +40,7 @@
 //! defaults (its schema is `deny_unknown_fields` + `default`, so the subset must
 //! use only known field names — it does).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -693,6 +693,7 @@ fn synproxy_out(
     protected: &[crate::config::SynProtect],
     policies: &[Policy],
     port_forwards: &[PortForwardOut],
+    ipv6_zones: &BTreeSet<&str>,
     notes: &mut Vec<String>,
 ) -> Vec<SynProxyOut> {
     let mut out = Vec::new();
@@ -717,10 +718,11 @@ fn synproxy_out(
                  port-forward or a load balancer, so the SYN proxy answers every IPv4 \
                  TCP SYN to it arriving on any zone, including connections this \
                  network's own clients open outward to that port elsewhere; those \
-                 connections lose window scaling, SACK and timestamps. IPv6 SYNs are \
-                 not proxied",
+                 connections lose window scaling, SACK and timestamps",
                 s.port, s.port
             ));
+            let reachable: Vec<&str> = ipv6_zones.iter().copied().collect();
+            note_ipv6_unproxied(s.port, &reachable, notes);
             out.push(SynProxyOut {
                 port: s.port,
                 mss,
@@ -732,11 +734,24 @@ fn synproxy_out(
         notes.push(format!(
             "firewall syn-protect {}: the SYN proxy answers IPv4 TCP SYNs to {} arriving \
              on zone {} (the zones that admit it); connections other zones open to that \
-             port are not proxied. IPv6 SYNs are not proxied",
+             port are not proxied",
             s.port,
             s.port,
             zones.join(", ")
         ));
+        // Reachable over IPv6: an admitting zone that carries IPv6, through a
+        // rule that is not IPv4-only (port-forwards are IPv4 only).
+        let reachable: Vec<&str> = admitting
+            .iter()
+            .filter(|p| ipv6_zones.contains(p.name.as_str()))
+            .filter(|p| {
+                p.port_rules
+                    .iter()
+                    .any(|r| admits_tcp_inbound(r, s.port) && r.family.as_deref() != Some("ipv4"))
+            })
+            .map(|p| p.name.as_str())
+            .collect();
+        note_ipv6_unproxied(s.port, &reachable, notes);
         out.extend(admitting.iter().map(|p| SynProxyOut {
             port: s.port,
             mss,
@@ -744,6 +759,30 @@ fn synproxy_out(
         }));
     }
     out
+}
+
+/// The zones with an IPv6 address on an enabled interface (static, SLAAC,
+/// DHCPv6 or a delegated prefix): where an IPv6 SYN can arrive.
+fn ipv6_zones(appliance: &Appliance) -> BTreeSet<&str> {
+    appliance
+        .interfaces
+        .iter()
+        .filter(|i| !i.disabled && (i.address6.is_some() || i.pd_from.is_some()))
+        .filter_map(|i| i.zone.as_deref())
+        .collect()
+}
+
+/// DP-35: the SYN proxy is IPv4 only. Where a protected port can be reached
+/// over IPv6, say so by zone, so `syn-protect` is never silently partial.
+fn note_ipv6_unproxied(port: u16, zones: &[&str], notes: &mut Vec<String>) {
+    if zones.is_empty() {
+        return;
+    }
+    notes.push(format!(
+        "firewall syn-protect {port}: TCP {port} is reachable over IPv6 on zone {}, and \
+         the SYN proxy is IPv4 only: IPv6 SYNs to it are not proxied",
+        zones.join(", ")
+    ));
 }
 
 /// A compiled rule that lets new TCP connections to `port` in: an accept for
@@ -1296,7 +1335,13 @@ fn compile_noted(
         }
     }
 
-    let synproxy = synproxy_out(&fw.syn_protect, &policies, &port_forwards, notes);
+    let synproxy = synproxy_out(
+        &fw.syn_protect,
+        &policies,
+        &port_forwards,
+        &ipv6_zones(appliance),
+        notes,
+    );
 
     // C22 load-balanced services — one `[[service]]` per enabled load balancer,
     // scoped to its ingress zone's policy.
