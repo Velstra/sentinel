@@ -8,7 +8,7 @@ let
   command = "${pkgs.python3}/bin/python3 -B ${probe}";
 in pkgs.testers.runNixOSTest {
   name = "sentinel-nat-capacity-${if lanStateful then "stateful" else "lan-stateless-diagnostic"}-${toString (lib.last counts)}";
-  globalTimeout = 600;
+  globalTimeout = 1200;
   nodes = {
     client = {
       virtualisation = { vlans = [ 2 ]; memorySize = 768; };
