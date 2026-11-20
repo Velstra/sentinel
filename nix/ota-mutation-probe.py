@@ -264,21 +264,29 @@ def main():
                 until(lambda: Path("/proc/sys/kernel/hostname").read_text().strip() == "mutation-save")
                 until(blocked)
                 applied = json.loads(epoch.read_bytes())["nonce"]
+                # A save never confirms a trial implicitly (01e3878): in the
+                # session that armed it, under the same mutation lock, it is
+                # refused and writes nothing.
                 process.communicate("save\nexit\n", timeout=10)
                 output.seek(0)
                 transcript = output.read()
-                assert process.returncode == 0 and "error:" not in transcript.lower(), transcript
-                assert "commit-confirm:" in transcript and "saved" in transcript, transcript
+                assert process.returncode != 0, transcript
+                assert "commit-confirm:" in transcript, transcript
+                assert "commit-confirm or its rollback is pending" in transcript, transcript
+                assert "saved" not in transcript, transcript
             finally:
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
+        assert 'mutation-save' not in saved.read_text()
+        cli("confirm")
+        cli("save")
         until(natural_gc)
         state = until(available)
         assert json.loads(epoch.read_bytes())["nonce"] != applied
         assert 'mutation-save' in saved.read_text()
         assert state["offer"] is None
-        phases.append({"name": "real-admin-save-cancels-confirm-under-one-mutation-lock", "passed": True})
+        phases.append({"name": "real-admin-save-refuses-a-pending-confirm-under-one-mutation-lock", "passed": True})
         cli("set system hostname mutation-fw\ncommit\nsave")
         assert Path("/proc/sys/kernel/hostname").read_text().strip() == "mutation-fw"
         # A real REST transaction writes a root-private journal. Normal admin
