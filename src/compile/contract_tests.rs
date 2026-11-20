@@ -547,9 +547,103 @@ hairpin = true
     assert!(w.contains("hairpin"), "{w}");
 }
 
+// ---- DP-31: the SYN proxy is scoped to the zones that admit the port --------
+
+fn synproxy(cfg: &toml::Value) -> Vec<&toml::Value> {
+    cfg.get("synproxy")
+        .and_then(toml::Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default()
+}
+
+fn policy_id(cfg: &toml::Value, zone: &str) -> i64 {
+    policy(cfg, zone)["id"].as_integer().expect("policy id")
+}
+
+const WEB_FORWARD: &str = r#"
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "192.168.50.10:443"
+"#;
+
 #[test]
-fn dp31_syn_protect_says_it_applies_to_every_zone() {
-    let w = warnings(&with("[[firewall.syn-protect]]\nport = 443\n"));
+fn dp31_a_forwarded_port_is_proxied_for_the_forwarding_zone_only() {
+    let text = with(&format!(
+        "{WEB_FORWARD}[[firewall.syn-protect]]\nport = 443\n"
+    ));
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let entries = synproxy(&cfg);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["port"].as_integer(), Some(443));
+    assert_eq!(
+        entries[0].get("policy").and_then(toml::Value::as_integer),
+        Some(policy_id(&cfg, "wan")),
+        "{cfg:?}"
+    );
+    let w = warnings(&text);
+    assert!(w.contains("arriving on zone wan"), "{w}");
+}
+
+#[test]
+fn dp31_a_port_opened_by_a_rule_is_proxied_for_that_zone() {
+    let text = with(
+        r#"
+[[rule]]
+name = "web-in"
+from = "wan"
+proto = "tcp"
+port = 443
+action = "accept"
+[[firewall.syn-protect]]
+port = 443
+mss = 1400
+"#,
+    );
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let entries = synproxy(&cfg);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0].get("policy").and_then(toml::Value::as_integer),
+        Some(policy_id(&cfg, "wan")),
+        "{cfg:?}"
+    );
+    assert_eq!(entries[0]["mss"].as_integer(), Some(1400));
+}
+
+/// A LAN client dialling the public address through a hairpin is an inside
+/// client: its zone's reflection entry must not make the proxy answer every
+/// LAN SYN to that port.
+#[test]
+fn dp31_a_hairpin_reflection_does_not_proxy_the_inside() {
+    let text = with(&format!(
+        "{WEB_FORWARD}hairpin = true\n[[firewall.syn-protect]]\nport = 443\n"
+    ));
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let lan = policy_id(&cfg, "lan");
+    let entries = synproxy(&cfg);
+    assert!(!entries.is_empty());
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.get("policy").and_then(toml::Value::as_integer) != Some(lan)),
+        "{entries:?}"
+    );
+}
+
+/// Nothing admits the port explicitly (a default-accept zone serves it): the
+/// proxy stays on for every zone rather than silently protecting nothing, and
+/// says what that costs.
+#[test]
+fn dp31_a_port_no_zone_admits_is_proxied_everywhere_and_says_so() {
+    let text = with("[[firewall.syn-protect]]\nport = 443\n");
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let entries = synproxy(&cfg);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(entries[0].get("policy").is_none(), "{entries:?}");
+    let w = warnings(&text);
     assert!(w.contains("syn-protect") && w.contains("any zone"), "{w}");
 }
 

@@ -38,6 +38,7 @@ Earlier measurements below remain historical evidence, not extra guarantees.
 | IPv6 | Filtering / routed forwarding is distinct from NAT64, NPTv6 and overlay support. No IPv6 stateful redirect fast path is claimed. Each requires its own packet gate. |
 | Conntrack capacity | Separate fixed 65,536-entry NAT and firewall-state maps. Entries per connection depend on the NAT path and policy; there is no universally qualified connection limit. A 128-connection pass does not clear sparse-map allocation failure, live-entry eviction or the 20,000-flow pressure gate. Occupancy warnings do not prevent these failures. |
 | XDP redirects | Fabric has explicit IPv4 FIB, load-balancer and overlay redirect paths. Those do **not** establish an established-flow fast path for the Sentinel router/NAT configuration. |
+| SYN proxy | IPv4 only; IPv6 SYNs to a protected port are not proxied. Scoped to the zones that admit the port (see the firewall handbook). Proxied connections lose window scaling, SACK and timestamps. |
 | Generic/SKB XDP | Driver fallback, not native-XDP performance. Native mode and each NIC driver require separate qualification. |
 | HA | Experimental. Targeted flow/fencing tests are not clearance for all witness-loss, partition and rolling-upgrade scenarios. Keep independent management and recovery access. |
 | Kernel compatibility | 6.12 is the current appliance selection. 6.6 / 6.12 / 6.18 checks load the same object on real guest kernels. A configured CI lane is not a compatibility claim: require its passing receipt for the exact object hash. |

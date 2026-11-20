@@ -268,7 +268,7 @@ show top-talkers           # hosts ranked by the volume attributed to them
 
 ## SYN-flood protection (SYN proxy)
 
-Enable SYN proxy only for the TCP service ports that need it and verify normal connections to each protected service. The proxy is keyed by port alone: it answers every IPv4 SYN to that port arriving on any zone, including connections your own clients open outward to that port elsewhere, and those connections lose window scaling, SACK and timestamps. IPv6 SYNs are not proxied.
+Enable SYN proxy only for the TCP service ports that need it and verify normal connections to each protected service. A protected port is proxied on the zones that admit it: a zone with an accept rule for that TCP port on arriving traffic, a TCP port-forward of it, or a load balancer on it. Connections other zones open to that port elsewhere — your LAN clients' outbound HTTPS under `syn-protect 443` — are not proxied, and a hairpin reflection does not count as admitting it. Proxied connections lose window scaling, SACK and timestamps. When no zone admits the port that way (the service sits behind a zone whose default action accepts), the proxy answers every IPv4 SYN to that port arriving on any zone, and `config check` says so. `config check` names the zones a port is proxied on. IPv6 SYNs are not proxied.
 
 ```text
 set firewall syn-protect 443

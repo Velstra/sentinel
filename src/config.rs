@@ -11722,27 +11722,8 @@ impl Appliance {
                 ));
             }
         }
-        // The data plane keys its SYN proxy on the TCP port alone.
-        if !self.firewall.syn_protect.is_empty() {
-            let ports = self
-                .firewall
-                .syn_protect
-                .iter()
-                .map(|s| s.port.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push(format!(
-                "firewall syn-protect {ports}: the SYN proxy answers every IPv4 TCP SYN to \
-                 {} arriving on any zone, including connections this network's own clients \
-                 open outward to that port elsewhere; those connections lose window scaling, \
-                 SACK and timestamps. IPv6 SYNs are not proxied",
-                if self.firewall.syn_protect.len() == 1 {
-                    "that port"
-                } else {
-                    "those ports"
-                }
-            ));
-        }
+        // The SYN proxy's scope (DP-31) is decided where the zones' rules and
+        // forwards are compiled, and reported from there (`rule_key_warnings`).
         out
     }
 

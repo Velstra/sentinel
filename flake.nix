@@ -8748,6 +8748,16 @@
                   ];
                 };
                 environment.systemPackages = [ pkgs.curl pkgs.python3 ];
+                # A service of the client's own on the protected port, for the
+                # DP-31 half: the LAN server dials OUT to it.
+                systemd.services.outside-web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/out && echo hello-from-outside > /srv/out/index.html
+                    exec ${pkgs.python3}/bin/python3 -m http.server 443 --directory /srv/out
+                  '';
+                };
                 environment.etc."synproxy-dscp.py".text = ''
                   import socket
 
@@ -8789,6 +8799,7 @@
                     interface = "eth1";
                   };
                 };
+                environment.systemPackages = [ pkgs.curl ];
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
                   after = [ "network-online.target" ];
@@ -8843,13 +8854,18 @@
 
             # Both segments zoned, both directions permitted, and tcp/443
             # syn-protected. The zones accept by default so that what the check
-            # proves is the proxy, not the rule engine.
+            # proves is the proxy, not the rule engine; the WAN zone admits 443
+            # by a rule as well, which is what scopes the proxy to it (DP-31).
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
                 "'set interface eth2 zone lan' "
                 "'set firewall zone wan default-action accept' "
                 "'set firewall zone lan default-action accept' "
+                "'set firewall rule web-in from wan' "
+                "'set firewall rule web-in proto tcp' "
+                "'set firewall rule web-in port 443' "
+                "'set firewall rule web-in action accept' "
                 "'set firewall syn-protect 443' "
                 "commit save exit "
                 "| sentinel configure\" 2>&1"
@@ -8982,6 +8998,32 @@
             client.succeed(
                 "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected"
             )
+
+            # DP-31: the proxy shields 443 from the zone that admits it, not
+            # from the inside. A LAN host dialling OUT to some other port-443
+            # service must reach it unproxied — no cookie SYN-ACK from the box,
+            # so its connection keeps window scaling, SACK and timestamps. Keyed
+            # by port alone, the proxy answered this SYN too.
+            client.wait_for_unit("outside-web.service")
+            client.wait_until_succeeds("ss -ltn | grep -q ':443 '", timeout=20)
+            # The counters are read live from the agent, so before/after is exact.
+            stats = fw.succeed("sentinel show firewall statistics")
+            outward_before = counter("synproxy_challenged")
+            for _ in range(3):
+                server.succeed(
+                    "curl -s --max-time 10 http://10.1.0.9:443/ | grep -q hello-from-outside"
+                )
+            stats = fw.succeed("sentinel show firewall statistics")
+            assert counter("synproxy_challenged") == outward_before, (
+                "an outbound LAN connection to the protected port was proxied:\n" + stats
+            )
+            # …while the zone that admits 443 is still proxied: the scope is
+            # narrower, not off.
+            client.succeed(
+                "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected"
+            )
+            stats = fw.succeed("sentinel show firewall statistics")
+            assert counter("synproxy_challenged") == outward_before + 1, stats
           '';
         };
 
