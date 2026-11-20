@@ -65,6 +65,10 @@ the audit's blocking findings are closed and requalified.
   accept rule, a port-forward or a load balancer). Outbound connections from
   other zones to that port are no longer proxied. A port no zone admits that
   way stays proxied everywhere, and `config check` says so.
+- Known limitation: IPv6 is not SYN-proxied in 1.0; the SYN proxy protects
+  IPv4 only. `config check` names every zone where a protected port is
+  reachable over IPv6. The IPv6 proxy is planned for 1.1
+  (`docs/design/dp35-ipv6-synproxy.md`).
 - IPv6 SYNs are MSS-clamped like IPv4 (PPPoE included). ICMPv6 errors about
   connections behind NPTv6, or quoting extension headers, now reach the host.
   Checked by `checks.v6-mss-npt-related`.
