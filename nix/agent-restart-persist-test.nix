@@ -150,6 +150,57 @@ let
     };
     environment.systemPackages = [ pkgs.python3 pkgs.netcat-openbsd pkgs.bpftools ];
   };
+  # With persistence: the dead agent's pinned hooks keep the state, and the
+  # next agent adopts it.
+  persistent = ''
+    assert receipt["dead"]["held"] == "ok", f"agent death dropped connection state: {receipt}"
+
+    receipt["restart_at"] = float(fw.succeed("cut -d' ' -f1 /proc/uptime"))
+    fw.succeed("systemctl start agent")
+    fw.wait_until_succeeds("journalctl -u agent --no-pager | grep -c 'Velstra is live.' | grep -qx 2")
+    journal = fw.succeed("journalctl -u agent --no-pager")
+    restarted: dict[str, Any] = {
+        "closed_port": reachable(8080),
+        "held": held("restarted"),
+        "adopted_state": "adopting the connection state of the previous agent" in journal,
+        "adopted_xdp": "adopted the pinned XDP attachment on eth1" in journal,
+        "adopted_egress": "adopted the pinned egress firewall on eth1" in journal,
+        "capacity": json.loads(fw.succeed("${python} ${query} capacity")),
+    }
+    restarted["stream_gaps"] = json.loads(fw.succeed("cat /run/stream-worst"))
+    restarted["stream_worst_gap_s"] = max(g for g, _ in restarted["stream_gaps"])
+    # The first start holds the link (no pins yet); a restart must not.
+    restarted["link_downed"] = journal.count("held until the data plane hooks it again") > 1
+    restarted["link_kept"] = "kept up: its pinned datapath hooks are still attached" in journal
+    receipt["restarted"] = restarted
+    save()
+    r = restarted
+    assert not r["closed_port"] and r["held"] == "ok", receipt
+    assert r["adopted_state"] and r["adopted_xdp"] and r["adopted_egress"], receipt
+    assert r["capacity"]["state_adopted_from_previous_agent"] is True, receipt
+    # Forwarding never stops: the hold left the link up and the stream through
+    # the datapath saw no gap beyond scheduling across SIGKILL and restart.
+    assert r["link_kept"] and not r["link_downed"], receipt
+    assert r["stream_worst_gap_s"] < 1.0, receipt
+
+    fw.succeed("systemctl stop agent")
+    receipt["stopped"] = {"closed_port": reachable(8080), "held": held("stopped")}
+    fw.succeed("${agent}/bin/velstra release-datapath")
+    receipt["released"] = {"closed_port": reachable(8080)}
+    save()
+    assert not receipt["stopped"]["closed_port"] and receipt["stopped"]["held"] == "ok", receipt
+    assert receipt["released"]["closed_port"], "release-datapath must detach the pinned hooks"
+  '';
+  # Without persistence the same kill is the fail-open baseline this release
+  # removes (DP-12): the hooks go with the process and so does the state. The
+  # control asserts that baseline, so a run where the scenario cannot tell the
+  # two apart (pins left behind, the held connection surviving) goes red
+  # instead of making the persistent variant prove nothing.
+  baseline = ''
+    dead = receipt["dead"]
+    assert dead["xdp"] == "0" and not dead["pins"].strip(), f"hooks outlived an unpersisted agent: {receipt}"
+    assert dead["held"] != "ok", f"the held connection survived without persistence: {receipt}"
+  '';
 in pkgs.testers.runNixOSTest {
   name = "sentinel-agent-restart-persist${pkgs.lib.optionalString (!persist) "-off"}";
   globalTimeout = 600;
@@ -211,43 +262,7 @@ in pkgs.testers.runNixOSTest {
     }
     save()
     assert not receipt["dead"]["closed_port"], f"agent death left the link unfiltered: {receipt}"
-    assert receipt["dead"]["held"] == "ok", f"agent death dropped connection state: {receipt}"
-
-    receipt["restart_at"] = float(fw.succeed("cut -d' ' -f1 /proc/uptime"))
-    fw.succeed("systemctl start agent")
-    fw.wait_until_succeeds("journalctl -u agent --no-pager | grep -c 'Velstra is live.' | grep -qx 2")
-    journal = fw.succeed("journalctl -u agent --no-pager")
-    restarted: dict[str, Any] = {
-        "closed_port": reachable(8080),
-        "held": held("restarted"),
-        "adopted_state": "adopting the connection state of the previous agent" in journal,
-        "adopted_xdp": "adopted the pinned XDP attachment on eth1" in journal,
-        "adopted_egress": "adopted the pinned egress firewall on eth1" in journal,
-        "capacity": json.loads(fw.succeed("${python} ${query} capacity")),
-    }
-    restarted["stream_gaps"] = json.loads(fw.succeed("cat /run/stream-worst"))
-    restarted["stream_worst_gap_s"] = max(g for g, _ in restarted["stream_gaps"])
-    # The first start holds the link (no pins yet); a restart must not.
-    restarted["link_downed"] = journal.count("held until the data plane hooks it again") > 1
-    restarted["link_kept"] = "kept up: its pinned datapath hooks are still attached" in journal
-    receipt["restarted"] = restarted
-    save()
-    r = restarted
-    assert not r["closed_port"] and r["held"] == "ok", receipt
-    assert r["adopted_state"] and r["adopted_xdp"] and r["adopted_egress"], receipt
-    assert r["capacity"]["state_adopted_from_previous_agent"] is True, receipt
-    # Forwarding never stops: the hold left the link up and the stream through
-    # the datapath saw no gap beyond scheduling across SIGKILL and restart.
-    assert r["link_kept"] and not r["link_downed"], receipt
-    assert r["stream_worst_gap_s"] < 1.0, receipt
-
-    fw.succeed("systemctl stop agent")
-    receipt["stopped"] = {"closed_port": reachable(8080), "held": held("stopped")}
-    fw.succeed("${agent}/bin/velstra release-datapath")
-    receipt["released"] = {"closed_port": reachable(8080)}
-    save()
-    assert not receipt["stopped"]["closed_port"] and receipt["stopped"]["held"] == "ok", receipt
-    assert receipt["released"]["closed_port"], "release-datapath must detach the pinned hooks"
+  '' + (if persist then persistent else baseline) + ''
     receipt["passed"] = True
     save()
   '';
