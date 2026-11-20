@@ -28,7 +28,7 @@
     # Reviewed public integrations; update these URLs and the lock together.
     # The former appliance backports are now included upstream.
     fabric = {
-      url = "github:Velstra/fabric/055867da1cd19968178e33eaeede6c8e8f3a1296";
+      url = "github:Velstra/fabric/698d66501c8f820d5e36f6386bb2105b306e32a3";
       flake = false;
     };
     # Test-only deployed allocator. Never advance this with the production pin:
@@ -414,7 +414,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-BJTh21e6m9CzhGxLxAqA6GnEA929Msw66J3k1SOS8dU=";
+      ebpfHash = "sha256-f91maVNI2z/wLCgYtNJYmIF/P0SE+qwchJqlZmUWDic=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
