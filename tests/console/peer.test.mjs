@@ -3,7 +3,7 @@
 import { browser, signIn, sleep, test, check, summary } from './harness.mjs';
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:net';
-import { createHash, X509Certificate } from 'node:crypto';
+import { createHash, randomBytes, X509Certificate } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,7 +21,14 @@ const replaceLocal = contents => {
   writeFileSync(config + '.peer-test', contents, {mode:0o600});
   renameSync(config + '.peer-test', config);
 };
-writeFileSync(join(work,'peer.toml'), '[system]\nhostname="peer-console-test"\n[services.ntp]\nupstream=["192.0.2.123"]\n', {mode:0o600});
+// The config-sync secret is the pair's peer credential, distinct from either
+// member's machine token: a bearer equal to the secret is read-only (CTRL-01),
+// so reusing the console's token as the secret would sign this browser in as
+// the peer. Disposable, generated per run.
+const syncSecret = randomBytes(32).toString('base64');
+const localEndpoint = new URL(process.env.CONSOLE_URL).host;
+writeFileSync(join(work,'peer.toml'), '[system]\nhostname="peer-console-test"\n[services.ntp]\nupstream=["192.0.2.123"]\n'
+  + `[system.config-sync]\npeer=[${JSON.stringify(localEndpoint)}]\nsecret=${JSON.stringify(syncSecret)}\n`, {mode:0o600});
 writeFileSync(join(work,'token'), process.env.CONSOLE_TOKEN, {mode:0o600});
 const peer = spawn(process.env.CONSOLE_BINARY, ['api','--listen',member,'--config',join(work,'peer.toml'),'--token-file',join(work,'token'),'--no-apply'], {stdio:['ignore','pipe','pipe']});
 // Drain diagnostics without retaining any configuration/credentials in evidence.
@@ -37,7 +44,7 @@ try {
   check(ready, 'TLS peer did not start');
   const cert = new X509Certificate(readFileSync(join(work,'web-tls','cert.pem')));
   const pin = createHash('sha256').update(cert.publicKey.export({type:'spki',format:'der'})).digest('base64');
-  const paired = original + `\n[system.config-sync]\npeer=[${JSON.stringify(member)}]\nsecret=${JSON.stringify(process.env.CONSOLE_TOKEN)}\npeer-fingerprint=${JSON.stringify(pin)}\n`;
+  const paired = original + `\n[system.config-sync]\npeer=[${JSON.stringify(member)}]\nsecret=${JSON.stringify(syncSecret)}\npeer-fingerprint=${JSON.stringify(pin)}\n`;
   replaceLocal(paired);
   page = await browser({width:1440,height:1000});
   await page.goto(process.env.CONSOLE_URL); await signIn(page, process.env.CONSOLE_TOKEN);
