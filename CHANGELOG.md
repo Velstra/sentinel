@@ -55,6 +55,25 @@ the audit's blocking findings are closed and requalified.
   check and mount, and a failed grow no longer fails the boot.
 - PROV-04: `sentinel config check` warns for zoned NICs without `hw-id`.
 
+### Release 1.0.0 datapath
+
+- DP-15: zone and global blocklists and GeoIP countries name sources only.
+  The LAN can reach a listed address and receive its answers; whatever a
+  listed address starts is still refused. There is no outbound blocklist.
+  Checked by `checks.blocklist-direction`.
+- DP-31: `syn-protect` proxies a port only on the zones that admit it (an
+  accept rule, a port-forward or a load balancer). Outbound connections from
+  other zones to that port are no longer proxied. A port no zone admits that
+  way stays proxied everywhere, and `config check` says so.
+- IPv6 SYNs are MSS-clamped like IPv4 (PPPoE included). ICMPv6 errors about
+  connections behind NPTv6, or quoting extension headers, now reach the host.
+  Checked by `checks.v6-mss-npt-related`.
+- `velstra verify-ebpf` (and so the `ebpf-verifier` checks) refuses a program
+  that uses more than 700,000 verifier instructions.
+- Known limitation, documented: a NIC that strips VLAN tags in hardware makes
+  the parent's zone judge VLAN traffic under native XDP (DP-22); turn
+  `offload rxvlan` off on such a parent.
+
 ### Changes since the 2026-10-26 candidate
 
 Summarised from the commit history between the 1.0.0 candidate date and the
