@@ -9,15 +9,15 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 const DIRECTORY: &str = "/var/lib/sentinel/update-trust";
-const MAX_INTEGER: u64 = (1 << 53) - 1;
-const MAX_LIFETIME: u64 = 14 * 86400;
-const CLOCK_SKEW: u64 = 300;
+pub(super) const MAX_INTEGER: u64 = (1 << 53) - 1;
+pub(super) const MAX_LIFETIME: u64 = 14 * 86400;
+pub(super) const CLOCK_SKEW: u64 = 300;
 // An unset RTC is not evidence that an otherwise expired signature is current.
-const MIN_CLOCK: u64 = 1704067200; // 2024-01-01 UTC; not a release timestamp.
+pub(super) const MIN_CLOCK: u64 = 1704067200; // 2024-01-01 UTC; not a release timestamp.
 const MAX_STATE: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -40,7 +40,28 @@ fn label_valid(label: &str) -> bool {
 }
 
 impl Freshness {
+    /// The manifest's own lifetime alone, without any channel timestamp.
+    #[cfg(test)]
     pub(super) fn validate(&self, channel: &str, now: u64) -> Result<()> {
+        self.validate_extended(channel, now, None)
+    }
+
+    /// Whether this metadata fails [`Self::validate`] ONLY because its own
+    /// lifetime has ended: the one case a channel timestamp may cover.
+    pub(super) fn expired_only(&self, channel: &str, now: u64) -> bool {
+        now >= self.expires_at && self.validate_extended(channel, now, Some(u64::MAX)).is_ok()
+    }
+
+    /// [`Self::validate`], where `extended` is the expiry of a channel
+    /// timestamp already verified to bind exactly this manifest
+    /// ([`super::timestamp::extension`]). It can only lengthen the lifetime
+    /// of metadata that is otherwise valid; every other check is unchanged.
+    pub(super) fn validate_extended(
+        &self,
+        channel: &str,
+        now: u64,
+        extended: Option<u64>,
+    ) -> Result<()> {
         ensure!(
             self.schema == 1
                 && label_valid(channel)
@@ -66,9 +87,16 @@ impl Freshness {
             self.issued_at <= now.saturating_add(CLOCK_SKEW),
             "signed update metadata is not yet valid; check time synchronization"
         );
+        if now < self.expires_at {
+            return Ok(());
+        }
+        let Some(until) = extended else {
+            bail!("signed update metadata expired; request a fresh release");
+        };
         ensure!(
-            now < self.expires_at,
-            "signed update metadata expired; request a fresh release"
+            now < until,
+            "signed update metadata expired and its channel timestamp expired too; \
+             request a fresh release"
         );
         Ok(())
     }
@@ -147,8 +175,9 @@ impl Ledger {
         manifest: &str,
         key: &str,
         now: u64,
+        extended: Option<u64>,
     ) -> Result<()> {
-        f.validate(channel, now)?;
+        f.validate_extended(channel, now, extended)?;
         ensure!(
             hash_valid(manifest) && hash_valid(key),
             "invalid signed offer fingerprint"
@@ -157,7 +186,7 @@ impl Ledger {
             now.saturating_add(CLOCK_SKEW) >= self.max_time,
             "system clock moved behind the trusted update ledger; repair time synchronization"
         );
-        f.validate(channel, now.max(self.max_time))?;
+        f.validate_extended(channel, now.max(self.max_time), extended)?;
         let id = scope(channel, &f.arch);
         if let Some(old) = self.scopes.get(&id) {
             ensure!(
@@ -282,6 +311,7 @@ fn mark_published(dir: &File, owner: u32) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observe_at(
     directory: &Path,
     owner: u32,
@@ -290,8 +320,9 @@ fn observe_at(
     manifest: &str,
     key: &str,
     now: u64,
+    extended: Option<u64>,
 ) -> Result<()> {
-    f.validate(channel, now)?;
+    f.validate_extended(channel, now, extended)?;
     ensure!(
         unsafe { libc::geteuid() } == owner,
         "secure update check requires root to persist rollback protection"
@@ -351,7 +382,7 @@ fn observe_at(
                 .context("update trust ledger unavailable; refusing to reset rollback protection");
         }
     };
-    ledger.observe(f, channel, manifest, key, now)?;
+    ledger.observe(f, channel, manifest, key, now, extended)?;
     let bytes = serde_json::to_vec(&ledger)?;
     ensure!(
         bytes.len() as u64 <= MAX_STATE,
@@ -403,6 +434,25 @@ pub(super) fn observe(
     chan: &crate::config::UpdateChannel,
     offer: &super::VerifiedOffer,
 ) -> Result<()> {
+    observe_with(
+        chan,
+        offer,
+        Path::new(DIRECTORY),
+        0,
+        Path::new(super::timestamp::KEY_PATH),
+    )
+}
+
+/// The one observation path: the release check, the pre-write recheck and the
+/// tests all come through here, so a channel timestamp is judged identically
+/// at the first disk write and at the offer.
+fn observe_with(
+    chan: &crate::config::UpdateChannel,
+    offer: &super::VerifiedOffer,
+    directory: &Path,
+    owner: u32,
+    timestamp_key: &Path,
+) -> Result<()> {
     let f = offer.manifest.freshness.as_ref().context(
         "signed update metadata has no freshness policy; request a current signed release",
     )?;
@@ -410,14 +460,16 @@ pub(super) fn observe(
         .duration_since(UNIX_EPOCH)
         .context("system clock precedes Unix epoch")?
         .as_secs();
+    let extended = super::timestamp::extension(chan, offer, f, timestamp_key, now)?;
     observe_at(
-        Path::new(DIRECTORY),
-        0,
+        directory,
+        owner,
         f,
         chan.label(),
         &offer.manifest_sha256,
         &offer.public_key_sha256,
         now,
+        extended,
     )
 }
 
@@ -427,20 +479,27 @@ pub(super) fn observe_test(
     offer: &super::VerifiedOffer,
     directory: &Path,
 ) -> Result<()> {
-    let f = offer
-        .manifest
-        .freshness
-        .as_ref()
-        .context("missing freshness")?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    observe_at(
+    observe_test_with_key(
+        chan,
+        offer,
+        directory,
+        &directory.join("no-timestamp-key.pem"),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn observe_test_with_key(
+    chan: &crate::config::UpdateChannel,
+    offer: &super::VerifiedOffer,
+    directory: &Path,
+    timestamp_key: &Path,
+) -> Result<()> {
+    observe_with(
+        chan,
+        offer,
         directory,
         unsafe { libc::geteuid() },
-        f,
-        chan.label(),
-        &offer.manifest_sha256,
-        &offer.public_key_sha256,
-        now,
+        timestamp_key,
     )
 }
 
@@ -463,7 +522,7 @@ mod tests {
         let directory = parent.join("trust");
         let owner = unsafe { libc::geteuid() };
         let write = |f: &Freshness, hash: &str, key: &str, time| {
-            observe_at(&directory, owner, f, "enterprise", hash, key, time)
+            observe_at(&directory, owner, f, "enterprise", hash, key, time, None)
         };
         let mut f = fresh();
         write(&f, &"a".repeat(64), &"b".repeat(64), MIN_CLOCK + 301).unwrap();
@@ -521,6 +580,7 @@ mod tests {
                 &"a".repeat(64),
                 &"b".repeat(64),
                 time,
+                None,
             )
         };
         write(&fresh(), MIN_CLOCK + 1).unwrap();
@@ -540,7 +600,8 @@ mod tests {
                 "enterprise",
                 &"a".repeat(64),
                 &"b".repeat(64),
-                MIN_CLOCK + 1
+                MIN_CLOCK + 1,
+                None,
             )
             .is_err()
         );
@@ -554,7 +615,16 @@ mod tests {
             let mut f = fresh();
             f.channel = label.into();
             f.sequence = sequence;
-            observe_at(&directory, owner, &f, label, manifest, key, MIN_CLOCK + 1)
+            observe_at(
+                &directory,
+                owner,
+                &f,
+                label,
+                manifest,
+                key,
+                MIN_CLOCK + 1,
+                None,
+            )
         };
         write("enterprise", 50, &"a".repeat(64), &"b".repeat(64)).unwrap();
         // Renaming the channel must not let a different signer in.
@@ -603,6 +673,7 @@ mod tests {
             &"a".repeat(64),
             &"b".repeat(64),
             MIN_CLOCK,
+            None,
         )
         .unwrap();
         std::fs::set_permissions(
@@ -618,7 +689,8 @@ mod tests {
                 "enterprise",
                 &"a".repeat(64),
                 &"b".repeat(64),
-                MIN_CLOCK
+                MIN_CLOCK,
+                None,
             )
             .is_err()
         );
@@ -632,7 +704,8 @@ mod tests {
                 "enterprise",
                 &"a".repeat(64),
                 &"b".repeat(64),
-                MIN_CLOCK
+                MIN_CLOCK,
+                None,
             )
             .is_err()
         );
