@@ -2153,16 +2153,52 @@ pub fn remove_file(path: &Path) -> Result<()> {
     sudo("rm", &["-f", p])
 }
 
-/// Ensure a directory exists, escalating to `sudo mkdir -p` if a direct create
-/// is denied.
+/// Ensure a runtime directory exists and every level it creates is
+/// traversable (0755), escalating each level to `sudo mkdir` if a direct
+/// create is denied.
+///
+/// The mode is explicit because the caller's umask is not ours to inherit. An
+/// operator's login umask is 077 on NixOS, sudo combines it with its own, and
+/// a plain `mkdir -p` then made `/run/sentinel/ppp` 0700 root: the very next
+/// step of the same commit, run as the operator, could no longer look inside
+/// it, and a PPPoE uplink failed to commit with "Permission denied". A
+/// directory that must be private says so with [`ensure_dir_mode`].
 pub fn ensure_dir(dir: &Path) -> Result<()> {
-    if dir.is_dir() || std::fs::create_dir_all(dir).is_ok() {
-        return Ok(());
+    for level in missing_levels(dir, |p| p.is_dir()) {
+        if create_traversable(&level).is_ok() {
+            continue;
+        }
+        let Some(d) = level.to_str() else {
+            bail!("non-UTF-8 path");
+        };
+        // `-m` applies to the last component only, and `level`'s parent exists,
+        // so this creates exactly one level, with exactly this mode. `-p`
+        // accepts a level that exists but was invisible to the caller.
+        sudo("mkdir", &["-p", "-m", "0755", "--", d])?;
     }
-    let Some(d) = dir.to_str() else {
-        bail!("non-UTF-8 path");
-    };
-    sudo("mkdir", &["-p", d])
+    Ok(())
+}
+
+/// The levels of `dir` that do not exist yet, outermost first.
+fn missing_levels(dir: &Path, is_dir: impl Fn(&Path) -> bool) -> Vec<std::path::PathBuf> {
+    let mut missing: Vec<std::path::PathBuf> = dir
+        .ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .take_while(|p| !is_dir(p))
+        .map(Path::to_path_buf)
+        .collect();
+    missing.reverse();
+    missing
+}
+
+/// Create one directory level directly, 0755 whatever the umask.
+fn create_traversable(level: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::create_dir(level) {
+        Ok(()) => std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o755)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && level.is_dir() => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Ensure a directory exists with an explicit mode (privileged `mkdir -m <mode>
@@ -3764,6 +3800,61 @@ mod tests {
             assert!(stdout.contains("1 passed; 0 failed; 0 ignored"), "{stdout}");
             assert_eq!(mask(), original_mask, "child changed the parent mask");
         }
+    }
+
+    #[test]
+    fn ensure_dir_creates_only_the_missing_levels_outermost_first() {
+        let existing = |p: &Path| {
+            p == Path::new("/run/sentinel") || p == Path::new("/run") || p == Path::new("/")
+        };
+        assert_eq!(
+            missing_levels(Path::new("/run/sentinel/ppp/peers"), existing),
+            [
+                Path::new("/run/sentinel/ppp"),
+                Path::new("/run/sentinel/ppp/peers")
+            ]
+        );
+        assert!(missing_levels(Path::new("/run/sentinel"), existing).is_empty());
+    }
+
+    #[test]
+    fn ensure_dir_makes_every_created_level_traversable_under_a_private_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        if std::env::args().next().as_deref() == Some("sentinel-ensure-dir-umask-child") {
+            let root =
+                std::env::temp_dir().join(format!("sentinel-ensure-dir-{}", std::process::id()));
+            let leaf = root.join("ppp").join("peers");
+            ensure_dir(&leaf).unwrap();
+            for level in [&root, &root.join("ppp"), &leaf] {
+                let mode = std::fs::metadata(level).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(mode, 0o755, "{} is {mode:o}", level.display());
+            }
+            ensure_dir(&leaf).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.arg0("sentinel-ensure-dir-umask-child").args([
+            "--exact",
+            "system::tests::ensure_dir_makes_every_created_level_traversable_under_a_private_umask",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        // SAFETY: after fork, only the child's mask changes, with one libc call.
+        unsafe {
+            child.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
