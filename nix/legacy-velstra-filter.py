@@ -11,6 +11,13 @@ unknown keys, so this rewrites exactly the constructs that postdate it:
   Deleting only the key would turn the rule into "any destination", so that
   is never done; a host with no address of the rule's family gets no rule,
   which is narrower than written, never wider.
+* ``blocklist_ingress_only = true`` (DP-15: the blocklist names sources only)
+  is dropped: the older agent then also matches the blocklist against
+  destinations at egress and refuses listed addresses' answers — what it always
+  did, and stricter than written, never wider.
+* ``[[synproxy]]`` entries scoped by ``policy`` (DP-31) lose the key and are
+  folded into one entry per port: the older agent proxies a port on every
+  zone, a superset of the zones written, and refuses a port listed twice.
 
 Anything else the older agent rejects still crash-loops it and fails the
 check: the list of rewrites is explicit on purpose.
@@ -25,6 +32,7 @@ import sys
 import tomllib
 
 DST_LOCAL = "dst-local = true"
+INGRESS_ONLY = "blocklist_ingress_only = true"
 
 
 def host_addresses(ip_json):
@@ -68,13 +76,27 @@ def expand_local(lines, addresses):
     return out
 
 
+def unscoped_synproxy(lines, seen_ports):
+    """A ``[[synproxy]]`` block without its ``policy``, or nothing when an
+    entry for the same port was already kept."""
+    port = tomllib.loads("".join(lines[1:]))["port"]
+    if port in seen_ports:
+        return []
+    seen_ports.add(port)
+    return [l for l in lines if not l.strip().startswith("policy =")]
+
+
 def rewrite(text, names, addresses):
-    kept, stripped, expanded = [], [], 0
+    kept, stripped, expanded, synproxy_ports = [], [], 0, set()
     for header, lines in blocks(text):
+        lines = [l for l in lines if l.strip() != INGRESS_ONLY]
         if header is not None and not header.startswith("[["):
             if header.strip("[]").strip() in names:
                 stripped.append(header)
                 continue
+        if header == "[[synproxy]]":
+            kept.extend(unscoped_synproxy(lines, synproxy_ports))
+            continue
         if header and header.startswith("[[") and any(l.strip() == DST_LOCAL for l in lines):
             kept.extend(expand_local(lines, addresses))
             expanded += 1
@@ -83,9 +105,13 @@ def rewrite(text, names, addresses):
     out = "".join(kept)
     parsed = tomllib.loads(out)
     assert not names & parsed.keys(), f"named tables survived the filter: {names & parsed.keys()}"
+    assert "blocklist_ingress_only" not in parsed, "blocklist_ingress_only survived the filter"
     for policy in parsed.get("policy", []):
+        assert "blocklist_ingress_only" not in policy, f"survived the filter: {policy}"
         for rule in policy.get("port_rule", []):
             assert "dst-local" not in rule, f"a dst-local rule survived the filter: {rule}"
+    for entry in parsed.get("synproxy", []):
+        assert "policy" not in entry, f"a scoped synproxy entry survived the filter: {entry}"
     return out, stripped, expanded
 
 

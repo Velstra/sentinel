@@ -169,16 +169,18 @@ This catalog preserves the existing task lookup for protocol and service fixture
 | `egress` | Applies the policy in the intended egress direction. |
 | `srcprefix` | every source-prefix **length** matches, not just the convenient ones |
 | `v6rules` | a rule scoped to IPv6 lands in its own trie and does not open the v4 one |
+| `blocklist-direction` | a zone blocklist refuses what a listed address starts, both families, while the LAN still reaches it and gets its answers |
 
 ## NAT
 
 | Check | Intended fixture scope |
 |---|---|
 | `nat` | Packet translations and stateful reverse-path handling. |
-| `synproxy` | Exercises the configured SYN proxy with a real connection. |
+| `synproxy` | Exercises the configured SYN proxy with a real connection, and that a LAN client's outbound SYN to the protected port is not proxied. |
 | `masq` | masquerade SNATs a private LAN client out of the WAN address |
 | `hairpin` | an internal client reaches a port-forwarded service via the box's **own** public IP |
 | `npt66` | stateless, checksum-neutral IPv6 prefix translation (RFC 6296) |
+| `v6-mss-npt-related` | an IPv6 SYN is MSS-clamped like IPv4; a Packet Too Big behind NPTv6, or quoting an extension header, reaches the inside host's socket; the inside host's port-unreachable names its external address |
 | `nat64` | an IPv6-only client reaches an IPv4-only server through the box, DNS64 included |
 | `conntracksync` | checks replicated conntrack state; use the causal HA flow fixtures to prove actual connection continuity |
 

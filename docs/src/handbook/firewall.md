@@ -130,7 +130,7 @@ Country codes select prefixes in the GeoIP database included in the appliance im
 set firewall zone wan geoip-block CN,RU
 ```
 
-A zone's blocklist and GeoIP countries are enforced on traffic arriving on the zone and, in this release, also on traffic leaving through it: `zone wan geoip-block XX` also stops LAN hosts reaching addresses in XX. Every zone's policy carries its own copy of the global blocklist and global GeoIP countries, so a global entry costs one data-plane entry per zone plus one; `config check` refuses a configuration whose total exceeds the data plane's 262,144 entries per address family.
+A zone's blocklist and GeoIP countries name **sources**: they refuse what a listed address sends in through the zone, and nothing else. `zone wan geoip-block XX` stops hosts in XX connecting in, and stops their packets to connections they started; it does not stop LAN hosts reaching addresses in XX, and the answers to those connections are let back in. An address added to a blocklist loses the connections it opened at once, but keeps answering ones that were opened towards it. On a zone with `stateful false` there is no connection to answer, so a listed address cannot answer anything either. There is no outbound blocklist in this release: to keep the inside from reaching listed addresses, write `direction out` rules for the protocols and ports concerned. The global blocklist (`set firewall blocklist`) works the same way on every zone. Every zone's policy carries its own copy of the global blocklist and global GeoIP countries, so a global entry costs one data-plane entry per zone plus one; `config check` refuses a configuration whose total exceeds the data plane's 262,144 entries per address family.
 
 ## Source validation (anti-spoofing)
 
@@ -268,7 +268,7 @@ show top-talkers           # hosts ranked by the volume attributed to them
 
 ## SYN-flood protection (SYN proxy)
 
-Enable SYN proxy only for the TCP service ports that need it and verify normal connections to each protected service. The proxy is keyed by port alone: it answers every IPv4 SYN to that port arriving on any zone, including connections your own clients open outward to that port elsewhere, and those connections lose window scaling, SACK and timestamps. IPv6 SYNs are not proxied.
+Enable SYN proxy only for the TCP service ports that need it and verify normal connections to each protected service. A protected port is proxied on the zones that admit it: a zone with an accept rule for that TCP port on arriving traffic, a TCP port-forward of it, or a load balancer on it. Connections other zones open to that port elsewhere — your LAN clients' outbound HTTPS under `syn-protect 443` — are not proxied, and a hairpin reflection does not count as admitting it. Proxied connections lose window scaling, SACK and timestamps. When no zone admits the port that way (the service sits behind a zone whose default action accepts), the proxy answers every IPv4 SYN to that port arriving on any zone, and `config check` says so. `config check` names the zones a port is proxied on. IPv6 is not SYN-proxied in 1.0: the SYN proxy protects IPv4 only. Where a protected port is reachable over IPv6 (a zone with an IPv6 address whose rules admit it, or any IPv6 zone when the port is proxied everywhere), `config check` names those zones.
 
 ```text
 set firewall syn-protect 443

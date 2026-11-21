@@ -40,7 +40,7 @@
 //! defaults (its schema is `deny_unknown_fields` + `default`, so the subset must
 //! use only known field names — it does).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -124,6 +124,10 @@ pub struct VelstraConfig {
     // precede the `[[policy]]`/`[[interface]]` tables below.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) blocklist: Vec<String>,
+    /// The blocklist names sources only (audit DP-15): see
+    /// [`Policy::blocklist_ingress_only`]. Emitted with a blocklist only.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) blocklist_ingress_only: bool,
     conntrack: ConntrackOut,
     state: StateOut,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,6 +306,10 @@ const DEFAULT_EXPORT_INTERVAL: u64 = 30;
 struct SynProxyOut {
     port: u16,
     mss: u16,
+    /// The zone policy whose arriving SYNs are proxied (DP-31). Omitted when
+    /// the port is proxied on every zone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<u32>,
 }
 
 /// The MSS a SYN proxy advertises when the appliance config does not say: a
@@ -324,6 +332,14 @@ pub(crate) struct Policy {
     // Scalars above, the array-of-tables below (TOML requires this order).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) blocklist: Vec<String>,
+    /// Sentinel's blocklists and GeoIP countries name **sources** — what may
+    /// not reach in through the zone — so the data plane must neither match
+    /// them against the destination of traffic leaving through the zone nor
+    /// refuse a listed address's answers to a connection opened towards it
+    /// (audit DP-15: `zone wan geoip-block XX` also cut the LAN off from XX).
+    /// Emitted with a blocklist only; without one there is nothing to scope.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) blocklist_ingress_only: bool,
     /// C20: the captive-portal gate for this zone. A sub-table, so it comes
     /// after the scalars and before the `[[policy.port_rule]]` array.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -653,6 +669,129 @@ fn is_false(b: &bool) -> bool {
 
 fn is_disabled(mode: &&'static str) -> bool {
     **mode == *"disable"
+}
+
+/// C15/DP-31: the `[[synproxy]]` entries for the protected ports, one per zone
+/// policy whose arriving SYNs are proxied.
+///
+/// A protected port is proxied on the zones that **admit it inbound**: by an
+/// accept rule for TCP on that port that applies to arriving traffic, by a TCP
+/// port-forward of it, or by a load balancer on it (the compiler opens a VIP
+/// with such a rule). That is where a flood against the service comes from.
+/// Proxying the port everywhere also answered every connection the inside
+/// opened to that port elsewhere — a LAN client's outbound HTTPS, under
+/// `syn-protect 443` — which then lost window scaling, SACK and timestamps
+/// (audit DP-31). A hairpin reflection is an inside client and does not count.
+///
+/// A port no zone admits that way (the service sits behind a default-accept
+/// zone) is still proxied on every zone, as before, and the note says so:
+/// leaving it unprotected would make the setting silently inert.
+///
+/// The appliance's default MSS is filled in here rather than in the data
+/// plane, so what was decided is visible in the emitted config.
+fn synproxy_out(
+    protected: &[crate::config::SynProtect],
+    policies: &[Policy],
+    port_forwards: &[PortForwardOut],
+    ipv6_zones: &BTreeSet<&str>,
+    notes: &mut Vec<String>,
+) -> Vec<SynProxyOut> {
+    let mut out = Vec::new();
+    for s in protected {
+        let mss = s.mss.unwrap_or(DEFAULT_SYNPROXY_MSS);
+        let admitting: Vec<&Policy> = policies
+            .iter()
+            .filter(|p| {
+                p.port_rules.iter().any(|r| admits_tcp_inbound(r, s.port))
+                    || port_forwards.iter().any(|f| {
+                        f.policy == p.id
+                            && f.proto == "tcp"
+                            && f.port == s.port
+                            && f.match_dst.is_none()
+                            && f.snat_ip.is_none()
+                    })
+            })
+            .collect();
+        if admitting.is_empty() {
+            notes.push(format!(
+                "firewall syn-protect {}: no zone admits TCP {} by an accept rule, a \
+                 port-forward or a load balancer, so the SYN proxy answers every IPv4 \
+                 TCP SYN to it arriving on any zone, including connections this \
+                 network's own clients open outward to that port elsewhere; those \
+                 connections lose window scaling, SACK and timestamps",
+                s.port, s.port
+            ));
+            let reachable: Vec<&str> = ipv6_zones.iter().copied().collect();
+            note_ipv6_unproxied(s.port, &reachable, notes);
+            out.push(SynProxyOut {
+                port: s.port,
+                mss,
+                policy: None,
+            });
+            continue;
+        }
+        let zones: Vec<&str> = admitting.iter().map(|p| p.name.as_str()).collect();
+        notes.push(format!(
+            "firewall syn-protect {}: the SYN proxy answers IPv4 TCP SYNs to {} arriving \
+             on zone {} (the zones that admit it); connections other zones open to that \
+             port are not proxied",
+            s.port,
+            s.port,
+            zones.join(", ")
+        ));
+        // Reachable over IPv6: an admitting zone that carries IPv6, through a
+        // rule that is not IPv4-only (port-forwards are IPv4 only).
+        let reachable: Vec<&str> = admitting
+            .iter()
+            .filter(|p| ipv6_zones.contains(p.name.as_str()))
+            .filter(|p| {
+                p.port_rules
+                    .iter()
+                    .any(|r| admits_tcp_inbound(r, s.port) && r.family.as_deref() != Some("ipv4"))
+            })
+            .map(|p| p.name.as_str())
+            .collect();
+        note_ipv6_unproxied(s.port, &reachable, notes);
+        out.extend(admitting.iter().map(|p| SynProxyOut {
+            port: s.port,
+            mss,
+            policy: Some(p.id),
+        }));
+    }
+    out
+}
+
+/// The zones with an IPv6 address on an enabled interface (static, SLAAC,
+/// DHCPv6 or a delegated prefix): where an IPv6 SYN can arrive.
+fn ipv6_zones(appliance: &Appliance) -> BTreeSet<&str> {
+    appliance
+        .interfaces
+        .iter()
+        .filter(|i| !i.disabled && (i.address6.is_some() || i.pd_from.is_some()))
+        .filter_map(|i| i.zone.as_deref())
+        .collect()
+}
+
+/// DP-35: the SYN proxy is IPv4 only. Where a protected port can be reached
+/// over IPv6, say so by zone, so `syn-protect` is never silently partial.
+fn note_ipv6_unproxied(port: u16, zones: &[&str], notes: &mut Vec<String>) {
+    if zones.is_empty() {
+        return;
+    }
+    notes.push(format!(
+        "firewall syn-protect {port}: TCP {port} is reachable over IPv6 on zone {}, and \
+         the SYN proxy is IPv4 only: IPv6 SYNs to it are not proxied",
+        zones.join(", ")
+    ));
+}
+
+/// A compiled rule that lets new TCP connections to `port` in: an accept for
+/// TCP on that port which applies to arriving traffic.
+fn admits_tcp_inbound(rule: &PortRule, port: u16) -> bool {
+    rule.proto == "tcp"
+        && rule.port == port
+        && rule.action == "pass"
+        && rule.direction.as_deref() != Some("out")
 }
 
 /// A zone's blocklist with its GeoIP countries expanded into it.
@@ -1044,6 +1183,7 @@ fn compile_noted(
                 drop_icmp: posture.block_icmp,
                 log: posture.log,
                 source_validation: posture.source_validation.as_str(),
+                blocklist_ingress_only: !geo_blocklist(&posture).is_empty(),
                 blocklist: geo_blocklist(&posture),
                 portal: portal_gate(appliance, zone),
                 port_rules,
@@ -1146,18 +1286,6 @@ fn compile_noted(
     // back through the box. Reflection needs the ingress zone's public IP known at
     // compile time — skipped (with the plain forward still emitted) when the
     // ingress zone is DHCP/address-less.
-    // C15: the SYN proxy is named by port, so it needs no zone resolution — the
-    // appliance's own default MSS is filled in here rather than in the data
-    // plane, so what was decided is visible in the emitted config.
-    let synproxy: Vec<SynProxyOut> = fw
-        .syn_protect
-        .iter()
-        .map(|s| SynProxyOut {
-            port: s.port,
-            mss: s.mss.unwrap_or(DEFAULT_SYNPROXY_MSS),
-        })
-        .collect();
-
     let mut port_forwards: Vec<PortForwardOut> = Vec::new();
     for dst in appliance.nat.destination.iter().filter(|d| !d.disabled) {
         let Some(&policy) = ids.get(dst.zone.as_str()) else {
@@ -1206,6 +1334,14 @@ fn compile_noted(
             }
         }
     }
+
+    let synproxy = synproxy_out(
+        &fw.syn_protect,
+        &policies,
+        &port_forwards,
+        &ipv6_zones(appliance),
+        notes,
+    );
 
     // C22 load-balanced services — one `[[service]]` per enabled load balancer,
     // scoped to its ingress zone's policy.
@@ -1308,6 +1444,7 @@ fn compile_noted(
         source_validation: fw.source_validation.as_str(),
         fail_closed: fw.fail_closed,
         blocklist: fw.blocklist.clone(),
+        blocklist_ingress_only: !fw.blocklist.is_empty(),
         policies,
         interfaces,
         port_forwards,

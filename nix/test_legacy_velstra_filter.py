@@ -77,6 +77,29 @@ class LegacyFilter(unittest.TestCase):
         names = [r["name"] for r in self.rules(out)]
         self.assertEqual(names, ["web"])
 
+    def test_a_source_only_blocklist_falls_back_to_both_directions(self):
+        text = (
+            'blocklist = ["203.0.113.7"]\nblocklist_ingress_only = true\n'
+            '[[policy]]\nid = 7\nblocklist = ["198.51.100.0/24"]\n'
+            "blocklist_ingress_only = true\n"
+        )
+        out, _, _ = legacy.rewrite(text, set(), [])
+        parsed = tomllib.loads(out)
+        self.assertNotIn("blocklist_ingress_only", parsed)
+        self.assertNotIn("blocklist_ingress_only", parsed["policy"][0])
+        self.assertEqual(parsed["policy"][0]["blocklist"], ["198.51.100.0/24"])
+
+    def test_scoped_synproxy_entries_fold_into_one_per_port(self):
+        text = (
+            "[[synproxy]]\nport = 443\nmss = 1460\npolicy = 7\n"
+            "[[synproxy]]\nport = 443\nmss = 1460\npolicy = 8\n"
+            "[[synproxy]]\nport = 8080\nmss = 1400\n"
+        )
+        out, _, _ = legacy.rewrite(text, set(), [])
+        entries = tomllib.loads(out)["synproxy"]
+        self.assertEqual([(e["port"], e["mss"]) for e in entries], [(443, 1460), (8080, 1400)])
+        self.assertFalse(any("policy" in e for e in entries))
+
 
 if __name__ == "__main__":
     unittest.main()
