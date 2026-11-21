@@ -271,6 +271,12 @@ in pkgs.testers.runNixOSTest {
         assert "error:" not in saved.lower() and "warning:" not in saved.lower(), saved
         assert "2.0.1-qa-capacity-base" in saved, saved
         machine.succeed("printf persistent-capacity-proof > /var/lib/sentinel/qa-capacity-proof")
+        # A refusal must leave the raw ESP bit-identical. On FAT that holds
+        # only without access-date updates: a mere read (bootctl list) on a
+        # `relatime` mount rewrote directory entries. The shipped mount must
+        # be `noatime`; never remount it here.
+        esp_options = machine.succeed("exec 3</boot/EFI/Linux; findmnt -n -t vfat -o OPTIONS /boot").strip()
+        assert "noatime" in esp_options.split(","), esp_options
         before = snapshot()
         for name in ("appliance.toml", "ssh/ssh_host_ed25519_key", "ssh/ssh_host_ed25519_key.pub",
                      "ssh/ssh_host_rsa_key", "ssh/ssh_host_rsa_key.pub", "web-tls/cert.pem", "web-tls/key.pem"):

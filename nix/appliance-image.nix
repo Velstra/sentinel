@@ -369,6 +369,21 @@ in
       };
     };
 
+    # The ESP (mounted by systemd-gpt-auto-generator) is FAT, which keeps a
+    # per-file access date. With the generator's default `relatime` the first
+    # read of a file on any day rewrites its directory entry, so a read-only
+    # operation such as `bootctl list` (every update check and refusal runs
+    # it) wrote the boot partition, where FAT has no journal to survive a
+    # power cut mid-write. Nothing reads those dates. Same options as the
+    # generator's, with `noatime` instead of `relatime`.
+    systemd.units."boot.mount" = {
+      overrideStrategy = "asDropin";
+      text = ''
+        [Mount]
+        Options=fmask=0177,dmask=0077,noexec,nosuid,nodev,nosymfollow,noatime
+      '';
+    };
+
     # A host-only native mount unit: an fstab x-systemd.requires= service
     # dependency is also parsed by initrd-fs, where this host service does not
     # exist. Do not pull host state preparation into the verity initrd.
