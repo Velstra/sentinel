@@ -136,6 +136,16 @@ in
     # Passphrase-based: `sentinel unlock` prompts via systemd-ask-password, which
     # the boot-time console password agent answers. TPM2 unattended unlock is a
     # documented follow-up (the on-disk format is standard LUKS2).
+    # The installer's own unlock of a target's volume must not claim the
+    # LABEL=data alias this box mounts its state by (see the rule file).
+    services.udev.packages = [
+      (pkgs.writeTextFile {
+        name = "sentinel-install-target-udev-rules";
+        destination = "/lib/udev/rules.d/12-sentinel-install-target.rules";
+        text = builtins.readFile ../udev/12-sentinel-install-target.rules;
+      })
+    ];
+
     systemd.services.sentinel-unlock = {
       description = "Unlock the encrypted Sentinel data volume";
       wantedBy = [ "local-fs.target" ];

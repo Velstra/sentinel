@@ -93,6 +93,10 @@ in pkgs.testers.runNixOSTest {
                 old = installer.succeed(f"blkid -s PARTUUID -o value /dev/vda{number}").strip()
                 assert installer.succeed(f"blkid -s PARTUUID -o value {target}{number}").strip() == old
         assert [installer.succeed(cmd) for cmd in gpt_reads] == source_gpt
+        # The box the install ran on keeps its own state and services: a target
+        # volume opened during the install must not take the LABEL=data alias
+        # this box mounts /var/lib/sentinel by.
+        installer.succeed("systemctl is-active var-lib-sentinel.mount sshd.service velstra.service wren.service")
         assert installer.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == source_config
         installer.shutdown()
 

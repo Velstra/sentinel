@@ -7049,7 +7049,9 @@
                   # Partition 6 is a LUKS2 container, not a bare ext4.
                   fstype = machine.succeed("blkid -s TYPE -o value /dev/vdb6").strip()
                   assert fstype == "crypto_LUKS", f"data partition should be LUKS, got {fstype!r}"
-                  # The install closed the volume: nothing is left unlocked.
+                  # The install closed the volume: nothing is left unlocked,
+                  # under the installer's own name or the appliance's.
+                  machine.fail("test -e /dev/mapper/sentinel-install-data")
                   machine.fail("test -e /dev/mapper/data")
 
               with subtest("the passphrase opens it and the ext4 (LABEL=data) is inside"):
@@ -7288,8 +7290,10 @@
             with subtest("the target's data partition is a LUKS2 container"):
                 fstype = machine.succeed("blkid -s TYPE -o value /dev/vdb6").strip()
                 assert fstype == "crypto_LUKS", f"data partition should be LUKS, got {fstype!r}"
-                # The install closed the volume behind it — nothing left unlocked.
-                assert "/dev/mapper/data" not in machine.succeed("ls /dev/mapper")
+                # The install closed the volume behind it — nothing left unlocked,
+                # under the installer's own name or the appliance's.
+                mapped = machine.succeed("ls /dev/mapper").split()
+                assert "sentinel-install-data" not in mapped and "data" not in mapped, mapped
 
             with subtest("the passphrase opens it and the seeded config is inside"):
                 machine.succeed(
@@ -9988,6 +9992,7 @@
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
+                "'set firewall zone firewall local true' "
                 "'set firewall rule watch-drop from wan' "
                 "'set firewall rule watch-drop to firewall' "
                 "'set firewall rule watch-drop action drop' "
@@ -10001,7 +10006,6 @@
                 "'set firewall rule watch-pass port 9997' "
                 "'set firewall rule watch-pass log true' "
                 "commit save exit "
-                "'set firewall zone firewall local true' "
                 "| sentinel configure\""
             )
             fw.wait_for_unit("velstra.service")
@@ -10431,6 +10435,7 @@
             client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.5", timeout=20)
 
             # The client is 10.1.0.5, so every one of these blocks contains it.
+            # It knocks on the box's own address, hence `to firewall`.
             cases = [("24", "10.1.0.0/24", 9924),
                      ("30", "10.1.0.4/30", 9930),
                      ("31", "10.1.0.4/31", 9931),
@@ -10445,7 +10450,6 @@
                           f"set firewall rule len{name} action drop",
                           f"set firewall rule len{name} proto tcp",
                           f"set firewall rule len{name} port {port}",
-            # It knocks on the box's own address, hence `to firewall`.
                           f"set firewall rule len{name} source {cidr}",
                           f"set firewall rule len{name} log true"]
             script = " ".join(f"'{l}' " for l in lines)
@@ -10523,6 +10527,7 @@
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
+                "'set firewall zone firewall local true' "
                 "'set firewall rule match-src from wan' "
                 "'set firewall rule match-src to firewall' "
                 "'set firewall rule match-src action drop' "
@@ -10536,7 +10541,6 @@
                 "'set firewall rule foreign-src proto tcp' "
                 "'set firewall rule foreign-src port 9997' "
                 "'set firewall rule foreign-src source 10.9.9.9/32' "
-                "'set firewall zone firewall local true' "
                 "'set firewall rule foreign-src log true' "
                 "commit save exit "
                 "| sentinel configure\""
@@ -15343,10 +15347,10 @@
             machine.succeed("hostname | grep -x fw-unrecorded")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             assert machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == saved_hash
+            machine.succeed("grep -q fw-base /run/sentinel/running.toml")
             machine.succeed(
                 "umount /run/sentinel/running.toml; rm /run/sentinel-running-pin.toml"
             )
-            machine.succeed("grep -q fw-base /run/sentinel/running.toml")
             machine.succeed("sentinel confirm-rollback")
             machine.succeed("hostname | grep -x fw-base")
             machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
