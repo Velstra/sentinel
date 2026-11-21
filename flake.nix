@@ -4812,6 +4812,15 @@
               systemd.services.sentinel-boot.environment.SENTINEL_GEOIP_DIR =
                 "/etc/geoip-test";
               environment.variables.SENTINEL_GEOIP_DIR = "/etc/geoip-test";
+              # An operator's `configure` re-executes itself once through sudo
+              # (one escalation per session), and sudo's environment reset
+              # drops the override above, so the root session would compile
+              # against the image's real database. Keep this one test-only
+              # data variable across that escalation; the session still takes
+              # the shipped sudo path.
+              security.sudo.extraConfig = ''
+                Defaults env_keep += "SENTINEL_GEOIP_DIR"
+              '';
               environment.systemPackages = [ pkgs.iputils ];
             };
         };
