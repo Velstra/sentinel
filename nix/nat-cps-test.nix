@@ -115,8 +115,9 @@ pkgs.testers.runNixOSTest {
     import os
     import re
     from pathlib import Path
+    from typing import Any
 
-    receipt = {"rate": ${toString rate}, "seconds": ${toString seconds}, "held": ${toString held}, "phases": []}
+    receipt: dict[str, Any] = {"rate": ${toString rate}, "seconds": ${toString seconds}, "held": ${toString held}, "phases": []}
 
     def preserve():
         Path(os.environ["out"], "nat-cps.json").write_text(json.dumps(receipt, indent=2))
