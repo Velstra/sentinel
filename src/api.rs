@@ -888,7 +888,18 @@ async fn get_trace(
     let appliance = state
         .appliance()
         .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
-    let answer = crate::trace::trace(&appliance, &query).map_err(ApiError::bad_request)?;
+    // The API serves the box's own configuration, so `to firewall` is judged
+    // against what the box holds live, as the data plane does (DP-16).
+    let held = if state.config_path == std::path::Path::new(crate::session::DEFAULT_CONFIG) {
+        tokio::task::spawn_blocking(crate::network_reconcile::held_addresses)
+            .await
+            .map_err(|e| ApiError::internal(anyhow!("reading live addresses: {e}")))?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let answer =
+        crate::trace::trace_holding(&appliance, &query, &held).map_err(ApiError::bad_request)?;
     Ok(Json(answer))
 }
 

@@ -838,7 +838,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let appliance = Appliance::load(&config)?;
-            let answer = trace::trace(
+            let held = trace_held_addresses(&config);
+            let answer = trace::trace_holding(
                 &appliance,
                 &trace::Query {
                     in_interface,
@@ -849,6 +850,7 @@ async fn main() -> Result<()> {
                     src_mac,
                     icmp_type,
                 },
+                &held,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&answer)?);
@@ -1137,6 +1139,24 @@ fn confirm_rollback(
     original: Option<&std::path::Path>,
 ) -> Result<()> {
     confirm::rollback(&live_apply(true), config, from_timer, original)
+}
+
+/// What the box's links hold live, for a trace of the box's own saved
+/// configuration on the box; nothing for a candidate file or off the box,
+/// where the running addresses say nothing about that configuration.
+fn trace_held_addresses(config: &std::path::Path) -> Vec<(String, std::net::IpAddr)> {
+    if config != std::path::Path::new(DEFAULT_CONFIG)
+        || !std::path::Path::new("/run/sentinel").is_dir()
+    {
+        return Vec::new();
+    }
+    network_reconcile::held_addresses().unwrap_or_else(|error| {
+        eprintln!(
+            "warning: the box's live addresses could not be read ({error:#}); `to firewall` \
+             is traced against the configured addresses only"
+        );
+        Vec::new()
+    })
 }
 
 /// The interactive configuration session — a VyOS/JunOS-style edit context.

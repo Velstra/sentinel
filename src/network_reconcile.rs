@@ -52,6 +52,25 @@ struct KernelAddress {
     scope: Option<String>,
 }
 
+/// Every address the box's links hold right now, as `(link, address)`,
+/// leaving out addresses whose duplicate-address detection failed (the
+/// kernel does not answer for them).
+pub(crate) fn held_addresses() -> Result<Vec<(String, IpAddr)>> {
+    Ok(held_in(&inventory()?))
+}
+
+fn held_in(inventory: &BTreeMap<String, KernelLink>) -> Vec<(String, IpAddr)> {
+    inventory
+        .values()
+        .flat_map(|link| {
+            link.addr_info
+                .iter()
+                .filter(|a| !a.dadfailed)
+                .map(|a| (link.ifname.clone(), a.local))
+        })
+        .collect()
+}
+
 pub(crate) fn inventory() -> Result<BTreeMap<String, KernelLink>> {
     let out = crate::system::escalated_output("ip", &["-details", "-json", "address", "show"])?;
     anyhow::ensure!(
@@ -498,6 +517,20 @@ mod tests {
 
     fn inventory_from(value: serde_json::Value) -> BTreeMap<String, KernelLink> {
         parse_inventory(&serde_json::to_vec(&vec![value]).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn held_addresses_are_every_live_address_except_a_failed_duplicate() {
+        let held = held_in(&inventory_from(serde_json::json!({
+            "ifname": "wan0", "ifindex": 2, "mtu": 1500, "flags": ["UP"],
+            "addr_info": [
+                {"local": "192.0.2.50", "prefixlen": 24, "dynamic": true},
+                {"local": "2001:db8::5", "prefixlen": 64, "dadfailed": true},
+                {"local": "fe80::1", "prefixlen": 64, "scope": "link"}
+            ]
+        })));
+        let addresses: Vec<String> = held.iter().map(|(l, a)| format!("{l} {a}")).collect();
+        assert_eq!(addresses, ["wan0 192.0.2.50", "wan0 fe80::1"]);
     }
 
     #[test]
