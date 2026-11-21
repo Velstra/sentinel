@@ -190,6 +190,16 @@ older one still sends and adopts them, and the two then disagree on their
 shared revision, so the next push is held as a conflict (resolve it as any
 conflict). Pushes from the updated member still replace these settings on
 the older one, as before the upgrade. Finish the upgrade promptly.
+
+Upgrade in this order: the standby first, then fail over to it, then the old
+primary. **Never fail back onto a member that is not yet upgraded.** A
+masqueraded connection that an upgraded (1.0) member owns does not survive a
+takeover by a pre-1.0 peer. The older allocator looks for the connection's
+public port in a different place, so it does not find it and assigns a new
+one, and the connection breaks. The other direction is covered: connections
+the older member owns survive the switch-over to the upgraded one
+(`checks.ha-napt-mixed-version`). An upgrade from 0.4 is not hitless anyway,
+because 1.0's members compute a different readiness digest (see above).
 ## Standby readiness
 
 `sentinel show ha` on the standby must read plain `HA Backup`. A reason in
