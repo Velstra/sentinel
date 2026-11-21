@@ -1,0 +1,26 @@
+{
+ "schema": "velstra-security-floor/1",
+ "note": "Minimum versions the shipped image closure must carry (checks.image-security-floor). Each floor names what it fixes. A floor that matches no store path fails the check: remove it rather than keep it. Same-version patch backports (glib, sudo, net-snmp, ...) are proven by the replacement half of the check instead.",
+ "floors": [
+  {
+   "package": "linux",
+   "minimum": "6.12.118",
+   "fixes": "linux-6.12.y stable fixes after 6.12.117 (nix/kernel.nix)"
+  },
+  {
+   "package": "sqlite",
+   "minimum": "3.54.1",
+   "fixes": "the three High advisories fixed in 3.54.0"
+  },
+  {
+   "package": "libcap",
+   "minimum": "2.78",
+   "fixes": "CVE-2026-4878"
+  },
+  {
+   "package": "suricata",
+   "minimum": "8.0.7",
+   "fixes": "the 8.0.3-8.0.6 advisories"
+  }
+ ]
+}

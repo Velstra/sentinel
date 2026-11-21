@@ -75,7 +75,15 @@
             prev.fetchurl args;
       };
 
-      pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
+      # The appliance kernel (nix/kernel.nix). The overlay makes every check
+      # that asks for pkgs.linuxPackages_6_12 boot the kernel the image ships.
+      sentinelKernel = import ./nix/kernel.nix;
+      kernelOverlay = _: prev: {
+        linuxPackages_6_12 = sentinelKernel prev;
+        linux_6_12 = (sentinelKernel prev).kernel;
+      };
+
+      pkgs = ((nixpkgs.legacyPackages.${system}.extend crateSource).extend kernelOverlay).extend
         (import ./nix/compact-tests.nix);
       # Only the fixed-output eBPF object is built from this set (see inputs).
       pkgsEbpf = nixpkgs-ebpf.legacyPackages.${system};
@@ -655,7 +663,8 @@
         {
           # Retain the appliance's LTS kernel ABI across base upgrades. The
           # separate three-kernel verifier matrix does not change the image ABI.
-          boot.kernelPackages = lib.mkDefault pkgs.linuxPackages_6_12;
+          # nix/kernel.nix: the pin's 6.12 recipe at a newer stable release.
+          boot.kernelPackages = lib.mkDefault (sentinelKernel pkgs);
           fileSystems."/sys/fs/bpf" = { device = "bpffs"; fsType = "bpf"; options = [ "nosuid" "nodev" "noexec" ]; };
           imports = [
             ./nix/appliance.nix
@@ -1854,9 +1863,11 @@
           kernelPackages = pkgs.linuxPackages_6_6;
           label = "6-6";
         };
+        # The image's own kernel, not a look-alike: the object must load on
+        # exactly what ships.
         ebpf-verifier-6-12 = import ./nix/ebpf-verifier-test.nix {
           inherit pkgs self;
-          kernelPackages = pkgs.linuxPackages_6_12;
+          kernelPackages = self.nixosConfigurations.sentinel-image.config.boot.kernelPackages;
           label = "6-12";
         };
         ebpf-verifier-6-18 = import ./nix/ebpf-verifier-test.nix {
@@ -1974,8 +1985,38 @@
           cp ${./tests/test_image_cve_gate.py} tests/test_image_cve_gate.py
           cp ${./tests/test_image_closure.py} tests/test_image_closure.py
           python3 -B -m unittest discover -s tests -p 'test_image_c*.py' -v
+          mkdir -p nix
+          cp ${./scripts/check_security_floor.py} scripts/check_security_floor.py
+          cp ${./nix/security-floor.json} nix/security-floor.json
+          cp ${./tests/test_security_floor.py} tests/test_security_floor.py
+          python3 -B -m unittest discover -s tests -p 'test_security_floor.py' -v
           touch $out
         '';
+        # The security fixes ship: the image closure meets every version floor
+        # in nix/security-floor.json (the kernel among them), and every
+        # security-backports.nix replacement took — no replaced path left, no
+        # backport whose package the image never contains. The sqlite3 shell
+        # (CVE-2026-119586, `.recover`) and libressl's ocspcheck
+        # (CVE-2026-118374) carry CVEs of their own and are never run: only
+        # the libraries ship, and this keeps it that way.
+        image-security-floor =
+          let
+            image = self.nixosConfigurations.sentinel-image.config;
+            replacements = pkgs.writeText "sentinel-security-replacements.json" (builtins.toJSON (map
+              (r: { old = "${r.oldDependency}"; new = "${r.newDependency}"; })
+              image.system.replaceDependencies.replacements));
+          in
+          pkgs.runCommand "sentinel-image-security-floor" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            mkdir -p scripts
+            cp ${./scripts/check_image_closure.py} scripts/check_image_closure.py
+            cp ${./scripts/check_security_floor.py} scripts/check_security_floor.py
+            python3 -B scripts/check_security_floor.py \
+              --floors ${./nix/security-floor.json} \
+              --replacements ${replacements} \
+              --forbid-program sqlite3 --forbid-program ocspcheck \
+              ${pkgs.closureInfo { rootPaths = [ image.system.build.toplevel ]; }}/store-paths
+            touch $out
+          '';
         # PROV-01 seeding tool, end to end against real e2fsprogs.
         seed-image-unit = pkgs.runCommand "sentinel-seed-image-unit" {
           nativeBuildInputs = [ pkgs.python3 ];

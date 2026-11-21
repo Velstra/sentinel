@@ -37,6 +37,8 @@ in pkgs.testers.runNixOSTest {
     # Print the receipt too: a rejected derivation must retain diagnostics via
     # nix log / CI artifacts, not depend on an unregistered failed $out.
     print("VERIFIER_RECEIPT=" + json.dumps(receipt))
+    # The receipt names the kernel that ran, and it must be the one asked for.
+    assert receipt["kernel"] == "${kernelPackages.kernel.modDirVersion}", receipt["kernel"]
     assert status == 0, verifier_output
     assert receipt["verified"] == expected, receipt
     assert "BTF couldn't be loaded" not in verifier_output, verifier_output
