@@ -97,6 +97,16 @@ def disk_rows():
     return json.loads(run(["sfdisk", "--json", "/dev/vda"]))["partitiontable"]
 
 
+# The appliance's configured channel label (native-update-test.nix).
+CHANNEL = "qa-enterprise"
+FRESHNESS_LIFETIME = 13 * 86400  # Under Sentinel's 14-day maximum.
+
+
+def freshness(now):
+    return {"schema": 1, "channel": CHANNEL, "arch": "x86_64", "sequence": 1,
+            "issued_at": now, "expires_at": now + FRESHNESS_LIFETIME}
+
+
 def inactive():
     return {str(n): digest("/dev/vda" + str(n)) for n in (4, 5)}
 
@@ -134,7 +144,10 @@ def main(sentinel, client):
     image = json.loads((resources / "image.json").read_bytes())
     manifest = {"version": descriptor["version"], "image": "sentinel_v1.0.0-lts.raw",
         "sha256": image["sha256"], "product": "velstra-sentinel",
-        "sysupdate": {"schema": 1, "resources": descriptor["resources"]}}
+        "sysupdate": {"schema": 1, "resources": descriptor["resources"]},
+        # Online offers must carry signed freshness (CTRL-26); without it
+        # Sentinel refuses even a correctly signed manifest as metadata-refused.
+        "freshness": freshness(int(time.time()))}
     scratch = Path("/run/qa-native-signing")
     scratch.mkdir(mode=0o700)
 
