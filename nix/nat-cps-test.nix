@@ -143,6 +143,15 @@ pkgs.testers.runNixOSTest {
         return [r.get("value") or r.get("formatted", {}).get("value") for r in rows]
 
     start_all()
+    # The NixOS test VMs boot with clocksource=acpi_pm. Under nested
+    # virtualisation every read of it is an I/O-port exit costing tens of
+    # microseconds, and the datapath reads the clock (bpf_ktime_get_ns)
+    # several times per packet. A rate check on that clock measures the
+    # emulated timer, not the datapath. No appliance runs on acpi_pm.
+    for machine in [fw, client, backend]:
+        machine.succeed("echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource")
+    receipt["clocksource"] = fw.succeed("cat /sys/devices/system/clocksource/clocksource0/current_clocksource").strip()
+    assert receipt["clocksource"] == "kvm-clock", receipt["clocksource"]
     fw.wait_for_unit("sentinel-boot.service")
     fw.wait_for_unit("velstra.service")
     backend.wait_for_unit("cps-peer.service")
