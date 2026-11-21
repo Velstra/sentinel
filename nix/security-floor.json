@@ -8,6 +8,11 @@
    "fixes": "linux-6.12.y stable fixes after 6.12.117 (nix/kernel.nix)"
   },
   {
+   "package": "haproxy",
+   "minimum": "3.4.5",
+   "fixes": "CVE-2026-90678 HTTP/3; CVE-2026-55203, CVE-2026-55204 (flake.nix haproxyFor)"
+  },
+  {
    "package": "sqlite",
    "minimum": "3.54.1",
    "fixes": "the three High advisories fixed in 3.54.0"

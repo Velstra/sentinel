@@ -178,16 +178,20 @@
         withMongo = false; withCzmq = false; withRabbitmq = false; withHiredis = false;
       };
 
-      # HAProxy 3.4.1 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
+      # HAProxy 3.4 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
       # (FCGI record-length overflow) and CVE-2026-55204 (HPACK NULL deref
-      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixes
-      # both. A leaf package, so it is substituted directly where it is used.
+      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixed
+      # both. 3.4.8 is the newest 3.4 release and also fixes CVE-2026-90678
+      # (HTTP/3, fixed in 3.4.5): the recipe builds USE_QUIC, even though
+      # Sentinel renders no QUIC bind. A leaf package, so it is substituted
+      # directly where it is used; nix/security-floor.json holds the floor.
       haproxyFor = p: assert p.haproxy.version == "3.3.17";
         p.haproxy.overrideAttrs (_: {
-          version = "3.4.1";
+          version = "3.4.8";
           src = p.fetchurl {
-            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.1.tar.gz";
-            sha256 = "1y12pjsja0cgbd3cidvql1b48ib32r1qdr8prz3knzfp9z7c8qif";
+            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.8.tar.gz";
+            # = haproxy-3.4.8.tar.gz.sha256 published beside the tarball.
+            hash = "sha256-AkvVIabLvjK0JoUxR+a71qibEHxaNBRIRhk/7lt8btE=";
           };
         });
 
