@@ -20,6 +20,10 @@ const LOCK_DIRECTORY: &str = "/run/sentinel-update";
 const CHUNK: usize = 4 * 1024 * 1024;
 const RESERVE: u64 = 512 * 1024 * 1024;
 const METADATA_HEADROOM: u64 = 8 * 1024 * 1024;
+/// What host tests keep free instead of [`RESERVE`]: enough to exercise the
+/// reserve arithmetic, small enough not to depend on the builder's disk.
+#[cfg(test)]
+const HOST_TEST_RESERVE: u64 = 16 * 1024 * 1024;
 const STDERR_TAIL: usize = 4096;
 const STATUS_MARKER: &str = "SENTINEL_HTTP_STATUS:";
 
@@ -232,6 +236,20 @@ impl ImageStage {
     }
 
     fn in_directory(directory: &File) -> Result<Self> {
+        Self::in_directory_reserving(directory, reserve)
+    }
+
+    /// A stage for host tests: the stream, file and process code is the
+    /// shipped code, but the reserve does not scale with the builder's disk.
+    /// The appliance keeps 5% of its state filesystem free; applied to a
+    /// build host's root, that made `nix build .#sentinel` fail its unit tests
+    /// whenever the builder had less than ~5% free (12.9 GB of a 258 GB disk).
+    #[cfg(test)]
+    fn for_host_test(directory: &File) -> Result<Self> {
+        Self::in_directory_reserving(directory, |_| HOST_TEST_RESERVE)
+    }
+
+    fn in_directory_reserving(directory: &File, reserve: fn(Space) -> u64) -> Result<Self> {
         let snapshot = space(directory)?;
         let reserve = reserve(snapshot);
         allow_allocation(snapshot.available, 0, reserve)?;
@@ -483,7 +501,7 @@ pub(crate) fn test_download_in(
     // their owned scratch FS, not the appliance-only mounted-ext4 guard.
     download_into(
         &mut command,
-        ImageStage::in_directory(&open_directory(directory)?)?,
+        ImageStage::for_host_test(&open_directory(directory)?)?,
         maximum,
     )
 }
@@ -553,7 +571,8 @@ mod tests {
     #[test]
     fn fd_identity_oracle_distinguishes_live_original_and_unrelated_files() {
         let scratch = crate::update::Scratch::new().unwrap();
-        let stage = ImageStage::in_directory(&open_directory(&scratch.join(".")).unwrap()).unwrap();
+        let stage =
+            ImageStage::for_host_test(&open_directory(&scratch.join(".")).unwrap()).unwrap();
         let witness = stage.file.try_clone().unwrap();
         let original = witness.metadata().unwrap();
         let unrelated = scratch.create_private("unrelated").unwrap();
@@ -661,7 +680,7 @@ mod tests {
         let path = scratch.join("parent");
         std::fs::create_dir(&path).unwrap();
         let directory = open_directory(&path).unwrap();
-        let mut stage = ImageStage::in_directory(&directory).unwrap();
+        let mut stage = ImageStage::for_host_test(&directory).unwrap();
         let renamed = scratch.join("renamed");
         std::fs::rename(&path, &renamed).unwrap();
         std::os::unix::fs::symlink("/does-not-exist", &path).unwrap();
@@ -697,15 +716,27 @@ mod tests {
     }
 
     #[test]
+    fn host_test_stages_do_not_scale_their_reserve_with_the_builder_disk() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let directory = open_directory(&scratch.join(".")).unwrap();
+        let host = space(&directory).unwrap();
+        let stage = ImageStage::for_host_test(&directory).unwrap();
+        assert_eq!(stage.reserve, HOST_TEST_RESERVE);
+        // The appliance's own rule is unchanged: at least RESERVE, and 5% of
+        // the filesystem.
+        assert_eq!(reserve(host), RESERVE.max(host.total / 20));
+    }
+
+    #[test]
     fn stage_budget_fails_without_consuming_the_filesystem() {
         let scratch = crate::update::Scratch::new().unwrap();
         let mut stage =
-            ImageStage::in_directory(&open_directory(&scratch.join(".")).unwrap()).unwrap();
+            ImageStage::for_host_test(&open_directory(&scratch.join(".")).unwrap()).unwrap();
         stage.budget = 4096;
         assert!(copy_sparse_bounded(&mut Cursor::new(vec![1u8; 8192]), &mut stage, 8192).is_err());
         assert_eq!(stage.file.metadata().unwrap().blocks(), 0);
         let mut stage =
-            ImageStage::in_directory(&open_directory(&scratch.join(".")).unwrap()).unwrap();
+            ImageStage::for_host_test(&open_directory(&scratch.join(".")).unwrap()).unwrap();
         stage.reserve = space(&stage.file).unwrap().available;
         let error =
             copy_sparse_bounded(&mut Cursor::new(vec![1u8; 4096]), &mut stage, 4096).unwrap_err();
