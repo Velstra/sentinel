@@ -208,7 +208,17 @@ Source masquerading can use the WAN interface’s current IPv4 address, includin
 set nat source wan-masq zone wan            # masquerade everything leaving wan
 ```
 
-Allocation searches a bounded candidate window. Collisions can reject a new connection even with free map capacity; logical expiry does not guarantee physical reclamation. Do not infer a supported connection limit from configured map sizes.
+Each connection gets its own public source port. Ports are scarce only between connections to the **same** remote address and port: each such endpoint has the whole 32768-port range (32768–65535) of the public address to itself, and connections to different endpoints never compete. The total number of connections is limited by the state tables, not by ports.
+
+A new connection examines a fixed window of 128 candidate ports, so opening it costs the same no matter how busy the box has been. If all 128 are taken, the opening packet is dropped and counted as `egress_nat_no_candidate` in `sentinel show firewall statistics`; the client's retransmission tries again. How often that happens depends on how full that one endpoint's range is:
+
+| Concurrent connections to one remote ip:port, per public address | Share of the range | New connections refused |
+| ---: | ---: | ---: |
+| up to ~29,500 | 90 % | none measurable |
+| ~31,100 | 95 % | about 0.15 % |
+| ~32,400 | 99 % | about 27 % |
+
+So plan for roughly **31,000 concurrent connections from one public address to one remote ip:port**. No NAT can exceed 32,768. A closed connection keeps its port for the closing timeout (30 s by default), so a single public address sustains roughly a thousand connections per second from fresh client ports to one remote service. When `egress_nat_no_candidate` grows, the remedy is more public addresses. In 1.0 masquerade translates to the one address of each uplink and has no address pool, so in practice that means spreading the traffic over another masquerading uplink. Logical expiry does not guarantee immediate physical reclamation; do not infer a supported connection limit from configured map sizes.
 
 #### Deterministic CGNAT
 
