@@ -37,7 +37,10 @@ let
   };
 in pkgs.testers.runNixOSTest {
   name = if publicationFailure then "sentinel-ota-publication-failure" else "sentinel-real-http-ota-stage-boot";
-  globalTimeout = 1200;
+  # The probe moves the 1.4 GB signed image over loopback TLS three or four
+  # times (~130-175 s each in the VM) and hashes 2-4 partitions per case;
+  # qual run b3 cut the probe at 650 s inside its last transfer (~800 s).
+  globalTimeout = 1800;
   nodes.donor = {
     imports = [ common ];
     system.name = "donor";
@@ -107,7 +110,7 @@ in pkgs.testers.runNixOSTest {
     if publication_failure:
         command += " --publication-failure"
     try:
-        output = machine.succeed(command + " --sentinel ${sentinel}/bin/sentinel", timeout=650)
+        output = machine.succeed(command + " --sentinel ${sentinel}/bin/sentinel", timeout=1200)
     except Exception:
         print("ACTUAL_STAGE_BOOT_INVENTORY", machine.execute("bootctl --json=short list"), flush=True)
         print("ACTUAL_STAGE_DURABLE_JOB_STATE", machine.execute("cat /var/lib/sentinel/update-jobs/state.json"), flush=True)
