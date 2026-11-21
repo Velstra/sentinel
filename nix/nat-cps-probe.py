@@ -56,7 +56,8 @@ async def one_connection(start_at, timeout, loop):
         if peer[0] != WAN_IP:
             return {'kind': 'untranslated', 'lag': lag, 'peer': peer}
         return {'kind': 'ok', 'lag': lag, 'connect': connected - began,
-                'total': time.monotonic() - began, 'wan_port': peer[1]}
+                'total': time.monotonic() - began, 'wan_port': peer[1],
+                'local_port': writer.get_extra_info('sockname')[1]}
     except asyncio.TimeoutError:
         return {'kind': 'timeout', 'lag': lag}
     except (OSError, ValueError, KeyError) as error:
@@ -96,6 +97,13 @@ def open_phase(args):
         kinds[row['kind']] = kinds.get(row['kind'], 0) + 1
     offered_for = per_worker / (args.rate / args.processes)
     connect = [row['connect'] for row in ok]
+    # Within one phase no binding expires (closing lifetime 30 s), so one
+    # WAN port may only ever carry one client port: a client that reuses a
+    # source port reuses its binding, anything else is a collision.
+    owners = {}
+    for row in ok:
+        owners.setdefault(row['wan_port'], set()).add(row['local_port'])
+    shared = sum(1 for ports in owners.values() if len(ports) > 1)
     lags = [row['lag'] for row in rows]
     print(json.dumps({
         'offered': len(rows),
@@ -110,7 +118,9 @@ def open_phase(args):
         'connect_max_ms': round(1000 * max(connect), 2) if connect else None,
         'retransmit_shaped_connects': sum(1 for value in connect if value >= 0.9),
         'client_lag_p99_ms': round(1000 * percentile(lags, 0.99), 2),
-        'distinct_wan_ports': len({row['wan_port'] for row in ok}),
+        'distinct_wan_ports': len(owners),
+        'distinct_client_ports': len({row['local_port'] for row in ok}),
+        'wan_ports_shared_by_client_ports': shared,
     }))
 
 
