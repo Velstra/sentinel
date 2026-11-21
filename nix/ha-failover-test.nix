@@ -39,8 +39,19 @@ let
       { name = "lan"; interface = "eth2"; vrid = 21; address = "10.2.0.100"; prefix=24; }
     ] ++ pkgs.lib.optionals leased [{name="lan6";interface="eth2";vrid=22;address="fd42:2::100";prefix=64;}]);
   };
+  # The NixOS test driver forwards every journal line, debug included, to the
+  # VM's emulated serial console, and journald writes it synchronously. The
+  # members' debug logging and periodic statistics tables back that console
+  # up; journald then stops reading, the agents' log writes block, wren's
+  # 25 ms lease renewals stall past the 250 ms witness lease, and ownership
+  # flaps in a quiet pair (measured: 2 of 3 runs reached term 3 before any
+  # fault). An appliance does not forward its journal to a console. The full
+  # journal stays available to the diagnostics through journalctl.
+  quietConsole = { lib, ... }: {
+    services.journald.extraConfig = lib.mkAfter "MaxLevelConsole=warning\n";
+  };
   firewall = number: priority: { lib, ... }: {
-    imports = [ self.nixosModules.sentinel ];
+    imports = [ self.nixosModules.sentinel quietConsole ];
     environment.systemPackages=[pkgs.python3 pkgs.wireguard-tools pkgs.bpftools pkgs.curl];
     virtualisation.vlans = [ 1 2 3 ];
     virtualisation.memorySize = 2048;
@@ -122,7 +133,7 @@ in pkgs.testers.runNixOSTest {
   } // pkgs.lib.optionalAttrs leased {
     witness = {lib,...}: {
       networking.hostName=lib.mkForce "witness";
-      imports=[self.nixosModules.sentinel];
+      imports=[self.nixosModules.sentinel quietConsole];
       virtualisation.vlans=[3];virtualisation.memorySize=1536;
       environment.systemPackages=[pkgs.python3];
       networking.firewall.enable=lib.mkForce false;
