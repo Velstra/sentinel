@@ -12224,6 +12224,10 @@
             # the DHCP relay to the back-segment server. ONE `set` per line.
             relay.succeed(
                 "su admin -c \"printf '%s\\n' "
+                # eth1, where velstra lives, keeps a zone: a commit that leaves
+                # no interface zoned stops the agent (DP-12), and the relayed
+                # segments stay unzoned so the relay, not a policy, is tested.
+                "'set interface eth1 zone mgmt' "
                 "'set interface eth2 address 10.1.0.1/24' "
                 "'set services dhcp-relay interface eth2' "
                 "'set services dhcp-relay server 10.2.0.2' "
@@ -12231,6 +12235,7 @@
                 "| sentinel configure\""
             )
             relay.wait_for_unit("velstra.service")
+            relay.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
 
             # Sentinel rendered the dnsmasq relay config + unit.
             relay.wait_until_succeeds(
@@ -12366,6 +12371,10 @@
             # the DHCPv6 relay to the back-segment server. ONE `set` per line.
             relay.succeed(
                 "su admin -c \"printf '%s\\n' "
+                # eth1, where velstra lives, keeps a zone: a commit that leaves
+                # no interface zoned stops the agent (DP-12), and the relayed
+                # segments stay unzoned so the relay, not a policy, is tested.
+                "'set interface eth1 zone mgmt' "
                 "'set interface eth2 address6 2001:db8:1::1/64' "
                 "'set services dhcp-relay interface eth2' "
                 "'set services dhcp-relay server6 2001:db8:2::2' "
@@ -12373,6 +12382,7 @@
                 "| sentinel configure\""
             )
             relay.wait_for_unit("velstra.service")
+            relay.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
 
             # Sentinel rendered the dnsmasq v6 relay line + unit.
             relay.wait_until_succeeds(
@@ -12487,6 +12497,10 @@
             # on the mDNS reflector between them. ONE `set` per line.
             relay.succeed(
                 "su admin -c \"printf '%s\\n' "
+                # eth1, where velstra lives, keeps a zone: a commit that leaves
+                # no interface zoned stops the agent (DP-12), and the relayed
+                # segments stay unzoned so the relay, not a policy, is tested.
+                "'set interface eth1 zone mgmt' "
                 "'set interface eth2 address 10.1.0.1/24' "
                 "'set interface eth3 address 10.2.0.1/24' "
                 "'set services mdns interface eth2' "
@@ -12495,6 +12509,7 @@
                 "| sentinel configure\""
             )
             relay.wait_for_unit("velstra.service")
+            relay.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
 
             # Sentinel rendered the avahi reflector config + unit.
             relay.wait_until_succeeds(
