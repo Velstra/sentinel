@@ -7,7 +7,10 @@
 # differ only in their own addresses. The backups are not on the flow's path:
 # a flow they show was replicated, not seen.
 let
-  secret = "conntracksync-vm-only-secret-at-least-32-bytes";
+  # Disposable, VM-only, and random: a config-sync secret that reads like
+  # words is refused at check and commit, the shape `sentinel ha secret
+  # generate` prints is what members carry.
+  secret = "3068fa053fabbb486b885db58711df27d387fd3b631a5c3c5c8aae6102578a3f";
   member = number: lan: { lib, ... }: {
     imports = [ self.nixosModules.sentinel ./test-network-seed.nix ];
     networking.hostName = lib.mkForce "member${toString number}";
