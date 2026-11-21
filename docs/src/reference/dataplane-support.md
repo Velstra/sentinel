@@ -1,10 +1,63 @@
 # Dataplane support and conformance
 
-Sentinel retains Fabric's stateful eBPF firewall. This is a development candidate,
-not a production support promise. A passing parser, host unit test or verifier
-load is not a passing packet test.
+Sentinel retains Fabric's stateful eBPF firewall. This page states what the
+1.0.0 data plane (the Fabric commit pinned in `flake.lock`) is qualified to do, how that was
+measured, and where it stops. A passing parser, host unit test or verifier
+load is not a passing packet test; every claim below names the VM check that
+exercises it on the shipped object.
 
-## Latest source checkpoint — 18–19 November 2026
+## Sentinel 1.0.0
+
+- **Connections:** the `nat-capacity-pressure` gate opens 20,000 masqueraded
+  connections and requires every one to answer a later held-connection probe;
+  `nat-pressure-reference` runs the same load through netfilter as the
+  oracle. Connection tables are sized from the box's memory with a floor of
+  16,384, and a reclaimer frees expired state. This is not a hardware
+  throughput or connections-per-second figure.
+- **Differential conformance:** `dataplane-conformance` compares Sentinel with
+  netfilter on identical topologies, fragmented UDP and echo through SNAT
+  included; `firewall-policy-conformance` covers policy matching across
+  families; `tcp-reset-validation` checks that out-of-window, inexact and
+  checksum-corrupt resets leave live connections alone.
+- **Verifier:** every shipped program loads on 6.6, 6.12 and 6.18
+  (`ebpf-verifier-6-6`, `-6-12`, `-6-18`) and on the CI runner's 7.0 kernel,
+  from one object.
+- **Restart and reconfigure:** `agent-restart-persist` keeps enforcing and keeps
+  NAT state across an agent restart; `agent-reconfigure-stall` bounds the
+  traffic gate of a commit on a 120,000-entry blocklist.
+
+## Current boundaries
+
+| Path | Status in 1.0.0 |
+| --- | --- |
+| Routed IPv4/IPv6 filtering | XDP ingress plus kernel routing and TC egress. Allowed traffic is **not** generally kernel-bypassed. |
+| Stateful TCP/UDP | Sequence-aware RST validation; XMAS, NULL, FIN-only and out-of-state packets dropped on stateful zones; TCP and UDP with IPv4 options refused on stateful zones. IPv6 and data-carrying RSTs are not checksum-verified; HA-imported state has no sequence window yet. |
+| IPv4 source NAT and destination NAT | Masquerade, static SNAT, DNAT, hairpin (client port rewritten) and load balancing pass their VM checks, with HA conntrack sync. GRE, ESP, SCTP and 6in4 are masqueraded; AH, ICMP timestamp and ICMP with options are dropped at WAN egress. |
+| Fragmented IPv4 through NAT | Translated. Non-first fragments that arrive before the first are dropped; later fragments of a port-forward reply on a masqueraded WAN are refused. |
+| ICMP errors related to flows | Delivered for tracked flows, IPv6 packet-too-big included (path-MTU discovery works). ICMPv6 errors about connections behind NPTv6, or quoting extension headers, reach the host (`v6-mss-npt-related`). |
+| IPv6 | Filtering and routed forwarding; NPTv6 and NAT64 have their own checks. IPv6 SYNs are MSS-clamped like IPv4. IPv6 fragments are not NAT-translated, and the SYN proxy is IPv4 only. |
+| Conntrack capacity | Sized from memory, floor 16,384 connections; expired state is reclaimed. The 20,000-connection gate is a VM regression bound, not a supported hardware limit. |
+| Blocklist and GeoIP | Name sources only: they refuse what a listed address sends in, and the answers to connections the inside opened towards it pass (`blocklist-direction`). There is no outbound blocklist. The global blocklist is copied into each zone policy; `config check` refuses it past 262,144 entries in total, and there is no bulk removal command. |
+| SYN proxy | IPv4 only in 1.0; IPv6 SYNs to a protected port are not proxied, and `config check` names the zones where that applies (planned for 1.1). Scoped to the zones that admit the port (see the firewall handbook). Proxied connections lose window scaling, SACK and timestamps. |
+| Masquerade ports | About 31,000 concurrent connections to one remote ip:port per public address; a new connection examines a fixed 128-port window and is refused, counted in `egress_nat_no_candidate`, when it finds none (`nat-cps`). |
+| Rule capacity | 8,192 rule-trie entries per address family, refused at `config check` and `commit`. |
+| VLANs on native XDP | A NIC that strips 802.1Q tags in hardware (rx-vlan-offload: ixgbe, i40e, ice, igc and others) hands native XDP on the parent an untagged frame, which the parent's zone then judges before the VLAN interface's own. Not reproducible on virtio. Until the data plane reads the stripped tag, turn the offload off on such a parent (`set interface <parent> offload rxvlan false`). |
+| XDP redirects | Fabric has explicit IPv4 FIB, load-balancer and overlay redirect paths. Those do **not** establish an established-flow fast path for the Sentinel router/NAT configuration. |
+| Generic/SKB XDP | Driver fallback, not native-XDP performance. Native mode and each NIC driver require separate qualification. |
+| HA | Experimental. The `ha-*`, `conntracksync` and `vrrp` checks cover witness and two-node election, failover with state, masquerade and SYN proxy failover; that is not clearance for every partition or witness-loss case. Rolling upgrades across a policy-digest change are not hitless (see the [1.0.0 release notes](../release-notes-1.0.0.md)). |
+| Kernel compatibility | 6.12 is the appliance kernel. 6.6 / 6.12 / 6.18 checks load the same object on real guest kernels. |
+
+An unsupported case is an open bug, not a silent success. There is no `xfail`
+list in the differential gate. No Mpps-per-core figures have been established
+for a Sentinel established-flow redirect path.
+
+## History before 1.0.0
+
+The measurements in this section were taken on earlier candidates. They record
+how the limits above were found and are kept as evidence, not as the current
+status.
+
+### Source checkpoint, 18–19 November 2026
 
 - **Not release-ready:** the full pressure gate opens all 20,000 connections,
   but only 16,322 pass the held-connection probe. NAT bindings remain present
@@ -24,27 +77,6 @@ load is not a passing packet test.
 The [remediation record](https://github.com/Velstra/sentinel/blob/main/docs/qa-release-findings-2026-11-18.md)
 separates source cohorts, fixed test fixtures, actual runtime fixes and failures.
 Earlier measurements below remain historical evidence, not extra guarantees.
-
-## Current boundaries
-
-| Path | Current status / limitation |
-| --- | --- |
-| Routed IPv4/IPv6 filtering | XDP ingress plus kernel routing and TC egress. Allowed traffic is **not** generally kernel-bypassed. |
-| Stateful TCP/UDP | Ordinary-flow and bulk-TCP regressions pass. Known release blocker: out-of-window, in-window nonexact and checksum-corrupt TCP resets delete live firewall state even when the endpoint rejects them, interrupting the existing connection. Sequence/window/checksum validation remains incomplete. |
-| IPv4 source NAT and destination NAT | Targeted plain DNAT, hairpin, concurrent TCP/UDP and established-flow HA tests pass on reviewed working sources. The latest standalone allocator passes nine deliberately colliding held connections; HA/synchronized configurations still use the restricted eight-candidate allocator. Capacity, broader regression and final committed-image qualification remain pending. |
-| Live IPv4 inventory changes | Working-branch tests cover added, labelled and removed addresses, DNAT/LB discovery and one surviving SNAT TCP flow. Observer errors and stale rollback snapshots hold the dataplane closed until reconciliation. This does not qualify every DHCP or link-replacement scenario. |
-| Fragmented IPv4 through NAT | Known release blocker. Large UDP datagrams and fragmented echo can be lost. Do not rely on this for production DNS, IKE or other large datagrams. |
-| ICMP errors related to NAT flows | Targeted IPv4 UDP-quote differential passes SNAT/DNAT/hairpin, including malformed quotes and error-queue checks. General PMTU, TCP quotes, fragmented NAT and final-image qualification remain open. Echo support alone does not establish RELATED ICMP support. |
-| IPv6 | Filtering / routed forwarding is distinct from NAT64, NPTv6 and overlay support. No IPv6 stateful redirect fast path is claimed. Each requires its own packet gate. |
-| Conntrack capacity | Separate fixed 65,536-entry NAT and firewall-state maps. Entries per connection depend on the NAT path and policy; there is no universally qualified connection limit. A 128-connection pass does not clear sparse-map allocation failure, live-entry eviction or the 20,000-flow pressure gate. Occupancy warnings do not prevent these failures. |
-| XDP redirects | Fabric has explicit IPv4 FIB, load-balancer and overlay redirect paths. Those do **not** establish an established-flow fast path for the Sentinel router/NAT configuration. |
-| Generic/SKB XDP | Driver fallback, not native-XDP performance. Native mode and each NIC driver require separate qualification. |
-| HA | Experimental. Targeted flow/fencing tests are not clearance for all witness-loss, partition and rolling-upgrade scenarios. Keep independent management and recovery access. |
-| Kernel compatibility | 6.12 is the current appliance selection. 6.6 / 6.12 / 6.18 checks load the same object on real guest kernels. A configured CI lane is not a compatibility claim: require its passing receipt for the exact object hash. |
-
-An unsupported case is an open bug, not a silent success. There is no `xfail`
-list in the differential gate. No Mpps-per-core figures have been established
-for a Sentinel established-flow redirect path.
 
 A separate working-source fragment containment regression
 now proves that unsupported nonlocal fragments on the Sentinel TC masquerade

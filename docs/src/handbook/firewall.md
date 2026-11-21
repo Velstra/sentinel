@@ -4,7 +4,7 @@
 
 Use the trace command to explain the configured outcome for a packet. Use live counters and logs to investigate actual traffic. Configuration examples run inside `sentinel configure`.
 
-This is a development candidate. Fragmented NAT, RELATED ICMP/PMTU and capacity limits are not production-qualified. Read the [support matrix and conformance gate](../reference/dataplane-support.md). Routed traffic currently uses kernel forwarding plus TC egress, not an established-flow XDP redirect fast path.
+Read the [support matrix and conformance gate](../reference/dataplane-support.md) for what the data plane is qualified to do and its known limits (IPv6 fragments are not translated, the SYN proxy is port-scoped and IPv4-only). Routed traffic currently uses kernel forwarding plus TC egress, not an established-flow XDP redirect fast path.
 
 ## Asking before you send (packet trace)
 

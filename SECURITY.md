@@ -8,8 +8,10 @@ Include the affected version or commit, image SHA-256, configuration with secret
 removed, reproduction steps and observed impact. Reports about bundled dependencies
 and image defaults are in scope, not only Sentinel's Rust code.
 
-Before 1.0, security fixes target the current main branch. A passing source CI run
-is not an image security assessment or a production release certification.
+Security fixes are released for the latest 1.0.x release and land on the main
+branch first. The supported versions and support periods are stated in the
+public support policy on the Velstra website. A passing source CI run is not an
+image security assessment or a production release certification.
 
 If credentials were exposed, replace the affected credentials first. Removing a
 file from the latest commit does not remove it from Git history or existing clones.

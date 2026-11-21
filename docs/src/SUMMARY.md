@@ -1,6 +1,7 @@
 # Summary
 
 [Sentinel operator guide](introduction.md)
+[Release notes 1.0.0](release-notes-1.0.0.md)
 
 # Try and operate
 - [Start a VM](operations/quickstart.md)
