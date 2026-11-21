@@ -15309,6 +15309,17 @@
             machine.wait_for_unit("sentinel-boot.service")
             machine.wait_for_unit("velstra.service")
 
+            def rolled_back(hostname, timeout=60):
+                # The previous active configuration is live and recorded again,
+                # and the rollback service has finished without failing.
+                machine.wait_until_succeeds(
+                    f"hostname | grep -x {hostname}"
+                    f" && grep -q '{hostname}' /run/sentinel/running.toml"
+                    " && ! systemctl is-active --quiet sentinel-confirm.service",
+                    timeout=timeout,
+                )
+                machine.fail("systemctl is-failed --quiet sentinel-confirm.service")
+
             # Baseline: a valid config with a known hostname, SAVED so
             # commit-confirm has a known-good config to revert to. Everything but
             # the hostname stays constant across the test, so the hostname alone
@@ -15351,9 +15362,11 @@
             machine.succeed(
                 "umount /run/sentinel/running.toml; rm /run/sentinel-running-pin.toml"
             )
+            # With a trial armed, a manual rollback starts the timer's own bound
+            # service and returns ("rollback scheduled"); restoration completes
+            # in that service, so wait for it rather than for the command.
             machine.succeed("sentinel confirm-rollback")
-            machine.succeed("hostname | grep -x fw-base")
-            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
+            rolled_back("fw-base")
 
             # --- commit-confirm + confirm (keep the change) ---------------------
             # A 10-minute window: the new hostname is applied live AND the
@@ -15388,16 +15401,17 @@
             machine.succeed("grep -q 'fw-c2' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             # Forcing the revert (the exact command the timer runs) restores the
-            # saved config and disarms the timer.
+            # previous ACTIVE configuration — fw-c1, confirmed above and live
+            # though unsaved — not the saved one, and disarms the timer.
             machine.succeed("sentinel confirm-rollback")
-            machine.succeed("hostname | grep -x fw-base")
-            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
+            rolled_back("fw-c1")
             machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
 
             # --- the real timer fires and auto-reverts (the headline) -----------
             # A 1-minute window with NO confirm: the transient systemd timer runs
             # `sentinel confirm-rollback` on its own and the box returns to the
-            # saved config — the lock-yourself-out safety net, proven end to end.
+            # configuration it ran before (fw-c1) — the lock-yourself-out safety
+            # net, proven end to end.
             machine.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set system hostname fw-c3' 'commit-confirm 1' exit "
@@ -15406,8 +15420,8 @@
             machine.succeed("hostname | grep -x fw-c3")
             machine.succeed("grep -q 'fw-c3' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
-            machine.wait_until_succeeds("hostname | grep -x fw-base", timeout=120)
-            machine.wait_until_succeeds("grep -q 'fw-base' /run/sentinel/running.toml", timeout=20)
+            rolled_back("fw-c1", timeout=150)
+            # Nothing in this check saved after the baseline.
             machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
           '';
         };
