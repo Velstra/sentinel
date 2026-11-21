@@ -100,13 +100,19 @@ in pkgs.testers.runNixOSTest {
         return values
 
     def capacity(text):
+        # Capacity report v2 (DP-06): the tables are sized from memory, for
+        # `connections_sized_for` connections: FW_FLOWS 6x, CONNTRACK 2x,
+        # SYN_FLOWS half of it.
         value = json.loads(text)
-        assert value["version"] == 1 and value["stale"] is False, value
+        assert value["version"] == 2 and value["status"] != "unavailable", value
         maps = {row["name"]: row for row in value["maps"]}
         assert set(maps) == {"CONNTRACK", "FW_FLOWS", "SYN_FLOWS"}, value
-        for row in maps.values():
-            assert row["sample_complete"] and row["error"] is None, row
-            assert row["map_id"] > 0 and row["max_entries"] == 65536, row
+        sized = value["connections_sized_for"]
+        assert sized >= 16384, value
+        expected = {"FW_FLOWS": 6 * sized, "CONNTRACK": 2 * sized, "SYN_FLOWS": sized // 2}
+        for name, row in maps.items():
+            assert row["error"] is None and row["age_ms"] is not None, row
+            assert row["max_entries"] == expected[name], row
         return value, maps
 
     def request(path, body=None, token=None, method=None):
@@ -241,8 +247,9 @@ in pkgs.testers.runNixOSTest {
             elif operation == "firewall-capacity":
                 _, api_maps = capacity(text)
                 _, cli_maps = capacity(answers[operation])
-                assert {name: row["map_id"] for name, row in api_maps.items()} == {
-                    name: row["map_id"] for name, row in cli_maps.items()}
+                # The same agent answers both: the same tables, the same sizes.
+                assert {name: row["max_entries"] for name, row in api_maps.items()} == {
+                    name: row["max_entries"] for name, row in cli_maps.items()}
         status, text = request("configure", body="set system hostname viewer-must-not-write\ncommit\nsave", token=token)
         assert status == 403, (status, text)
         assert fw.succeed("hostname").strip() == "observe-fw"
@@ -328,7 +335,7 @@ in pkgs.testers.runNixOSTest {
             assert "unavailable" in text, text
             assert "rx_packets" not in text and "observed-below-threshold" not in text, text
         fw.succeed("systemctl start velstra.service")
-        fw.wait_until_succeeds("sentinel show firewall capacity | ${pkgs.python3}/bin/python3 -c " + shlex.quote("import json,sys; assert json.load(sys.stdin)['version']==1"), timeout=30)
+        fw.wait_until_succeeds("sentinel show firewall capacity | ${pkgs.python3}/bin/python3 -c " + shlex.quote("import json,sys; assert json.load(sys.stdin)['version']==2"), timeout=30)
         capacity(capability("firewall-capacity"))
         fw.succeed("systemctl stop wren.service")
         text = opaque(capability("bgp-summary", succeeds=False))
