@@ -263,6 +263,20 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   Checked by `checks.v6-mss-npt-related`.
 - `velstra verify-ebpf` (and so the `ebpf-verifier` checks) refuses a program
   that uses more than 700,000 verifier instructions.
+- PERF-02: masquerade no longer collapses to a few hundred new connections per
+  second after one ICMP echo or port-forward. Each new connection examines a
+  fixed window of 128 ports, whatever the box has seen before. The handbook
+  states the remaining ceiling: about 31,000 concurrent connections to one
+  remote ip:port per public address, with refusals counted in
+  `egress_nat_no_candidate`. Checked by `checks.nat-cps` (2 x 20,000 opens at
+  2000/s) and `checks.nat-domain-cgnat`.
+- Known limitation, documented (HA rolling upgrade): masqueraded connections
+  that a 1.0 member owns do not survive a takeover by a pre-1.0 peer. The
+  older allocator cannot find their ports. This is unchanged by PERF-02.
+  Upgrade the standby, fail over to it, then upgrade the old primary, and
+  never fail back onto a peer that is not yet upgraded. The 1.0 readiness
+  digest change (DP-13/DP-15) already makes the 0.4 to 1.0 upgrade
+  non-hitless.
 - Known limitation, documented: a NIC that strips VLAN tags in hardware makes
   the parent's zone judge VLAN traffic under native XDP (DP-22); turn
   `offload rxvlan` off on such a parent.

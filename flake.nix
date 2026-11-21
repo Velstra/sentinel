@@ -414,7 +414,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-RofZEwDe3YYlYkSV0UcQ0dECng3WagQlCSo2JN9qf6M=";
+      ebpfHash = "sha256-//AseKOn/+eQ2TYVTHe0eOiA/s9+gsterUupKvyvAy4=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
@@ -1882,6 +1882,12 @@
         update-release = import ./nix/update-release-test.nix { inherit pkgs sentinel; };
         update-capacity = import ./nix/update-capacity-test.nix { inherit pkgs self; };
         napt-concurrency = import ./nix/napt-test.nix { inherit pkgs self; };
+        # PERF-02: masqueraded new-connection rate after a non-allocator NAT write.
+        nat-cps = import ./nix/nat-cps-test.nix { inherit pkgs self; };
+        # CGNAT: a 65-port (non-power-of-two) block holds 65 sockets; the 66th is refused.
+        nat-domain-cgnat = import ./nix/nat-domain-cgnat-test.nix { inherit pkgs self; };
+        # A reused client tuple's binding holds its public port through the server's TIME_WAIT.
+        nat-port-reopen = import ./nix/nat-port-reopen-test.nix { inherit pkgs self; };
         ipsec-failclosed = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; };
         ipsec-provenance = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllDirections = true; };
         ipsec-full-selectors = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllSelectors = true; };

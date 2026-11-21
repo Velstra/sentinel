@@ -1,4 +1,11 @@
-{ pkgs, self, legacyPackage ? null }:
+# legacyNode = 2 runs the reverse upgrade window (the current agent owns the
+# flow, the older one takes over). That direction is a known, documented
+# limitation (handbook "Mixed versions during an upgrade"): the older
+# allocator cannot find the current one's binding, so it is not a wired
+# check. Reproduce with an `ha-napt-mixed-version-reverse` entry in flake.nix
+# beside `ha-napt-mixed-version`, passing `legacyNode = 2`; on fabric 0422e3a
+# and 1f76ea4 alike the stream times out after takeover (WAN port 59268).
+{ pkgs, self, legacyPackage ? null, legacyNode ? 1 }:
 let
   # Test-only. On a real box Sentinel and the agent ship in one image (and an
   # A/B rollback boots both old); only this fixture pairs the CURRENT compiler
@@ -91,7 +98,7 @@ let
     networking.firewall.enable = lib.mkForce false;
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance node);
-    services.velstra.package = lib.mkIf (node == 1 && legacyPackage != null)
+    services.velstra.package = lib.mkIf (node == legacyNode && legacyPackage != null)
       (lib.mkForce legacyAgent);
     environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.tcpdump ];
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
@@ -213,7 +220,7 @@ let
             time.sleep(0.02)
   '';
 in pkgs.testers.runNixOSTest {
-  name = "sentinel-ha-two-node-established-snat-flow${pkgs.lib.optionalString (legacyPackage != null) "-mixed-version"}";
+  name = "sentinel-ha-two-node-established-snat-flow${pkgs.lib.optionalString (legacyPackage != null) "-mixed-version"}${pkgs.lib.optionalString (legacyPackage != null && legacyNode == 2) "-legacy-takes-over"}";
   nodes = {
     primary = member 1;
     secondary = member 2;
@@ -291,7 +298,18 @@ in pkgs.testers.runNixOSTest {
             print(node.name, node.execute("ip route; ip -s neigh; cat /tmp/stream-status /tmp/accepted 2>/dev/null; journalctl -u ha-flow-stream -u ha-flow-echo --no-pager -n 40")[1])
             print(node.execute("systemctl stop ha-flow-packets; ${pkgs.tcpdump}/bin/tcpdump -nn -tt -e -S -r /tmp/flow.pcap 2>/dev/null | tail -n 100")[1])
 
-    start_all()
+    # The primary must own the pair before its peer exists. Booted together,
+    # whichever member's agent comes up first promotes itself (a two-node
+    # pair has no preemption), and a secondary that booted 3 s earlier once
+    # took term 1 and failed the VIP wait below. Staged, the test decides
+    # the owner, not the boot order.
+    for node in (primary, client, server):
+        node.start()
+    primary.wait_for_unit("velstra.service")
+    primary.wait_for_unit("wren.service")
+    primary.wait_until_succeeds("ip -o address show eth1 | grep -q 10.1.0.100 && ip -o address show eth2 | grep -q 10.2.0.100", timeout=90)
+    primary.wait_until_succeeds(py('import json; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==1 and r["authority"]["term"]>0'), timeout=30)
+    secondary.start()
     primary_alive = True
     try:
         # Exactly two HA appliances and two traffic endpoints: no witness or
@@ -324,12 +342,17 @@ in pkgs.testers.runNixOSTest {
             # Actual old agent/object on owner, current object on standby.
             # Keep Python indentation literal, not stripped by a nested Nix
             # indented string. No test-written NAT or replacement program.
-            old_command = primary.succeed("systemctl show velstra.service -p ExecStart --value")
-            new_command = secondary.succeed("systemctl show velstra.service -p ExecStart --value")
+            # legacyNode 1: the old agent owns the flow and the current one
+            # takes over. legacyNode 2: the reverse, a fail-back onto a peer
+            # not yet upgraded.
+            old_node, new_node = (primary, secondary) if ${toString legacyNode} == 1 else (secondary, primary)
+            old_command = old_node.succeed("systemctl show velstra.service -p ExecStart --value")
+            new_command = new_node.succeed("systemctl show velstra.service -p ExecStart --value")
             assert "${legacyPath}/bin/velstra" in old_command, old_command
             assert "${self.packages.x86_64-linux.velstra}/bin/velstra" in new_command, new_command
             assert "${legacyPath}" != "${self.packages.x86_64-linux.velstra}"
-            assert translated["port"] == 47009, translated
+            if ${toString legacyNode} == 1:
+                assert translated["port"] == 47009, translated
         owner = json.loads(primary.succeed("cat /run/velstra/ha/role.json"))["authority"]
         # A flow entry AND a fresh complete matching-generation snapshot must
         # already exist on the real standby before disrupting its owner.
