@@ -174,6 +174,16 @@ fn now_ms() -> u64 {
     ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
 }
 
+/// True only when the journal path does not exist; any other answer (an
+/// entry of any type, an unreadable directory) is left to the locked read.
+fn no_journal(path: &Path) -> Result<bool> {
+    match journal(path).symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).context("looking for a pending configuration transaction"),
+    }
+}
+
 fn read(path: &Path) -> Result<Option<Pending>> {
     let Some(text) = system::read_owned_regular(&journal(path), 64 * 1024 * 1024)? else {
         return Ok(None);
@@ -575,6 +585,16 @@ fn recover_with(
     booting: bool,
     apply: impl FnOnce(&Appliance) -> Result<()>,
 ) -> Result<bool> {
+    // The timer ticks every second. Without a journal there is nothing to
+    // recover, and holding the configuration locks for that tick made
+    // nonblocking writers (an update job's final checkpoint, the API's update
+    // admission) fail as busy. A writer creates the journal under the same
+    // locks, so one that appears after this look is seen by the next tick.
+    // Boot and explicit requests keep taking the locks: the boot run is what
+    // creates the transaction lock as root for later sessions to share.
+    if !force && !booting && no_journal(path)? {
+        return Ok(false);
+    }
     let _lock = system::apply_lock()?;
     let _file = system::lock_config_at(&path.with_extension("transaction.lock"))?;
     let Some(mut pending) = read(path)? else {
@@ -888,6 +908,36 @@ mod tests {
         assert!(refused.to_string().contains("cannot inspect"));
         assert!(read(&path).unwrap().is_none());
         assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn idle_recovery_tick_takes_no_configuration_lock() {
+        // The timer fires every second. With no transaction journal it has
+        // nothing to do, and holding the configuration locks for that tick
+        // made every nonblocking writer that met it (an update job's final
+        // checkpoint, the API's update admission) fail as "busy".
+        use std::os::unix::io::AsRawFd;
+        let path = fixture();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("transaction.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let (done, finished) = std::sync::mpsc::channel();
+        let tick = path.clone();
+        std::thread::spawn(move || {
+            let result = recover_with(&tick, &Apply::off(), false, false, |_| {
+                panic!("nothing to recover")
+            });
+            let _ = done.send(result.map_err(|error| format!("{error:#}")));
+        });
+        let result = finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("an idle recovery tick waited for a held configuration lock");
+        assert_eq!(result, Ok(false));
+        drop(held);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
