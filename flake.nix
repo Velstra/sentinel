@@ -625,13 +625,17 @@
       # NOTE: `.#sentinel-image` by contrast builds a raw DISK IMAGE (flashable,
       # no run script) — that's why `./result/bin/run-*-vm` doesn't exist after
       # building it. Use this app to *boot*; build the image to *flash*.
-      apps.${system}.seed-image = {
-        type = "app";
-        program = "${seedImage}/bin/sentinel-seed-image";
-      };
-      apps.${system}.vm = {
-        type = "app";
-        program = "${self.nixosConfigurations.appliance.config.system.build.vm}/bin/run-${applianceData.system.hostname}-vm";
+      # One attribute set: Nix refuses a second `apps.${system}.<name>` binding
+      # ("dynamic attribute already defined"), which broke every `nix run`.
+      apps.${system} = {
+        seed-image = {
+          type = "app";
+          program = "${seedImage}/bin/sentinel-seed-image";
+        };
+        vm = {
+          type = "app";
+          program = "${self.nixosConfigurations.appliance.config.system.build.vm}/bin/run-${applianceData.system.hostname}-vm";
+        };
       };
 
       # The appliance: the base config + the Velstra data-plane service. The
@@ -1976,6 +1980,14 @@
           cp ${./tests/test_seed_image.py} tests/test_seed_image.py
           python3 -B -m unittest discover -s tests -p 'test_seed_image.py' -v 2>&1 | tee log
           ! grep -q "skipped" log
+          touch $out
+        '';
+        # The documented entry points `nix run .#seed-image` / `.#vm` must evaluate: the
+        # seeding tool is the only supported cloud provisioning path (PROV-01). Referencing
+        # the vm app's type only, so this check does not build a VM.
+        apps-evaluate = pkgs.runCommand "sentinel-apps-evaluate" { } ''
+          test -x ${self.apps.${system}.seed-image.program}
+          test "${self.apps.${system}.vm.type}" = app
           touch $out
         '';
         # STATIC-08: the console harness reaps its browser and profile on every path.
