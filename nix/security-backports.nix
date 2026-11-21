@@ -148,6 +148,45 @@ let
       patches = (old.patches or [ ]) ++ [ ./security-patches/sudo-CVE-2026-35535.patch ];
     });
 
+  # gzip 1.15 contains the pin's two CVE patches (CVE-2026-41991/-41992, the
+  # LZH decoder); the release makes the fix visible to version scanners.
+  gzip = assert pkgs.gzip.version == "1.14";
+    pkgs.gzip.overrideAttrs (old: {
+      version = "1.15";
+      src = pkgs.fetchurl {
+        url = "mirror://gnu/gzip/gzip-1.15.tar.xz";
+        hash = "sha256-mqDMeA3sFWuCgoRIM7NCq3ywjCXSzZoYac3Q3zHe/0g=";
+      };
+      patches = [ ];
+    });
+
+  # MIT krb5 1.22.3: NegoEx parsing (CVE-2026-40355/-40356, the pin's patch),
+  # rd_cred NULL dereference (CVE-2026-107778) and 20 further CVEs. The pin's
+  # two patches are upstream PRs 1505/1506, both in 1.22.3.
+  krb5 = assert pkgs.krb5.version == "1.22.2";
+    pkgs.krb5.overrideAttrs (old: {
+      version = "1.22.3";
+      src = pkgs.fetchurl {
+        url = "https://kerberos.org/dist/krb5/1.22/krb5-1.22.3.tar.gz";
+        hash = "sha256-/pCvhEGtn6mwZLjlMHfO+3gqlvimgnawMdxUrxeJ/ws=";
+      };
+      patches = [ ];
+    });
+
+  # hostapd 2.12: the pin builds CONFIG_IEEE80211BE (Wi-Fi 7 / MLO), so
+  # CVE-2026-58374 (MLO) is reachable; 2.12 fixes it and contains the pin's
+  # four security patches (advisory 2026-1, CVE-2025-24912). The OpenWrt
+  # no-scan patch, the recipe's first, stays.
+  hostapd = assert pkgs.hostapd.version == "2.11" && lib.length pkgs.hostapd.patches == 5;
+    pkgs.hostapd.overrideAttrs (old: {
+      version = "2.12";
+      src = pkgs.fetchurl {
+        url = "https://w1.fi/releases/hostapd-2.12.tar.gz";
+        hash = "sha256-9DUCVhwoukerd+GOGpc9BzYcaMyLFBeOYZvVeWtw6r0=";
+      };
+      patches = [ (lib.head old.patches) ];
+    });
+
   # IMG-02: the PAM side of imported password hashes. The management API
   # verifies $1$/$5$/$6$ with the pinned helper, but sshd, login and sudo go
   # through pam_unix and the system libcrypt, which nixpkgs builds with the
@@ -175,8 +214,8 @@ in
     description = ''
       Rewrite the system closure to the backported libcap, Net-SNMP,
       Suricata, lego, dnsproxy, SQLite, Linux-PAM, libxcrypt, iproute2,
-      cyrus-sasl, GLib and sudo builds. Disable only to compare against
-      the unpatched pin.
+      cyrus-sasl, GLib, sudo, gzip, krb5 and hostapd builds. Disable
+      only to compare against the unpatched pin.
     '';
   };
 
@@ -193,10 +232,13 @@ in
       ++ replace pkgs.iproute2 iproute2
       ++ replace pkgs.cyrus_sasl cyrus_sasl
       ++ replace pkgs.glib glib
-      ++ replace pkgs.sudo sudo;
+      ++ replace pkgs.sudo sudo
+      ++ replace pkgs.gzip gzip
+      ++ replace pkgs.krb5 krb5
+      ++ replace pkgs.hostapd hostapd;
     system.build.securityBackports = {
       inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl
-        glib sudo;
+        glib sudo gzip krb5 hostapd;
     };
     assertions = [ {
       # pam_userdb is not built (see linux-pam above); a stack that names it

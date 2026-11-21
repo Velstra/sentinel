@@ -13,6 +13,21 @@
    "fixes": "CVE-2026-90678 HTTP/3; CVE-2026-55203, CVE-2026-55204 (flake.nix haproxyFor)"
   },
   {
+   "package": "gzip",
+   "minimum": "1.15",
+   "fixes": "CVE-2026-41991, CVE-2026-41992 in a released version"
+  },
+  {
+   "package": "krb5",
+   "minimum": "1.22.3",
+   "fixes": "CVE-2026-40355, CVE-2026-40356, CVE-2026-107778 and the other 1.22.3 fixes"
+  },
+  {
+   "package": "hostapd",
+   "minimum": "2.12",
+   "fixes": "CVE-2026-58374 Wi-Fi 7 MLO"
+  },
+  {
    "package": "sqlite",
    "minimum": "3.54.1",
    "fixes": "the three High advisories fixed in 3.54.0"

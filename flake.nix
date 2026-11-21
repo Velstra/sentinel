@@ -3744,7 +3744,9 @@
         nodes.fw =
           { lib, pkgs, ... }:
           {
-            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
+            # The shipped closure's backports: the access point must come up
+            # on the hostapd the image carries (2.12), not the pin's 2.11.
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ./nix/security-backports.nix ];
             networking.hostName = lib.mkForce "fw";
             networking.firewall.enable = lib.mkForce false;
             virtualisation.vlans = [ 1 ];
@@ -3764,6 +3766,8 @@
           fw.wait_for_unit("sentinel-boot.service")
           fw.wait_until_succeeds("ip link show wlan0", timeout=60)
           fw.wait_until_succeeds("ip link show wlan1", timeout=60)
+          version = fw.succeed("hostapd -v 2>&1 || true")
+          assert "hostapd v2.12" in version, version
 
           # Inspect systemd's effective property, not just the Nix source. This
           # option belongs to [Unit]; [Service] silently ignored the old value.
