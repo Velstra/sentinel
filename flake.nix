@@ -6378,8 +6378,14 @@
           # The rule goes in through a file rather than a nested quoting cascade:
           # a Suricata rule contains quotes, spaces and `->`, and what is being
           # tested is the detector, not the test's own escaping.
+          # The watched link carries a zone. Blocking is the data plane's job,
+          # and a commit that leaves no interface zoned stops the agent (DP-12):
+          # `show ids blocks` would then have nothing to ask. Accept by default
+          # so the detector, not the policy, decides what this test sees.
           fw.succeed(
               """cat > /tmp/ids.cfg <<'CFG'
+          set interface eth1 zone lan
+          set firewall zone lan default-action accept
           set services ids interface eth1
           set services ids rule alert icmp any any -> any any (msg:"velstra ids echo request"; itype:8; sid:1000001; rev:1;)
           set services ids ruleset /var/lib/sentinel/absent.rules
@@ -6390,6 +6396,8 @@
           )
           fw.succeed("sed -i 's/^          //' /tmp/ids.cfg")
           fw.succeed("su admin -c 'sentinel configure < /tmp/ids.cfg'")
+          fw.wait_for_unit("velstra.service")
+          fw.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
           fw.succeed("test -e /run/sentinel/suricata.yaml")
           fw.wait_for_unit("sentinel-ids.service")
 
