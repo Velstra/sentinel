@@ -15323,26 +15323,30 @@
             # A failed snapshot publication is NOT a successful commit. The
             # actual CLI must return failure while retaining its armed safety
             # timer; the saved baseline stays unchanged. This is a real atomic
-            # rename failure, not a mocked apply or systemd response.
+            # rename failure, not a mocked apply or systemd response: a copy of
+            # the running file is bind-mounted over it, so every read before the
+            # apply still finds the valid, root-owned active configuration (a
+            # non-regular file there is refused before anything is applied),
+            # and only the final rename onto the mount point fails (EBUSY).
             saved_hash = machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
             machine.succeed(
-                "mv /run/sentinel/running.toml /run/sentinel/running-before-publication.toml; "
-                "mkdir -m 0700 /run/sentinel/running.toml"
+                "cp -a /run/sentinel/running.toml /run/sentinel-running-pin.toml; "
+                "mount --bind /run/sentinel-running-pin.toml /run/sentinel/running.toml"
             )
             refused = machine.fail(
                 "su admin -c \"printf '%s\\n' "
                 "'set system hostname fw-unrecorded' 'commit-confirm 10' exit "
                 "| sentinel configure 2>&1\""
             )
-            assert "candidate applied and rollback timer armed" in refused, refused
-            assert "recording the running configuration failed" in refused, refused
+            assert "candidate applied and rollback armed" in refused, refused
+            assert "recording active intent failed" in refused, refused
             machine.succeed("hostname | grep -x fw-unrecorded")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             assert machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == saved_hash
             machine.succeed(
-                "rmdir /run/sentinel/running.toml; "
-                "mv /run/sentinel/running-before-publication.toml /run/sentinel/running.toml"
+                "umount /run/sentinel/running.toml; rm /run/sentinel-running-pin.toml"
             )
+            machine.succeed("grep -q fw-base /run/sentinel/running.toml")
             machine.succeed("sentinel confirm-rollback")
             machine.succeed("hostname | grep -x fw-base")
             machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
