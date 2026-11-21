@@ -9972,23 +9972,27 @@
 
             # Zone the WAN nic; add a logged DROP on tcp/9999 and a logged PASS on
             # tcp/9997. The policy-wide log is left off, so anything that appears
-            # in the journal got there via the rule's own log bit.
+            # in the journal got there via the rule's own log bit. The traffic is
+            # addressed to the box itself, so the rules name the local zone: a
+            # deny `to wan` would be refused at commit, because a non-local `to`
+            # zone does not match the routed egress interface.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
                 "'set firewall rule watch-drop from wan' "
-                "'set firewall rule watch-drop to wan' "
+                "'set firewall rule watch-drop to firewall' "
                 "'set firewall rule watch-drop action drop' "
                 "'set firewall rule watch-drop proto tcp' "
                 "'set firewall rule watch-drop port 9999' "
                 "'set firewall rule watch-drop log true' "
                 "'set firewall rule watch-pass from wan' "
-                "'set firewall rule watch-pass to wan' "
+                "'set firewall rule watch-pass to firewall' "
                 "'set firewall rule watch-pass action accept' "
                 "'set firewall rule watch-pass proto tcp' "
                 "'set firewall rule watch-pass port 9997' "
                 "'set firewall rule watch-pass log true' "
                 "commit save exit "
+                "'set firewall zone firewall local true' "
                 "| sentinel configure\""
             )
             fw.wait_for_unit("velstra.service")
@@ -10424,13 +10428,15 @@
                      ("32", "10.1.0.5/32", 9932)]
 
             lines = ["set interface eth1 zone wan",
-                     "set firewall zone wan default-action accept"]
+                     "set firewall zone wan default-action accept",
+                     "set firewall zone firewall local true"]
             for name, cidr, port in cases:
                 lines += [f"set firewall rule len{name} from wan",
-                          f"set firewall rule len{name} to wan",
+                          f"set firewall rule len{name} to firewall",
                           f"set firewall rule len{name} action drop",
                           f"set firewall rule len{name} proto tcp",
                           f"set firewall rule len{name} port {port}",
+            # It knocks on the box's own address, hence `to firewall`.
                           f"set firewall rule len{name} source {cidr}",
                           f"set firewall rule len{name} log true"]
             script = " ".join(f"'{l}' " for l in lines)
@@ -10503,23 +10509,25 @@
 
             # Zone the WAN nic; add a logged DROP tcp/9999 whose source MATCHES the
             # client (10.1.0.2/32), and a logged DROP tcp/9997 whose source is a
-            # foreign block (10.9.9.9/32) the client can never match.
+            # foreign block (10.9.9.9/32) the client can never match. Both are
+            # `to firewall`: the client knocks on the box's own address.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
                 "'set firewall rule match-src from wan' "
-                "'set firewall rule match-src to wan' "
+                "'set firewall rule match-src to firewall' "
                 "'set firewall rule match-src action drop' "
                 "'set firewall rule match-src proto tcp' "
                 "'set firewall rule match-src port 9999' "
                 "'set firewall rule match-src source 10.1.0.2/32' "
                 "'set firewall rule match-src log true' "
                 "'set firewall rule foreign-src from wan' "
-                "'set firewall rule foreign-src to wan' "
+                "'set firewall rule foreign-src to firewall' "
                 "'set firewall rule foreign-src action drop' "
                 "'set firewall rule foreign-src proto tcp' "
                 "'set firewall rule foreign-src port 9997' "
                 "'set firewall rule foreign-src source 10.9.9.9/32' "
+                "'set firewall zone firewall local true' "
                 "'set firewall rule foreign-src log true' "
                 "commit save exit "
                 "| sentinel configure\""
