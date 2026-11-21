@@ -1774,7 +1774,7 @@ pub(crate) fn retire_login_account(
         "managed login UID changed; refusing to retire a different identity"
     );
     anyhow::ensure!(
-        actual_uid != unsafe { libc::geteuid() },
+        actual_uid != commit_caller_uid(),
         "cannot retire the account running this commit; use another administrator or the root recovery console"
     );
     run_priv("usermod", &["-L", "-e", "1970-01-02", user])?;
@@ -2837,6 +2837,35 @@ pub fn is_root() -> bool {
     (unsafe { libc::geteuid() }) == 0
 }
 
+/// The account running this commit: the effective user, or — in a root
+/// process sudo started — the operator sudo authenticated (`SUDO_UID`).
+///
+/// An operator's `configure` re-executes itself once through sudo (see
+/// `escalate`), so its effective uid is 0 while the commit is still that
+/// operator's. Guards that refuse to retire or demote "the account running
+/// this commit" must judge that operator, not root. Only a canonical managed
+/// login uid is taken; anything else falls back to the effective uid. A root
+/// process can set `SUDO_UID` itself, but that only makes the guard refuse
+/// more, never less.
+pub(crate) fn commit_caller_uid() -> u32 {
+    commit_caller_uid_from(
+        unsafe { libc::geteuid() },
+        std::env::var("SUDO_UID").ok().as_deref(),
+    )
+}
+
+fn commit_caller_uid_from(euid: u32, sudo_uid: Option<&str>) -> u32 {
+    if euid != 0 {
+        return euid;
+    }
+    sudo_uid
+        .and_then(|value| {
+            let uid: u32 = value.parse().ok()?;
+            (value == uid.to_string() && managed_login_uid(uid)).then_some(uid)
+        })
+        .unwrap_or(euid)
+}
+
 fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
     run_priv_with(cmd, &bin(cmd), args, is_root(), |program, arguments| {
         Command::new(program)
@@ -2895,6 +2924,24 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_escalated_session_runs_as_the_operator_sudo_authenticated() {
+        assert_eq!(super::commit_caller_uid_from(0, Some("1001")), 1001);
+        assert_eq!(super::commit_caller_uid_from(0, None), 0, "root console");
+        assert_eq!(
+            super::commit_caller_uid_from(1001, Some("1002")),
+            1001,
+            "a non-root process is its own effective user"
+        );
+        for invalid in ["", "x", "01001", "+1001", "0", "999", "65534", "4294967295"] {
+            assert_eq!(
+                super::commit_caller_uid_from(0, Some(invalid)),
+                0,
+                "SUDO_UID {invalid:?} is not a managed login"
+            );
+        }
+    }
+
     use super::*;
 
     /// boothealth: removing the last zone binding stops a persisting agent;
