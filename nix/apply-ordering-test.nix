@@ -94,5 +94,23 @@ pkgs.testers.runNixOSTest {
         machine.fail("ip -4 address show mgmt0 | grep -q '192.0.3.1/24'")
         machine.succeed("ip -4 route show exact 198.51.100.10/32 | grep -q 'via 192.0.2.2'")
         machine.succeed("ping -c 3 -W 2 198.51.100.10")
+
+    with subtest("an uplink the same commit creates is hooked after it exists"):
+        # The only zoned link is a VLAN this commit adds. The agent's uplink
+        # (`--iface`) must exist when it starts, so the firewall stage keeps
+        # the running launch settings and the uplink moves, with one restart,
+        # once networkd has created the VLAN; restarting onto it earlier made
+        # the agent exit and the commit fail.
+        configure([
+            "delete interface enp42s0 zone",
+            "set interface wan10 parent enp42s0",
+            "set interface wan10 vlan 10",
+            "set interface wan10 zone wan",
+            "set interface wan10 address 192.0.4.1/24",
+        ])
+        machine.succeed("grep -Fx VELSTRA_IFACE=wan10 /run/sentinel/velstra.env")
+        machine.succeed("systemctl is-active velstra.service")
+        machine.succeed("ip -details link show wan10 | grep -q prog/xdp")
+        machine.succeed("ping -c 3 -W 2 198.51.100.10")
   '';
 }
