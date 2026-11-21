@@ -150,16 +150,24 @@ let
             "success_resets_origin_and_account_budgets_four_times": True}
 
     elif mode == "account":
+        # CTRL-27: the distributed bound is per account from origins that never
+        # signed it in (SIGN_IN_PER_ACCOUNT_NEW_ORIGINS, 100 per 10 min); an
+        # origin that did is exempt. .43 signs in first (one new-origin attempt,
+        # then trusted); 99 failures from 20 never-trusted origins (<= 5 each,
+        # under the per-source and per-pair 10) spend the rest of the budget.
         accepted(login("10.1.0.43", username="budget-victim"), "read-only")
-        guesses = [{"source": "10.1.0." + str(43 + index % 4),
-            "username": "budget-victim", "password": "wrong-password"} for index in range(30)]
+        guesses = [{"source": "10.1.0." + str(20 + index % 20),
+            "username": "budget-victim", "password": "wrong-password"} for index in range(99)]
         results = parallel(guesses)
         for result in results:
             refused(result, 401)
-        refused(login("10.1.0.47", username="budget-victim"), 429, "for this account")
+        refused(login("10.1.0.47", username="budget-victim"), 429,
+            "for this account from new addresses")
+        accepted(login("10.1.0.43", username="budget-victim"), "read-only")
         accepted(login("10.1.0.47"))
-        records[mode] = {"initial_correct_password_works": True, "distributed_failures": 30,
+        records[mode] = {"initial_correct_password_works": True, "distributed_failures": 99,
             "fresh_origin_correct_password_refused": True,
+            "known_origin_correct_password_works": True,
             "different_account_same_origin_works": True}
 
     elif mode == "ipv6":
