@@ -146,8 +146,8 @@ pkgs.testers.runNixOSTest {
                 "| grep -q 'hold-links-down: tenant0 kept up: its pinned datapath hooks are still attached'",
                 timeout=30,
             )
-            log = fw.succeed(f"journalctl --after-cursor='{cursor}' -u velstra.service")
-            assert "tenant0 held until the data plane hooks it again" not in log, log
+            journal = fw.succeed(f"journalctl --after-cursor='{cursor}' -u velstra.service")
+            assert "tenant0 held until the data plane hooks it again" not in journal, journal
             fw.wait_until_succeeds("systemctl is-active velstra.service", timeout=30)
             fw.succeed("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'")
             fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
