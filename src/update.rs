@@ -37,6 +37,7 @@ use crate::config::UpdateChannel;
 use crate::system;
 
 mod freshness;
+mod timestamp;
 pub use freshness::Freshness;
 
 /// A signed release manifest: the small JSON document, signed by the pinned key,
@@ -1358,6 +1359,177 @@ mod tests {
             std::fs::write(dir.join("release.json"), invalid).unwrap();
             assert!(check(&chan).is_err());
         }
+    }
+
+    fn openssl(args: &[&str]) {
+        let output = Command::new(openssl_bin()).args(args).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// ENT-03 reader, end to end through the shipped observation path: an
+    /// expired manifest is accepted only with a fresh timestamp for exactly
+    /// its bytes, under a pinned key that is not the release key.
+    #[test]
+    fn an_expired_manifest_is_installable_only_under_a_bound_fresh_channel_timestamp() {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let dir = Scratch::new().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(dir.join("image.raw"), b"image").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "version": "9.1.0", "image": "image.raw",
+            "sha256": sha256_hex(&dir.join("image.raw")).unwrap(), "product": PRODUCT,
+            "freshness": {"schema":1,"channel":"enterprise","arch":std::env::consts::ARCH,
+                "sequence":5,"issued_at": now - 20 * 86400, "expires_at": now - 6 * 86400},
+        }))
+        .unwrap();
+        let mut chan = signed_channel(&dir, &body);
+        chan.name = Some("enterprise".into());
+        let manifest_sha256 = digest_hex(&body);
+        for name in ["ts", "other"] {
+            let key = dir.join(&format!("{name}.key"));
+            openssl(&["genpkey", "-algorithm", "ED25519", "-out", s(&key).unwrap()]);
+            let public = dir.join(&format!("{name}.pem"));
+            openssl(&[
+                "pkey",
+                "-in",
+                s(&key).unwrap(),
+                "-pubout",
+                "-out",
+                s(&public).unwrap(),
+            ]);
+        }
+        let publish = |signer: &str, change: &dyn Fn(&mut serde_json::Value)| {
+            let mut document = serde_json::json!({
+                "schema": 1, "role": "timestamp", "channel": "enterprise",
+                "arch": std::env::consts::ARCH, "manifest_sha256": manifest_sha256,
+                "sequence": 5, "issued_at": now - 60, "expires_at": now + 3600,
+            });
+            change(&mut document);
+            let document = serde_json::to_vec(&document).unwrap();
+            std::fs::write(dir.join("ts-document"), &document).unwrap();
+            let signature = dir.join("ts-document.sig");
+            let _ = std::fs::remove_file(&signature);
+            openssl(&[
+                "pkeyutl",
+                "-sign",
+                "-rawin",
+                "-inkey",
+                s(&dir.join(signer)).unwrap(),
+                "-in",
+                s(&dir.join("ts-document")).unwrap(),
+                "-out",
+                s(&signature).unwrap(),
+            ]);
+            let envelope = serde_json::json!({"schema": 1, "timestamp": b64(&document),
+                "signature": b64(&std::fs::read(&signature).unwrap())});
+            std::fs::write(
+                dir.join("timestamp.json"),
+                serde_json::to_vec(&envelope).unwrap(),
+            )
+            .unwrap();
+        };
+        let trust = dir.join("trust");
+        let check = |key: &Path| {
+            check_offer_using(&chan, |offer| {
+                freshness::observe_test_with_key(&chan, offer, &trust, key)
+            })
+        };
+        let pinned = dir.join("ts.pem");
+        // No pinned timestamp key: exactly the old behaviour.
+        publish("ts.key", &|_| {});
+        let error = check(&dir.join("absent.pem")).unwrap_err().to_string();
+        assert!(error.contains("expired"), "{error}");
+        // Pinned key and a bound, fresh timestamp: accepted, at the offer and
+        // at the pre-write recheck alike.
+        let offer = check(&pinned).unwrap();
+        assert_eq!(offer.manifest_sha256, manifest_sha256);
+        freshness::observe_test_with_key(&chan, &offer, &trust, &pinned).unwrap();
+        // Refusals: wrong signer, swapped channel, wrong digest, older and
+        // newer sequence, an expired timestamp. (The 90-day ceiling and the
+        // remaining window rules are vectors in `timestamp::tests`.)
+        type Change = fn(&mut serde_json::Value);
+        let refusals: &[(&str, &str, &str, Change)] = &[
+            (
+                "wrong key",
+                "other.key",
+                "does not match the pinned key",
+                |_| {},
+            ),
+            ("swapped channel", "ts.key", "scope differs", |v| {
+                v["channel"] = "community".into()
+            }),
+            ("wrong digest", "ts.key", "does not bind", |v| {
+                v["manifest_sha256"] = "00".repeat(32).into()
+            }),
+            ("older sequence", "ts.key", "does not bind", |v| {
+                v["sequence"] = 4.into()
+            }),
+            ("newer sequence", "ts.key", "does not bind", |v| {
+                v["sequence"] = 6.into()
+            }),
+            (
+                "expired timestamp",
+                "ts.key",
+                "channel timestamp expired",
+                |v| {
+                    let now = v["issued_at"].as_u64().unwrap() + 60;
+                    v["issued_at"] = (now - 7200).into();
+                    v["expires_at"] = (now - 1).into();
+                },
+            ),
+        ];
+        for (name, signer, reason, change) in refusals {
+            publish(signer, change);
+            let error = format!("{:#}", check(&pinned).unwrap_err());
+            assert!(error.contains(reason), "{name}: {error}");
+        }
+        // The release key can never act as the timestamp key.
+        publish("release.key", &|_| {});
+        let error = check(&dir.join("release.pub")).unwrap_err();
+        assert!(format!("{error:#}").contains("must differ"), "{error:#}");
+        // A channel without timestamp.json still refuses the expired manifest.
+        std::fs::remove_file(dir.join("timestamp.json")).unwrap();
+        let error = check(&pinned).unwrap_err().to_string();
+        assert!(error.contains("publishes no timestamp"), "{error}");
+        // The clock is read again after the timestamp fetch: one that lapses
+        // while it downloads is refused, not judged by the earlier reading.
+        publish("ts.key", &|_| {});
+        let late = std::cell::Cell::new(false);
+        let error = check_offer_using(&chan, |offer| {
+            freshness::observe_test_with_clock(&chan, offer, &trust, &pinned, || {
+                Ok(if late.replace(true) { now + 3600 } else { now })
+            })
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("channel timestamp expired too"),
+            "{error:#}"
+        );
+        // A current manifest never needs (or fetches) a timestamp.
+        let fresh = serde_json::to_vec(&serde_json::json!({
+            "version": "9.1.0", "image": "image.raw",
+            "sha256": sha256_hex(&dir.join("image.raw")).unwrap(), "product": PRODUCT,
+            "freshness": {"schema":1,"channel":"enterprise","arch":std::env::consts::ARCH,
+                "sequence":6,"issued_at": now - 60, "expires_at": now + 3600},
+        }))
+        .unwrap();
+        std::fs::write(dir.join("manifest.json"), &fresh).unwrap();
+        openssl(&[
+            "pkeyutl",
+            "-sign",
+            "-rawin",
+            "-inkey",
+            s(&dir.join("release.key")).unwrap(),
+            "-in",
+            s(&dir.join("manifest.json")).unwrap(),
+            "-out",
+            s(&dir.join("manifest.json.sig")).unwrap(),
+        ]);
+        check(&pinned).unwrap();
     }
 
     /// A `file://` channel whose `manifest.json` is `body`, signed by a fresh
