@@ -5772,7 +5772,12 @@
             for m in (n1, n2):
                 m.wait_for_unit("multi-user.target")
                 # The appliance's own agent would hold eth1; this test needs it.
+                # A stopped agent deliberately leaves its pinned hooks enforcing
+                # (DP-12), so release those pins too, and prove eth1 is bare
+                # before the test's own agents attach to it.
                 m.succeed("systemctl stop velstra.service")
+                m.succeed("rm -rf /sys/fs/bpf/velstra")
+                m.wait_until_fails("ip -d link show eth1 | grep -q xdp", timeout=10)
 
             # Each locator is a routed /64, so the two ends can actually reach each
             # other. Asserted before anything is sent: a green run against a dead
