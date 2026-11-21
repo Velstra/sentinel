@@ -1878,6 +1878,8 @@
         update-release = import ./nix/update-release-test.nix { inherit pkgs sentinel; };
         update-capacity = import ./nix/update-capacity-test.nix { inherit pkgs self; };
         napt-concurrency = import ./nix/napt-test.nix { inherit pkgs self; };
+        # PERF-02: masqueraded new-connection rate after a non-allocator NAT write.
+        nat-cps = import ./nix/nat-cps-test.nix { inherit pkgs self; };
         ipsec-failclosed = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; };
         ipsec-provenance = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllDirections = true; };
         ipsec-full-selectors = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllSelectors = true; };

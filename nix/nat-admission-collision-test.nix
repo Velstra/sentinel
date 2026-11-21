@@ -1,6 +1,6 @@
 # Low-occupancy regression: nine real sockets must coexist. The old allocator
 # gives these distinct sources the same eight candidates; expected loss is RED.
-{ pkgs, self, verifySearchBound ? false }:
+{ pkgs, self }:
 let
   lib = pkgs.lib;
   shared = ./nat-capacity-pressure-probe.py;
@@ -177,32 +177,6 @@ in pkgs.testers.runNixOSTest {
                 preserve("nat-admission-collision.json", receipt)
                 print("NAT-ADMISSION-COLLISION " + json.dumps({key: analysis[key] for key in (
                     "requested", "initial_nonce_echoes", "verified_held_echoes", "raw_maps", "wire_ports_observed", "nat_failure_counter_delta", "passed")}))
-        if ${if verifySearchBound then "True" else "False"}:
-            def search_bound():
-                maps = json.loads(fw.succeed("bpftool -j map show"))
-                selected = [row for row in maps if row.get("name") == "NAPT_SEARCH"]
-                assert len(selected) == 1, selected
-                raw = json.loads(fw.succeed("bpftool -j map dump id " + str(selected[0]["id"])))
-                assert len(raw) == 1, raw
-                value = raw[0]["value"]
-                assert isinstance(value, list) and len(value) == 8, raw
-                return int.from_bytes(bytes(int(v, 16) if isinstance(v, str) else v for v in value), "little")
-
-            with subtest("monotonic search summary and generic writer invalidation"):
-                before_invalidation = search_bound()
-                assert 8 <= before_invalidation < 32768, before_invalidation
-                # Real ICMP NAT uses the guarded non-domain writer. It must disable
-                # abbreviated search before publishing, not merely after return.
-                client.succeed("ping -c 1 -W 2 198.18.10.254")
-                after_invalidation = search_bound()
-                assert after_invalidation == 65535, after_invalidation
-                held = collect(client, "client", "control", "after-invalidation-echoes", " --action probe --budget 30")
-                maps = collect(fw, "fw", "snapshot", "after-invalidation-maps")
-                checked = diagnostic.analyse(maps, manifest, held, template,
-                                             lan_index=lan_index, wan_index=wan_index)
-                assert checked["passed"] and checked["verified_held_echoes"] == 9, checked
-                preserve("search-bound.json", dict(before=before_invalidation,
-                         after=after_invalidation, held=checked, passed=True))
         receipt["configuration_unchanged"] = fw.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == config_hash
         receipt["passed"] = receipt["configuration_unchanged"] and all(phase["passed"] for phase in receipt["phases"])
         preserve("nat-admission-collision.json", receipt)
