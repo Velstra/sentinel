@@ -234,6 +234,13 @@ These cases are exercised by `checks.ha-witness-failover`:
   default) after it resumes, its data plane can still consider its old lease
   valid while the witness has already granted the peer. Drain or demote an
   active member before migrating or suspending it.
+  Its wall clock also falls behind by the pause until NTP corrects it. Both
+  members answer WireGuard peers with one shared identity, and a peer accepts
+  a handshake from that identity only with a newer timestamp than the last
+  one, so after the lagging member takes over (for example by preempting
+  back), WireGuard tunnels through it stall for up to its clock offset. Keep
+  both members time-synchronised (`services ntp upstream`), and let NTP
+  correct a resumed member before it takes over again.
 - **Agent crash while the witness is away**: both members end up unable to use
   their state; once the witness returns, the pair opens a new epoch on its own
   (see Standby readiness). Expect a short outage and new connections.

@@ -366,10 +366,21 @@ in pkgs.testers.runNixOSTest {
     # Its clock stops with it. A resumed member must become an eligible, caught
     # up standby again by itself, and the pair must survive the NEXT failure
     # too, without restarting velstra anywhere.
+    def resume(node):
+        node.send_monitor_command("cont")
+        # The members share one WireGuard identity, and a peer accepts a
+        # handshake from it only with a newer wall-clock timestamp than the
+        # last one. A resumed VM's wall clock is behind by its pause, so its
+        # handshakes were refused until its clock passed its peer's last one
+        # (master 13.5 s and backup 8.3 s behind after these pauses). Members
+        # run NTP; step the resumed wall clock as a time sync would. Leases
+        # run on CLOCK_BOOTTIME, which this leaves stopped as before.
+        if ${if wireguard then "True" else "False"}:
+            node.succeed(f"date -u -s @{time.time():.6f}")
     def pause(node, seconds):
         node.send_monitor_command("stop")
         time.sleep(seconds)
-        node.send_monitor_command("cont")
+        resume(node)
     # (1) The owner pauses: the standby takes over; the owner returns, catches
     # up from its successor and (preempt) takes ownership back.
     # The stream must be alive going in, or a pause could not be judged.
@@ -379,7 +390,7 @@ in pkgs.testers.runNixOSTest {
     wait_forwarding("owner VM paused",started,max(5.0,handover_bound),paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(8)
-    master.send_monitor_command("cont")
+    resume(master)
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
     master.wait_until_succeeds(agent_caught_up(master),timeout=20)
     check_stream("paused owner resumed and preempted")
@@ -392,7 +403,7 @@ in pkgs.testers.runNixOSTest {
     wait_forwarding("second consecutive pause failover",started,max(5.0,handover_bound),paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(3)
-    master.send_monitor_command("cont")
+    resume(master)
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
     check_stream("both members recovered from VM pauses")
     ''}
