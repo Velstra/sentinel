@@ -33,6 +33,16 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("sentinel-boot.service")
     machine.wait_for_unit("velstra.service")
     machine.wait_for_unit("wren.service")
+    # velstra.service is active from the moment the agent process starts, but
+    # it attaches its hooks to eth1 seconds later. A ping sent while the
+    # egress and XDP hooks were going on was lost (its request left 0.4 s
+    # before "attached to eth1"), so judge the link once the running
+    # invocation reports its data plane live.
+    machine.wait_until_succeeds(
+        "journalctl --no-pager _SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value velstra.service)"
+        " | grep -qF 'Velstra is live.'",
+        timeout=60,
+    )
     machine.succeed("ping -c 1 -W 2 10.10.0.2")
     try:
         machine.succeed("${pkgs.python3}/bin/python3 -B ${./sentinel-wren-adapter-probe.py}", timeout=360)
