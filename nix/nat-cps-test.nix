@@ -10,9 +10,11 @@
 # Floor: 2000 new connections/s, offered open-loop for 10 s per phase, every
 # one of them completed, at most 1 % needing a SYN retransmission. That is
 # 4x the live collapse and well under what the routed path did on the same
-# hardware (14k/s); the per-phase binding count (20000) stays inside one
-# remote endpoint's 32768-port domain within the 30 s closing lifetime, so a
-# failure here is the allocator, not port exhaustion. The client's own lag is
+# hardware (14k/s). A cleanly closed binding holds its port for 120 s, so the
+# second phase meets the first phase's bindings still in place: about 25,000
+# of one remote endpoint's 32768 ports in use (measured), below the 80 % fill
+# at which the 128-probe window refuses nothing. A failure here is the
+# allocator or a binding's lifetime, not port exhaustion. The client's own lag is
 # asserted too, so a client that cannot offer the rate fails as invalid
 # rather than passing or failing for the wrong reason.
 let
@@ -183,8 +185,11 @@ pkgs.testers.runNixOSTest {
 
     for phase in ["first", "after-expiry"]:
         if phase == "after-expiry":
-            # Let the first phase's closing bindings expire and be reclaimed:
-            # the second phase meets the table the first one left behind.
+            # Past the 30 s firewall closing timeout and inside the server's
+            # 60 s TIME_WAIT: the second phase meets the table the first one
+            # left behind, with its reset bindings already expired and its
+            # clean ones still held (120 s). Reused client tuples and
+            # reissued public ports both happen here.
             fw.sleep(45)
         counters = stats()
         runtime = egress_runtime()
