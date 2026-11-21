@@ -140,8 +140,16 @@ pkgs.testers.runNixOSTest {
         local_probe("policy-removal-recovers", True)
         configure(["set interface eth1 address 198.18.88.100/24"])
         local_probe("static-interface-has-no-DHCP-exemption", False)
+        static_since = int(firewall.succeed("date +%s").strip())
         configure(["set interface eth1 address dhcp"])
+        # The static address was the leased one, so its presence alone proves
+        # nothing: wait for a lease networkd wrote after the switch back.
+        firewall.wait_until_succeeds("test $(stat -c %Y " + client_lease + ") -ge " + str(static_since), timeout=75)
         firewall.wait_until_succeeds("ip -o -4 address show dev eth1 | grep -q '198.18.88.100/'", timeout=75)
+        # As after the first lease: the agent refreshes its host snapshot for
+        # the new address under its closed update gate. A probe sent into that
+        # refresh is dropped by design (fail-closed), not refused by policy.
+        firewall.sleep(3)
         local_probe("declared-client-reenabled", True)
         Path(os.environ["out"], "late-dhcp-client.json").write_text(json.dumps({
             "server_started_after_real_XDP_attachment": True,
