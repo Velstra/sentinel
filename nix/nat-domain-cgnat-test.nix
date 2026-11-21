@@ -134,7 +134,11 @@ in pkgs.testers.runNixOSTest {
         fw.wait_until_succeeds("${command} snapshot --output /run/qa-domain-baseline.json", timeout=30)
         baseline = read_json(fw, "/run/qa-domain-baseline.json")
         preserve("baseline-raw-maps.json", baseline)
-        assert all(baseline["maps"][name]["raw_count"] == 0 for name in ("CONNTRACK", "FW_FLOWS", "SYN_FLOWS"))
+        # Only NAT state must be empty: the LAN client's own link-local
+        # multicast (LLMNR to 224.0.0.252 and ff02::1:3, UDP 5355) already
+        # holds firewall flows, and later phases count CONNTRACK only.
+        receipt["baseline_counts"] = {name: row["raw_count"] for name, row in baseline["maps"].items()}
+        assert baseline["maps"]["CONNTRACK"]["raw_count"] == 0, receipt["baseline_counts"]
         for name in ("eth1", "eth2"):
             fw.wait_until_succeeds("ip -details link show " + name + " | grep -q prog/xdp", timeout=30)
         fw.succeed("sentinel config check /var/lib/sentinel/appliance.toml")
