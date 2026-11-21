@@ -115,10 +115,37 @@ let
   withoutDb = drv: lib.filter (input: (input.pname or "") != "db") drv.buildInputs;
   iproute2 = assert pkgs.iproute2.version == "7.0.0";
     pkgs.iproute2.overrideAttrs (old: { buildInputs = withoutDb old; });
+  # SRP (CVE-2026-129483, server authentication bypass in the SRP plugin) is
+  # off by upstream default; disabling it explicitly makes its absence a build
+  # property, and the install check refuses a build that has the plugin.
   cyrus_sasl = assert pkgs.cyrus_sasl.version == "2.1.28";
     pkgs.cyrus_sasl.overrideAttrs (old: {
       buildInputs = withoutDb old;
-      configureFlags = old.configureFlags ++ [ "--with-dblib=none" ];
+      configureFlags = old.configureFlags ++ [ "--with-dblib=none" "--disable-srp" ];
+      # stdenv sets nullglob: a pattern that matches nothing expands to
+      # nothing, so test each match rather than `ls` the pattern. The PLAIN
+      # plugin must be there, or this is looking in the wrong directory.
+      postInstall = (old.postInstall or "") + ''
+        test -e "$out/lib/sasl2/libplain.so"
+        for plugin in "$out"/lib/sasl2/libsrp*; do
+          echo "cyrus-sasl: the SRP plugin was built despite --disable-srp: $plugin" >&2
+          exit 1
+        done
+      '';
+    });
+
+  # GLib: D-Bus introspection XML parser state confusion, out-of-bounds read
+  # (CVE-2026-58016); upstream c9da977c, first released in 2.89.0.
+  glib = assert pkgs.glib.version == "2.88.3";
+    pkgs.glib.overrideAttrs (old: {
+      patches = (old.patches or [ ]) ++ [ ./security-patches/glib-CVE-2026-58016.patch ];
+    });
+
+  # sudo: the mailer ran with the invoking user's group (CVE-2026-35535);
+  # upstream 3e474c2, which also makes a failed uid/gid/groups change fatal.
+  sudo = assert pkgs.sudo.version == "1.9.17p2";
+    pkgs.sudo.overrideAttrs (old: {
+      patches = (old.patches or [ ]) ++ [ ./security-patches/sudo-CVE-2026-35535.patch ];
     });
 
   # IMG-02: the PAM side of imported password hashes. The management API
@@ -147,7 +174,9 @@ in
     default = true;
     description = ''
       Rewrite the system closure to the backported libcap, Net-SNMP,
-      Suricata, lego, dnsproxy, SQLite, Linux-PAM and libxcrypt builds. Disable only to compare against the unpatched pin.
+      Suricata, lego, dnsproxy, SQLite, Linux-PAM, libxcrypt, iproute2,
+      cyrus-sasl, GLib and sudo builds. Disable only to compare against
+      the unpatched pin.
     '';
   };
 
@@ -162,9 +191,12 @@ in
       ++ replace pkgs.sqlite sqlite
       ++ replace pkgs.linux-pam linux-pam
       ++ replace pkgs.iproute2 iproute2
-      ++ replace pkgs.cyrus_sasl cyrus_sasl;
+      ++ replace pkgs.cyrus_sasl cyrus_sasl
+      ++ replace pkgs.glib glib
+      ++ replace pkgs.sudo sudo;
     system.build.securityBackports = {
-      inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl;
+      inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl
+        glib sudo;
     };
     assertions = [ {
       # pam_userdb is not built (see linux-pam above); a stack that names it
