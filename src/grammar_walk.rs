@@ -554,10 +554,31 @@ struct Ground {
 }
 
 fn ground(dir: &std::path::Path, key: usize, extra: &[&str]) -> Ground {
-    let path = dir.join(format!("base-{key}.toml"));
+    try_ground(dir, &format!("base-{key}"), None, BASE, extra).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`ground`] from an optional saved file `seed` and any starting lines,
+/// reporting the first line refused instead of panicking — a leaf's context
+/// may itself need [`BASE`].
+fn try_ground(
+    dir: &std::path::Path,
+    name: &str,
+    seed: Option<&str>,
+    base: &[&str],
+    extra: &[&str],
+) -> Result<Ground, String> {
+    let path = dir.join(format!("{name}.toml"));
     let _ = std::fs::remove_file(&path);
-    let mut s = Session::load(&path).expect("empty session");
-    for line in BASE.iter().chain(extra.iter()) {
+    if let Some(text) = seed {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, text).map_err(|e| format!("seed: {e}"))?;
+        // Admission reads a saved file only when group and others cannot write
+        // it, whatever the umask of the machine running the test.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("seed mode: {e}"))?;
+    }
+    let mut s = Session::load(&path).map_err(|e| format!("seed session: {e}"))?;
+    for line in base.iter().chain(extra.iter()) {
         let mut toks: Vec<&str> = line.split_whitespace().collect();
         let cmd = toks.remove(0);
         let r = if cmd == "delete" {
@@ -565,14 +586,15 @@ fn ground(dir: &std::path::Path, key: usize, extra: &[&str]) -> Ground {
         } else {
             s.set(&toks)
         };
-        r.unwrap_or_else(|e| panic!("context line {line:?}: {e}"));
+        r.map_err(|e| format!("context line {line:?}: {e}"))?;
     }
-    s.save(Some(&path)).expect("save ground");
-    Ground {
-        toml: std::fs::read_to_string(&path).unwrap(),
-        show: Session::load(&path).unwrap().show(),
+    s.save(Some(&path))
+        .map_err(|e| format!("save ground: {e}"))?;
+    Ok(Ground {
+        toml: std::fs::read_to_string(&path).map_err(|e| e.to_string())?,
+        show: Session::load(&path).map_err(|e| e.to_string())?.show(),
         path,
-    }
+    })
 }
 
 struct Outcome {
@@ -846,6 +868,116 @@ fn every_settable_path_is_accepted_shown_persisted_and_deletable() {
         report.display(),
         bad.iter()
             .take(40)
+            .map(|b| format!("  [{}] {} — {}", b.stage, b.line, b.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The saved file [`every_settable_path_persists_on_an_empty_configuration`]
+/// starts from. Loaded, not built with `set`: a session loaded from a file
+/// holds every section at its serde default — the state of a box configured
+/// from what it booted — while lines typed into an empty session leave some
+/// postures unset, and an unset posture serializes as a non-default one
+/// (`fail_closed = false`) that keeps its section in the file anyway.
+const ALONE: &str = "[system]\nhostname = \"walker\"\n";
+
+/// Every settable path, set **alone** on an otherwise empty configuration,
+/// survives a commit, a save and a re-load.
+///
+/// The walk above starts from [`BASE`], which already fills the firewall, NAT,
+/// policy, PKI and VRF sections. A section's serde skip predicate that forgets
+/// one of its fields is invisible there: the section is written anyway because
+/// a sibling the predicate does check is set. `firewall syn-protect` was
+/// exactly that — kept beside the base's zones and rules, silently dropped on
+/// its own, so the proxy ran after `commit` and was gone from `running.toml`
+/// and the next boot (DP-31-persist). Starting from nothing makes the leaf the
+/// only reason its section exists, so every skip predicate is judged by every
+/// field the grammar can set — with no list of either kept here.
+///
+/// A leaf the empty configuration cannot hold (its context, its value or its
+/// commit needs an object from [`BASE`]) is skipped: the walk above judges it.
+#[test]
+fn every_settable_path_persists_on_an_empty_configuration() {
+    let leaves = walk_leaves();
+    let dir = std::env::temp_dir().join(format!("sentinel-walk-alone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut grounds: Vec<(Vec<&'static str>, Option<Ground>)> = Vec::new();
+    let mut lost: Vec<Outcome> = Vec::new();
+    let mut judged: Vec<String> = Vec::new();
+
+    for leaf in &leaves {
+        let extra = context_for(&leaf.path);
+        let idx = match grounds.iter().position(|(k, _)| *k == extra) {
+            Some(i) => i,
+            None => {
+                let name = format!("alone-{}", grounds.len());
+                let ground = try_ground(&dir, &name, Some(ALONE), &[], &extra).ok();
+                grounds.push((extra.clone(), ground));
+                grounds.len() - 1
+            }
+        };
+        let Some(g) = &grounds[idx].1 else {
+            continue;
+        };
+        let Ok(toks) = accepted_line(leaf, &g.path) else {
+            continue;
+        };
+        let line = format!("set {}", toks.join(" "));
+        let view: Vec<&str> = toks.iter().map(String::as_str).collect();
+
+        let p = dir.join("one.toml");
+        let _ = std::fs::remove_file(&p);
+        std::fs::copy(&g.path, &p).unwrap();
+        let mut s = Session::load(&p).unwrap();
+        s.set(&view).unwrap();
+        let after_show = s.show();
+        if s.commit().is_err() {
+            continue;
+        }
+        s.save(Some(&p)).expect("save");
+        let after_toml = std::fs::read_to_string(&p).unwrap();
+        if after_show == g.show {
+            // The value already was the value: nothing to persist.
+            continue;
+        }
+        judged.push(line.clone());
+        if after_toml == g.toml {
+            lost.push(Outcome {
+                line,
+                stage: "unsaved",
+                detail: "shown in the candidate, absent from the saved file".into(),
+            });
+        } else if Session::load(&p).unwrap().show() != after_show {
+            lost.push(Outcome {
+                line,
+                stage: "persisted",
+                detail: "the saved configuration reads back differently".into(),
+            });
+        }
+    }
+
+    // The walk must have judged something real, including the setting that
+    // motivated it — otherwise a broken walker reports a clean tree.
+    assert!(
+        judged.len() > 200,
+        "only {} paths could be judged alone — the walker is broken",
+        judged.len()
+    );
+    assert!(
+        judged
+            .iter()
+            .any(|l| l.starts_with("set firewall syn-protect")),
+        "the walk never set `firewall syn-protect` on its own"
+    );
+    assert!(
+        lost.is_empty(),
+        "{} of {} paths set alone are lost on save:\n{}",
+        lost.len(),
+        judged.len(),
+        lost.iter()
             .map(|b| format!("  [{}] {} — {}", b.stage, b.line, b.detail))
             .collect::<Vec<_>>()
             .join("\n")

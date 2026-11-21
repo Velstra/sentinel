@@ -176,7 +176,8 @@ This catalog preserves the existing task lookup for protocol and service fixture
 | Check | Intended fixture scope |
 |---|---|
 | `nat` | Packet translations and stateful reverse-path handling. |
-| `synproxy` | Exercises the configured SYN proxy with a real connection, and that a LAN client's outbound SYN to the protected port is not proxied. |
+| `synproxy` | Exercises the configured SYN proxy with a real connection, and that a LAN client's outbound SYN to the protected port is not proxied, and a server that speaks first answers through the proxy. |
+| `synproxy-edge` | SYN proxy on a deny-by-default masquerading edge box: a port-forward that remaps its port, servers that speak first (routed and port-forwarded), and `syn-protect` surviving save, an unrelated commit and a reboot |
 | `masq` | masquerade SNATs a private LAN client out of the WAN address |
 | `hairpin` | an internal client reaches a port-forwarded service via the box's **own** public IP |
 | `npt66` | stateless, checksum-neutral IPv6 prefix translation (RFC 6296) |
