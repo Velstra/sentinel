@@ -1882,6 +1882,8 @@
         nat-cps = import ./nix/nat-cps-test.nix { inherit pkgs self; };
         # CGNAT: a 65-port (non-power-of-two) block holds 65 sockets; the 66th is refused.
         nat-domain-cgnat = import ./nix/nat-domain-cgnat-test.nix { inherit pkgs self; };
+        # A reused client tuple's binding holds its public port through the server's TIME_WAIT.
+        nat-port-reopen = import ./nix/nat-port-reopen-test.nix { inherit pkgs self; };
         ipsec-failclosed = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; };
         ipsec-provenance = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllDirections = true; };
         ipsec-full-selectors = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllSelectors = true; };
