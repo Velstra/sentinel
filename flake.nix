@@ -414,7 +414,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-GVogty4UCsNEJc13ggz4FHzyzmeCr3gc8VWWstrssV0=";
+      ebpfHash = "sha256-cTBm8JRT2N5p0fEyIOIynuVfdwE4zhuOIq2Ly3yVGWc=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
