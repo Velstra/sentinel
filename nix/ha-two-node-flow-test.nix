@@ -298,7 +298,18 @@ in pkgs.testers.runNixOSTest {
             print(node.name, node.execute("ip route; ip -s neigh; cat /tmp/stream-status /tmp/accepted 2>/dev/null; journalctl -u ha-flow-stream -u ha-flow-echo --no-pager -n 40")[1])
             print(node.execute("systemctl stop ha-flow-packets; ${pkgs.tcpdump}/bin/tcpdump -nn -tt -e -S -r /tmp/flow.pcap 2>/dev/null | tail -n 100")[1])
 
-    start_all()
+    # The primary must own the pair before its peer exists. Booted together,
+    # whichever member's agent comes up first promotes itself (a two-node
+    # pair has no preemption), and a secondary that booted 3 s earlier once
+    # took term 1 and failed the VIP wait below. Staged, the test decides
+    # the owner, not the boot order.
+    for node in (primary, client, server):
+        node.start()
+    primary.wait_for_unit("velstra.service")
+    primary.wait_for_unit("wren.service")
+    primary.wait_until_succeeds("ip -o address show eth1 | grep -q 10.1.0.100 && ip -o address show eth2 | grep -q 10.2.0.100", timeout=90)
+    primary.wait_until_succeeds(py('import json; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==1 and r["authority"]["term"]>0'), timeout=30)
+    secondary.start()
     primary_alive = True
     try:
         # Exactly two HA appliances and two traffic endpoints: no witness or
