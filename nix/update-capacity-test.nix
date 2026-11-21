@@ -84,9 +84,9 @@ in pkgs.testers.runNixOSTest {
       nativeBuildInputs = [ pkgs.openssl pkgs.python3 ];
     } ''
       mkdir -p "$out"
-      python3 - ${raw} "$out" ${pki.private}/release.key ${pkgs.openssl}/bin/openssl <<'PY'
-      import base64,hashlib,json,pathlib,subprocess,sys
-      image,out,key,openssl=sys.argv[1:]
+      python3 - ${raw} "$out" <<'PY'
+      import hashlib,json,pathlib,sys
+      image,out=sys.argv[1:]
       digest=hashlib.sha256()
       with open(image,"rb") as source:
           while block:=source.read(4*1024**2): digest.update(block)
@@ -95,13 +95,6 @@ in pkgs.testers.runNixOSTest {
                            "sha256":digest.hexdigest(),"product":"velstra-sentinel"},
                           separators=(",",":")).encode()
       (out/"manifest.json").write_bytes(manifest)
-      subprocess.run([openssl,"pkeyutl","-sign","-rawin","-inkey",key,
-                      "-in",str(out/"manifest.json"),"-out",str(out/"signature")],check=True)
-      signature=(out/"signature").read_bytes()
-      assert len(signature)==64
-      (out/"release.json").write_text(json.dumps({"schema":1,
-          "manifest":base64.b64encode(manifest).decode(),
-          "signature":base64.b64encode(signature).decode()}))
       PY
     '';
   in ''
@@ -152,7 +145,25 @@ in pkgs.testers.runNixOSTest {
                 "RAW_bytes":candidate.stat().st_size,"RAW_SHA256":manifest["sha256"],
                 "source_VM_is_the_only_started_node":True,"TMPDIR_override":False,
                 "external_auxiliary_disk":False,"manual_bless_or_boot_repair":False}
-    server = reference.ReleaseServer(candidate,"${proof}/release.json",
+    # Signed online metadata carries a freshness policy (scope, sequence and a
+    # lifetime of at most 14 days); an offer without one is refused. It is
+    # signed here, when the check runs, not in the cached proof derivation: a
+    # build-time `issued_at` would expire under a later `--rebuild`. One
+    # publication, so one sequence; a corrupt signature never reaches the
+    # appliance's sequence ledger.
+    import base64
+    now = int(time.time())
+    signed = json.dumps({**manifest, "freshness": {"schema": 1, "channel": "default", "arch": "x86_64",
+        "sequence": 1, "issued_at": now, "expires_at": now + 86400}}, separators=(",", ":")).encode()
+    publication = Path(tempfile.mkdtemp(prefix="qa-capacity-release-"))
+    (publication / "manifest.json").write_bytes(signed)
+    subprocess.run(["${pkgs.openssl}/bin/openssl", "pkeyutl", "-sign", "-rawin", "-inkey", "${pki.private}/release.key",
+                    "-in", str(publication / "manifest.json"), "-out", str(publication / "signature")], check=True)
+    signature = (publication / "signature").read_bytes()
+    assert len(signature) == 64
+    (publication / "release.json").write_text(json.dumps({"schema": 1,
+        "manifest": base64.b64encode(signed).decode(), "signature": base64.b64encode(signature).decode()}))
+    server = reference.ReleaseServer(candidate,str(publication / "release.json"),
         "${pki.private}/tls.crt","${pki.private}/tls.key",port=${toString port}).start()
     def healthy(trial=False):
         machine.wait_for_unit("multi-user.target")
