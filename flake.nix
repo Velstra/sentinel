@@ -8807,6 +8807,12 @@
                   };
                 };
                 environment.systemPackages = [ pkgs.curl ];
+                # A service whose server speaks first (SMTP-like), for DP-31.
+                systemd.services.banner = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = "exec ${pkgs.python3}/bin/python3 ${./nix/synproxy-banner.py} serve 2525";
+                };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
                   after = [ "network-online.target" ];
@@ -8873,7 +8879,12 @@
                 "'set firewall rule web-in proto tcp' "
                 "'set firewall rule web-in port 443' "
                 "'set firewall rule web-in action accept' "
+                "'set firewall rule banner-in from wan' "
+                "'set firewall rule banner-in proto tcp' "
+                "'set firewall rule banner-in port 2525' "
+                "'set firewall rule banner-in action accept' "
                 "'set firewall syn-protect 443' "
+                "'set firewall syn-protect 2525' "
                 "commit save exit "
                 "| sentinel configure\" 2>&1"
             )
@@ -9031,6 +9042,24 @@
             )
             stats = fw.succeed("sentinel show firewall statistics")
             assert counter("synproxy_challenged") == outward_before + 1, stats
+
+            # DP-31: a server that speaks first. The proxy acknowledges the
+            # server's SYN-ACK itself, so no egress hook sees that ACK; unless
+            # the firewall learns of it, every server segment is refused as
+            # invalid until the client happens to send one — and a client
+            # waiting for a banner never does.
+            server.wait_for_unit("banner.service")
+            stats = fw.succeed("sentinel show firewall statistics")
+            banner_before = counter("synproxy_spliced")
+            client.succeed("python3 ${./nix/synproxy-banner.py} probe 10.2.0.2 2525")
+            for _ in range(15):
+                stats = fw.succeed("sentinel show firewall statistics")
+                if counter("synproxy_spliced") > banner_before:
+                    break
+                fw.sleep(2)
+            assert counter("synproxy_spliced") > banner_before, (
+                "the server-first exchange was not proxied:\n" + stats
+            )
           '';
         };
 
@@ -9306,6 +9335,11 @@
         #   nix build .#checks.x86_64-linux.conntracksync -L
         ha-kernel = import ./nix/ha-kernel-test.nix { inherit pkgs velstra-ha-tests; };
         ha-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; };
+        # C15 SYN proxy on a deny-by-default masquerading edge box: remapping
+        # port-forwards, servers that speak first, and syn-protect surviving
+        # save, an unrelated commit and a reboot (DP-31). See the file.
+        #   nix build .#checks.x86_64-linux.synproxy-edge -L
+        synproxy-edge = import ./nix/synproxy-edge-test.nix { inherit pkgs self; };
         ha-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; };
         ha-masquerade-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; masquerade = true; };
         ha-wireguard-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; wireguard = true; };
