@@ -162,8 +162,12 @@ def main(sentinel, client):
             "signature": base64.b64encode(signature).decode()}).encode()
 
     body = json.dumps(manifest, separators=(",", ":")).encode()
+    # A release that changes between review and staging is a newer signed
+    # offer (a higher sequence). Reusing sequence 1 for different bytes would
+    # be refused by the rollback ledger before the conflict path is reached.
+    newer = {**manifest, "freshness": {**manifest["freshness"], "sequence": 2}}
     envelopes = {"valid": envelope(body), "bad-signature": envelope(body, True),
-        "swapped": envelope(json.dumps(manifest, indent=2).encode())}
+        "swapped": envelope(json.dumps(newer, indent=2).encode())}
     mode = {"kind": "valid", "swapped": False, "pause": False}
     entered, release = threading.Event(), threading.Event()
     release.set()
@@ -250,7 +254,16 @@ def main(sentinel, client):
             assert refused.returncode != 0 and not refused.stdout, refused
             assert disk_rows() == original_table and inactive() == original_bytes
             return json.loads(run([sentinel, "system", "update", "stage", "--offer", state["offer"]["id"]]))
-        code, job = request("/system/updates/stage", payload(state, True))
+        # Busy is a documented, write-free refusal: the once-per-second
+        # sentinel-apply-recovery timer briefly holds the configuration writer
+        # lock. Retry it a bounded number of times, as check() does.
+        for _ in range(5):
+            code, job = request("/system/updates/stage", payload(state, True))
+            if code != 409 or "busy" not in str(job.get("error", "")):
+                break
+            assert disk_rows() == original_table and inactive() == original_bytes
+            time.sleep(1)
+            state = until(available)
         assert code == 202, (code, job)
         return job
 
@@ -268,6 +281,9 @@ def main(sentinel, client):
             assert done["phase"] == "failed" and done["error"] == error, done
             assert disk_rows() == original_table and inactive() == original_bytes
             record(kind + "-refused-before-go", done)
+            if kind == "metadata-change":
+                # The ledger now holds sequence 2; the channel keeps serving it.
+                envelopes["valid"] = envelopes["swapped"]
         mode.update(kind="valid", swapped=False, pause=True)
         browser = json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "check"], timeout=120))
         assert browser["passed"] and until(lambda: terminal(browser["job"]["id"]))["phase"] == "checked"
