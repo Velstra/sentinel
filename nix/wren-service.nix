@@ -77,9 +77,14 @@ in
         SocketUser = "root";
         SocketGroup = "root";
         SocketMode = "0600";
-        # One request at a time (the helper also locks); never let a burst
-        # of requests put the socket into a failed state.
-        MaxConnections = 1;
+        # With Accept=yes systemd drops a connection beyond MaxConnections
+        # rather than queueing it ("Too many incoming connections (1),
+        # dropping connection" in ha-wireguard-failover, when a cancelled
+        # takeover's request was still being answered), which skipped a
+        # needed step. A few instances may run; the helper's flock makes them
+        # decide one at a time, each on a clock read under the lock. Never
+        # let a burst of requests put the socket into a failed state.
+        MaxConnections = 4;
         TriggerLimitIntervalSec = 0;
       };
     };
