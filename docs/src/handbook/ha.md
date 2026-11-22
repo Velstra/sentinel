@@ -44,6 +44,20 @@ release acceptance and open HA failure cases remain unresolved.
    before pairing. A custom `services web port` must appear in the peer endpoint.
    Keep the credential out of shell arguments, public logs and screenshots.
 
+6. **Run NTP on both members** (`services ntp upstream`). Certificate checks,
+   one-time passwords, log timestamps and update freshness all read the wall
+   clock. With HA WireGuard a member also aligns its clock with its
+   predecessor's when it takes over (see Failure behaviour), but only within
+   bounds; NTP is what keeps it right. The appliance's chrony steps any offset
+   over one second as soon as it measures it (`makestep 1.0 -1`), so a member
+   resumed from a VM pause is corrected at its next poll. Without NTP on
+   either member, repeated pauses and takeovers can carry both clocks ahead of
+   real time, by up to about 5 s per cycle; NTP removes that drift. Between
+   two NTP-synchronised members the step is capped at 60 seconds, so a standby
+   that was paused for longer than that while its kernel still reports
+   synchronised is not stepped; its tunnels then follow once NTP corrects it.
+   That is the accepted price of not following a faulty "synchronised" peer.
+
 Do not activate an incomplete election by setting `system.ha.enabled = true`
 manually. Pairing validates and records the member profiles.
 
@@ -247,10 +261,38 @@ These cases are exercised by `checks.ha-witness-failover`:
   Its wall clock also falls behind by the pause until NTP corrects it. Both
   members answer WireGuard peers with one shared identity, and a peer accepts
   a handshake from that identity only with a newer timestamp than the last
-  one, so after the lagging member takes over (for example by preempting
-  back), WireGuard tunnels through it stall for up to its clock offset. Keep
-  both members time-synchronised (`services ntp upstream`), and let NTP
-  correct a resumed member before it takes over again.
+  one. So a member that takes over with HA WireGuard interfaces steps its
+  wall clock forward to its predecessor's once it holds the VIPs, before it
+  reconfigures WireGuard and initiates handshakes. The owner replicates its
+  clock over the authenticated state stream, to standbys that announce they
+  understand it. Tunnels then follow the takeover in about a second
+  (`checks.ha-wireguard-failover`, including preemption by a member that was
+  paused).
+
+  Wren does not step the clock itself. A small socket-activated helper
+  (`wren-ha-clock-step`) does. It holds `CAP_SYS_TIME` and nothing else, and
+  takes no amount or time from Wren. It reads the predecessor's clock from
+  `/run/velstra/ha-clock`, where the agent publishes it, and keeps its lock,
+  step budget and decisions in `/run/velstra-ha-clock-step`. Wren's unit
+  cannot see either directory, so Wren can trigger a decision on the agent's
+  reading but can neither forge the reading nor touch the budget. Requests
+  are served one at a time, under a lock, on a freshly read clock.
+
+  The step is logged with the old and new time and is never taken backward.
+  It is refused in four cases:
+  - when the lag exceeds 10 minutes;
+  - when both clocks claim NTP synchronisation and disagree by more than
+    60 seconds, since one of them is faulty;
+  - when this member's clock is NTP-synchronised and its predecessor's is not;
+  - when the steps of this boot would exceed 10 minutes in total.
+
+  A refused or failed step still takes over, and `sentinel show health`
+  reports `ha-clock-behind-peer`; tunnels may then stall for up to the clock
+  offset. The report clears when NTP synchronises a clock that was not
+  synchronised at the takeover, or when a later takeover steps or finds the
+  clock in step on a fresh reading. A missing or stale peer reading is logged
+  on the takeover. It is not reported itself, and it does not clear an earlier
+  report.
 - **Agent crash while the witness is away**: both members end up unable to use
   their state; once the witness returns, the pair opens a new epoch on its own
   (see Standby readiness). Expect a short outage and new connections.

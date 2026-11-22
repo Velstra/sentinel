@@ -306,7 +306,10 @@ in pkgs.testers.runNixOSTest {
             print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -tt -n -e -S -r /tmp/ha-packets.pcap 2>/dev/null | tail -n 55"))
         raise AssertionError(f"established TCP stream stalled after {label}")
     # Fault to resumed forwarding (SIGKILL, pause, preemption): the lease
-    # run-out plus the takeover gap, plus a WireGuard handshake retry.
+    # run-out plus the takeover gap, plus a WireGuard handshake retry
+    # (ha_extra: REKEY_TIMEOUT 5 s + REKEY_TIMEOUT_JITTER_MAX 1/3 s, one lost
+    # initiation; Linux drivers/net/wireguard/messages.h). The new owner
+    # initiates at once, so a WireGuard handover normally costs about 1 s.
     handover_bound=ha_bound.HA_FAULT_TO_RESUME_MAX+ha_extra
     def wait_forwarding(label, started, bound, paused=None):
         # Forwarding has resumed once the established stream advances again.
@@ -372,6 +375,15 @@ in pkgs.testers.runNixOSTest {
     # The cold owner's empty complete baseline must exist before VPN recovery,
     # even after its witness claim has already matured to the active term.
     master.wait_until_succeeds(python_command('import json; r=json.load(open("/run/velstra/ha/role.json")); c=json.load(open("/run/velstra/ha/wireguard.json")); assert r["vpn_ready"] and c["node"]==1 and c["endpoints"]==[]'),timeout=15)
+    # The takeover clock step is the socket-activated helper's, not Wren's:
+    # Wren parses untrusted routing protocols and must hold no CAP_SYS_TIME
+    # (bit 25). clock_caught_up below then proves the shipped path steps.
+    for node in (master,backup):
+        node.succeed("systemctl is-active --quiet wren-ha-clock-step.socket wren-ha-clock-step.service")
+        node.succeed("test -S /run/velstra-ha-clock.sock")
+        wren_caps=node.succeed("awk '/^CapEff/ {print $2}' /proc/$(systemctl show -p MainPID --value wren.service)/status").strip()
+        assert not int(wren_caps,16) & (1 << 25), (node.name, "wren holds CAP_SYS_TIME", wren_caps)
+        assert "ProtectClock=yes" in node.succeed("systemctl show -p ProtectClock wren.service"), node.name
     ''}
     server.wait_for_unit("ha-echo.service")
     for node in (client, server):
@@ -488,6 +500,12 @@ in pkgs.testers.runNixOSTest {
     # crash does. The warm standby must be forwarding within a bound, and the
     # restarted member must rejoin by itself (no reboot, no manual restart).
     for service in ("velstra.service","wren.service"):
+        # The fault is meant to hit a pair with a warm standby. After the
+        # previous preemption the standby needs the new owner's complete
+        # snapshot before it may take over; killing the owner earlier left a
+        # cold standby, and the owner's restarted wren took the pair back
+        # instead (3.78 s, and the backup never held the VIP).
+        backup.wait_until_succeeds(agent_caught_up(backup),timeout=20)
         started=time.monotonic()
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
         wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
@@ -525,16 +543,28 @@ in pkgs.testers.runNixOSTest {
     # up standby again by itself, and the pair must survive the NEXT failure
     # too, without restarting velstra anywhere.
     def resume(node):
+        # A resumed VM's wall clock is behind by its pause, and these VMs run
+        # no NTP. That is the case under test: the members share one
+        # WireGuard identity, a remote peer accepts a handshake from it only
+        # with a newer wall-clock timestamp than the last one, and the new
+        # owner itself must bring its clock up to its predecessor's before it
+        # initiates (wren-ha clock). The test must not resync it.
         node.send_monitor_command("cont")
-        # The members share one WireGuard identity, and a peer accepts a
-        # handshake from it only with a newer wall-clock timestamp than the
-        # last one. A resumed VM's wall clock is behind by its pause, so its
-        # handshakes were refused until its clock passed its peer's last one
-        # (master 13.5 s and backup 8.3 s behind after these pauses). Members
-        # run NTP; step the resumed wall clock as a time sync would. Leases
-        # run on CLOCK_BOOTTIME, which this leaves stopped as before.
-        if ${if wireguard then "True" else "False"}:
-            node.succeed(f"date -u -s @{time.time():.6f}")
+    def clock_caught_up(label):
+        # The returning owner stepped its wall clock to its predecessor's,
+        # through the helper, on the agent's reading.
+        status=json.loads(master.succeed("cat /run/velstra-ha-clock-step/status.json"))
+        # Wren cannot see the reading or the helper's state, let alone write
+        # them: from Wren's own mount namespace both are empty and read-only.
+        master.succeed("test -s /run/velstra/ha-clock/peer.json")
+        wren_pid=master.succeed("systemctl show -p MainPID --value wren.service").strip()
+        for path in ("/run/velstra/ha-clock", "/run/velstra-ha-clock-step"):
+            master.succeed(f"test -z \"$(nsenter -t {wren_pid} -m ls -A {path} 2>/dev/null)\"")
+            master.fail(f"nsenter -t {wren_pid} -m touch {path}/forged")
+        ours=float(master.succeed("date +%s.%N")); theirs=float(backup.succeed("date +%s.%N"))
+        print(f"{label}: clock decision {status}, master-backup {ours-theirs:+.3f}s")
+        assert status["action"]=="step" and "error" not in status, (label,status)
+        assert abs(theirs-ours) < 1.0, (label,ours,theirs)
     def pause(node, seconds):
         node.send_monitor_command("stop")
         time.sleep(seconds)
@@ -551,6 +581,9 @@ in pkgs.testers.runNixOSTest {
     resume(master)
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
     master.wait_until_succeeds(agent_caught_up(master),timeout=20)
+    ${pkgs.lib.optionalString wireguard ''
+    clock_caught_up("paused owner resumed and preempted")
+    ''}
     check_stream("paused owner resumed and preempted")
     # (2) The standby pauses and resumes: it must catch up again by itself.
     pause(backup,8)
@@ -566,6 +599,9 @@ in pkgs.testers.runNixOSTest {
     # Preemption is a handover like any other, with the same bound: a
     # WireGuard client must first handshake with the returning owner.
     wait_forwarding("resumed owner preempted after the second pause",time.monotonic(),handover_bound)
+    ${pkgs.lib.optionalString wireguard ''
+    clock_caught_up("resumed owner preempted after the second pause")
+    ''}
     check_stream("both members recovered from VM pauses")
     ''}
     check_stream("all fault and recovery scenarios")
