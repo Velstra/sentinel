@@ -38,18 +38,29 @@ def status(text=None):
     if text is None:
         text = run("wren", "--socket", SOCKET, "show", "reload").stdout
     fields = {}
+    failed = []
     for line in text.splitlines():
         key, sep, value = line.partition(" ")
-        assert sep and key not in fields and key in {
-            "scope", "generation", "state", "pending-prefixes", "detail"}, text
+        assert sep, text
+        if key == "failed-route":
+            # Wren names each route the kernel refused: table, prefix, owner.
+            table, prefix, owner = value.split(" ")
+            assert table.isdecimal() and owner, text
+            failed.append((int(table), prefix, owner))
+            continue
+        assert key not in fields and key in {
+            "scope", "generation", "state", "pending-prefixes", "detail",
+            "failed-routes-omitted"}, text
         fields[key] = value
     assert {"scope", "generation", "state", "pending-prefixes"} <= fields.keys(), text
     assert fields["scope"] == "routing" and fields["state"] in {
-        "pending", "converged", "rejected", "superseded"}, text
-    for key in ("generation", "pending-prefixes"):
-        assert fields[key].isascii() and fields[key].isdecimal(), text
-        fields[key] = int(fields[key])
-    assert fields["state"] != "converged" or fields["pending-prefixes"] == 0, text
+        "pending", "converged", "degraded", "rejected", "superseded"}, text
+    for key in ("generation", "pending-prefixes", "failed-routes-omitted"):
+        if key in fields:
+            assert fields[key].isascii() and fields[key].isdecimal(), text
+            fields[key] = int(fields[key])
+    assert fields["state"] != "converged" or (fields["pending-prefixes"] == 0 and not failed), text
+    fields["failed-routes"] = failed
     return fields
 
 
@@ -210,6 +221,9 @@ def pending_evidence(baseline, baseline_pid, generation):
         return None
     assert current["generation"] == generation + 1 and current["state"] == "pending", current
     assert current["pending-prefixes"] > 0 and pid() == baseline_pid, current
+    # Only the operator's off-link route may be refused, and only as static.
+    assert all(route == (254, BAD, "static") for route in current["failed-routes"]), current
+    assert "failed-routes-omitted" not in current, current
     old = tomllib.loads(baseline[str(FILES[0])].decode())
     candidate = tomllib.loads(FILES[0].read_text())
     old_static, new_static = old.pop("static", []), candidate.pop("static", [])
@@ -273,7 +287,8 @@ def failure_case(actor, active, foreign):
         assert restored_pid != before_pid, "timed-out generation not terminated by rollback restart"
         restored_status = status()
         assert restored_status == {"scope": "routing", "generation": 0,
-                                   "state": "converged", "pending-prefixes": 0}, restored_status
+                                   "state": "converged", "pending-prefixes": 0,
+                                   "failed-routes": []}, restored_status
         assert run("sentinel", "service-readiness", "wren.service").stdout.strip() == "ready"
         assert run("sentinel", "service-readiness", "velstra.service").stdout.strip() == "ready"
         proof = observe(foreign, active)
