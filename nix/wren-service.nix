@@ -99,11 +99,13 @@ in
           "CAP_NET_ADMIN"
           "CAP_NET_RAW"
           "CAP_NET_BIND_SERVICE"
+          "CAP_SYS_TIME"
         ];
         CapabilityBoundingSet = [
           "CAP_NET_ADMIN"
           "CAP_NET_RAW"
           "CAP_NET_BIND_SERVICE"
+          "CAP_SYS_TIME"
         ];
         # Sandboxing. wren writes only its control socket under /run/wren
         # (RuntimeDirectory, which stays writable under ProtectSystem=strict) and
@@ -114,7 +116,12 @@ in
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
-        ProtectClock = true;
+        # Not ProtectClock: a WireGuard HA member that takes over steps its wall
+        # clock forward to its predecessor's (forward only, at most 10 min,
+        # never onto an unsynchronised peer from a synchronised clock), or the
+        # remote peers reject its handshakes as replays (wren-ha clock.rs).
+        # That needs CAP_SYS_TIME above and clock_settime unfiltered.
+        ProtectClock = false;
         ProtectKernelModules = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
