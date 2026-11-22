@@ -8,7 +8,9 @@
 # twice, with long-lived connections echoing throughout.
 #
 # Floor: 2000 new connections/s, offered open-loop for 10 s per phase, every
-# one of them completed, at most 1 % needing a SYN retransmission. That is
+# one of them completed, the firewall losing nothing it received, and at most
+# 2 % needing a SYN retransmission (the links between test VMs drop packets
+# on their own; the receipt measures every hop). That is
 # 4x the live collapse and well under what the routed path did on the same
 # hardware (14k/s). A cleanly closed binding holds its port for 120 s, so the
 # second phase meets the first phase's bindings still in place: about 25,000
@@ -172,6 +174,30 @@ pkgs.testers.runNixOSTest {
     def path_delta(before, after):
         return {k: delta(before[k], after[k]) for k in after}
 
+    # Each hop of the test network: what one end sent minus what the next
+    # end received. "fw" rows are the firewall itself (received on one NIC,
+    # not sent on the other); the rest are the links between VMs.
+    HOPS = [
+        ("client>fw", "client_links", "eth1_tx_packets", "fw_links", "eth2_rx_packets"),
+        ("fw lan>wan", "fw_links", "eth2_rx_packets", "fw_links", "eth1_tx_packets"),
+        ("fw>server", "fw_links", "eth1_tx_packets", "server_links", "eth1_rx_packets"),
+        ("server>fw", "server_links", "eth1_tx_packets", "fw_links", "eth1_rx_packets"),
+        ("fw wan>lan", "fw_links", "eth1_rx_packets", "fw_links", "eth2_tx_packets"),
+        ("fw>client", "fw_links", "eth2_tx_packets", "client_links", "eth1_rx_packets"),
+    ]
+
+    def hop_loss(path):
+        return {name: path[a].get(ak, 0) - path[b].get(bk, 0) for name, a, ak, b, bk in HOPS}
+
+    # Every data-plane counter that means a packet was refused, by reason.
+    DATAPLANE_DROPS = ["dropped_default", "dropped_blocklist", "dropped_rule", "dropped_icmp",
+                       "malformed", "egress_dropped", "rejected", "dropped_rate_limit",
+                       "dropped_spoofed", "dropped_not_yours", "dropped_port_rate", "dropped_portal",
+                       "tcp_invalid_reset", "tcp_invalid_flags", "firewall_state_write_failed",
+                       "synproxy_rejected", "forward_ttl_exceeded", "lb_no_backend"]
+    NAT_DROPS = ["egress_nat_no_candidate", "egress_nat_claim_failed", "nat_claim_collision",
+                 "egress_nat_fragment_dropped", "egress_nat_unsupported_dropped"]
+
     def napt_search_bound():
         out = fw.execute("bpftool -j map dump name NAPT_SEARCH")
         if out[0] != 0:
@@ -240,6 +266,9 @@ pkgs.testers.runNixOSTest {
         result["phase"] = phase
         result["counters"] = delta(counters, stats())
         result["path"] = path_delta(path, path_counters())
+        result["hop_loss"] = hop_loss(result["path"])
+        result["dataplane_drops"] = {k: result["counters"][k] for k in DATAPLANE_DROPS if result["counters"].get(k)}
+        result["nat_drops"] = {k: result["counters"][k] for k in NAT_DROPS if result["counters"].get(k)}
         runs = after[1] - runtime[1]
         result["egress_runs"] = runs
         result["egress_mean_ns"] = (after[0] - runtime[0]) // runs if runs else None
@@ -252,6 +281,11 @@ pkgs.testers.runNixOSTest {
     receipt["held_result"] = json.loads(client.succeed("cat /tmp/held.json"))
     preserve()
     print(json.dumps(receipt, indent=2))
+    print("packets lost per hop (sent minus received) and refusals per phase:")
+    for result in receipt["phases"]:
+        print(result["phase"].ljust(13), "  ".join(f"{k}={v}" for k, v in result["hop_loss"].items()),
+              " slow-connects=" + str(result["retransmit_shaped_connects"]),
+              " dataplane-drops=" + json.dumps(result["dataplane_drops"]))
 
     # A dead datapath under default-accept would pass a rate check for the
     # wrong reason: every completion must have been masqueraded.
@@ -264,13 +298,23 @@ pkgs.testers.runNixOSTest {
         assert result["counters"].get("egress_masqueraded", 0) >= result["offered"], (name, result["counters"])
         assert result["failures"] == {}, (name, result["failures"], result)
         assert result["completed"] == result["offered"], (name, result)
-        # The test network itself loses the odd SYN under a 2000/s open
-        # loop (one retransmission, ~1 s); the collapse loses nearly all.
-        assert result["retransmit_shaped_connects"] <= result["offered"] // 100, (name, result)
-        assert result["completed_rate"] >= 0.95 * ${toString rate}, (name, result)
         assert result["wan_ports_shared_by_client_ports"] == 0, (name, result)
-        assert result["counters"].get("egress_nat_no_candidate", 0) == 0, (name, result["counters"])
-        assert result["counters"].get("egress_nat_claim_failed", 0) == 0, (name, result["counters"])
+        # What the firewall owns. It forwards what it receives: received on
+        # one NIC minus sent on the other is the few packets of sampling skew
+        # between the two counter reads (and the odd ARP), not a loss.
+        for hop in ("fw lan>wan", "fw wan>lan"):
+            assert abs(result["hop_loss"][hop]) <= 4, (name, hop, result["hop_loss"])
+        assert sum(result["dataplane_drops"].values()) <= 3, (name, result["dataplane_drops"])
+        assert result["nat_drops"] == {}, (name, result["nat_drops"])
+        # A tripwire for the PERF-02 collapse, which left most new connections
+        # retransmitting their SYN (thousands per phase). The test network's
+        # links between VMs lose packets on their own under this open loop:
+        # over twelve phases on an idle builder up to 652 per hop, and up to
+        # 276 connections needed a retransmission while the firewall lost
+        # none. 2 % of the offered connections leaves room for that and still
+        # fails the collapse by an order of magnitude.
+        assert result["retransmit_shaped_connects"] <= result["offered"] // 50, (name, result["hop_loss"], result)
+        assert result["completed_rate"] >= 0.95 * ${toString rate}, (name, result)
     fw.succeed("systemctl is-active sentinel-boot.service velstra.service")
   '';
 }
