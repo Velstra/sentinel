@@ -469,6 +469,12 @@ in pkgs.testers.runNixOSTest {
     # crash does. The warm standby must be forwarding within a bound, and the
     # restarted member must rejoin by itself (no reboot, no manual restart).
     for service in ("velstra.service","wren.service"):
+        # The fault is meant to hit a pair with a warm standby. After the
+        # previous preemption the standby needs the new owner's complete
+        # snapshot before it may take over; killing the owner earlier left a
+        # cold standby, and the owner's restarted wren took the pair back
+        # instead (3.78 s, and the backup never held the VIP).
+        backup.wait_until_succeeds(agent_caught_up(backup),timeout=20)
         started=time.monotonic()
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
         wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
