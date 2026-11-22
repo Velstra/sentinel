@@ -78,9 +78,16 @@
       # The appliance kernel (nix/kernel.nix). The overlay makes every check
       # that asks for pkgs.linuxPackages_6_12 boot the kernel the image ships.
       sentinelKernel = import ./nix/kernel.nix;
-      kernelOverlay = _: prev: {
+      kernelOverlay = final: prev: {
         linuxPackages_6_12 = sentinelKernel prev;
         linux_6_12 = (sentinelKernel prev).kernel;
+      } // replaceOverlay final prev;
+      # system.replaceDependencies with a store-hash rewrite
+      # (nix/replace-direct-dependencies.nix). Only build-support changes, so
+      # no package rebuilds; nix/security-backports.nix requires it.
+      replaceOverlay = final: _: {
+        replaceDirectDependencies =
+          final.callPackage ./nix/replace-direct-dependencies.nix { } // { rewritesStoreHashes = true; };
       };
 
       pkgs = ((nixpkgs.legacyPackages.${system}.extend crateSource).extend kernelOverlay).extend
@@ -1806,6 +1813,7 @@
           # everything above libcap/libxcrypt, and image-booting checks that
           # run host store paths inside the guest would no longer find them.
           ./nix/security-backports.nix
+          { nixpkgs.overlays = [ replaceOverlay ]; }
           # The verity image build reads `config.nixpkgs.hostPlatform` (efiArch);
           # define it explicitly (this nixpkgs' `nixosSystem` doesn't set it from
           # the `system` arg).

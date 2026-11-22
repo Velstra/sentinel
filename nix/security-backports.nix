@@ -148,6 +148,23 @@ let
       patches = (old.patches or [ ]) ++ [ ./security-patches/sudo-CVE-2026-35535.patch ];
     });
 
+  # glibc: the pin is release/2.42/master at 2.42-103. The branch head 2.42-113
+  # adds the gettext LANGUAGE traversal (CVE-2026-84243), regcomp/regexec
+  # double free (CVE-2026-100290), wide scanf overflow (CVE-2026-115819) and
+  # ISO-2022-CN-EXT over-read (CVE-2026-121758) fixes. The patch is
+  # `git show --minimal --reverse glibc-2.42-103-ge39d4ded3f..glibc-2.42-113-g85a0a0562a
+  # -- . ':!ADVISORIES'`, nixpkgs' own recipe for its 2.42-master.patch.
+  # (`version` is passthru "2.42"; the store name carries the patch level.)
+  # Replacing glibc needs the store-hash rewrite: see
+  # nix/replace-direct-dependencies.nix.
+  glibc = assert pkgs.glibc.name == "glibc-2.42-103";
+    pkgs.glibc.overrideAttrs (old: {
+      version = "2.42-113";
+      patches = old.patches ++ [
+        ./security-patches/glibc-2.42-113-CVE-2026-84243-CVE-2026-100290-CVE-2026-115819-CVE-2026-121758.patch
+      ];
+    });
+
   # gzip 1.15 contains the pin's two CVE patches (CVE-2026-41991/-41992, the
   # LZH decoder); the release makes the fix visible to version scanners.
   gzip = assert pkgs.gzip.version == "1.14";
@@ -214,8 +231,8 @@ in
     description = ''
       Rewrite the system closure to the backported libcap, Net-SNMP,
       Suricata, lego, dnsproxy, SQLite, Linux-PAM, libxcrypt, iproute2,
-      cyrus-sasl, GLib, sudo, gzip, krb5 and hostapd builds. Disable
-      only to compare against the unpatched pin.
+      cyrus-sasl, GLib, sudo, glibc, gzip, krb5 and hostapd builds.
+      Disable only to compare against the unpatched pin.
     '';
   };
 
@@ -233,14 +250,20 @@ in
       ++ replace pkgs.cyrus_sasl cyrus_sasl
       ++ replace pkgs.glib glib
       ++ replace pkgs.sudo sudo
+      ++ replace pkgs.glibc glibc
       ++ replace pkgs.gzip gzip
       ++ replace pkgs.krb5 krb5
       ++ replace pkgs.hostapd hostapd;
     system.build.securityBackports = {
       inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl
-        glib sudo gzip krb5 hostapd;
+        glib sudo glibc gzip krb5 hostapd;
     };
     assertions = [ {
+      # The upstream base-name rewrite leaves GLib's original, and with it
+      # the replaced glibc, in the closure (nix/replace-direct-dependencies.nix).
+      assertion = pkgs.replaceDirectDependencies.rewritesStoreHashes or false;
+      message = "security backports need the store-hash replaceDirectDependencies overlay (flake.nix replaceOverlay)";
+    } {
       # pam_userdb is not built (see linux-pam above); a stack that names it
       # would fail closed at login, so refuse to build one instead.
       assertion = !lib.any (service: lib.hasInfix "pam_userdb" (service.text or ""))

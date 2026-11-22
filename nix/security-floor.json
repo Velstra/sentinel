@@ -13,6 +13,11 @@
    "fixes": "CVE-2026-90678 HTTP/3; CVE-2026-55203, CVE-2026-55204 (flake.nix haproxyFor)"
   },
   {
+   "package": "glibc",
+   "minimum": "2.42-113",
+   "fixes": "CVE-2026-84243, CVE-2026-100290, CVE-2026-115819, CVE-2026-121758 (release/2.42 head)"
+  },
+  {
    "package": "gzip",
    "minimum": "1.15",
    "fixes": "CVE-2026-41991, CVE-2026-41992 in a released version"
