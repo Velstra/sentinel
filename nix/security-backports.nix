@@ -26,10 +26,26 @@ let
       patches = (old.patches or [ ]) ++ [ ./security-patches/net-snmp-CVE-2026-89147.patch ];
     });
 
+  # Go 1.26.11. A Go program carries its own copy of the standard library, and
+  # 1.26.10's has eight High advisories (CVE-2026-97033..-97043, fixed in
+  # 1.26.11) in the three Go programs the image ships: lego, dnsproxy and
+  # libcap's captree. A dependency rewrite cannot reach a statically linked
+  # library, so those three are built with this toolchain (the assertions
+  # below hold them to it). Source hash as in nixos-unstable 2786a2a.
+  go = assert pkgs.go_1_26.version == "1.26.10";
+    pkgs.go_1_26.overrideAttrs (_: {
+      version = "1.26.11";
+      src = pkgs.fetchurl {
+        url = "https://go.dev/dl/go1.26.11.src.tar.gz";
+        hash = "sha256-1EEBsP8n7SpMda1GwXucdDWSCeLrLKfJ32y0/baOGWk=";
+      };
+    });
+  buildGoModule = pkgs.buildGo126Module.override { inherit go; };
+
   # libcap 2.78 contains the cap_set_file TOCTOU fix (CVE-2026-4878) and the
   # recipe's only patch.
   libcap = assert pkgs.libcap.version == "2.77";
-    pkgs.libcap.overrideAttrs (old: {
+    (pkgs.libcap.override { inherit go; }).overrideAttrs (old: {
       version = "2.78";
       src = pkgs.fetchurl {
         url = "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.78.tar.xz";
@@ -64,7 +80,7 @@ let
   # go-jose 4.1.9); no source file changes. The versions stay, so the store
   # names keep their length.
   goDeps = name: patch: hash: assert lib.elem pkgs.${name}.version [ "4.35.2" "0.81.4" ];
-    pkgs.${name}.overrideAttrs (old: {
+    (pkgs.${name}.override { inherit buildGoModule; }).overrideAttrs (old: {
       patches = (old.patches or [ ]) ++ [ patch ];
       vendorHash = hash;
     });
@@ -258,7 +274,13 @@ in
       inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl
         glib sudo glibc gzip krb5 hostapd;
     };
-    assertions = [ {
+    assertions = map (program: {
+      assertion = program.passthru.go.version or null == go.version;
+      message = "${program.name} is not built with the backported Go ${go.version}";
+    }) [ lego dnsproxy ] ++ [ {
+      assertion = lib.elem go libcap.nativeBuildInputs;
+      message = "libcap's captree is not built with the backported Go ${go.version}";
+    } {
       # The upstream base-name rewrite leaves GLib's original, and with it
       # the replaced glibc, in the closure (nix/replace-direct-dependencies.nix).
       assertion = pkgs.replaceDirectDependencies.rewritesStoreHashes or false;
