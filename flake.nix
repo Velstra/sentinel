@@ -9478,6 +9478,10 @@
           legacyPackage = legacy-napt-velstra;
         };
         ha-witness-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; };
+        # A log output that stops reading must not move HA ownership: the
+        # master's wren and agent write into FIFOs nobody reads, term fixed
+        # for 60 s, both dropped-line counters above zero.
+        ha-log-stall = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; logStall = true; };
         ha-witness-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; synproxy = true; };
 
         conntracksync = import ./nix/conntracksync-test.nix { inherit pkgs self; };

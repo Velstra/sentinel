@@ -1,6 +1,6 @@
-{ pkgs, self, synproxy ? false, leased ? false, wireguard ? false, masquerade ? false }:
+{ pkgs, self, synproxy ? false, leased ? false, wireguard ? false, masquerade ? false, logStall ? false }:
 let
-  name = if masquerade then "sentinel-ha-masquerade-failover" else if wireguard then "sentinel-ha-wireguard-failover" else if leased && synproxy then "sentinel-ha-witness-synproxy-failover" else if leased then "sentinel-ha-witness-failover" else if synproxy then "sentinel-ha-synproxy-failover" else "sentinel-ha-failover";
+  name = if logStall then "sentinel-ha-log-stall" else if masquerade then "sentinel-ha-masquerade-failover" else if wireguard then "sentinel-ha-wireguard-failover" else if leased && synproxy then "sentinel-ha-witness-synproxy-failover" else if leased then "sentinel-ha-witness-failover" else if synproxy then "sentinel-ha-synproxy-failover" else "sentinel-ha-failover";
   secret = "3495f763f76345f694398991ac86dc4f1b6c48ab2334e10f5b4a3ddd1fc4bd50";
   appliance = number: priority: (pkgs.formats.toml {}).generate "ha-appliance.toml" {
     system = {
@@ -51,7 +51,8 @@ let
     services.journald.extraConfig = lib.mkAfter "MaxLevelConsole=warning\n";
   };
   firewall = number: priority: { lib, ... }: {
-    imports = [ self.nixosModules.sentinel quietConsole ];
+    imports = [ self.nixosModules.sentinel quietConsole ]
+      ++ lib.optional (logStall && number == "1") logStallOutputs;
     environment.systemPackages=[pkgs.python3 pkgs.wireguard-tools pkgs.bpftools pkgs.curl];
     virtualisation.vlans = [ 1 2 3 ];
     virtualisation.memorySize = 2048;
@@ -63,6 +64,128 @@ let
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
     systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
   };
+  # checks.ha-log-stall: on the master, wren's and the agent's stdout and
+  # stderr go to FIFOs that a holder keeps open. Until /run/log-stall/stop
+  # exists the holder copies them to its own journal; then it stops reading
+  # but keeps them open, which is what a journal that stopped reading looks
+  # like to a writer. 4 KiB pipes and a one-line log queue make a quiet daemon
+  # reach the blocked (or, fixed, the dropping) path within seconds, without
+  # loading the VM the way console forwarding does.
+  logStallHolder = pkgs.writeText "log-stall-holder.py" ''
+    import fcntl, os, select, subprocess, sys, time
+    paths = ["/run/log-stall/wren.fifo", "/run/log-stall/velstra.fifo"]
+    for path in paths:
+        if not os.path.exists(path):
+            os.mkfifo(path, 0o600)
+    fds = {os.open(path, os.O_RDWR | os.O_NONBLOCK): path for path in paths}
+    for fd in fds:
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 4096)
+    subprocess.run(["systemd-notify", "--ready"], check=True)
+    stopped = False
+    while True:
+        if os.path.exists("/run/log-stall/stop"):
+            if not stopped:
+                print("log-stall holder: no longer reading", flush=True)
+                stopped = True
+            time.sleep(0.2)
+            continue
+        if stopped:
+            print("log-stall holder: reading again", flush=True)
+            stopped = False
+        ready, _, _ = select.select(list(fds), [], [], 0.2)
+        for fd in ready:
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            sys.stdout.write(data.decode(errors="replace"))
+        sys.stdout.flush()
+  '';
+  # The test driver forwards every journal line to each VM's emulated serial
+  # console, synchronously, which starves a VM of CPU and moves ownership by
+  # itself; an appliance does not do that. Keep it to warnings in this check
+  # so what it measures is the daemons' own log writes.
+  logStallOutputs = { lib, ... }: {
+    systemd.services.log-stall-holder = {
+      wantedBy = [ "multi-user.target" ];
+      before = [ "wren.service" "velstra.service" ];
+      serviceConfig = {
+        Type = "notify";
+        NotifyAccess = "all";
+        RuntimeDirectory = "log-stall";
+        RuntimeDirectoryPreserve = "yes";
+        ExecStart = "${pkgs.python3}/bin/python3 ${logStallHolder}";
+      };
+    };
+    systemd.services.wren = {
+      requires = [ "log-stall-holder.service" ];
+      after = [ "log-stall-holder.service" ];
+      environment.WREN_LOG_QUEUE_LINES = "1";
+      serviceConfig.StandardOutput = lib.mkForce "file:/run/log-stall/wren.fifo";
+      serviceConfig.StandardError = lib.mkForce "file:/run/log-stall/wren.fifo";
+    };
+    systemd.services.velstra = {
+      requires = [ "log-stall-holder.service" ];
+      after = [ "log-stall-holder.service" ];
+      environment.VELSTRA_LOG_QUEUE_LINES = "1";
+      serviceConfig.StandardOutput = lib.mkForce "file:/run/log-stall/velstra.fifo";
+      serviceConfig.StandardError = lib.mkForce "file:/run/log-stall/velstra.fifo";
+    };
+  };
+  # checks.ha-log-stall: the master's log outputs stop being read (see
+  # logStallOutputs) while both daemons keep logging. A daemon whose logging
+  # blocks then stalls: wren's 25 ms lease renewals miss the 250 ms witness
+  # lease, or the agent's HA heartbeat goes stale, and ownership moves with no
+  # fault. Fixed, both drop and count log lines instead, and the term does not
+  # move for 60 s. Only the quiet pair is needed, not the fault matrix.
+  logStallScript = ''
+    import time, shlex
+    def python_command(script):
+        return "${pkgs.python3}/bin/python3 -c " + shlex.quote(script)
+    start_all()
+    witness.wait_for_unit("sentinel-witness.service")
+    for node in (master,backup):
+        node.wait_for_unit("velstra.service")
+        node.wait_for_unit("wren.service")
+    master.wait_until_succeeds("journalctl -u log-stall-holder --no-pager | grep -q 'authenticated TCP listening'",timeout=90)
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=60)
+    master.wait_until_succeeds(python_command('import json,subprocess; state=json.loads(subprocess.check_output(["sentinel","agent-query","ha-status"])); assert state["role"]=="Master"'),timeout=30)
+    backup.wait_until_succeeds("sentinel show ha | grep -qx 'HA Backup'",timeout=30)
+    term_script='import json; print(json.load(open("/run/velstra/ha/role.json"))["authority"]["term"])'
+    terms_before={n.name:int(n.succeed(python_command(term_script)).strip()) for n in (master,backup)}
+    master.succeed("touch /run/log-stall/stop")
+    master.wait_until_succeeds("journalctl -u log-stall-holder --no-pager | grep -q 'no longer reading'",timeout=10)
+    # wren is quiet when nothing changes; each routing reload logs its
+    # admission. The agent prints its statistics table every 5 s.
+    master.succeed("systemd-run --unit=log-stall-load --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'for i in $(seq 400); do timeout 2 wren --socket /run/wren/wren.sock reload >/dev/null 2>&1; done'")
+    # Then make the lease task itself log: 10 s in, once the pipes are full,
+    # delay the master's packets on its control link (eth3, to the witness)
+    # by 21 ms for 3 s. A witness exchange waits on three of them (connect,
+    # handshake, request), about 65 ms: inside the 80 ms I/O budget, so every
+    # renewal still succeeds, but past the 60 ms threshold of the "close to
+    # its I/O budget" warning, which the lease task writes. Blocking, that
+    # write never returns and the lease lapses; lossy, the line is dropped.
+    master.succeed("systemd-run --unit=log-stall-slow --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'sleep 10; tc qdisc add dev eth3 root netem delay 21ms; sleep 3; tc qdisc del dev eth3 root'")
+    seen=set()
+    quiet_end=time.monotonic()+60
+    while time.monotonic()<quiet_end:
+        seen.add(tuple(int(n.succeed(python_command(term_script)).strip()) for n in (master,backup)))
+        time.sleep(1)
+    terms_after={n.name:int(n.succeed(python_command(term_script)).strip()) for n in (master,backup)}
+    print("log-stall terms", terms_before, terms_after, sorted(seen))
+    if not (terms_after==terms_before and seen=={(terms_before["master"],terms_before["backup"])}):
+        master.succeed("rm -f /run/log-stall/stop")
+        time.sleep(3)
+        print(master.execute("journalctl -u log-stall-holder --no-pager -n 80 -o cat")[1])
+        print(backup.execute("journalctl -u wren --no-pager -n 40 -o cat")[1])
+        raise AssertionError(("HA ownership moved while the log output was blocked", terms_before, terms_after, sorted(seen)))
+    master.succeed("sentinel show ha | grep -qx 'HA Master'")
+    # Both daemons reached the drop path and count it.
+    wren_dropped=int(master.succeed("timeout 5 wren --socket /run/wren/wren.sock show metrics | awk '/^wren_log_lines_dropped_total / {print $2}'").strip() or 0)
+    agent_dropped=int(master.succeed("timeout 5 sentinel show firewall statistics | awk '/log_lines_dropped/ {print $2}'").strip() or 0)
+    print("log-stall dropped", {"wren": wren_dropped, "agent": agent_dropped})
+    assert wren_dropped>0 and agent_dropped>0, (wren_dropped, agent_dropped)
+  '';
   echo = pkgs.writeText "ha-echo.py" ''
     import socket, threading
     def serve(connection, peer):
@@ -149,7 +272,7 @@ in pkgs.testers.runNixOSTest {
     };
 
   };
-  testScript = ''
+  testScript = if logStall then logStallScript else ''
     import time, json, shlex
     def python_command(script):
         return "${pkgs.python3}/bin/python3 -c " + shlex.quote(script)
