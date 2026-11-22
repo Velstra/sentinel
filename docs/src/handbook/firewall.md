@@ -341,6 +341,25 @@ show firewall hits
 
 ## What was already refused (firewall log)
 
+`log` decides what reaches this log. On a zone or as the firewall-wide
+default (`set firewall zone <zone> log true`, `set firewall global log true`)
+it records every packet the firewall drops or rejects, with the reason. On a
+rule (`set firewall rule <name> log true`) it records that rule's drops, and
+for an accepting rule each new flow it admits. Packets of flows already
+admitted are never logged, however busy the link: forwarding, NAT and
+tunnelling are counted (`show firewall statistics`), not logged.
+
+The journal is rationed: the agent writes at most a burst of 100 such lines
+and then 10 a second, and for every 10 s in which it held lines back one
+`suppressed N data-plane log record(s)` warning says how many. The drop
+counters still count every packet, and `show firewall statistics` reports the
+held-back total as `log_lines_suppressed`. A flood of logged drops therefore
+costs log lines, never the firewall's speed or the rest of the journal.
+
+The console's live view is a different stream: on a logging zone or policy it
+shows every packet, accepted ones included. It is bounded and lossy — under
+load it skips packets — and it never reaches the journal.
+
 Read the firewall log for recent decisions. A counter reason can be shared by several rules; use a trace to identify candidate matches.
 
 ```text

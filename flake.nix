@@ -433,7 +433,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-kx4wk0sAK83wC0l9vOsXFiafNjP1DddhSFIURhmsa2I=";
+      ebpfHash = "sha256-WTuruZVYWDnfHaJyHDG9fy8bPfYcPfnbS5Yab0ozpwY=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
@@ -1907,6 +1907,9 @@
         napt-concurrency = import ./nix/napt-test.nix { inherit pkgs self; };
         # PERF-02: masqueraded new-connection rate after a non-allocator NAT write.
         nat-cps = import ./nix/nat-cps-test.nix { inherit pkgs self; };
+        # `log` logs decisions, never the packets of admitted flows, and a flood
+        # of logged drops does not stall the box.
+        log-fastpath = import ./nix/log-fastpath-test.nix { inherit pkgs self; };
         # CGNAT: a 65-port (non-power-of-two) block holds 65 sockets; the 66th is refused.
         nat-domain-cgnat = import ./nix/nat-domain-cgnat-test.nix { inherit pkgs self; };
         # A reused client tuple's binding holds its public port through the server's TIME_WAIT.
