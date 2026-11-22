@@ -138,6 +138,40 @@ pkgs.testers.runNixOSTest {
         assert rows, "velstra_egress is not loaded"
         return (sum(p.get("run_time_ns", 0) for p in rows), sum(p.get("run_cnt", 0) for p in rows))
 
+    # Where a retransmitted SYN was lost, per phase: the server's listen
+    # queues, the client's own retransmissions, every NIC and qdisc on the
+    # path, and (in `counters`) every data-plane drop and NAT counter.
+    SERVER_TCP = ["TcpExtListenOverflows", "TcpExtListenDrops", "TcpExtTCPReqQFullDrop",
+                  "TcpExtTCPReqQFullDoCookies", "TcpExtSyncookiesSent", "TcpExtTCPBacklogDrop"]
+    CLIENT_TCP = ["TcpRetransSegs", "TcpExtTCPSynRetrans", "TcpExtTCPTimeouts"]
+
+    def nstat(machine, names):
+        text = machine.succeed("nstat -saz " + " ".join(names))
+        return {n: int(v) for n, v in re.findall(r"^([A-Za-z0-9]+)\s+(\d+)", text, re.M) if n in names}
+
+    def link_drops(machine):
+        drops = {}
+        for link in json.loads(machine.succeed("ip -s -j link show")):
+            stats64 = link.get("stats64", {})
+            for way in ("rx", "tx"):
+                drops[link["ifname"] + "_" + way + "_dropped"] = stats64.get(way, {}).get("dropped", 0)
+                # Packet counts per hop: what one end sent and the next end
+                # received tells which link of the test network lost it.
+                drops[link["ifname"] + "_" + way + "_packets"] = stats64.get(way, {}).get("packets", 0)
+        return drops
+
+    def qdisc_drops(machine):
+        return {q["dev"] + "_" + q["kind"] + "_" + q.get("handle", "") + "_drops": q.get("drops", 0)
+                for q in json.loads(machine.succeed("tc -s -j qdisc show"))}
+
+    def path_counters():
+        return {"server_tcp": nstat(backend, SERVER_TCP), "client_tcp": nstat(client, CLIENT_TCP),
+                "server_links": link_drops(backend), "client_links": link_drops(client),
+                "fw_links": link_drops(fw), "fw_qdiscs": qdisc_drops(fw)}
+
+    def path_delta(before, after):
+        return {k: delta(before[k], after[k]) for k in after}
+
     def napt_search_bound():
         out = fw.execute("bpftool -j map dump name NAPT_SEARCH")
         if out[0] != 0:
@@ -183,6 +217,10 @@ pkgs.testers.runNixOSTest {
     )
     client.wait_until_succeeds("test -s /tmp/held.ready", timeout=60)
 
+    receipt["server_listen"] = {
+        "sysctl": backend.succeed("sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_syncookies").strip(),
+        "sockets": backend.succeed("ss -ltn 'sport = :9200'").strip(),
+    }
     for phase in ["first", "after-expiry"]:
         if phase == "after-expiry":
             # Past the 30 s firewall closing timeout and inside the server's
@@ -192,6 +230,7 @@ pkgs.testers.runNixOSTest {
             # reissued public ports both happen here.
             fw.sleep(45)
         counters = stats()
+        path = path_counters()
         runtime = egress_runtime()
         result = json.loads(client.succeed(
             "prlimit --nofile=65536 ${python} ${./nat-cps-probe.py} open"
@@ -200,6 +239,7 @@ pkgs.testers.runNixOSTest {
         after = egress_runtime()
         result["phase"] = phase
         result["counters"] = delta(counters, stats())
+        result["path"] = path_delta(path, path_counters())
         runs = after[1] - runtime[1]
         result["egress_runs"] = runs
         result["egress_mean_ns"] = (after[0] - runtime[0]) // runs if runs else None
