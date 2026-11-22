@@ -182,12 +182,16 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
 - WireGuard through an HA pair follows a takeover in about a second, also when
   the new owner was VM-paused: its wall clock lagged, and the remote peers
   dropped its handshakes as replays until the lag had passed (6 s to beyond
-  15 s measured). The owner now replicates its clock to the standby, and a
-  member that takes over steps its clock forward to its predecessor's. The
-  step is forward-only and logged, at most 10 minutes, and never taken by an
-  NTP-synchronised member from an unsynchronised peer. A refused step is
-  reported by `sentinel show health` (`ha-clock-behind-peer`). Checked by
-  `checks.ha-wireguard-failover`.
+  15 s measured). The owner now replicates its clock to standbys that
+  announce support, and a member that takes over steps its clock forward to
+  its predecessor's after taking the VIPs and before reconfiguring WireGuard.
+  The socket-activated `wren-ha-clock-step` helper takes the step; it holds
+  only `CAP_SYS_TIME`, and Wren keeps `ProtectClock` and no clock capability.
+  The step is forward-only and logged: at most 10 minutes, at most 60 seconds
+  between two NTP-synchronised clocks, and never by an NTP-synchronised member
+  from an unsynchronised peer. A refused step is reported by
+  `sentinel show health` (`ha-clock-behind-peer`) until NTP resolves it.
+  Checked by `checks.ha-wireguard-failover`.
 
 ### Updates and boot trust
 

@@ -368,6 +368,15 @@ in pkgs.testers.runNixOSTest {
     # The cold owner's empty complete baseline must exist before VPN recovery,
     # even after its witness claim has already matured to the active term.
     master.wait_until_succeeds(python_command('import json; r=json.load(open("/run/velstra/ha/role.json")); c=json.load(open("/run/velstra/ha/wireguard.json")); assert r["vpn_ready"] and c["node"]==1 and c["endpoints"]==[]'),timeout=15)
+    # The takeover clock step is the socket-activated helper's, not Wren's:
+    # Wren parses untrusted routing protocols and must hold no CAP_SYS_TIME
+    # (bit 25). clock_caught_up below then proves the shipped path steps.
+    for node in (master,backup):
+        node.succeed("systemctl is-active --quiet wren-ha-clock-step.socket")
+        node.succeed("test -S /run/velstra-ha-clock.sock")
+        wren_caps=node.succeed("awk '/^CapEff/ {print $2}' /proc/$(systemctl show -p MainPID --value wren.service)/status").strip()
+        assert not int(wren_caps,16) & (1 << 25), (node.name, "wren holds CAP_SYS_TIME", wren_caps)
+        assert "ProtectClock=yes" in node.succeed("systemctl show -p ProtectClock wren.service"), node.name
     ''}
     server.wait_for_unit("ha-echo.service")
     for node in (client, server):

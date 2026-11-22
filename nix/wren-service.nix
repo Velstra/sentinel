@@ -56,6 +56,63 @@ in
         RestrictSUIDSGID = true;
       };
     };
+    # The HA WireGuard clock step (wren-ha clock.rs). A member that takes over
+    # brings its wall clock up to its predecessor's before WireGuard initiates,
+    # or the remote peers drop its handshakes as replays. Wren parses untrusted
+    # routing protocols, so it does not hold CAP_SYS_TIME: it connects here and
+    # sends nothing. One sandboxed helper instance per connection reads the
+    # agent's replicated clock itself, applies the rules (forward only; at most
+    # 10 min, or 60 s when both clocks are NTP-synchronised; never by a
+    # synchronised member onto an unsynchronised peer), steps, records
+    # /run/velstra/ha/clock.json and answers with its decision.
+    systemd.sockets.wren-ha-clock-step = {
+      description = "HA WireGuard clock-step requests from Wren";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = "/run/velstra-ha-clock.sock";
+        Accept = true;
+        SocketUser = "root";
+        SocketGroup = "root";
+        SocketMode = "0600";
+        MaxConnections = 4;
+      };
+    };
+    systemd.services."wren-ha-clock-step@" = {
+      description = "Step the wall clock for an HA WireGuard takeover";
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/wren-ha-clock-step";
+        StandardInput = "socket";
+        StandardOutput = "socket";
+        StandardError = "journal";
+        RuntimeMaxSec = 10;
+        # CAP_SYS_TIME and nothing else; clock_settime must stay unfiltered.
+        CapabilityBoundingSet = [ "CAP_SYS_TIME" ];
+        AmbientCapabilities = [ "CAP_SYS_TIME" ];
+        ProtectClock = false;
+        SystemCallFilter = [ "@system-service" "@clock" ];
+        SystemCallArchitectures = "native";
+        # It reads wireguard.json and writes clock.json there, nothing else.
+        ProtectSystem = "strict";
+        ReadWritePaths = [ "/run/velstra/ha" ];
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        PrivateNetwork = true;
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectHostname = true;
+        RestrictNamespaces = true;
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        NoNewPrivileges = true;
+        UMask = "0077";
+      };
+    };
     systemd.services.wren = {
       environment.WREN_WG_BIN = "${pkgs.wireguard-tools}/bin/wg";
       description = "Wren routing daemon (control plane)";
@@ -99,13 +156,11 @@ in
           "CAP_NET_ADMIN"
           "CAP_NET_RAW"
           "CAP_NET_BIND_SERVICE"
-          "CAP_SYS_TIME"
         ];
         CapabilityBoundingSet = [
           "CAP_NET_ADMIN"
           "CAP_NET_RAW"
           "CAP_NET_BIND_SERVICE"
-          "CAP_SYS_TIME"
         ];
         # Sandboxing. wren writes only its control socket under /run/wren
         # (RuntimeDirectory, which stays writable under ProtectSystem=strict) and
@@ -116,12 +171,7 @@ in
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
-        # Not ProtectClock: a WireGuard HA member that takes over steps its wall
-        # clock forward to its predecessor's (forward only, at most 10 min,
-        # never onto an unsynchronised peer from a synchronised clock), or the
-        # remote peers reject its handshakes as replays (wren-ha clock.rs).
-        # That needs CAP_SYS_TIME above and clock_settime unfiltered.
-        ProtectClock = false;
+        ProtectClock = true;
         ProtectKernelModules = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
