@@ -193,11 +193,16 @@ uses more kernel memory for them than before (DP-06).
   and the masquerade and SYN-proxy failovers, not every partition or
   witness-loss case. Rolling upgrades are not hitless (above), and the witness
   is a single point of authority by design.
-- **HA with WireGuard needs synchronised clocks.** Both members answer WireGuard
-  peers with one identity, and a peer accepts a handshake only with a newer
-  timestamp than the last. A member whose wall clock fell behind (a hypervisor
-  pause or migration) stalls the tunnels for up to its clock offset after it
-  takes over. Keep both members on NTP ([HA handbook](handbook/ha.md)).
+- **HA with WireGuard steps a lagging clock forward on takeover.** Both members
+  answer WireGuard peers with one identity, and a peer accepts a handshake only
+  with a newer timestamp than the last. A member whose wall clock fell behind
+  (a hypervisor pause or migration) therefore steps it forward to its
+  predecessor's before it initiates, and tunnels follow the takeover in about a
+  second. The step is forward-only and logged. It is refused beyond 10 minutes,
+  or when this member is NTP-synchronised and its predecessor is not. Then
+  tunnels may stall until NTP corrects the clock, and `sentinel show health`
+  reports `ha-clock-behind-peer`. Run NTP on both members
+  ([HA handbook](handbook/ha.md)).
 - **Kernel CVEs without a 6.12.y fix.** 1.0.0 ships Linux 6.12.118. Of the
   181 High/Critical kernel matches the image scan reports, the kernel CNA's
   per-branch records show 109 already fixed on 6.12.y and 3 not present in 6.12;

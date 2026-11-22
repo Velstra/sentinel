@@ -179,6 +179,15 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   are not copied (CTRL-09, CTRL-10). A commit on the backup member warns.
 - Wren no longer withdraws a healthy owner's addresses after a slow witness
   exchange (pinned Wren ba95bca).
+- WireGuard through an HA pair follows a takeover in about a second, also when
+  the new owner was VM-paused: its wall clock lagged, and the remote peers
+  dropped its handshakes as replays until the lag had passed (6 s to beyond
+  15 s measured). The owner now replicates its clock to the standby, and a
+  member that takes over steps its clock forward to its predecessor's. The
+  step is forward-only and logged, at most 10 minutes, and never taken by an
+  NTP-synchronised member from an unsynchronised peer. A refused step is
+  reported by `sentinel show health` (`ha-clock-behind-peer`). Checked by
+  `checks.ha-wireguard-failover`.
 
 ### Updates and boot trust
 

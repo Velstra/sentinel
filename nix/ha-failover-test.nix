@@ -296,9 +296,14 @@ in pkgs.testers.runNixOSTest {
             print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -tt -n -e -S -r /tmp/ha-packets.pcap 2>/dev/null | tail -n 55"))
         raise AssertionError(f"established TCP stream stalled after {label}")
     # A WireGuard handover also needs the client's tunnel to handshake with
-    # the new owner: WireGuard retries an unanswered handshake after 5 s
-    # (REKEY_TIMEOUT), so its bound is that plus one second.
-    handover_bound=${if wireguard then "6.0" else "3.0"}
+    # the new owner. The new owner initiates at once, so it normally costs no
+    # more than any handover (about 1 s). The bound allows one lost
+    # initiation: WireGuard retries after REKEY_TIMEOUT (5 s) plus up to
+    # REKEY_TIMEOUT_JITTER_MAX (1/3 s; WireGuard protocol, Linux
+    # drivers/net/wireguard/messages.h), on top of the slowest measured
+    # handover without WireGuard (1.28 s over 13 runs) and 0.5 s margin:
+    # 7.2 s. A handshake that needs two retries (2 x REKEY_TIMEOUT) fails it.
+    handover_bound=${if wireguard then "7.2" else "3.0"}
     def wait_forwarding(label, started, bound, paused=None):
         # Forwarding has resumed once the established stream advances again.
         before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
@@ -467,6 +472,12 @@ in pkgs.testers.runNixOSTest {
     # crash does. The warm standby must be forwarding within a bound, and the
     # restarted member must rejoin by itself (no reboot, no manual restart).
     for service in ("velstra.service","wren.service"):
+        # The fault is meant to hit a pair with a warm standby. After the
+        # previous preemption the standby needs the new owner's complete
+        # snapshot before it may take over; killing the owner earlier left a
+        # cold standby, and the owner's restarted wren took the pair back
+        # instead (3.78 s, and the backup never held the VIP).
+        backup.wait_until_succeeds(agent_caught_up(backup),timeout=20)
         started=time.monotonic()
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
         wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
@@ -504,16 +515,20 @@ in pkgs.testers.runNixOSTest {
     # up standby again by itself, and the pair must survive the NEXT failure
     # too, without restarting velstra anywhere.
     def resume(node):
+        # A resumed VM's wall clock is behind by its pause, and these VMs run
+        # no NTP. That is the case under test: the members share one
+        # WireGuard identity, a remote peer accepts a handshake from it only
+        # with a newer wall-clock timestamp than the last one, and the new
+        # owner itself must bring its clock up to its predecessor's before it
+        # initiates (wren-ha clock). The test must not resync it.
         node.send_monitor_command("cont")
-        # The members share one WireGuard identity, and a peer accepts a
-        # handshake from it only with a newer wall-clock timestamp than the
-        # last one. A resumed VM's wall clock is behind by its pause, so its
-        # handshakes were refused until its clock passed its peer's last one
-        # (master 13.5 s and backup 8.3 s behind after these pauses). Members
-        # run NTP; step the resumed wall clock as a time sync would. Leases
-        # run on CLOCK_BOOTTIME, which this leaves stopped as before.
-        if ${if wireguard then "True" else "False"}:
-            node.succeed(f"date -u -s @{time.time():.6f}")
+    def clock_caught_up(label):
+        # The returning owner stepped its wall clock to its predecessor's.
+        status=json.loads(master.succeed("cat /run/velstra/ha/clock.json"))
+        ours=float(master.succeed("date +%s.%N")); theirs=float(backup.succeed("date +%s.%N"))
+        print(f"{label}: clock decision {status}, master-backup {ours-theirs:+.3f}s")
+        assert status["action"]=="step" and "error" not in status, (label,status)
+        assert abs(theirs-ours) < 1.0, (label,ours,theirs)
     def pause(node, seconds):
         node.send_monitor_command("stop")
         time.sleep(seconds)
@@ -530,6 +545,9 @@ in pkgs.testers.runNixOSTest {
     resume(master)
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
     master.wait_until_succeeds(agent_caught_up(master),timeout=20)
+    ${pkgs.lib.optionalString wireguard ''
+    clock_caught_up("paused owner resumed and preempted")
+    ''}
     check_stream("paused owner resumed and preempted")
     # (2) The standby pauses and resumes: it must catch up again by itself.
     pause(backup,8)
@@ -545,6 +563,9 @@ in pkgs.testers.runNixOSTest {
     # Preemption is a handover like any other, with the same bound: a
     # WireGuard client must first handshake with the returning owner.
     wait_forwarding("resumed owner preempted after the second pause",time.monotonic(),handover_bound)
+    ${pkgs.lib.optionalString wireguard ''
+    clock_caught_up("resumed owner preempted after the second pause")
+    ''}
     check_stream("both members recovered from VM pauses")
     ''}
     check_stream("all fault and recovery scenarios")
