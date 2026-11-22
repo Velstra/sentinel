@@ -274,6 +274,16 @@ in pkgs.testers.runNixOSTest {
   };
   testScript = if logStall then logStallScript else ''
     import time, json, shlex
+    import importlib.util
+    # The one failover bound every HA check uses; formula and measurements
+    # are in nix/ha-failover-bound.py.
+    ha_spec = importlib.util.spec_from_file_location("ha_failover_bound", "${./ha-failover-bound.py}")
+    assert ha_spec is not None and ha_spec.loader is not None
+    ha_bound = importlib.util.module_from_spec(ha_spec)
+    ha_spec.loader.exec_module(ha_bound)
+    ha_bound.ha_use_tcpdump("${pkgs.tcpdump}/bin/tcpdump")
+    # A WireGuard peer may have to wait for a handshake retry on top.
+    ha_extra = ${if wireguard then "ha_bound.HA_WIREGUARD_EXTRA" else "0.0"}
     def python_command(script):
         return "${pkgs.python3}/bin/python3 -c " + shlex.quote(script)
     def check_stream(label):
@@ -295,10 +305,9 @@ in pkgs.testers.runNixOSTest {
             node.succeed("systemctl stop ha-packets")
             print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -tt -n -e -S -r /tmp/ha-packets.pcap 2>/dev/null | tail -n 55"))
         raise AssertionError(f"established TCP stream stalled after {label}")
-    # A WireGuard handover also needs the client's tunnel to handshake with
-    # the new owner: WireGuard retries an unanswered handshake after 5 s
-    # (REKEY_TIMEOUT), so its bound is that plus one second.
-    handover_bound=${if wireguard then "6.0" else "3.0"}
+    # Fault to resumed forwarding (SIGKILL, pause, preemption): the lease
+    # run-out plus the takeover gap, plus a WireGuard handshake retry.
+    handover_bound=ha_bound.HA_FAULT_TO_RESUME_MAX+ha_extra
     def wait_forwarding(label, started, bound, paused=None):
         # Forwarding has resumed once the established stream advances again.
         before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
@@ -367,6 +376,9 @@ in pkgs.testers.runNixOSTest {
     server.wait_for_unit("ha-echo.service")
     for node in (client, server):
         node.succeed("systemd-run --unit=ha-packets ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/ha-packets.pcap -i eth1 tcp port 8443")
+    ${pkgs.lib.optionalString (!wireguard) ''
+    ha_bound.ha_capture_start(client,"eth1",8443)
+    ''}
     client.succeed("systemd-run --unit=ha-stream ${pkgs.python3}/bin/python3 ${stream}")
     client.wait_until_succeeds("test -f /tmp/stream-ready",timeout=20)
     # Prove the flow crossed the intended datapath before the crash. Splicing
@@ -383,6 +395,7 @@ in pkgs.testers.runNixOSTest {
     time.sleep(2)
     before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
     # No priority-zero advert, service shutdown or graceful address removal.
+    anchor=ha_bound.ha_fault_anchor(client)
     started=time.monotonic()
     ${if leased then ''
     master.succeed("systemctl kill --kill-who=main --signal=SIGSTOP wren.service")
@@ -392,7 +405,9 @@ in pkgs.testers.runNixOSTest {
         # only when both WAN and LAN VIPs are present within the same deadline.
         code,_=backup.execute("ip -o address show eth2 | grep -q 10.2.0.100 && ip -o address show eth1 | grep -q 10.1.0.100")
         if code == 0: break
-        assert time.monotonic()-started < 1.0, "VIP promotion exceeded one second"
+        # Seen from the driver: lease run-out, takeover, and the driver's own
+        # command latency.
+        assert time.monotonic()-started < ha_bound.HA_LEASE_RUNOUT_MAX+ha_bound.HA_TAKEOVER_MAX+ha_bound.HA_DRIVER_LATENCY_MAX, "VIP promotion exceeded the takeover bound"
         time.sleep(0.01)
     elapsed=time.monotonic()-started
     backup.succeed("ip -o address show eth1 | grep -q 10.1.0.100")
@@ -410,7 +425,7 @@ in pkgs.testers.runNixOSTest {
     ''}
     time.sleep(2)
     after=json.loads(client.succeed("cat /tmp/stream-status"))
-    if after["count"] <= before+20 or after["maximum_gap"] >= 1.0:
+    if after["count"] <= before+20 or after["maximum_gap"] >= ha_bound.HA_GAP_MAX+ha_extra:
         print(f"TCP progress before crash={before}, after={after}")
         print(backup.succeed("sentinel show firewall flows; sentinel show firewall statistics; ip -s neighbour; journalctl -u velstra --no-pager -n 100"))
         for node in (client, server):
@@ -419,7 +434,13 @@ in pkgs.testers.runNixOSTest {
             print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -n -e -r /tmp/ha-packets.pcap 2>&1 | tail -n 80"))
         print(server.succeed("cat /tmp/accepted"))
     assert after["count"] > before+20, "established TCP connection did not continue"
-    assert after["maximum_gap"] < 1.0, after
+    ${pkgs.lib.optionalString (!wireguard) ''
+    # (a) takeover within its bound, (b) the first retry after the new
+    # owner's ARP answered. Inside a WireGuard tunnel the retries are not on
+    # the client's underlay link; that variant keeps the backstop only.
+    ha_bound.ha_takeover(client,anchor,backup.succeed("cat /sys/class/net/eth2/address").strip(),"10.2.0.100","10.1.0.10",8443)
+    ''}
+    assert after["maximum_gap"] < ha_bound.HA_GAP_MAX+ha_extra, after
     ${pkgs.lib.optionalString leased ''
     # Old process is paused, yet its still-live kernel must enforce expiry.
     master.succeed(python_command('import json,time; r=json.load(open("/run/velstra/ha/role.json")); assert r["deadline_ns"] < time.clock_gettime_ns(time.CLOCK_BOOTTIME)'))
@@ -524,7 +545,7 @@ in pkgs.testers.runNixOSTest {
     check_stream("before the VM pause scenarios")
     started=time.monotonic()
     master.send_monitor_command("stop")
-    wait_forwarding("owner VM paused",started,max(5.0,handover_bound),paused=master)
+    wait_forwarding("owner VM paused",started,handover_bound,paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(8)
     resume(master)
@@ -537,7 +558,7 @@ in pkgs.testers.runNixOSTest {
     # (3) The next failure: the resumed standby takes over.
     started=time.monotonic()
     master.send_monitor_command("stop")
-    wait_forwarding("second consecutive pause failover",started,max(5.0,handover_bound),paused=master)
+    wait_forwarding("second consecutive pause failover",started,handover_bound,paused=master)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(3)
     resume(master)
