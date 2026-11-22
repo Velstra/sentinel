@@ -372,7 +372,7 @@ in pkgs.testers.runNixOSTest {
     # Wren parses untrusted routing protocols and must hold no CAP_SYS_TIME
     # (bit 25). clock_caught_up below then proves the shipped path steps.
     for node in (master,backup):
-        node.succeed("systemctl is-active --quiet wren-ha-clock-step.socket")
+        node.succeed("systemctl is-active --quiet wren-ha-clock-step.socket wren-ha-clock-step.service")
         node.succeed("test -S /run/velstra-ha-clock.sock")
         wren_caps=node.succeed("awk '/^CapEff/ {print $2}' /proc/$(systemctl show -p MainPID --value wren.service)/status").strip()
         assert not int(wren_caps,16) & (1 << 25), (node.name, "wren holds CAP_SYS_TIME", wren_caps)

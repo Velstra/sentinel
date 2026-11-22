@@ -73,18 +73,16 @@ in
       wantedBy = [ "sockets.target" ];
       socketConfig = {
         ListenStream = "/run/velstra-ha-clock.sock";
-        Accept = true;
+        # One long-running helper serves requests one at a time from the
+        # listen queue, so a request is never dropped. (Accept=yes spawned a
+        # sandboxed instance per request, which cost each WireGuard takeover
+        # 0.2-0.4 s, and dropped requests beyond MaxConnections.) The
+        # helper's flock still serialises decisions.
+        Accept = false;
         SocketUser = "root";
         SocketGroup = "root";
         SocketMode = "0600";
-        # With Accept=yes systemd drops a connection beyond MaxConnections
-        # rather than queueing it ("Too many incoming connections (1),
-        # dropping connection" in ha-wireguard-failover, when a cancelled
-        # takeover's request was still being answered), which skipped a
-        # needed step. A few instances may run; the helper's flock makes them
-        # decide one at a time, each on a clock read under the lock. Never
-        # let a burst of requests put the socket into a failed state.
-        MaxConnections = 4;
+        # Never let a burst of requests put the socket into a failed state.
         TriggerLimitIntervalSec = 0;
       };
     };
@@ -92,14 +90,18 @@ in
       "d /run/velstra-ha-clock-step 0700 root root -"
       "d /run/velstra/ha-clock 0700 root root -"
     ];
-    systemd.services."wren-ha-clock-step@" = {
+    systemd.services.wren-ha-clock-step = {
       description = "Step the wall clock for an HA WireGuard takeover";
+      # Started at boot, not on the first takeover, so no takeover waits
+      # for it to start.
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "wren-ha-clock-step.socket" ];
+      after = [ "wren-ha-clock-step.socket" ];
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/wren-ha-clock-step";
-        StandardInput = "socket";
-        StandardOutput = "socket";
+        Restart = "on-failure";
+        RestartSec = 1;
         StandardError = "journal";
-        RuntimeMaxSec = 10;
         # CAP_SYS_TIME and nothing else; clock_settime must stay unfiltered.
         CapabilityBoundingSet = [ "CAP_SYS_TIME" ];
         AmbientCapabilities = [ "CAP_SYS_TIME" ];
