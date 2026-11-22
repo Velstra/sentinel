@@ -257,6 +257,14 @@ in pkgs.testers.runNixOSTest {
   };
   testScript = ''
     import json, re, shlex, time
+    import importlib.util
+    # The one failover bound every HA check uses; formula and measurements
+    # are in nix/ha-failover-bound.py.
+    ha_spec = importlib.util.spec_from_file_location("ha_failover_bound", "${./ha-failover-bound.py}")
+    assert ha_spec is not None and ha_spec.loader is not None
+    ha_bound = importlib.util.module_from_spec(ha_spec)
+    ha_spec.loader.exec_module(ha_bound)
+    ha_bound.ha_use_tcpdump("${pkgs.tcpdump}/bin/tcpdump")
 
     def py(source):
         return "${pkgs.python3}/bin/python3 -c " + shlex.quote(source)
@@ -335,6 +343,7 @@ in pkgs.testers.runNixOSTest {
         for node in (client, server):
             node.succeed("systemd-run --unit=ha-flow-packets ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/flow.pcap -i eth1 tcp port 8443")
             node.wait_until_succeeds("journalctl -u ha-flow-packets --no-pager | grep -q 'listening on eth1'", timeout=5)
+        ha_bound.ha_capture_start(client, "eth1", 8443)
         client.succeed("systemd-run --unit=ha-flow-stream ${pkgs.python3}/bin/python3 ${stream}")
         client.wait_until_succeeds("test -s /tmp/stream-status", timeout=8)
         baseline = progress(0, 50, "before fault")
@@ -367,6 +376,7 @@ in pkgs.testers.runNixOSTest {
         client.wait_until_succeeds("test $(wc -l < /tmp/udp-replies) -ge 20", timeout=10)
         probe_before = probe_replies()
         before = status()["count"]
+        anchor = ha_bound.ha_fault_anchor(client)
         started = time.monotonic()
         primary.succeed("systemctl kill --kill-who=main --signal=SIGSTOP wren.service")
         # Both VIPs and actual data-plane acknowledgement, not desired election
@@ -413,6 +423,12 @@ in pkgs.testers.runNixOSTest {
         stream_gap = reply_gap(before - 1)
         print(f"in-guest forwarding gap across warm promotion {gap:.3f}s (TCP stream gap {stream_gap:.3f}s incl. retransmission backoff; host elapsed {elapsed:.3f}s)")
         assert gap <= 1.5, f"warm two-node promotion exceeded replica budget: in-guest gap {gap:.3f}s"
+        # (a) and (b) of the shared bound. Without a witness the standby
+        # takes over only once the 1000 ms peer timeout has passed, on top of
+        # the lease-run-out-relative takeover budget.
+        ha_bound.ha_takeover(client, anchor, secondary.succeed("cat /sys/class/net/eth2/address").strip(),
+                             "10.2.0.100", "10.1.0.10", 8443,
+                             takeover_max=ha_bound.HA_TAKEOVER_MAX + ha_bound.HA_TWO_NODE_PEER_TIMEOUT)
         server.succeed("systemd-run --unit=old-mac-capture ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/old-mac.pcap -i eth1 'tcp src port 41001 and tcp dst port 8443'")
         server.wait_until_succeeds("journalctl -u old-mac-capture --no-pager | grep -q 'listening on eth1'", timeout=5)
         # Raw Ethernet targets the old MAC without changing the live stream's
