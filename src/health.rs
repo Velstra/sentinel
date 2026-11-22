@@ -290,6 +290,17 @@ fn snapshot(
         )),
         None => issues.push(issue("clock-unavailable", "unknown", "Clock synchronisation could not be determined.", "Inspect the kernel clock discipline and time service status.")),
     }
+    if let Some(lag) = clock.ha_peer.as_ref().filter(|lag| !lag.stepped) {
+        issues.push(issue(
+            "ha-clock-behind-peer", "warning",
+            &format!(
+                "This member's clock was {:.1} s behind its HA peer at its last WireGuard takeover and was not stepped ({}). WireGuard tunnels through the pair may stall after a takeover until NTP corrects it.",
+                lag.behind_ms as f64 / 1000.0,
+                lag.reason.as_deref().unwrap_or("no reason recorded"),
+            ),
+            "Run NTP on both HA members (Services / NTP) and check chronyd.service on each; a member that resumes from a VM pause must reach its time source.",
+        ));
+    }
     if appliance.is_none() {
         issues.push(issue(
             "configuration-unavailable",
@@ -410,6 +421,7 @@ fn snapshot(
             "ntp_configured": appliance.map(|config| !config.services.ntp.is_empty()),
             "ntp_servers": appliance.map(|config| &config.services.ntp.upstream),
             "service": chrony,
+            "ha_peer": clock.ha_peer.as_ref().map(|lag| json!({"behind_ms": lag.behind_ms, "stepped": lag.stepped, "reason": lag.reason})),
         },
         "systemd": {"available": failures.is_ok(), "failed_units": failures.as_ref().ok(), "error": failures.as_ref().err()},
         "network": {"default_route": default_route},
@@ -488,6 +500,7 @@ mod tests {
             synchronised: sync,
             now: 1_793_554_000,
             newer_state: None,
+            ha_peer: None,
         }
     }
 
@@ -509,6 +522,38 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry["code"] == code)
+    }
+
+    #[test]
+    fn a_clock_left_behind_its_ha_peer_is_a_warning_a_stepped_one_is_not() {
+        let run = |lag: Option<crate::clock::HaPeerLag>| {
+            snapshot(
+                Some(&appliance()),
+                crate::clock::Clock {
+                    ha_peer: lag,
+                    ..clock(Some(true))
+                },
+                Ok(vec![]),
+                Ok(vec![ssh_unit("active", "running")]),
+                vec![],
+                Some(true),
+            )
+        };
+        let refused = run(Some(crate::clock::HaPeerLag {
+            behind_ms: 9_140,
+            stepped: false,
+            reason: Some("this member's clock is NTP-synchronised and the peer's is not".into()),
+        }));
+        assert!(has_issue(&refused, "ha-clock-behind-peer"), "{refused}");
+        assert_eq!(refused["clock"]["ha_peer"]["behind_ms"], 9_140);
+        let stepped = run(Some(crate::clock::HaPeerLag {
+            behind_ms: 9_140,
+            stepped: true,
+            reason: None,
+        }));
+        assert!(!has_issue(&stepped, "ha-clock-behind-peer"), "{stepped}");
+        assert_eq!(stepped["clock"]["ha_peer"]["stepped"], true);
+        assert!(!has_issue(&run(None), "ha-clock-behind-peer"));
     }
 
     #[test]

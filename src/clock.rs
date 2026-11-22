@@ -64,6 +64,49 @@ pub struct Clock {
     /// A path this appliance wrote whose timestamp lies in the future of `now`,
     /// with that timestamp — corroboration, never the reason for a verdict.
     pub newer_state: Option<(&'static str, i64)>,
+    /// What the last HA WireGuard promotion found about this member's clock
+    /// against the previous owner's (`None` when it found nothing to report).
+    pub ha_peer: Option<HaPeerLag>,
+}
+
+/// Where wren records its clock decision at a WireGuard HA promotion
+/// (wren-ha `wireguard::align_clock`).
+const HA_CLOCK_STATUS: &str = "/run/velstra/ha/clock.json";
+
+/// A lag behind the HA peer that the promotion stepped away or could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaPeerLag {
+    pub behind_ms: u64,
+    /// The clock was stepped forward to the peer's.
+    pub stepped: bool,
+    /// Why it was not stepped, when it was not.
+    pub reason: Option<String>,
+}
+
+impl HaPeerLag {
+    /// Parse wren's record; only a step or a refusal is worth reporting.
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let behind_ms = value["behind_ns"].as_u64()? / 1_000_000;
+        match value["action"].as_str()? {
+            "step" if value["error"].is_null() => Some(Self {
+                behind_ms,
+                stepped: true,
+                reason: None,
+            }),
+            "step" => Some(Self {
+                behind_ms,
+                stepped: false,
+                reason: value["error"].as_str().map(String::from),
+            }),
+            "refuse" => Some(Self {
+                behind_ms,
+                stepped: false,
+                reason: value["reason"].as_str().map(String::from),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Ask the kernel, then look for corroboration.
@@ -78,6 +121,9 @@ pub fn current() -> Clock {
         synchronised: kernel_sync(),
         now,
         newer_state: newest_state_after(now),
+        ha_peer: std::fs::read_to_string(HA_CLOCK_STATUS)
+            .ok()
+            .and_then(|text| HaPeerLag::parse(&text)),
     }
 }
 
@@ -230,6 +276,7 @@ mod tests {
             synchronised: Some(true),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert_eq!(c.describe(), "2021-01-14 03:22:57 UTC — synchronised");
     }
@@ -242,6 +289,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         let line = c.describe();
         assert!(
@@ -259,6 +307,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: Some(("/var/lib/sentinel/appliance.toml", 1_786_000_000)),
+            ha_peer: None,
         };
         let line = c.describe();
         assert!(line.contains("/var/lib/sentinel/appliance.toml"), "{line}");
@@ -284,6 +333,7 @@ mod tests {
             synchronised: None,
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert!(c.describe().contains("unknown"), "{}", c.describe());
         assert!(c.schedule_warning(&scheduled(1, false)).is_none());
@@ -297,6 +347,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         let w = bad
             .schedule_warning(&scheduled(2, false))
@@ -320,6 +371,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert!(bad.schedule_warning(&scheduled(0, false)).is_none());
 
@@ -327,6 +379,7 @@ mod tests {
             synchronised: Some(true),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert!(good.schedule_warning(&scheduled(1, false)).is_none());
     }
