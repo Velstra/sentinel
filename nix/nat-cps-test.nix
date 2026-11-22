@@ -8,7 +8,9 @@
 # twice, with long-lived connections echoing throughout.
 #
 # Floor: 2000 new connections/s, offered open-loop for 10 s per phase, every
-# one of them completed, the firewall losing nothing it received, and at most
+# one of them completed, the firewall refusing nothing but repeated server RSTs
+# for flows a first RST already closed (each refusal logged and attributed),
+# and at most
 # 2 % needing a SYN retransmission (the links between test VMs drop packets
 # on their own; the receipt measures every hop). That is
 # 4x the live collapse and well under what the routed path did on the same
@@ -64,7 +66,7 @@ pkgs.testers.runNixOSTest {
         "net.core.somaxconn" = 8192;
         "net.ipv4.tcp_max_syn_backlog" = 16384;
       };
-      environment.systemPackages = [ pkgs.curl ];
+      environment.systemPackages = [ pkgs.curl pkgs.tcpdump ];
       systemd.services.cps-peer = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
@@ -86,6 +88,12 @@ pkgs.testers.runNixOSTest {
         appliance = lib.mkForce (pkgs.writeText "nat-cps.toml" ''
           [system]
           hostname="fw"
+          # Logs the packets the data plane refuses, and only those (a pass
+          # is logged by a rule's own `log` alone): each refusal below is named
+          # by its WAN port. Under this load it is also the regression guard
+          # for the log flood, where `log` logged every reverse-NAT packet.
+          [zone.wan]
+          log=true
           [zone.lan]
           default_action="accept"
           [[interface]]
@@ -198,6 +206,24 @@ pkgs.testers.runNixOSTest {
     NAT_DROPS = ["egress_nat_no_candidate", "egress_nat_claim_failed", "nat_claim_collision",
                  "egress_nat_fragment_dropped", "egress_nat_unsupported_dropped"]
 
+    def journal_cursor():
+        return fw.succeed("journalctl -u velstra -n0 --show-cursor").strip().split("cursor: ")[-1]
+
+    def refusals(cursor):
+        # The data plane's DROP lines since `cursor`: (source, proto, port, reason).
+        text = fw.succeed("journalctl -u velstra --no-pager -o cat --after-cursor='" + cursor + "' | grep -E 'DROP[0-9]* ' || true")
+        return [(m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)) for m in
+                re.finditer(r"DROP (\S+) proto=(\d+) dport=(\d+) reason=(\w+)", text)]
+
+    def server_resets(capture):
+        # RSTs the server sent, per WAN port it sent them to.
+        text = backend.succeed("tcpdump -r " + capture + " -nn 2>/dev/null || true")
+        resets: dict[int, int] = {}
+        for m in re.finditer(r" > 198\.18\.10\.100\.(\d+): Flags \[R", text):
+            port = int(m.group(1))
+            resets[port] = resets.get(port, 0) + 1
+        return resets
+
     def napt_search_bound():
         out = fw.execute("bpftool -j map dump name NAPT_SEARCH")
         if out[0] != 0:
@@ -255,6 +281,10 @@ pkgs.testers.runNixOSTest {
             # clean ones still held (120 s). Reused client tuples and
             # reissued public ports both happen here.
             fw.sleep(45)
+        capture = "/tmp/server-resets-" + phase + ".pcap"
+        backend.succeed("systemd-run --unit=server-resets-" + phase + " ${pkgs.tcpdump}/bin/tcpdump -p -U -i eth1 -w " + capture + " 'tcp src port 9200 and tcp[13] & 4 != 0'")
+        backend.wait_until_succeeds("test -s " + capture, timeout=10)
+        cursor = journal_cursor()
         counters = stats()
         path = path_counters()
         runtime = egress_runtime()
@@ -269,6 +299,9 @@ pkgs.testers.runNixOSTest {
         result["hop_loss"] = hop_loss(result["path"])
         result["dataplane_drops"] = {k: result["counters"][k] for k in DATAPLANE_DROPS if result["counters"].get(k)}
         result["nat_drops"] = {k: result["counters"][k] for k in NAT_DROPS if result["counters"].get(k)}
+        backend.succeed("systemctl stop server-resets-" + phase)
+        result["refusals"] = refusals(cursor)
+        result["server_resets"] = server_resets(capture)
         runs = after[1] - runtime[1]
         result["egress_runs"] = runs
         result["egress_mean_ns"] = (after[0] - runtime[0]) // runs if runs else None
@@ -286,6 +319,9 @@ pkgs.testers.runNixOSTest {
         print(result["phase"].ljust(13), "  ".join(f"{k}={v}" for k, v in result["hop_loss"].items()),
               " slow-connects=" + str(result["retransmit_shaped_connects"]),
               " dataplane-drops=" + json.dumps(result["dataplane_drops"]))
+        for source, proto, port, reason in result["refusals"]:
+            print("  refused", source, "proto", proto, "WAN port", port, reason,
+                  "- server RSTs to that port:", result["server_resets"].get(port, 0))
 
     # A dead datapath under default-accept would pass a rate check for the
     # wrong reason: every completion must have been masqueraded.
@@ -302,9 +338,24 @@ pkgs.testers.runNixOSTest {
         # What the firewall owns. It forwards what it receives: received on
         # one NIC minus sent on the other is the few packets of sampling skew
         # between the two counter reads (and the odd ARP), not a loss.
-        for hop in ("fw lan>wan", "fw wan>lan"):
-            assert abs(result["hop_loss"][hop]) <= 4, (name, hop, result["hop_loss"])
-        assert sum(result["dataplane_drops"].values()) <= 3, (name, result["dataplane_drops"])
+        dropped = sum(result["dataplane_drops"].values())
+        assert abs(result["hop_loss"]["fw lan>wan"]) <= 4, (name, result["hop_loss"])
+        assert abs(result["hop_loss"]["fw wan>lan"] - dropped) <= 4, (name, result["hop_loss"], dropped)
+        # The one refusal this load legitimately causes: when a client
+        # retransmission reaches a server that has already closed, the server
+        # answers with several RSTs in quick succession. The first closes the
+        # flow in the firewall, and the repeats find no state and fall to the
+        # WAN default drop. Every refusal must be exactly that: logged, from
+        # the server, TCP, dropped_default, to a WAN port that received more
+        # server RSTs than refusals. Anything else is a real drop.
+        assert set(result["dataplane_drops"]) <= {"dropped_default"}, (name, result["dataplane_drops"])
+        assert len(result["refusals"]) == dropped, (name, "a refusal was not logged", result["refusals"], dropped)
+        per_port: dict[int, int] = {}
+        for source, proto, port, reason in result["refusals"]:
+            assert (source, proto, reason) == ("198.18.10.254", 6, "dropped_default"), (name, source, proto, port, reason)
+            per_port[port] = per_port.get(port, 0) + 1
+        for port, count in per_port.items():
+            assert count < result["server_resets"].get(port, 0), (name, "not a repeated RST", port, count, result["server_resets"].get(port, 0))
         assert result["nat_drops"] == {}, (name, result["nat_drops"])
         # A tripwire for the PERF-02 collapse, which left most new connections
         # retransmitting their SYN (thousands per phase). The test network's
