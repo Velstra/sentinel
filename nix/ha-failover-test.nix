@@ -405,6 +405,9 @@ in pkgs.testers.runNixOSTest {
     time.sleep(3)
     master.send_monitor_command("cont")
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
+    # Preemption is a handover like any other, with the same bound: a
+    # WireGuard client must first handshake with the returning owner.
+    wait_forwarding("resumed owner preempted after the second pause",time.monotonic(),handover_bound)
     check_stream("both members recovered from VM pauses")
     ''}
     check_stream("all fault and recovery scenarios")

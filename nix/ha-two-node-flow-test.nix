@@ -103,6 +103,10 @@ let
     environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.tcpdump ];
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
     systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
+    # As in ha-failover-test.nix: the test driver forwards every journal line
+    # synchronously to the serial console, and a backed-up console stalls the
+    # agents' logging and with it HA timing. The journal itself keeps it all.
+    services.journald.extraConfig = lib.mkAfter "MaxLevelConsole=warning\n";
   };
   echo = pkgs.writeText "two-node-single-connection-echo.py" ''
     import json, socket, threading
