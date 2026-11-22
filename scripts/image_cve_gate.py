@@ -330,8 +330,10 @@ def validate_waivers(doc, findings, today, kernel_version=None, table=None):
     if baseline is not None:
         errors += review_errors(baseline, "kernel-baseline", today)
         installed = kernel_version or next((f.version for f in findings if f.kind == KERNEL), None)
-        if not isinstance(baseline.get("max-unresolved"), int) or baseline["max-unresolved"] < 0:
-            errors.append("kernel-baseline: max-unresolved must be a non-negative integer")
+        if "max-unresolved" in baseline:
+            errors.append("kernel-baseline: a count ceiling (max-unresolved) accepts CVEs nobody reviewed; "
+                          "list the reviewed CVE ids in reviewed-cves instead")
+        errors += baseline_list_errors(baseline)
         if installed and baseline.get("kernel-version") != installed:
             errors.append(f"kernel-baseline reviewed {baseline.get('kernel-version')} but the image ships "
                           f"kernel {installed}; re-review the unresolved kernel matches")
@@ -339,6 +341,34 @@ def validate_waivers(doc, findings, today, kernel_version=None, table=None):
 
 
 # --- verdict ----------------------------------------------------------------
+
+def baseline_list_errors(baseline):
+    """reviewed-cves: {disposition: [CVE id, ...]}, every id exact and listed once."""
+    groups = baseline.get("reviewed-cves")
+    if not isinstance(groups, dict) or not groups:
+        return ["kernel-baseline: reviewed-cves must map each triage disposition to its CVE ids"]
+    errors, seen = [], set()
+    for disposition, ids in groups.items():
+        if not isinstance(ids, list) or not ids:
+            errors.append(f"kernel-baseline: {disposition} must be a non-empty list of CVE ids")
+            continue
+        for cve in ids:
+            if not isinstance(cve, str) or not WAIVER_ID.match(cve.upper()):
+                errors.append(f"kernel-baseline: {cve!r} in {disposition} is not one exact CVE id")
+            elif cve.upper() in seen:
+                errors.append(f"kernel-baseline: {cve} is listed twice")
+            else:
+                seen.add(cve.upper())
+    return errors
+
+
+def baseline_cves(baseline):
+    groups = baseline.get("reviewed-cves") if isinstance(baseline, dict) else None
+    if not isinstance(groups, dict):
+        return set()
+    return {cve.upper() for ids in groups.values() if isinstance(ids, list)
+            for cve in ids if isinstance(cve, str)}
+
 
 def kernel_version_of(sbom):
     for artifact in sbom.get("artifacts", []):
@@ -410,9 +440,19 @@ def evaluate(grype, vulnix, waivers, patched, sbom, closure, table, today, sever
         policy.append(f"{len(unresolved)} kernel matches at or above {severity} have no fix in the "
                       f"{'.'.join(map(str, version_tuple(kernel or '')[:2]))} branch: review them and record a "
                       "kernel-baseline (see docs/src/building/vulnerability-scan.md)")
-    elif unresolved and isinstance(baseline.get("max-unresolved"), int) and len(unresolved) > baseline["max-unresolved"]:
-        policy.append(f"kernel matches without a branch fix grew to {len(unresolved)}, above the reviewed "
-                      f"ceiling {baseline['max-unresolved']}")
+    elif baseline is not None:
+        # The baseline names the reviewed CVEs; a kernel CVE it does not name
+        # is unreviewed and blocks, and a name no finding carries is stale.
+        reviewed = baseline_cves(baseline)
+        found = {r["id"] for r in unresolved}
+        missing = sorted(found - reviewed)
+        if missing:
+            policy.append(f"{len(missing)} kernel matches without a branch fix are not in the reviewed "
+                          f"kernel-baseline: {' '.join(missing)}")
+        stale = sorted(reviewed - found)
+        if stale:
+            policy.append(f"kernel-baseline names {len(stale)} CVEs no unresolved kernel match carries "
+                          f"(stale; remove them): {' '.join(stale)}")
     coverage = critical_coverage(sbom, closure, table)
     blocking = sorted((row(f, s) for f, s in zip(findings, statuses) if s == "blocking"),
                       key=lambda r: (-SEVERITY.get(r["severity"], 0), r["package"], r["id"]))

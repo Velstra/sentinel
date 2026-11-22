@@ -244,7 +244,7 @@ class Waivers(unittest.TestCase):
         self.assertTrue(self.validate([waiver("CVE-2026-*")]))
 
     def test_kernel_baseline_must_name_installed_version(self):
-        baseline = {"kernel-version": "6.12.113", "max-unresolved": 10, "reason": "r",
+        baseline = {"kernel-version": "6.12.113", "reviewed-cves": {"open": ["CVE-2026-2"]}, "reason": "r",
                     "reviewed-by": "x", "reviewed": "2026-11-01", "expires": "2026-12-01"}
         findings = [gate.Finding("CVE-2026-2", "linux-kernel", "6.12.117", "High", kind="linux-kernel")]
         errors = self.validate([], findings, baseline)
@@ -372,14 +372,42 @@ class Policy(unittest.TestCase):
         self.assertFalse(verdict["pass"])
         self.assertTrue(any("kernel" in e for e in verdict["policy-errors"]), verdict)
 
-    def test_kernel_baseline_ceiling(self):
+    def kernel_case(self, listed, extra=None):
         matches = [grype_match(f"CVE-2026-6{i}", "linux-kernel", "6.12.117", kind="linux-kernel",
                                fixed=("6.18.33",)) for i in range(3)]
-        baseline = {"kernel-version": "6.12.117", "max-unresolved": 3, "reason": "reviewed backports",
-                    "reviewed-by": "release-review", "reviewed": "2026-11-15", "expires": "2026-12-15"}
-        self.assertTrue(self.evaluate(matches, kernel=baseline)["pass"])
-        baseline["max-unresolved"] = 2
-        verdict = self.evaluate(matches, kernel=baseline)
+        baseline = {"kernel-version": "6.12.117", "reviewed-cves": listed, "reason": "CNA triage",
+                    "reviewed-by": "release-review", "reviewed": "2026-11-15", "expires": "2026-12-15",
+                    **(extra or {})}
+        return self.evaluate(matches, kernel=baseline)
+
+    def test_kernel_baseline_lists_every_unresolved_cve(self):
+        verdict = self.kernel_case({"open": ["CVE-2026-60", "CVE-2026-61"], "fixed-on-branch": ["CVE-2026-62"]})
+        self.assertTrue(verdict["pass"], verdict["policy-errors"])
+
+    def test_kernel_cve_missing_from_the_baseline_fails(self):
+        verdict = self.kernel_case({"open": ["CVE-2026-60", "CVE-2026-61"]})
+        self.assertFalse(verdict["pass"])
+        self.assertTrue(any("CVE-2026-62" in e for e in verdict["policy-errors"]), verdict["policy-errors"])
+
+    def test_stale_kernel_baseline_entry_fails(self):
+        verdict = self.kernel_case({"open": ["CVE-2026-60", "CVE-2026-61", "CVE-2026-62", "CVE-2026-69"]})
+        self.assertFalse(verdict["pass"])
+        self.assertTrue(any("CVE-2026-69" in e and "stale" in e for e in verdict["policy-errors"]),
+                        verdict["policy-errors"])
+
+    def test_kernel_cve_listed_twice_fails(self):
+        verdict = self.kernel_case({"open": ["CVE-2026-60", "CVE-2026-61", "CVE-2026-62"],
+                                    "fixed-on-branch": ["CVE-2026-62"]})
+        self.assertFalse(verdict["pass"])
+
+    def test_count_ceiling_is_refused(self):
+        verdict = self.kernel_case({"open": ["CVE-2026-60", "CVE-2026-61", "CVE-2026-62"]},
+                                   {"max-unresolved": 3})
+        self.assertFalse(verdict["pass"])
+        self.assertTrue(any("ceiling" in e for e in verdict["policy-errors"]), verdict["policy-errors"])
+
+    def test_kernel_baseline_needs_a_cve_list(self):
+        verdict = self.kernel_case({})
         self.assertFalse(verdict["pass"])
 
     def test_summary_counts_per_package(self):
