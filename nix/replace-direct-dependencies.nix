@@ -1,7 +1,7 @@
 # nixpkgs' replaceDirectDependencies (pkgs/build-support/
-# replace-direct-dependencies.nix at the pin), rewriting store HASHES instead
-# of whole base names. system.replaceDependencies calls it for every path it
-# rewrites, through the overlay in flake.nix.
+# replace-direct-dependencies.nix at the pin), rewriting the bare store hash
+# as well as the whole base name. system.replaceDependencies calls it for
+# every path it rewrites, through the overlay in flake.nix.
 #
 # The upstream rewrite replaces "<hash>-<name>" as one string. A compiler
 # that expands a constant path into overlapping vector stores leaves the
@@ -12,7 +12,11 @@
 # (checks.image-security-floor caught it), and at run time it would compute
 # the path of the original. A store hash is 32 base-32 characters and names
 # exactly one path, which is also how Nix itself rewrites self-references,
-# so rewriting the hash alone is exact.
+# so a bare-hash rule is exact. It runs after the upstream whole-base-name
+# rule, never instead of it: a hash-only rewrite of
+# "<hash>-glibc-2.42-103/lib/ld-linux-x86-64.so.2" would name a path that
+# does not exist (the replacement is glibc-2.42-113), and every program in
+# the system failed to start in the VM checks until the order was this.
 #
 # Everything else is upstream's. The overlay marks the package set with
 # `replaceDirectDependencies.rewritesStoreHashes`, and security-backports.nix
@@ -74,6 +78,11 @@ else
                 echo "cannot rewrite $oldBasename to $newBasename: length does not match" >&2
                 exit 1
             fi
+            # The whole base name first: a version backport changes the name
+            # too (glibc-2.42-103 -> glibc-2.42-113), and a reference must
+            # name the path that exists. Then the bare hash, for whatever
+            # occurrence the first rule did not reach.
+            echo "s|$oldBasename|$newBasename|g" >> rewrite.sed
             echo "s|''${oldBasename:0:32}|''${newBasename:0:32}|g" >> rewrite.sed
         done
     }
