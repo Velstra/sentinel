@@ -499,19 +499,34 @@ in pkgs.testers.runNixOSTest {
     # HA-04: SIGKILL every process of the owner's unit, as an OOM kill or a
     # crash does. The warm standby must be forwarding within a bound, and the
     # restarted member must rejoin by itself (no reboot, no manual restart).
+    # The witness lets a member preempt a new owner only after the owner's
+    # preemption hold (wren-ha PREEMPT_HOLD_MS). Without it a restarted wren
+    # took the pair back 3-4 s after the fault, as soon as its agent held the
+    # successor's snapshot. A WireGuard takeover still waiting for a handshake
+    # retry then lost the pair before it forwarded: two handovers for one
+    # fault, and the backup no longer held the VIP when forwarding resumed.
+    preempt_hold=10.0
+    def owner_now(node):
+        # This member holds a live grant and its VIPs (Wren's role file).
+        return python_command('import json,time; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==r["node"] and r["deadline_ns"]>time.clock_gettime_ns(time.CLOCK_BOOTTIME) and r["vips_ready"], r')
     for service in ("velstra.service","wren.service"):
-        # The fault is meant to hit a pair with a warm standby. After the
+        # The fault is meant to hit a pair with a warm standby: after the
         # previous preemption the standby needs the new owner's complete
-        # snapshot before it may take over; killing the owner earlier left a
-        # cold standby, and the owner's restarted wren took the pair back
-        # instead (3.78 s, and the backup never held the VIP).
+        # snapshot before it may take over.
         backup.wait_until_succeeds(agent_caught_up(backup),timeout=20)
         started=time.monotonic()
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
         wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
         backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
         check_stream(service+" abrupt exit")
-        master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=25)
+        # Judge the return by the authority the master holds, not by its
+        # address: a SIGKILLed wren leaves its VIPs on the interface until
+        # its restart (RestartSec 2 s) removes them, under a closed fence.
+        master.wait_until_succeeds(owner_now(master),timeout=25)
+        returned=time.monotonic()-started
+        print(f"{service} SIGKILL on the owner: the owner took the pair back {returned:.2f}s after the fault")
+        assert returned>=preempt_hold, f"{service}: the owner preempted {returned:.2f}s after the fault, inside the new owner's {preempt_hold}s hold"
+        master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
         check_stream(service+" recovered and preempted")
     # Recreated non-VIP data links must also be fenced before they go up.
     old_index=master.succeed("cat /sys/class/net/dmz0/ifindex").strip()
@@ -528,11 +543,17 @@ in pkgs.testers.runNixOSTest {
     for node in (master,backup):
         node.wait_until_succeeds("! ip -o address show eth2 | grep -q 10.2.0.100",timeout=5)
     witness.succeed("systemctl start sentinel-witness")
-    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
     # Witness loss stops forwarding by design. Wait for this outage to end
     # before the next fault: chaining two faults onto one stream measured
     # neither, and (with the WireGuard handover) overran the stream's timeout.
+    # The outage ends with whichever member the restarted witness grants
+    # first after its quarantine.
     wait_forwarding("witness outage (by design)",witness_lost,10.0)
+    # If that was the backup, the master takes the pair back only after the
+    # backup's preemption hold: a handover of its own, with its own bound.
+    master.wait_until_succeeds(owner_now(master),timeout=int(preempt_hold)+10)
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
+    wait_forwarding("witness outage: the master owns again",time.monotonic(),handover_bound)
     # SIGSTOP the data-plane userspace: the independent guard must still expire.
     master.succeed("systemctl kill --kill-who=main --signal=SIGSTOP velstra.service")
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
@@ -583,7 +604,11 @@ in pkgs.testers.runNixOSTest {
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(8)
     resume(master)
-    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
+    # A resumed VM still carries the VIPs it held when it froze, until its
+    # wren sees the lapsed lease: judge the return by its authority. It
+    # comes after the backup's preemption hold.
+    master.wait_until_succeeds(owner_now(master),timeout=30)
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     master.wait_until_succeeds(agent_caught_up(master),timeout=20)
     ${pkgs.lib.optionalString wireguard ''
     clock_caught_up("paused owner resumed and preempted")
@@ -599,7 +624,8 @@ in pkgs.testers.runNixOSTest {
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(3)
     resume(master)
-    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
+    master.wait_until_succeeds(owner_now(master),timeout=30)
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     # Preemption is a handover like any other, with the same bound: a
     # WireGuard client must first handshake with the returning owner.
     wait_forwarding("resumed owner preempted after the second pause",time.monotonic(),handover_bound)
