@@ -290,7 +290,11 @@ fn snapshot(
         )),
         None => issues.push(issue("clock-unavailable", "unknown", "Clock synchronisation could not be determined.", "Inspect the kernel clock discipline and time service status.")),
     }
-    if let Some(lag) = clock.ha_peer.as_ref().filter(|lag| !lag.stepped) {
+    if let Some(lag) = clock
+        .ha_peer
+        .as_ref()
+        .filter(|lag| lag.unresolved(clock.synchronised))
+    {
         issues.push(issue(
             "ha-clock-behind-peer", "warning",
             &format!(
@@ -421,7 +425,7 @@ fn snapshot(
             "ntp_configured": appliance.map(|config| !config.services.ntp.is_empty()),
             "ntp_servers": appliance.map(|config| &config.services.ntp.upstream),
             "service": chrony,
-            "ha_peer": clock.ha_peer.as_ref().map(|lag| json!({"behind_ms": lag.behind_ms, "stepped": lag.stepped, "reason": lag.reason})),
+            "ha_peer": clock.ha_peer.as_ref().map(|lag| json!({"behind_ms": lag.behind_ms, "stepped": lag.stepped, "reason": lag.reason, "unresolved": lag.unresolved(clock.synchronised)})),
         },
         "systemd": {"available": failures.is_ok(), "failed_units": failures.as_ref().ok(), "error": failures.as_ref().err()},
         "network": {"default_route": default_route},
@@ -525,13 +529,13 @@ mod tests {
     }
 
     #[test]
-    fn a_clock_left_behind_its_ha_peer_is_a_warning_a_stepped_one_is_not() {
-        let run = |lag: Option<crate::clock::HaPeerLag>| {
+    fn a_clock_left_behind_its_ha_peer_is_a_warning_until_it_is_resolved() {
+        let run = |lag: Option<crate::clock::HaPeerLag>, sync: bool| {
             snapshot(
                 Some(&appliance()),
                 crate::clock::Clock {
                     ha_peer: lag,
-                    ..clock(Some(true))
+                    ..clock(Some(sync))
                 },
                 Ok(vec![]),
                 Ok(vec![ssh_unit("active", "running")]),
@@ -539,21 +543,31 @@ mod tests {
                 Some(true),
             )
         };
-        let refused = run(Some(crate::clock::HaPeerLag {
-            behind_ms: 9_140,
-            stepped: false,
-            reason: Some("this member's clock is NTP-synchronised and the peer's is not".into()),
-        }));
-        assert!(has_issue(&refused, "ha-clock-behind-peer"), "{refused}");
-        assert_eq!(refused["clock"]["ha_peer"]["behind_ms"], 9_140);
-        let stepped = run(Some(crate::clock::HaPeerLag {
-            behind_ms: 9_140,
-            stepped: true,
-            reason: None,
-        }));
+        let lag = |stepped, decided_unsynchronised| {
+            Some(crate::clock::HaPeerLag {
+                behind_ms: 9_140,
+                stepped,
+                reason: (!stepped).then(|| "the lag exceeds the 10 min step limit".into()),
+                decided_unsynchronised,
+            })
+        };
+        // Refused while unsynchronised: reported until NTP synchronises.
+        let open = run(lag(false, true), false);
+        assert!(has_issue(&open, "ha-clock-behind-peer"), "{open}");
+        assert_eq!(open["clock"]["ha_peer"]["behind_ms"], 9_140);
+        let settled = run(lag(false, true), true);
+        assert!(!has_issue(&settled, "ha-clock-behind-peer"), "{settled}");
+        assert_eq!(settled["clock"]["ha_peer"]["unresolved"], false);
+        // Refused while synchronised: a fault NTP will not clear.
+        assert!(has_issue(
+            &run(lag(false, false), true),
+            "ha-clock-behind-peer"
+        ));
+        // A step raises nothing.
+        let stepped = run(lag(true, true), false);
         assert!(!has_issue(&stepped, "ha-clock-behind-peer"), "{stepped}");
         assert_eq!(stepped["clock"]["ha_peer"]["stepped"], true);
-        assert!(!has_issue(&run(None), "ha-clock-behind-peer"));
+        assert!(!has_issue(&run(None, false), "ha-clock-behind-peer"));
     }
 
     #[test]
