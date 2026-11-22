@@ -215,7 +215,8 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   newer 6.12.y source, `nix/kernel.nix`), HAProxy 3.4.8, glibc 2.42-113 (the
   release/2.42 branch head), gzip 1.15, krb5 1.22.3 and hostapd 2.12, and
   patched GLib (CVE-2026-58016) and sudo (CVE-2026-35535); cyrus-sasl is
-  built without SRP. Backports rewrite store hashes rather than base names,
+  built without SRP; lego, dnsproxy and libcap's captree are built with Go
+  1.26.11. Backports also rewrite bare store hashes after whole base names,
   which GLib's own binaries require. `checks.image-security-floor`
   fails the build when the image closure falls below a recorded version
   floor, when a backport did not replace the package it backports, or when
