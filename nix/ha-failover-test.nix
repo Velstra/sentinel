@@ -538,6 +538,10 @@ in pkgs.testers.runNixOSTest {
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     master.succeed("systemctl kill --kill-who=main --signal=SIGCONT velstra.service")
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
+    # The preemption is a handover with the same bound as any other: a
+    # WireGuard client may first need a handshake retry to the returning
+    # owner, which a 3 s stream checkpoint cannot cover.
+    wait_forwarding("data-plane userspace resumed and preempted",time.monotonic(),handover_bound)
     # HA-03: pause a whole member VM (hypervisor stall, live migration, suspend).
     # Its clock stops with it. A resumed member must become an eligible, caught
     # up standby again by itself, and the pair must survive the NEXT failure
