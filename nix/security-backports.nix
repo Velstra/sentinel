@@ -26,10 +26,26 @@ let
       patches = (old.patches or [ ]) ++ [ ./security-patches/net-snmp-CVE-2026-89147.patch ];
     });
 
+  # Go 1.26.11. A Go program carries its own copy of the standard library, and
+  # 1.26.10's has eight High advisories (CVE-2026-97033..-97043, fixed in
+  # 1.26.11) in the three Go programs the image ships: lego, dnsproxy and
+  # libcap's captree. A dependency rewrite cannot reach a statically linked
+  # library, so those three are built with this toolchain (the assertions
+  # below hold them to it). Source hash as in nixos-unstable 2786a2a.
+  go = assert pkgs.go_1_26.version == "1.26.10";
+    pkgs.go_1_26.overrideAttrs (_: {
+      version = "1.26.11";
+      src = pkgs.fetchurl {
+        url = "https://go.dev/dl/go1.26.11.src.tar.gz";
+        hash = "sha256-1EEBsP8n7SpMda1GwXucdDWSCeLrLKfJ32y0/baOGWk=";
+      };
+    });
+  buildGoModule = pkgs.buildGo126Module.override { inherit go; };
+
   # libcap 2.78 contains the cap_set_file TOCTOU fix (CVE-2026-4878) and the
   # recipe's only patch.
   libcap = assert pkgs.libcap.version == "2.77";
-    pkgs.libcap.overrideAttrs (old: {
+    (pkgs.libcap.override { inherit go; }).overrideAttrs (old: {
       version = "2.78";
       src = pkgs.fetchurl {
         url = "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.78.tar.xz";
@@ -64,7 +80,7 @@ let
   # go-jose 4.1.9); no source file changes. The versions stay, so the store
   # names keep their length.
   goDeps = name: patch: hash: assert lib.elem pkgs.${name}.version [ "4.35.2" "0.81.4" ];
-    pkgs.${name}.overrideAttrs (old: {
+    (pkgs.${name}.override { inherit buildGoModule; }).overrideAttrs (old: {
       patches = (old.patches or [ ]) ++ [ patch ];
       vendorHash = hash;
     });
@@ -115,10 +131,93 @@ let
   withoutDb = drv: lib.filter (input: (input.pname or "") != "db") drv.buildInputs;
   iproute2 = assert pkgs.iproute2.version == "7.0.0";
     pkgs.iproute2.overrideAttrs (old: { buildInputs = withoutDb old; });
+  # SRP (CVE-2026-129483, server authentication bypass in the SRP plugin) is
+  # off by upstream default; disabling it explicitly makes its absence a build
+  # property, and the install check refuses a build that has the plugin.
   cyrus_sasl = assert pkgs.cyrus_sasl.version == "2.1.28";
     pkgs.cyrus_sasl.overrideAttrs (old: {
       buildInputs = withoutDb old;
-      configureFlags = old.configureFlags ++ [ "--with-dblib=none" ];
+      configureFlags = old.configureFlags ++ [ "--with-dblib=none" "--disable-srp" ];
+      # stdenv sets nullglob: a pattern that matches nothing expands to
+      # nothing, so test each match rather than `ls` the pattern. The PLAIN
+      # plugin must be there, or this is looking in the wrong directory.
+      postInstall = (old.postInstall or "") + ''
+        test -e "$out/lib/sasl2/libplain.so"
+        for plugin in "$out"/lib/sasl2/libsrp*; do
+          echo "cyrus-sasl: the SRP plugin was built despite --disable-srp: $plugin" >&2
+          exit 1
+        done
+      '';
+    });
+
+  # GLib: D-Bus introspection XML parser state confusion, out-of-bounds read
+  # (CVE-2026-58016); upstream c9da977c, first released in 2.89.0.
+  glib = assert pkgs.glib.version == "2.88.3";
+    pkgs.glib.overrideAttrs (old: {
+      patches = (old.patches or [ ]) ++ [ ./security-patches/glib-CVE-2026-58016.patch ];
+    });
+
+  # sudo: the mailer ran with the invoking user's group (CVE-2026-35535);
+  # upstream 3e474c2, which also makes a failed uid/gid/groups change fatal.
+  sudo = assert pkgs.sudo.version == "1.9.17p2";
+    pkgs.sudo.overrideAttrs (old: {
+      patches = (old.patches or [ ]) ++ [ ./security-patches/sudo-CVE-2026-35535.patch ];
+    });
+
+  # glibc: the pin is release/2.42/master at 2.42-103. The branch head 2.42-113
+  # adds the gettext LANGUAGE traversal (CVE-2026-84243), regcomp/regexec
+  # double free (CVE-2026-100290), wide scanf overflow (CVE-2026-115819) and
+  # ISO-2022-CN-EXT over-read (CVE-2026-121758) fixes. The patch is
+  # `git show --minimal --reverse glibc-2.42-103-ge39d4ded3f..glibc-2.42-113-g85a0a0562a
+  # -- . ':!ADVISORIES'`, nixpkgs' own recipe for its 2.42-master.patch.
+  # (`version` is passthru "2.42"; the store name carries the patch level.)
+  # Replacing glibc needs the store-hash rewrite: see
+  # nix/replace-direct-dependencies.nix.
+  glibc = assert pkgs.glibc.name == "glibc-2.42-103";
+    pkgs.glibc.overrideAttrs (old: {
+      version = "2.42-113";
+      patches = old.patches ++ [
+        ./security-patches/glibc-2.42-113-CVE-2026-84243-CVE-2026-100290-CVE-2026-115819-CVE-2026-121758.patch
+      ];
+    });
+
+  # gzip 1.15 contains the pin's two CVE patches (CVE-2026-41991/-41992, the
+  # LZH decoder); the release makes the fix visible to version scanners.
+  gzip = assert pkgs.gzip.version == "1.14";
+    pkgs.gzip.overrideAttrs (old: {
+      version = "1.15";
+      src = pkgs.fetchurl {
+        url = "mirror://gnu/gzip/gzip-1.15.tar.xz";
+        hash = "sha256-mqDMeA3sFWuCgoRIM7NCq3ywjCXSzZoYac3Q3zHe/0g=";
+      };
+      patches = [ ];
+    });
+
+  # MIT krb5 1.22.3: NegoEx parsing (CVE-2026-40355/-40356, the pin's patch),
+  # rd_cred NULL dereference (CVE-2026-107778) and 20 further CVEs. The pin's
+  # two patches are upstream PRs 1505/1506, both in 1.22.3.
+  krb5 = assert pkgs.krb5.version == "1.22.2";
+    pkgs.krb5.overrideAttrs (old: {
+      version = "1.22.3";
+      src = pkgs.fetchurl {
+        url = "https://kerberos.org/dist/krb5/1.22/krb5-1.22.3.tar.gz";
+        hash = "sha256-/pCvhEGtn6mwZLjlMHfO+3gqlvimgnawMdxUrxeJ/ws=";
+      };
+      patches = [ ];
+    });
+
+  # hostapd 2.12: the pin builds CONFIG_IEEE80211BE (Wi-Fi 7 / MLO), so
+  # CVE-2026-58374 (MLO) is reachable; 2.12 fixes it and contains the pin's
+  # four security patches (advisory 2026-1, CVE-2025-24912). The OpenWrt
+  # no-scan patch, the recipe's first, stays.
+  hostapd = assert pkgs.hostapd.version == "2.11" && lib.length pkgs.hostapd.patches == 5;
+    pkgs.hostapd.overrideAttrs (old: {
+      version = "2.12";
+      src = pkgs.fetchurl {
+        url = "https://w1.fi/releases/hostapd-2.12.tar.gz";
+        hash = "sha256-9DUCVhwoukerd+GOGpc9BzYcaMyLFBeOYZvVeWtw6r0=";
+      };
+      patches = [ (lib.head old.patches) ];
     });
 
   # IMG-02: the PAM side of imported password hashes. The management API
@@ -147,7 +246,9 @@ in
     default = true;
     description = ''
       Rewrite the system closure to the backported libcap, Net-SNMP,
-      Suricata, lego, dnsproxy, SQLite, Linux-PAM and libxcrypt builds. Disable only to compare against the unpatched pin.
+      Suricata, lego, dnsproxy, SQLite, Linux-PAM, libxcrypt, iproute2,
+      cyrus-sasl, GLib, sudo, glibc, gzip, krb5 and hostapd builds.
+      Disable only to compare against the unpatched pin.
     '';
   };
 
@@ -162,11 +263,29 @@ in
       ++ replace pkgs.sqlite sqlite
       ++ replace pkgs.linux-pam linux-pam
       ++ replace pkgs.iproute2 iproute2
-      ++ replace pkgs.cyrus_sasl cyrus_sasl;
+      ++ replace pkgs.cyrus_sasl cyrus_sasl
+      ++ replace pkgs.glib glib
+      ++ replace pkgs.sudo sudo
+      ++ replace pkgs.glibc glibc
+      ++ replace pkgs.gzip gzip
+      ++ replace pkgs.krb5 krb5
+      ++ replace pkgs.hostapd hostapd;
     system.build.securityBackports = {
-      inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl;
+      inherit libcap net-snmp libxcrypt suricata lego dnsproxy sqlite linux-pam iproute2 cyrus_sasl
+        glib sudo glibc gzip krb5 hostapd;
     };
-    assertions = [ {
+    assertions = map (program: {
+      assertion = program.passthru.go.version or null == go.version;
+      message = "${program.name} is not built with the backported Go ${go.version}";
+    }) [ lego dnsproxy ] ++ [ {
+      assertion = lib.elem go libcap.nativeBuildInputs;
+      message = "libcap's captree is not built with the backported Go ${go.version}";
+    } {
+      # The upstream base-name rewrite leaves GLib's original, and with it
+      # the replaced glibc, in the closure (nix/replace-direct-dependencies.nix).
+      assertion = pkgs.replaceDirectDependencies.rewritesStoreHashes or false;
+      message = "security backports need the store-hash replaceDirectDependencies overlay (flake.nix replaceOverlay)";
+    } {
       # pam_userdb is not built (see linux-pam above); a stack that names it
       # would fail closed at login, so refuse to build one instead.
       assertion = !lib.any (service: lib.hasInfix "pam_userdb" (service.text or ""))

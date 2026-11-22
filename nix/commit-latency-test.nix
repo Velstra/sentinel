@@ -10,7 +10,9 @@
 pkgs.testers.runNixOSTest {
   name = "sentinel-commit-latency";
   nodes.fw = { lib, ... }: {
-    imports = [ self.nixosModules.sentinel ];
+    # The shipped closure's backports, sudo among them: the single escalation
+    # is measured on the patched sudo the image carries.
+    imports = [ self.nixosModules.sentinel ./security-backports.nix ];
     networking.hostName = lib.mkForce "fw";
     virtualisation.vlans = [ 1 2 ];
     virtualisation.memorySize = 2048;

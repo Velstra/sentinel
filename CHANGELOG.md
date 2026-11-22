@@ -211,6 +211,16 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   The gate's remaining 21 findings and 171 kernel matches have PROPOSED,
   unreviewed waivers in `scripts/cve-waivers.json`; the gate fails until a
   person reviews them.
+- Release CVE review: the image ships Linux 6.12.118 (the pin's recipe at the
+  newer 6.12.y source, `nix/kernel.nix`), HAProxy 3.4.8, glibc 2.42-113 (the
+  release/2.42 branch head), gzip 1.15, krb5 1.22.3 and hostapd 2.12, and
+  patched GLib (CVE-2026-58016) and sudo (CVE-2026-35535); cyrus-sasl is
+  built without SRP; lego, dnsproxy and libcap's captree are built with Go
+  1.26.11. Backports also rewrite bare store hashes after whole base names,
+  which GLib's own binaries require. `checks.image-security-floor`
+  fails the build when the image closure falls below a recorded version
+  floor, when a backport did not replace the package it backports, or when
+  the `sqlite3` shell or `ocspcheck` ships.
 - IMG-05: an image-level CVE gate with a maintained Nix-to-NVD CPE table
   (`scripts/nix_cpe_map.json`), the kernel cataloger and vulnix as a second
   source; it fails when a critical package cannot be matched.

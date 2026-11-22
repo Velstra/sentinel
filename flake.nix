@@ -75,7 +75,22 @@
             prev.fetchurl args;
       };
 
-      pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
+      # The appliance kernel (nix/kernel.nix). The overlay makes every check
+      # that asks for pkgs.linuxPackages_6_12 boot the kernel the image ships.
+      sentinelKernel = import ./nix/kernel.nix;
+      kernelOverlay = final: prev: {
+        linuxPackages_6_12 = sentinelKernel prev;
+        linux_6_12 = (sentinelKernel prev).kernel;
+      } // replaceOverlay final prev;
+      # system.replaceDependencies with a store-hash rewrite
+      # (nix/replace-direct-dependencies.nix). Only build-support changes, so
+      # no package rebuilds; nix/security-backports.nix requires it.
+      replaceOverlay = final: _: {
+        replaceDirectDependencies =
+          final.callPackage ./nix/replace-direct-dependencies.nix { } // { rewritesStoreHashes = true; };
+      };
+
+      pkgs = ((nixpkgs.legacyPackages.${system}.extend crateSource).extend kernelOverlay).extend
         (import ./nix/compact-tests.nix);
       # Only the fixed-output eBPF object is built from this set (see inputs).
       pkgsEbpf = nixpkgs-ebpf.legacyPackages.${system};
@@ -170,16 +185,20 @@
         withMongo = false; withCzmq = false; withRabbitmq = false; withHiredis = false;
       };
 
-      # HAProxy 3.4.1 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
+      # HAProxy 3.4 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
       # (FCGI record-length overflow) and CVE-2026-55204 (HPACK NULL deref
-      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixes
-      # both. A leaf package, so it is substituted directly where it is used.
+      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixed
+      # both. 3.4.8 is the newest 3.4 release and also fixes CVE-2026-90678
+      # (HTTP/3, fixed in 3.4.5): the recipe builds USE_QUIC, even though
+      # Sentinel renders no QUIC bind. A leaf package, so it is substituted
+      # directly where it is used; nix/security-floor.json holds the floor.
       haproxyFor = p: assert p.haproxy.version == "3.3.17";
         p.haproxy.overrideAttrs (_: {
-          version = "3.4.1";
+          version = "3.4.8";
           src = p.fetchurl {
-            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.1.tar.gz";
-            sha256 = "1y12pjsja0cgbd3cidvql1b48ib32r1qdr8prz3knzfp9z7c8qif";
+            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.8.tar.gz";
+            # = haproxy-3.4.8.tar.gz.sha256 published beside the tarball.
+            hash = "sha256-AkvVIabLvjK0JoUxR+a71qibEHxaNBRIRhk/7lt8btE=";
           };
         });
 
@@ -655,7 +674,8 @@
         {
           # Retain the appliance's LTS kernel ABI across base upgrades. The
           # separate three-kernel verifier matrix does not change the image ABI.
-          boot.kernelPackages = lib.mkDefault pkgs.linuxPackages_6_12;
+          # nix/kernel.nix: the pin's 6.12 recipe at a newer stable release.
+          boot.kernelPackages = lib.mkDefault (sentinelKernel pkgs);
           fileSystems."/sys/fs/bpf" = { device = "bpffs"; fsType = "bpf"; options = [ "nosuid" "nodev" "noexec" ]; };
           imports = [
             ./nix/appliance.nix
@@ -1793,6 +1813,7 @@
           # everything above libcap/libxcrypt, and image-booting checks that
           # run host store paths inside the guest would no longer find them.
           ./nix/security-backports.nix
+          { nixpkgs.overlays = [ replaceOverlay ]; }
           # The verity image build reads `config.nixpkgs.hostPlatform` (efiArch);
           # define it explicitly (this nixpkgs' `nixosSystem` doesn't set it from
           # the `system` arg).
@@ -1854,9 +1875,11 @@
           kernelPackages = pkgs.linuxPackages_6_6;
           label = "6-6";
         };
+        # The image's own kernel, not a look-alike: the object must load on
+        # exactly what ships.
         ebpf-verifier-6-12 = import ./nix/ebpf-verifier-test.nix {
           inherit pkgs self;
-          kernelPackages = pkgs.linuxPackages_6_12;
+          kernelPackages = self.nixosConfigurations.sentinel-image.config.boot.kernelPackages;
           label = "6-12";
         };
         ebpf-verifier-6-18 = import ./nix/ebpf-verifier-test.nix {
@@ -1974,8 +1997,38 @@
           cp ${./tests/test_image_cve_gate.py} tests/test_image_cve_gate.py
           cp ${./tests/test_image_closure.py} tests/test_image_closure.py
           python3 -B -m unittest discover -s tests -p 'test_image_c*.py' -v
+          mkdir -p nix
+          cp ${./scripts/check_security_floor.py} scripts/check_security_floor.py
+          cp ${./nix/security-floor.json} nix/security-floor.json
+          cp ${./tests/test_security_floor.py} tests/test_security_floor.py
+          python3 -B -m unittest discover -s tests -p 'test_security_floor.py' -v
           touch $out
         '';
+        # The security fixes ship: the image closure meets every version floor
+        # in nix/security-floor.json (the kernel among them), and every
+        # security-backports.nix replacement took — no replaced path left, no
+        # backport whose package the image never contains. The sqlite3 shell
+        # (CVE-2026-119586, `.recover`) and libressl's ocspcheck
+        # (CVE-2026-118374) carry CVEs of their own and are never run: only
+        # the libraries ship, and this keeps it that way.
+        image-security-floor =
+          let
+            image = self.nixosConfigurations.sentinel-image.config;
+            replacements = pkgs.writeText "sentinel-security-replacements.json" (builtins.toJSON (map
+              (r: { old = "${r.oldDependency}"; new = "${r.newDependency}"; })
+              image.system.replaceDependencies.replacements));
+          in
+          pkgs.runCommand "sentinel-image-security-floor" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            mkdir -p scripts
+            cp ${./scripts/check_image_closure.py} scripts/check_image_closure.py
+            cp ${./scripts/check_security_floor.py} scripts/check_security_floor.py
+            python3 -B scripts/check_security_floor.py \
+              --floors ${./nix/security-floor.json} \
+              --replacements ${replacements} \
+              --forbid-program sqlite3 --forbid-program ocspcheck \
+              ${pkgs.closureInfo { rootPaths = [ image.system.build.toplevel ]; }}/store-paths
+            touch $out
+          '';
         # PROV-01 seeding tool, end to end against real e2fsprogs.
         seed-image-unit = pkgs.runCommand "sentinel-seed-image-unit" {
           nativeBuildInputs = [ pkgs.python3 ];
@@ -3699,7 +3752,9 @@
         nodes.fw =
           { lib, pkgs, ... }:
           {
-            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
+            # The shipped closure's backports: the access point must come up
+            # on the hostapd the image carries (2.12), not the pin's 2.11.
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ./nix/security-backports.nix ];
             networking.hostName = lib.mkForce "fw";
             networking.firewall.enable = lib.mkForce false;
             virtualisation.vlans = [ 1 ];
@@ -3719,6 +3774,8 @@
           fw.wait_for_unit("sentinel-boot.service")
           fw.wait_until_succeeds("ip link show wlan0", timeout=60)
           fw.wait_until_succeeds("ip link show wlan1", timeout=60)
+          version = fw.succeed("hostapd -v 2>&1 || true")
+          assert "hostapd v2.12" in version, version
 
           # Inspect systemd's effective property, not just the Nix source. This
           # option belongs to [Unit]; [Service] silently ignored the old value.
