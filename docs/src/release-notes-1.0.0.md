@@ -201,8 +201,9 @@ uses more kernel memory for them than before (DP-06).
   tunnels follow the takeover in about a second. A small helper with only
   `CAP_SYS_TIME` takes the step, not Wren. The step is forward-only and logged.
   It is refused beyond 10 minutes, beyond 60 seconds when both clocks claim NTP
-  synchronisation, and when this member is NTP-synchronised and its
-  predecessor is not. Then tunnels may stall until NTP corrects the clock, and
+  synchronisation, when this member is NTP-synchronised and its predecessor is
+  not, and beyond 10 minutes of steps in one boot. Wren cannot forge the
+  predecessor's reading the helper acts on. Then tunnels may stall until NTP corrects the clock, and
   `sentinel show health` reports `ha-clock-behind-peer`. Run NTP on both
   members ([HA handbook](handbook/ha.md)).
 - **Kernel CVEs without a 6.12.y fix.** 1.0.0 ships Linux 6.12.118. Of the

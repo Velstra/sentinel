@@ -60,11 +60,14 @@ in
     # brings its wall clock up to its predecessor's before WireGuard initiates,
     # or the remote peers drop its handshakes as replays. Wren parses untrusted
     # routing protocols, so it does not hold CAP_SYS_TIME: it connects here and
-    # sends nothing. One sandboxed helper instance per connection reads the
-    # agent's replicated clock itself, applies the rules (forward only; at most
-    # 10 min, or 60 s when both clocks are NTP-synchronised; never by a
-    # synchronised member onto an unsynchronised peer), steps, records
-    # /run/velstra/ha/clock.json and answers with its decision.
+    # sends nothing. One sandboxed helper instance at a time:
+    # - It reads the predecessor's clock that the agent publishes in
+    #   /run/velstra/ha-clock, which Wren cannot see.
+    # - It applies the rules: forward only; at most 10 min, or 60 s when both
+    #   clocks are NTP-synchronised; never by a synchronised member onto an
+    #   unsynchronised peer; at most 10 min in total per boot.
+    # - It steps under a lock in /run/velstra-ha-clock-step, which Wren also
+    #   cannot see, records its decision there and answers with it.
     systemd.sockets.wren-ha-clock-step = {
       description = "HA WireGuard clock-step requests from Wren";
       wantedBy = [ "sockets.target" ];
@@ -74,9 +77,16 @@ in
         SocketUser = "root";
         SocketGroup = "root";
         SocketMode = "0600";
-        MaxConnections = 4;
+        # One request at a time (the helper also locks); never let a burst
+        # of requests put the socket into a failed state.
+        MaxConnections = 1;
+        TriggerLimitIntervalSec = 0;
       };
     };
+    systemd.tmpfiles.rules = [
+      "d /run/velstra-ha-clock-step 0700 root root -"
+      "d /run/velstra/ha-clock 0700 root root -"
+    ];
     systemd.services."wren-ha-clock-step@" = {
       description = "Step the wall clock for an HA WireGuard takeover";
       serviceConfig = {
@@ -91,9 +101,10 @@ in
         ProtectClock = false;
         SystemCallFilter = [ "@system-service" "@clock" ];
         SystemCallArchitectures = "native";
-        # It reads wireguard.json and writes clock.json there, nothing else.
+        # It reads the agent's /run/velstra/ha-clock and writes only its own
+        # directory.
         ProtectSystem = "strict";
-        ReadWritePaths = [ "/run/velstra/ha" ];
+        ReadWritePaths = [ "-/run/velstra-ha-clock-step" ];
         ProtectHome = true;
         PrivateTmp = true;
         PrivateDevices = true;
@@ -140,6 +151,12 @@ in
       serviceConfig = {
         RuntimeDirectory = "wren";
         ReadWritePaths = [ "/run/velstra/ha" ];
+        # The clock-step helper's inputs and state: Wren must neither forge
+        # the predecessor's clock nor touch the step budget.
+        InaccessiblePaths = [
+          "-/run/velstra/ha-clock"
+          "-/run/velstra-ha-clock-step"
+        ];
         ExecStart = "${cfg.package}/bin/wren --config /run/sentinel/wren.toml --backend kernel --socket /run/wren/wren.sock";
         # A successful reload means kernel reconciliation completed, not merely
         # that a signal was delivered. Keep validation and execution on one pin.

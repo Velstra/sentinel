@@ -52,7 +52,11 @@ release acceptance and open HA failure cases remain unresolved.
    over one second as soon as it measures it (`makestep 1.0 -1`), so a member
    resumed from a VM pause is corrected at its next poll. Without NTP on
    either member, repeated pauses and takeovers can carry both clocks ahead of
-   real time, by up to about 5 s per cycle; NTP removes that drift.
+   real time, by up to about 5 s per cycle; NTP removes that drift. Between
+   two NTP-synchronised members the step is capped at 60 seconds, so a standby
+   that was paused for longer than that while its kernel still reports
+   synchronised is not stepped; its tunnels then follow once NTP corrects it.
+   That is the accepted price of not following a faulty "synchronised" peer.
 
 Do not activate an incomplete election by setting `system.ha.enabled = true`
 manually. Pairing validates and records the member profiles.
@@ -266,21 +270,29 @@ These cases are exercised by `checks.ha-witness-failover`:
   paused).
 
   Wren does not step the clock itself. A small socket-activated helper
-  (`wren-ha-clock-step`) does: it holds `CAP_SYS_TIME` and nothing else,
-  reads the replicated clock itself, and takes no amount or time from Wren.
+  (`wren-ha-clock-step`) does. It holds `CAP_SYS_TIME` and nothing else, and
+  takes no amount or time from Wren. It reads the predecessor's clock from
+  `/run/velstra/ha-clock`, where the agent publishes it, and keeps its lock,
+  step budget and decisions in `/run/velstra-ha-clock-step`. Wren's unit
+  cannot see either directory, so Wren can trigger a decision on the agent's
+  reading but can neither forge the reading nor touch the budget. Requests
+  are served one at a time, under a lock, on a freshly read clock.
+
   The step is logged with the old and new time and is never taken backward.
-  It is refused in three cases:
+  It is refused in four cases:
   - when the lag exceeds 10 minutes;
   - when both clocks claim NTP synchronisation and disagree by more than
     60 seconds, since one of them is faulty;
-  - when this member's clock is NTP-synchronised and its predecessor's is not.
+  - when this member's clock is NTP-synchronised and its predecessor's is not;
+  - when the steps of this boot would exceed 10 minutes in total.
 
   A refused or failed step still takes over, and `sentinel show health`
   reports `ha-clock-behind-peer`; tunnels may then stall for up to the clock
   offset. The report clears when NTP synchronises a clock that was not
-  synchronised at the takeover, or when a later takeover records a new
-  decision. A missing or stale peer reading is logged on the takeover and not
-  reported.
+  synchronised at the takeover, or when a later takeover steps or finds the
+  clock in step on a fresh reading. A missing or stale peer reading is logged
+  on the takeover. It is not reported itself, and it does not clear an earlier
+  report.
 - **Agent crash while the witness is away**: both members end up unable to use
   their state; once the witness returns, the pair opens a new epoch on its own
   (see Standby readiness). Expect a short outage and new connections.

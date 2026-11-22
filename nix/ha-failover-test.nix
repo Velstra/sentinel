@@ -529,8 +529,16 @@ in pkgs.testers.runNixOSTest {
         # initiates (wren-ha clock). The test must not resync it.
         node.send_monitor_command("cont")
     def clock_caught_up(label):
-        # The returning owner stepped its wall clock to its predecessor's.
-        status=json.loads(master.succeed("cat /run/velstra/ha/clock.json"))
+        # The returning owner stepped its wall clock to its predecessor's,
+        # through the helper, on the agent's reading.
+        status=json.loads(master.succeed("cat /run/velstra-ha-clock-step/status.json"))
+        # Wren cannot see the reading or the helper's state, let alone write
+        # them: from Wren's own mount namespace both are empty and read-only.
+        master.succeed("test -s /run/velstra/ha-clock/peer.json")
+        wren_pid=master.succeed("systemctl show -p MainPID --value wren.service").strip()
+        for path in ("/run/velstra/ha-clock", "/run/velstra-ha-clock-step"):
+            master.succeed(f"test -z \"$(nsenter -t {wren_pid} -m ls -A {path} 2>/dev/null)\"")
+            master.fail(f"nsenter -t {wren_pid} -m touch {path}/forged")
         ours=float(master.succeed("date +%s.%N")); theirs=float(backup.succeed("date +%s.%N"))
         print(f"{label}: clock decision {status}, master-backup {ours-theirs:+.3f}s")
         assert status["action"]=="step" and "error" not in status, (label,status)

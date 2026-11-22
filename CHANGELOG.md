@@ -188,8 +188,10 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   The socket-activated `wren-ha-clock-step` helper takes the step; it holds
   only `CAP_SYS_TIME`, and Wren keeps `ProtectClock` and no clock capability.
   The step is forward-only and logged: at most 10 minutes, at most 60 seconds
-  between two NTP-synchronised clocks, and never by an NTP-synchronised member
-  from an unsynchronised peer. A refused step is reported by
+  between two NTP-synchronised clocks, never by an NTP-synchronised member
+  from an unsynchronised peer, and at most 10 minutes in total per boot. The
+  helper reads the predecessor's clock from where the agent publishes it,
+  outside Wren's reach. A refused step is reported by
   `sentinel show health` (`ha-clock-behind-peer`) until NTP resolves it.
   Checked by `checks.ha-wireguard-failover`.
 

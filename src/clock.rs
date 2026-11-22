@@ -69,9 +69,9 @@ pub struct Clock {
     pub ha_peer: Option<HaPeerLag>,
 }
 
-/// Where the HA clock-step helper records its decision at a WireGuard
-/// takeover (wren-ha `clock::align`).
-const HA_CLOCK_STATUS: &str = "/run/velstra/ha/clock.json";
+/// Where the HA clock-step helper records its decisions at WireGuard
+/// takeovers (wren-ha `clock::align`), in its own directory.
+const HA_CLOCK_STATUS: &str = "/run/velstra-ha-clock-step/status.json";
 
 /// A lag behind the HA peer that the takeover stepped away or could not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,9 +86,12 @@ pub struct HaPeerLag {
 }
 
 impl HaPeerLag {
-    /// Parse the helper's record; only a step or a refusal is worth reporting.
+    /// The lag the helper's record still holds open: its `unresolved` entry,
+    /// the latest refusal or failed step that no step and no in-step decision
+    /// on a fresh reading has settled. A later unknown decision keeps it.
     pub fn parse(text: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let record: serde_json::Value = serde_json::from_str(text).ok()?;
+        let value = record.get("unresolved").filter(|v| v.is_object())?;
         let behind_ms = value["behind_ns"].as_u64()? / 1_000_000;
         let stepped = value["stepped"].is_array();
         let reason = match value["action"].as_str()? {
@@ -235,25 +238,24 @@ mod tests {
     use super::HaPeerLag;
 
     #[test]
-    fn the_helpers_clock_record_reports_a_step_a_refusal_or_nothing() {
-        let stepped = HaPeerLag::parse(
-            r#"{"action":"step","behind_ns":9140000000,"stepped":[1,2],"local_synchronised":false}"#,
-        )
-        .unwrap();
-        assert!(stepped.stepped && stepped.behind_ms == 9140 && stepped.reason.is_none());
+    fn the_helpers_record_reports_the_unresolved_lag_and_nothing_else() {
         let failed = HaPeerLag::parse(
-            r#"{"action":"step","behind_ns":2000000000,"error":"EPERM","local_synchronised":false}"#,
+            r#"{"action":"step","behind_ns":2000000000,"error":"EPERM","local_synchronised":false,"unresolved":{"action":"step","behind_ns":2000000000,"error":"EPERM","local_synchronised":false}}"#,
         )
         .unwrap();
         assert!(!failed.stepped && failed.reason.as_deref() == Some("EPERM"));
-        let refused = HaPeerLag::parse(
-            r#"{"action":"refuse","behind_ns":61000000000,"reason":"both clocks are NTP-synchronised and disagree by more than 60 s","local_synchronised":true}"#,
-        )
+        assert!(failed.decided_unsynchronised && failed.behind_ms == 2_000);
+        let refused = r#"{"action":"refuse","behind_ns":61000000000,"reason":"both clocks are NTP-synchronised and disagree by more than 60 s","local_synchronised":true}"#;
+        let refused = HaPeerLag::parse(&format!(
+            r#"{{"action":"unknown","reason":"the peer clock reading is stale","local_synchronised":true,"unresolved":{refused}}}"#
+        ))
         .unwrap();
+        // An unknown decision after a refusal still reports the refusal.
         assert!(!refused.stepped && !refused.decided_unsynchronised && refused.behind_ms == 61_000);
         for nothing in [
+            r#"{"action":"step","behind_ns":9140000000,"stepped":[1,2],"local_synchronised":false}"#,
             r#"{"action":"in-step","local_synchronised":true}"#,
-            r#"{"action":"unknown","reason":"the peer clock reading is stale","local_synchronised":false}"#,
+            r#"{"action":"refuse","behind_ns":1,"reason":"r","local_synchronised":true}"#,
             "not json",
         ] {
             assert_eq!(HaPeerLag::parse(nothing), None, "{nothing}");
