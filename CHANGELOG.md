@@ -194,6 +194,14 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   outside Wren's reach. A refused step is reported by
   `sentinel show health` (`ha-clock-behind-peer`) until NTP resolves it.
   Checked by `checks.ha-wireguard-failover`.
+- A recovering higher-priority member no longer preempts a takeover that is
+  still in progress. After the owner's Wren was killed, its restarted
+  coordinator took the pair back 3 to 4 s after the fault; a WireGuard
+  takeover still waiting for a handshake retry lost the pair before it
+  forwarded, so one fault cost two handovers (3.95 s of outage). The
+  witness now lets a member preempt only after the owner has held its
+  authority for 10 s (Wren `PREEMPT_HOLD_MS`). Checked by the witness
+  failover checks, which assert the hold.
 
 ### Updates and boot trust
 

@@ -252,6 +252,17 @@ These cases are exercised by `checks.ha-witness-failover`:
   member restarts empty, imports the new owner's state and rejoins.
 - **Routing daemon crash** (`wren` killed): the lease lapses and the standby
   takes over the same way.
+- **Failback** (`preempt = true` on the higher-priority member): a member that
+  recovers takes ownership back only after the new owner has held it for
+  10 s. Expect the VIPs to move back about 10 s after a failover, not at once.
+  Without that hold, a restarted `wren` took the pair back 3 to 4 s after the
+  fault, as soon as its agent held the successor's state. A WireGuard
+  takeover still waiting for a handshake retry then lost the pair before it
+  forwarded, so one fault cost two handovers. Failover itself does not wait. The hold is a fixed
+  value in 1.0, not a setting. The witness enforces it, so it applies as soon
+  as the witness runs 1.0, also while the members still run different
+  versions; members that talk to an older witness fail back without it.
+  Two-node mode has its own election and no such hold.
 - **VM pause, suspend or live migration**: a resumed member catches up from the
   current owner by itself and is eligible again; the next failure still fails
   over. A paused VM's clock stops with it, so for up to one lease (250 ms by

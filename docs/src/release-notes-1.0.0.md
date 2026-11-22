@@ -115,6 +115,17 @@ configuration on the old image and stage the update again.
   ports, so the connection rate no longer collapses after an ICMP echo or a
   port-forward (DP-26, PERF-02).
 
+### HA behaviour that changed
+
+- **Failback waits 10 s (witness mode):** a higher-priority member with
+  `preempt = true` takes ownership back only once the current owner has held
+  it for 10 s. Failover is not delayed. Earlier, a member whose `wren` had just
+  restarted took the pair back 3 to 4 s after the fault. A WireGuard takeover
+  still waiting for a handshake retry then lost the pair before it forwarded,
+  so one fault cost two handovers (3.95 s of outage). The hold is fixed in 1.0 and cannot be configured. The witness
+  enforces it, so a pair gets it once its witness runs 1.0, whatever version
+  the members run. Two-node mode (no witness) is unchanged.
+
 ### Credentials and management
 
 - The config-sync secret is no longer a full-access API bearer (CTRL-01, CTRL-07).
