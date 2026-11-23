@@ -208,15 +208,19 @@ let
     connection.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
     reader = connection.makefile("rb")
     count = 0; maximum_gap = 0; last = time.monotonic()
+    # Reply times on the client's wall clock, the time base of a fault
+    # anchor: the checks judge when forwarding resumed, not when they looked.
+    replies = __import__("collections").deque(maxlen=800)
     with open("/tmp/stream-ready", "w") as ready: ready.write("connected")
     while not __import__("os").path.exists("/tmp/stream-stop"):
         message = f"{count}\n".encode()
         connection.sendall(message)
         assert reader.readline() == message, "TCP stream changed or reset"
         now = time.monotonic(); maximum_gap=max(maximum_gap,now-last);last=now
+        replies.append(round(time.time(), 4))
         count+=1
         with open("/tmp/stream-status.next","w") as status:
-            json.dump({"count":count,"maximum_gap":maximum_gap},status)
+            json.dump({"count":count,"maximum_gap":maximum_gap,"times":list(replies)},status)
         __import__("os").replace("/tmp/stream-status.next","/tmp/stream-status")
         time.sleep(0.02)
     assert count>50
@@ -311,16 +315,32 @@ in pkgs.testers.runNixOSTest {
     # initiation; Linux drivers/net/wireguard/messages.h). The new owner
     # initiates at once, so a WireGuard handover normally costs about 1 s.
     handover_bound=ha_bound.HA_FAULT_TO_RESUME_MAX+ha_extra
-    def wait_forwarding(label, started, bound, paused=None):
-        # Forwarding has resumed once the established stream advances again.
-        before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
+    # A fault of a known class: the backstop on the client's reply times, then
+    # (without WireGuard, whose retransmissions are not on the client's
+    # underlay link) the split check of the takeover from the capture.
+    def fault_bound(fault):
+        return ha_bound.ha_fault_to_resume_max(fault)+ha_extra
+    def takeover_split(fault, anchor):
+        ${if wireguard then "return None" else ''return ha_bound.ha_takeover_split(client,anchor,backup.succeed("cat /sys/class/net/eth2/address").strip(),"10.2.0.100","10.1.0.10",8443,fault)''}
+    def wait_forwarding(label, anchor, bound, paused=None, outage=True):
+        # Forwarding has resumed when the client stream's own replies resume:
+        # judged at that instant, on the client's clock, against the fault
+        # anchor taken just before the fault. A poll that sees it late neither
+        # hides a miss nor makes one. `outage` false: the handover is already
+        # under way, the bound runs from the call.
+        polled_until = time.monotonic() + bound + ha_bound.HA_DRIVER_LATENCY_MAX
         while True:
-            current=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
-            if current>before+3:
-                elapsed=time.monotonic()-started
+            times = json.loads(client.succeed("cat /tmp/stream-status"))["times"]
+            resumed = ha_bound.ha_resume(times, anchor, outage=outage)
+            if resumed is not None:
+                elapsed = resumed - anchor
                 print(f"{label}: forwarding resumed {elapsed:.2f}s after the fault")
+                if not ha_bound.ha_resumed_within(resumed, anchor, bound):
+                    if paused is not None:
+                        paused.send_monitor_command("cont")
+                    raise AssertionError(f"{label}: forwarding resumed {elapsed:.2f}s after the fault, over its {bound}s bound")
                 return elapsed
-            if time.monotonic()-started>bound:
+            if time.monotonic() > polled_until:
                 # Diagnostics run commands on every member: a paused VM would
                 # hang them, so resume it first.
                 if paused is not None:
@@ -627,8 +647,11 @@ in pkgs.testers.runNixOSTest {
         backup.wait_until_succeeds("test -e /tmp/vip-local.ready",timeout=10)
         vip_steady_start(backup)
         started=time.monotonic()
+        fault=ha_bound.ha_fault_anchor(client)
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
-        wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
+        fault_class={"velstra.service":"agent crash","wren.service":"wren crash"}[service]
+        wait_forwarding(service+" SIGKILL on the owner",fault,fault_bound(fault_class))
+        takeover_split(fault_class,fault)
         vip_steady_check(backup,service+" SIGKILL on the owner")
         backup.wait_until_succeeds("test -s /tmp/vip-local.json || test -s /tmp/vip-local.err",timeout=25)
         print(backup.execute("cat /tmp/vip-local.err 2>/dev/null")[1])
@@ -655,7 +678,7 @@ in pkgs.testers.runNixOSTest {
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
     check_stream("recreated data link")
     # The witness outage removes authority from both live dataplanes.
-    witness_lost=time.monotonic()
+    witness_lost=ha_bound.ha_fault_anchor(client)
     witness.succeed("systemctl stop sentinel-witness")
     time.sleep(0.5)
     for node in (master,backup):
@@ -671,7 +694,7 @@ in pkgs.testers.runNixOSTest {
     # backup's preemption hold: a handover of its own, with its own bound.
     master.wait_until_succeeds(owner_now(master),timeout=int(preempt_hold)+10)
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
-    wait_forwarding("witness outage: the master owns again",time.monotonic(),handover_bound)
+    wait_forwarding("witness outage: the master owns again",ha_bound.ha_fault_anchor(client),handover_bound,outage=False)
     # SIGSTOP the data-plane userspace: the independent guard must still expire.
     # Wren then stops renewing (the agent's report goes stale) and drops the
     # VIPs when the lease it last renewed ends: never earlier on a single late
@@ -703,7 +726,7 @@ in pkgs.testers.runNixOSTest {
     # The preemption is a handover with the same bound as any other: a
     # WireGuard client may first need a handshake retry to the returning
     # owner, which a 3 s stream checkpoint cannot cover.
-    wait_forwarding("data-plane userspace resumed and preempted",time.monotonic(),handover_bound)
+    wait_forwarding("data-plane userspace resumed and preempted",ha_bound.ha_fault_anchor(client),handover_bound,outage=False)
     # HA-03: pause a whole member VM (hypervisor stall, live migration, suspend).
     # Its clock stops with it. A resumed member must become an eligible, caught
     # up standby again by itself, and the pair must survive the NEXT failure
@@ -739,9 +762,10 @@ in pkgs.testers.runNixOSTest {
     # up from its successor and (preempt) takes ownership back.
     # The stream must be alive going in, or a pause could not be judged.
     check_stream("before the VM pause scenarios")
-    started=time.monotonic()
+    fault=ha_bound.ha_fault_anchor(client)
     master.send_monitor_command("stop")
-    wait_forwarding("owner VM paused",started,handover_bound,paused=master)
+    wait_forwarding("owner VM paused",fault,fault_bound("vm pause"),paused=master)
+    takeover_split("vm pause",fault)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(8)
     resume(master)
@@ -759,9 +783,10 @@ in pkgs.testers.runNixOSTest {
     pause(backup,8)
     backup.wait_until_succeeds(agent_caught_up(backup),timeout=20)
     # (3) The next failure: the resumed standby takes over.
-    started=time.monotonic()
+    fault=ha_bound.ha_fault_anchor(client)
     master.send_monitor_command("stop")
-    wait_forwarding("second consecutive pause failover",started,handover_bound,paused=master)
+    wait_forwarding("second consecutive pause failover",fault,fault_bound("vm pause"),paused=master)
+    takeover_split("vm pause",fault)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     time.sleep(3)
     resume(master)
@@ -769,7 +794,7 @@ in pkgs.testers.runNixOSTest {
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     # Preemption is a handover like any other, with the same bound: a
     # WireGuard client must first handshake with the returning owner.
-    wait_forwarding("resumed owner preempted after the second pause",time.monotonic(),handover_bound)
+    wait_forwarding("resumed owner preempted after the second pause",ha_bound.ha_fault_anchor(client),handover_bound,outage=False)
     ${pkgs.lib.optionalString wireguard ''
     clock_caught_up("resumed owner preempted after the second pause")
     ''}
