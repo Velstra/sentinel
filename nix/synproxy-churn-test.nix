@@ -8,7 +8,7 @@
 # server's went out untranslated.
 #
 # The agent's state tables are shrunk to their minimum (`[state] connections =
-# 1024`, so SYN_FLOWS holds 1024) to make "as many as the map holds" a minute's
+# 1024`, so SYN_FLOWS holds 2048) to make "as many as the map holds" a minute's
 # work. Short connections close both ways real clients do — normally (FIN) and
 # with a reset — paced so that the firewall's own tables never fill: what is
 # under test is the proxy's record, not capacity. Idle connections run routed
@@ -25,7 +25,10 @@
 let
   banner = ./synproxy-banner.py;
   attack = ./synproxy-attack.py;
-  churn = 1100;
+  # More than SYN_FLOWS holds at the minimum table size (2048: two records
+  # per connection for 1024 connections), so without the agent's sweep its
+  # LRU must evict.
+  churn = 2150;
 in
 pkgs.testers.runNixOSTest {
   name = "sentinel-synproxy-churn";
@@ -194,7 +197,8 @@ pkgs.testers.runNixOSTest {
     fw.succeed("systemctl restart velstra.service")
     fw.wait_for_unit("velstra.service")
     fw.wait_until_succeeds(
-        "bpftool -j map show name SYN_FLOWS | grep -q '\"max_entries\":1024'", timeout=60
+        # 2048 here; 1024 on builds that sized one record per two connections.
+        "bpftool -j map show name SYN_FLOWS | grep -Eq '\"max_entries\":(1024|2048)'", timeout=60
     )
     fw.fail("journalctl -u velstra.service | grep -q 'Error: loading'")
 
@@ -237,7 +241,7 @@ pkgs.testers.runNixOSTest {
         # port the server uses (2525 for both), so one client port reused
         # across them inside the sweep window is the documented limitation,
         # not what this measures.
-        client.succeed("python3 ${banner} churn 10.2.0.2 2525 ${toString churn} 40 20000", timeout=600)
+        client.succeed("python3 ${banner} churn 10.2.0.2 2525 ${toString churn} 40 20000", timeout=900)
         client.succeed("python3 ${banner} churn 10.1.0.1 8025 150 40 30000", timeout=600)
         admitted = counter("synproxy_admitted") - before
         assert admitted >= ${toString churn} + 150, f"only {admitted} churn connections were proxied"
