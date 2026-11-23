@@ -4,6 +4,17 @@
 
 Sentinel separates day-to-day configuration from the image that boots the box.
 
+```mermaid
+flowchart LR
+  op([CLI / web console]) -->|candidate| sentinel[Sentinel<br/>validate + reconcile]
+  sentinel --> fabric[Fabric<br/>eBPF/XDP policy]
+  sentinel --> wren[Wren<br/>routing]
+  sentinel --> networkd[systemd-networkd<br/>links + addresses]
+  sentinel -->|save| conf[(appliance.toml<br/>data partition)]
+  conf -->|boot-time reconcile| sentinel
+  store[[Verified store<br/>A/B slot]] -.->|boots| sentinel
+```
+
 <a id="why-image--runtime-apply-and-not-self-rebuild"></a><a id="the-pieces"></a>
 
 ## Follow a configuration change

@@ -15,6 +15,7 @@ Build from an x86-64 Linux checkout. The command determines whether you get an e
 | Build installation media | `nix build .#sentinel-iso` |
 | Obtain OVMF for a UEFI VM | `nix build .#qemu-firmware` |
 | Build the web frontend | `nix build .#sentinel-ui` |
+| Build the image before signing | `nix build .#sentinel-image-unsigned` |
 | Build Fabric, the eBPF object or Wren | `.#velstra`, `.#velstra-ebpf`, `.#wren` |
 
 <a id="nixos-configurations--nixosconfigurationsname"></a><a id="apps--nix-run-name"></a><a id="modules"></a><a id="useful-eval-queries"></a>
@@ -22,7 +23,8 @@ Build from an x86-64 Linux checkout. The command determines whether you get an e
 ## Run a VM or inspect outputs
 
 ```sh
-nix run .#vm
+nix run .#vm                                  # development appliance VM
+nix run .#seed-image -- --help                # seed a raw image for a cloud import
 # From the build host, list the outputs of your checkout:
 nix flake show --no-write-lock-file
 ```
@@ -48,4 +50,4 @@ nix eval --json .#packages.x86_64-linux --apply builtins.attrNames
 nix eval --json .#checks.x86_64-linux --apply builtins.attrNames
 ```
 
-Public image builds use development signing identities. A public package or module is not an Enterprise QCOW2/sysupdate certification. The `vm` application is a development VM, not necessarily a boot of the exact release disk. Evaluate, build and boot-test the intended artifact and dependency cohort separately.
+> **Warning:** Public image builds use development signing identities. A public package or module is not an Enterprise QCOW2/sysupdate certification. The `vm` application is a development VM, not necessarily a boot of the exact release disk. Evaluate, build and boot-test the intended artifact and dependency cohort separately.

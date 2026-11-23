@@ -1,11 +1,20 @@
 # Third-party notices and source obligations
 
-**Release requirement, not yet a delivered artifact.** The current image and
-bundled console do not contain a complete verified third-party notices bundle.
-A source SBOM is not a substitute for the licenses and notices required by the
-actual shipped software. Do not claim this gap is closed by this page.
+> **Warning:** Release requirement, not yet a delivered artifact. The current image and
+> bundled console do not contain a complete verified third-party notices bundle.
+> A source SBOM is not a substitute for the licenses and notices required by the
+> actual shipped software. Do not claim this gap is closed by this page.
+
+```mermaid
+flowchart LR
+  inv[Inventory: image closure,<br/>lockfiles, console bundle] --> rec[Reconcile with linked<br/>and embedded components]
+  rec --> bundle[Notices bundle:<br/>texts, mappings, source access]
+  bundle --> ship[Read-only image path + console<br/>legal surface: still outstanding]
+```
 
 ## Required inputs
+
+<details><summary>Inventory inputs for the bundle</summary>
 
 Build the inventory from one reviewed release cohort:
 
@@ -23,7 +32,11 @@ Use the installed SBOM and build provenance as inventory inputs, then reconcile
 them with actual linked/embedded components. Package metadata alone may omit
 copyrights, dual-license choices, additional NOTICE files and source obligations.
 
+</details>
+
 ## Bundle acceptance
+
+<details><summary>Per-component records, required contents and delivery</summary>
 
 For every distributed component, record its name, exact version/source revision,
 source URL, selected license expression, and hashes of the source license/notice
@@ -46,6 +59,8 @@ image path, expose it from the console's legal/about surface, and publish the
 matching source access information alongside the artifacts. Test access as an
 ordinary operator on the built image and verify the bundle's hash after extraction.
 Those image/UI delivery hooks and their regression tests are still outstanding.
+
+</details>
 
 ## Licences of the first-party components
 

@@ -37,14 +37,37 @@ Pinned inputs improve repeatability; they do not by themselves prove byte-for-by
 
 ## Compare the unsigned image, not the signed one
 
-Two builds of the same revision produce the same **unsigned** verity image (`nix build .#sentinel-image-unsigned`) and the same `usrhash` (the dm-verity root hash on the kernel command line, which binds the whole store partition). Those are the artifacts to compare and attest: the unsigned image carries an unsigned systemd-boot and UKI, so it does not depend on any key.
+```sh
+nix build .#sentinel-image-unsigned --print-out-paths
+```
 
-`nix build .#sentinel-image` then signs systemd-boot and the UKI with development PK/KEK/db keys that each builder generates for itself inside a derivation. Their private keys are therefore readable in that builder's Nix store; they are demonstration keys, not secrets, and no enrollment payloads (`PK.auth`, `KEK.auth`, `db.auth`) are shipped for them unless a lab opts in with `velstra.appliance.secureBoot.developmentEnrollment`. Every signature is made at one fixed signing time (2025-01-01 00:00:00 UTC), so a rebuild with the same keys reproduces the signatures; the rebuilt signed image still differs in a handful of FAT directory-entry timestamp bytes on the ESP (measured: 10 bytes), and a different builder has different keys and so different signatures.
+Compare and attest the **unsigned** verity image and its `usrhash` (the dm-verity root hash on the kernel command line, which binds the whole store partition). The unsigned image carries an unsigned systemd-boot and UKI, so it does not depend on any key.
+
+```mermaid
+flowchart LR
+  rev[Same revision + lock] --> unsigned[Unsigned image<br/>+ usrhash]
+  unsigned -->|identical across builders| cmp{{Compare and attest}}
+  unsigned --> dev[sentinel-image<br/>per-builder development keys]
+  unsigned --> rel[Release image<br/>signed outside the store]
+  rel -->|check against release certificates| verify{{Verify a release}}
+```
+
+| Artifact | Same across builds? |
+|---|---|
+| `nix build .#sentinel-image-unsigned`, `usrhash` | Yes, for the same revision. |
+| `nix build .#sentinel-image`, same builder and keys | Signatures reproduce (fixed signing time 2025-01-01 00:00:00 UTC), but a handful of FAT directory-entry timestamp bytes on the ESP differ (measured: 10 bytes). |
+| `nix build .#sentinel-image`, different builder | No: each builder has different keys and so different signatures. |
+
+`nix build .#sentinel-image` signs systemd-boot and the UKI with [development PK/KEK/db keys](../architecture/secure-boot.md#choose-the-signing-identity) that each builder generates for itself inside a derivation; no enrollment payloads (`PK.auth`, `KEK.auth`, `db.auth`) ship for them unless a lab opts in.
 
 Release images are signed afterwards, outside the store, with the release identity (`scripts/community_release.py sign` in the release workflow), which replaces every development signature and installs the release's enrollment payloads. To verify a release, compare its `usrhash` and unsigned payload with your own build, then check the signatures against the published release certificates.
+
+<details><summary>Hashes, toolchain and offline claims</summary>
 
 A fixed-output derivation can reuse an older cached object when its expected output hash is unchanged, even if a source revision changed. Verify the measured object and its ABI against the intended userspace cohort before accepting new hashes. Development ABI guards or a fixture's pins are not proof that the published appliance integrates them.
 
 Keep the eBPF Rust nightly and LLVM versions compatible. An offline-build claim requires the complete closure and a successful build with network access disabled, not merely a populated source cache.
 
 Ignore rules are not a secret scan or a history rewrite. Review tracked files, release artifacts and reachable history separately.
+
+</details>

@@ -2,14 +2,21 @@
 
 <a id="test-suite-nixostests"></a><a id="also-here"></a><a id="also-here-1"></a>
 
-Run these commands from the repository root. Test counts change with the source;
-the commands below, not a number copied into this handbook, define the suite.
-A configured check is not a passing test or a release certificate.
+```sh
+# from the repository root
+nix eval --json .#checks.x86_64-linux --apply builtins.attrNames   # list the current checks
+nix build .#checks.x86_64-linux.quickstart -L                      # run one VM check
+```
 
-This inventory includes development fixtures whose flake wiring and dependency
-pins are still being integrated. Query the checked-out flake before selecting a
-name; a fixture file or a standalone receipt does not mean that the published
-package exposes it or uses the same tested dependency cohort.
+```mermaid
+flowchart LR
+  src[Source checks<br/>cargo, npm] --> eval[Flake evaluation<br/>no VM runs]
+  eval --> vm[VM check<br/>needs KVM]
+  vm --> all[Full check set]
+  all -.->|does not replace| final[Acceptance + SBOM/CVE<br/>of the final signed image]
+```
+
+The flake, not a count copied here, defines the suite, including fixtures whose wiring and pins are still being integrated. A fixture file or standalone receipt does not mean the published package exposes it or uses the tested cohort; a configured check is not a passing test or release certificate.
 
 ## Source checks
 
@@ -17,45 +24,36 @@ package exposes it or uses the same tested dependency cohort.
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-```
-
-For the React console:
-
-```sh
+# React console
 npm --prefix ui ci
 npm --prefix ui test
 npm --prefix ui run build
 tests/console/run.sh
 ```
 
-The browser runner needs Node.js and Chromium. It starts a temporary loopback
-API with `--no-apply`: it tests browser interactions and configuration writes,
-not the workstation's network or a deployed firewall. See
-[the browser test instructions](https://github.com/Velstra/sentinel/blob/main/tests/console/README.md)
-for prerequisites and targeted suites. Live packet and HA tests are separate.
+The browser runner needs Node.js and Chromium and uses a temporary loopback API with `--no-apply`: it covers browser interactions and configuration writes, not the network, a deployed firewall, live packets or HA. See the [browser test instructions](https://github.com/Velstra/sentinel/blob/main/tests/console/README.md).
 
 ## List and evaluate the current Nix checks
 
 ```sh
-nix eval --json .#checks.x86_64-linux --apply builtins.attrNames
-nix flake check --no-build --no-write-lock-file
+nix eval --json .#checks.x86_64-linux --apply builtins.attrNames   # names from the current flake
+nix flake check --no-build --no-write-lock-file   # evaluates only: runs no VM test, proves no image boots
 ```
-
-The first command gets names directly from the current flake. The second only
-evaluates them: it does **not** execute the VM tests or prove that images boot.
 
 ## Run a real VM check
 
-Use an x86_64 Linux host with usable `/dev/kvm` and enough RAM for the selected
-topology. Each command below builds its dependencies and executes that check:
+Needs x86_64 Linux, usable `/dev/kvm` and enough RAM for the topology:
 
 ```sh
 nix build .#checks.x86_64-linux.quickstart -L
 nix build .#checks.x86_64-linux.nat -L
 nix build .#checks.x86_64-linux.bootfallback -L
+nix flake check -L   # everything: builds images and runs many multi-VM topologies
 ```
 
-Useful starting points; query the flake for the complete inventory:
+Allow substantial disk, memory and time; save logs and output paths before removing artifacts.
+
+> **Warning:** A failure, timeout, interrupted check or unexecuted check is not a pass.
 
 | Area | Check names | Scope |
 | --- | --- | --- |
@@ -84,44 +82,23 @@ Useful starting points; query the flake for the complete inventory:
 | Browser | `console`, `console-ux` | Browser interactions against a test API; complements the live packet checks. |
 | Compiler/agent boundary | `contract` | Compiled configuration is accepted by the pinned Fabric loader. |
 
-Checks for additional protocols and services are development coverage, not a
-claim that every option, peer implementation or failure mode is supported. See
-[routing status](../handbook/routing.md#qualification-status) and
-[dataplane support](dataplane-support.md).
-
-Run the complete current check set with:
-
-```sh
-nix flake check -L
-```
-
-This can build images and run many multi-VM topologies. Allow substantial disk,
-memory and time. A failure, timeout, interrupted check or unexecuted check is not
-a pass. Save logs and output paths before removing build artifacts.
+Other protocol checks are development coverage, not support for every option, peer or failure mode ([routing status](../handbook/routing.md#qualification-status), [dataplane support](dataplane-support.md)).
 
 ## Release evidence
 
-Record the exact Git revisions, input lockfile, eBPF object hash, image SHA-256,
-command, result and retained output for each release check. Source unit tests,
-evaluation and a development-image VM are different evidence classes. None can
-replace a complete acceptance run and SBOM/CVE assessment of the final signed
-image. Do not reuse a result from another source cohort.
+Record per release check: exact Git revisions, input lockfile, eBPF object hash, image SHA-256, command, result and retained output. The evidence classes above are not interchangeable; never reuse a result from another source cohort.
 
-The public workflow is
-[.github/workflows/ci-public.yml](https://github.com/Velstra/sentinel/blob/main/.github/workflows/ci-public.yml).
-Inspect its current matrix to see which checks actually run on a PR. The
-scheduled dependency audit is not a scheduled execution of the entire VM suite.
+[ci-public.yml](https://github.com/Velstra/sentinel/blob/main/.github/workflows/ci-public.yml) shows which checks run on a PR; the scheduled dependency audit does not run the VM suite.
 
 ## Kernel verifier compatibility
 
-Host Rust tests cannot verify an eBPF program. Compatibility requires loading
-the exact object into each target kernel in a privileged test VM. The
-[dataplane matrix](dataplane-support.md) distinguishes configured kernel lanes
-from passing receipts; an unexecuted lane is not support for that kernel.
+Host Rust tests cannot verify eBPF; the exact object must load into each target kernel in a privileged VM, and an unexecuted lane is not support ([dataplane matrix](dataplane-support.md)).
 
 ## Additional fixture catalog
 
-This catalog preserves the existing task lookup for protocol and service fixtures. It is not a passing-results ledger. Some fixtures or wiring may differ in the current checkout; the attribute query above and the fixture source are authoritative. Rendering, adjacency and replication checks do not by themselves prove full service interoperability or failover. Experimental-feature limits still apply.
+Jump to: [Boot](#image--boot-integrity) · [Config](#config-lifecycle--management) · [Firewall](#firewall-ebpf-data-plane) · [NAT](#nat) · [Routing](#routing-wren-control-plane) · [L2](#interfaces--l2) · [Addressing](#address--name-services) · [WAN](#wan--shaping) · [VPN](#vpn) · [Services](#services)
+
+A task lookup, not a passing-results ledger; the fixture source is authoritative. Rendering, adjacency and replication checks alone do not prove service interoperability or failover; experimental-feature limits apply.
 
 ## Image & boot integrity
 
