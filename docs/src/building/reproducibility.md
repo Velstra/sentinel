@@ -41,7 +41,7 @@ Pinned inputs improve repeatability; they do not by themselves prove byte-for-by
 nix build .#sentinel-image-unsigned --print-out-paths
 ```
 
-Two builds of the same revision produce the same **unsigned** verity image and the same `usrhash` (the dm-verity root hash on the kernel command line, which binds the whole store partition). Compare and attest those: the unsigned image carries an unsigned systemd-boot and UKI, so it does not depend on any key.
+Compare and attest the **unsigned** verity image and its `usrhash` (the dm-verity root hash on the kernel command line, which binds the whole store partition). The unsigned image carries an unsigned systemd-boot and UKI, so it does not depend on any key.
 
 ```mermaid
 flowchart LR
@@ -58,7 +58,7 @@ flowchart LR
 | `nix build .#sentinel-image`, same builder and keys | Signatures reproduce (fixed signing time 2025-01-01 00:00:00 UTC), but a handful of FAT directory-entry timestamp bytes on the ESP differ (measured: 10 bytes). |
 | `nix build .#sentinel-image`, different builder | No: each builder has different keys and so different signatures. |
 
-`nix build .#sentinel-image` signs systemd-boot and the UKI with development PK/KEK/db keys that each builder generates for itself inside a derivation. Their private keys are therefore readable in that builder's Nix store; they are demonstration keys, not secrets, and no enrollment payloads (`PK.auth`, `KEK.auth`, `db.auth`) are shipped for them unless a lab opts in with `velstra.appliance.secureBoot.developmentEnrollment`.
+`nix build .#sentinel-image` signs systemd-boot and the UKI with [development PK/KEK/db keys](../architecture/secure-boot.md#choose-the-signing-identity) that each builder generates for itself inside a derivation; no enrollment payloads (`PK.auth`, `KEK.auth`, `db.auth`) ship for them unless a lab opts in.
 
 Release images are signed afterwards, outside the store, with the release identity (`scripts/community_release.py sign` in the release workflow), which replaces every development signature and installs the release's enrollment payloads. To verify a release, compare its `usrhash` and unsigned payload with your own build, then check the signatures against the published release certificates.
 

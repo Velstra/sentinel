@@ -24,7 +24,7 @@ flowchart LR
 
 The output includes the ESP, a signed kernel image, the verified store, space for the alternate slot, and a writable data partition. `nix build .#sentinel-image-unsigned` builds the same image before any signature; see [compare the unsigned image](reproducibility.md#compare-the-unsigned-image-not-the-signed-one).
 
-> **Warning:** Source builds sign with per-build development keys that are not a trust identity: their private keys sit in the builder's world-readable Nix store, so do not enroll them in firmware. The image ships no enrollment payloads for them (`/loader/keys/sentinel/` holds only a README); release images are re-signed outside the store with the release identity.
+> **Warning:** Source builds sign with per-build [development keys](../architecture/secure-boot.md#choose-the-signing-identity) that are not a trust identity: their private keys sit in the builder's world-readable Nix store, so do not enroll them in firmware. Release images are re-signed outside the store with the release identity.
 
 <a id="trying-it-in-a-vm-first"></a>
 
