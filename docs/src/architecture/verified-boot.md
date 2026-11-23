@@ -4,6 +4,14 @@
 
 The kernel reads the immutable Nix store through dm-verity. A root hash embedded in the unified kernel image anchors the verification tree.
 
+```mermaid
+flowchart LR
+  sb[Secure Boot<br/>verifies UKI signature] --> uki[Unified kernel image<br/>embeds root hash]
+  uki --> verity[dm-verity tree<br/>verity partition]
+  verity --> store[(/nix/store<br/>read-only)]
+  data[(Data partition: config, credentials<br/>not covered by verity)]
+```
+
 ## Inspect a booted image
 
 ```sh
