@@ -2,23 +2,6 @@
 
 ## [Unreleased]
 
-### HA and config sync
-
-- A takeover no longer closes the new owner's configuration gate. Every VRRP
-  virtual address is now emitted to the agent (`virtual_addresses`) and counts
-  as a local destination on both members whether or not the member holds it.
-  Taking the VIPs then changes no `to firewall` rule, and the agent only adds
-  the address for its own sockets. Before, the takeover rewrote the rule set
-  with the gate closed: the new owner dropped 1 to 6 forwarded packets, and
-  could lose its own first witness renewals and with them, rarely, its fresh
-  lease (seen as a 0.13 to 0.35 s VIP gap within 3 s of a takeover). Checked in
-  `checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
-  `checks.ha-witness-synproxy-failover`, `checks.ha-failover` (plain VRRP) and
-  `checks.ha-two-node-flow`, which count the agent's gate closures from just
-  before each fault to 3 s after promotion. A VIP whose prefix length the
-  interface does not already carry (a `/32` VIP, or one outside its subnets)
-  still takes the rewrite.
-
 ## [1.0.0]
 
 The first release with a stable configuration language. The release date is
@@ -219,6 +202,31 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   witness now lets a member preempt only after the owner has held its
   authority for 10 s (Wren `PREEMPT_HOLD_MS`). Checked by the witness
   failover checks, which assert the hold.
+- A takeover no longer closes the new owner's configuration gate. Every VRRP
+  virtual address is now emitted to the agent (`virtual_addresses`) and counts
+  as a local destination on both members whether or not the member holds it.
+  Taking the VIPs then changes no `to firewall` rule, and the agent only adds
+  the address for its own sockets. Before, the takeover rewrote the rule set
+  with the gate closed: the new owner dropped 1 to 6 forwarded packets, and
+  could lose its own first witness renewals and with them, rarely, its fresh
+  lease (seen as a 0.13 to 0.35 s VIP gap within 3 s of a takeover). Checked in
+  `checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
+  `checks.ha-witness-synproxy-failover`, `checks.ha-failover` (plain VRRP) and
+  `checks.ha-two-node-flow`, which count the agent's gate closures from just
+  before each fault to 3 s after promotion. A VIP whose prefix length the
+  interface does not already carry (a `/32` VIP, or one outside its subnets)
+  still takes the rewrite.
+- With a lease, an owner now holds its VIPs on the lease alone. Wren renews
+  the lease only while the data-plane agent's report is fresh (100 ms) and
+  eligible. A stalled or ineligible agent therefore gives up the VIPs when the
+  lease ends, at most about 0.45 s after it stops. One late report no longer
+  withdraws them: before, Wren withdrew the VIPs at the first stale report.
+  The leased failover checks
+  (`checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
+  `checks.ha-witness-synproxy-failover`, `checks.ha-masquerade-failover`,
+  `checks.ha-log-stall`) stop the owner's agent. Inside the owner they time
+  how long until both VIPs are gone. They also assert that the standby takes
+  over and keeps the VIPs for 3 s.
 
 ### Updates and boot trust
 
@@ -333,10 +341,65 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
 
 ### Release verification
 
-Every `checks.x86_64-linux.*` check (194) is run under KVM on the release
-commit, and the release is not tagged unless each one passes or is listed
-here with its reason. Result on the release commit: PLACEHOLDER (filled in
-from the integrated qualification run).
+Every `checks.x86_64-linux.*` check (207) is run under KVM, with Fabric and
+Wren built from clean source archives, and the release is not tagged unless
+each one passes or is listed here with its reason. Result (2026-11-22/23):
+
+- The full run covered the 206 checks of the time: 202 passed on every run.
+  `checks.ha-bound-unit` (the 207th) came with the HA changes below and passed
+  in every later run. Two failures were defects in test fixtures, fixed
+  before release: `checks.ipsec-route-ownership` planted its foreign route
+  with Wren's own `static` protocol, and
+  `checks.observe-readonly` expected the SYN-proxy table at half its size.
+  `checks.ha-witness-synproxy-failover` failed 2 of 5 runs on takeover timing,
+  which the HA changes in this release address. `checks.source-cohort`
+  compares the `flake.lock` pins with the sources, so it runs on the re-pinned
+  release commit.
+- After the HA changes, 47 checks were run again and all passed: agent
+  lifecycle and configuration, forwarding, image, console, API, every routing
+  protocol, and the verifier on every kernel. The host test suites of Fabric
+  and Wren passed too. The HA checks then ran one at a time on idle builders.
+  On the release trees, 34 of 35 runs passed:
+
+  | check | passed |
+  |---|---|
+  | `ha-witness-synproxy-failover` | 8 of 8 |
+  | `ha-witness-failover` | 5 of 5 |
+  | `ha-wireguard-failover` | 4 of 5 |
+  | `ha-failover`, `ha-synproxy-failover` | 3 of 3 each |
+  | `ha-napt-mixed-version`, `ha-log-stall` | 3 of 3 each |
+  | `ha-pair`, `ha-two-node`, `ha-two-node-flow` | 1 of 1 each |
+
+  The one failure released a stalled agent's VIPs after 0.507 s, against the
+  0.505 s bound of the time. That bound has since been derived term by term
+  and is 0.54 s.
+- HA takeover, from the client's own capture: the time from the outage start
+  to the new owner's first frame, against its design.
+
+  | fault | measured | design |
+  |---|---|---|
+  | agent crash | 0.43–0.47 s | 0.675 s |
+  | Wren crash | 0.21–0.28 s | 0.32 s |
+  | owner VM paused | 0.32–0.42 s | 0.47 s |
+
+- The data plane loads under the verifier on kernels 6.6, 6.12, 6.18 and the
+  CI runner's 7.0. The largest program per kernel, against the
+  700,000-instruction budget of `velstra verify-ebpf`:
+
+  | kernel | program | instructions |
+  |---|---|---|
+  | 6.6 | `velstra_egress_v6` | 486,883 |
+  | 6.12 | `velstra_egress_v6` | 478,284 |
+  | 6.18 | `velstra_egress_v6` | 505,079 |
+  | 7.0 | `velstra_v4_state` | 309,389 |
+
+  On 7.0 all 24 programs verify, and the IPv4 handoff probe passes 54 of 54.
+- After that, the release trees changed only in documentation and test bounds.
+  On the final trees these all pass: the `velstra-ebpf` build against the
+  pinned `ebpfHash`, `checks.ebpf-verifier-6-12`, `checks.ha-bound-unit`,
+  `checks.commit` and the documentation build. Every check evaluates.
+  `checks.source-cohort` is the exception, since it needs the re-pinned
+  `flake.lock`.
 
 Defects found by qualification and fixed before release, beyond the audit
 findings above:
