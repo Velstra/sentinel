@@ -384,6 +384,10 @@ our tests. While the gate is closed every attached link drops traffic, the HA
 sync link included, so an owner commit costs a few packets and about one witness
 renewal; the owner keeps its lease.
 
+After a policy commit on the owner the pair has no failover until the standby
+has the new policy and the owner's state for the new term: about 1–3 s in our
+tests.
+
 ## Regression entry points
 
 ```sh
