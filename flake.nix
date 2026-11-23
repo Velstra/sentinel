@@ -3786,7 +3786,9 @@
           fw.wait_for_unit("sentinel-boot.service")
           fw.wait_until_succeeds("ip link show wlan0", timeout=60)
           fw.wait_until_succeeds("ip link show wlan1", timeout=60)
-          version = fw.succeed("hostapd -v 2>&1 || true")
+          # `hostapd -v` prints its version and exits non-zero; read the output
+          # without discarding the status of anything else.
+          _, version = fw.execute("hostapd -v 2>&1")
           assert "hostapd v2.12" in version, version
 
           # Inspect systemd's effective property, not just the Nix source. This
