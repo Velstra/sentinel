@@ -15,6 +15,9 @@
 # and through a port-forward that changes the port (public 8025 -> inside
 # 2525), whose server side carries a different tuple than the client opened.
 #
+# A SYN flood with more distinct tuples than FW_FLOWS holds must leave an idle
+# proxied connection working: the cookie-answered SYNs create no state.
+#
 # Then blind forgeries a sender who knows only who is talking to whom can send
 # with an idle connection's tuple — a SYN on the live tuple, a SYN from the
 # same client port to another server, a FIN and a reset with made-up sequence
@@ -202,6 +205,7 @@ pkgs.testers.runNixOSTest {
     )
     fw.fail("journalctl -u velstra.service | grep -q 'Error: loading'")
 
+    flooded = hold("/tmp/flooded", "10.2.0.2", 2525)
     routed = hold("/tmp/routed", "10.2.0.2", 2525)
     forwarded = hold("/tmp/forwarded", "10.1.0.1", 8025)
     target = hold("/tmp/target", "10.2.0.2", 2525)
@@ -234,6 +238,26 @@ pkgs.testers.runNixOSTest {
         assert survived == recorded, f"the target's splice changed or went: {recorded} -> {survived}"
         speaks("/tmp/target")
     scenario("off-path forgeries do not end a live splice", attacks)
+
+    def syn_flood():
+        # The attack the proxy exists for: more spoofed SYNs to the protected
+        # port, from distinct tuples, than FW_FLOWS holds (6144 here). They are
+        # answered with cookies and must create no connection state, or the
+        # flood evicts the idle connection's state and the agent's sweep then
+        # ends its splice.
+        before = entries("FW_FLOWS")
+        challenged = counter("synproxy_challenged")
+        client.succeed(f"{forge} flood 10.2.0.2 2525 12000", timeout=300)
+        fw.wait_until_succeeds(
+            f"sentinel show firewall statistics | awk '/synproxy_challenged/ {{exit ($2 >= {challenged + 10000}) ? 0 : 1}}'",
+            timeout=60,
+        )
+        after = entries("FW_FLOWS")
+        print(f"FW_FLOWS holds {before} entries before the SYN flood, {after} after it")
+        # Two sweep rounds and the grace, then the idle connection speaks.
+        fw.sleep(8)
+        speaks("/tmp/flooded")
+    scenario("a SYN flood leaves an idle proxied connection working", syn_flood)
 
     def churn():
         before = counter("synproxy_admitted")

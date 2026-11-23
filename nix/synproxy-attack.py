@@ -6,6 +6,9 @@
 #   syn     SRC SPORT DST DPORT            a bare SYN from the client's tuple
 #   fin     SRC SPORT DST DPORT            a FIN|ACK from the client's tuple with
 #                                          made-up sequence numbers
+#   flood   DST DPORT COUNT                COUNT bare SYNs from distinct spoofed
+#                                          sources (198.51.0.0/16), the SYN
+#                                          flood the proxy exists for
 #   poison  SRC SPORT DST DPORT ACK IFACE MAC
 #                                          an ACK "from the server" (SRC is the
 #                                          server) injected on the client's
@@ -46,8 +49,20 @@ def send_ip(data, dst):
         raw.sendto(data, (dst, 0))
 
 
+def flood(dst, dport, count):
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw:
+        for n in range(count):
+            src = f"198.51.{(n >> 8) & 0xFF}.{n & 0xFF}"
+            sport = 1024 + (n * 7919) % 60000
+            raw.sendto(packet(src, sport, dst, dport, n * 2654435761 & 0xFFFFFFFF, 0, 0x02), (dst, 0))
+
+
 def main(argv):
     kind = argv[1]
+    if kind == "flood":
+        flood(argv[2], int(argv[3]), int(argv[4]))
+        print(f"sent {argv[4]} spoofed SYNs to {argv[2]}:{argv[3]}")
+        return
     src, sport, dst, dport = argv[2], int(argv[3]), argv[4], int(argv[5])
     if kind == "syn":
         send_ip(packet(src, sport, dst, dport, 0x0BAD5EED, 0, 0x02), dst)
