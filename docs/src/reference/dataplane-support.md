@@ -62,12 +62,25 @@ nix build .#checks.x86_64-linux.dataplane-conformance -L --out-link result-confo
 cat result-conformance/conformance.json
 ```
 
+```mermaid
+flowchart LR
+  subgraph Sentinel lane
+    l1[LAN endpoint] --> dut[Sentinel] --> w1[WAN endpoint]
+  end
+  subgraph Reference lane
+    l2[LAN endpoint] --> ref[nftables] --> w2[WAN endpoint]
+  end
+  w1 --> cmp{{Compare receipts}}
+  w2 --> cmp
+```
+
 The six-VM topology uses separate LAN/WAN segments for nftables and Sentinel.
 Both have identical addresses, policies, payloads, MTUs and kernel versions.
-The endpoints use native sockets, not Fabric's parser. A peer reports the actual
-source address and payload digest; TCP also verifies the returned payload.
-The test independently validates the oracle's expected result before comparing
-Sentinel. A failure on both sides is a setup/oracle error, **not** a pass.
+
+- The endpoints use native sockets, not Fabric's parser.
+- A peer reports the actual source address and payload digest; TCP also verifies the returned payload.
+- The test independently validates the oracle's expected result before comparing Sentinel.
+- A failure on both sides is a setup/oracle error, **not** a pass.
 
 The initial inventory contains 17 cases: IPv4 TCP/UDP masquerade, four-MiB
 bidirectional TCP, fragmented UDP, echo and fragmented echo, RELATED ICMP
