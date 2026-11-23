@@ -159,7 +159,7 @@ hold at least 16,384 connections, so a larger box
 uses more kernel memory for them than before (DP-06). The SYN proxy's records now
 end with their connections (the agent removes a record no live connection state
 claims), and its table is sized for two records per connection instead of one
-per two, so on the same memory the default sizing holds about 11 % fewer
+per two, so on the same memory the default sizing holds about 7 % fewer
 connections. The tables' layout changed with it: the **first agent restart after
 the upgrade starts with fresh state** instead of adopting the pinned tables
 (pinned state never survives the upgrade's reboot either).

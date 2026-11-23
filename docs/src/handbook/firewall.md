@@ -290,7 +290,7 @@ A protected port can sit behind a port-forward, including one that changes the p
 
 **A proxied connection lives exactly as long as its connection state**, like every other connection through the box. The proxy keeps one record per proxied connection (its sequence offset), and the agent removes it once no live firewall or NAT state claims it: within about 30 s of that state ending, and only on the active member of an HA pair. So a proxied connection ends when its state does — idle longer than `tcp-established` (`set firewall global conntrack tcp-established`, 24 h by default), half-closed and idle longer than the half-close allowance (at least 120 s), or evicted when the state table is full — and idle proxied connections keep their records however many others come and go.
 
-A SYN flood against a protected port costs the box one cookie reply per SYN and no connection state, so it does not displace the protected connections' state. Ending records costs the agent a pass over the connection-state tables every few seconds while a port is SYN-proxied, roughly a second of CPU per pass on a box sized for millions of connections.
+A SYN flood against a protected port costs the box one cookie reply per SYN and no connection state, so it does not displace the protected connections' state. Ending records costs the agent a pass over the connection-state tables every few seconds while a port is SYN-proxied.
 
 Two consequences:
 
