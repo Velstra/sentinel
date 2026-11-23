@@ -1,13 +1,10 @@
 # Update trust and recovery reference
 
-The short procedure is [review and stage an update](../operations/update.md);
-this page holds the trust, boot-selection and recovery rules behind it. The
-architecture is in [A/B update slots](../architecture/ab-updates.md).
-
-OS updates are **A/B**: a new image is written to the inactive store slot and
-the bootloader is switched to it. Automatic fallback requires an intact,
-previously blessed slot; an unprovisioned or broken first installation has no
-such guarantee.
+The rules behind [review and stage an update](../operations/update.md); the
+design is in [A/B update slots](../architecture/ab-updates.md). A new image is
+written to the inactive store slot and the bootloader switches to it.
+Automatic fallback requires an intact, previously blessed slot; an
+unprovisioned or broken first installation has no such guarantee.
 
 ## Signed channel: local CLI or Web UI
 
@@ -38,23 +35,24 @@ sequenceDiagram
   Wk-->>Op: job done, no reboot
 ```
 
-Output is JSON. Each submission returns a durable job; `--wait` observes it for
-at most five minutes without owning or cancelling it. Disconnects and API
-restarts do not stop the independent worker. If a submission's outcome is
-unknown, inspect `system status` by its request correlation; do not resubmit
-blindly.
+Output is JSON. Each submission returns a durable job that disconnects and API
+restarts do not stop; `--wait` observes it for at most five minutes without
+owning or cancelling it. If an outcome is unknown, inspect `system status` by
+its request correlation instead of resubmitting. In the Web UI the same steps
+are **System → System updates** → **Check signed channel** → **Download &
+stage update**, with one shared job history.
 
-In **System → System updates**: refresh, **Check signed channel**, review the
-exact verified offer, then **Download & stage update**. CLI jobs appear in the
-same retained history. A change to configuration, trust or boot identity needs a
-fresh check and review. Pending config changes, remote member selection,
-read-only accounts and stale observations cannot authorize Stage.
+Staging does not reboot or claim a successful boot: check boot selection and
+cluster readiness, then reboot one member at a time. There is no
+trust/downgrade override. Native Enterprise `update check` uses this worker;
+the former unreviewed `update install` path is refused.
 
-Staging replaces the inactive slot and selects a counted next boot. It does not
-reboot or claim a successful boot. Check boot selection and cluster readiness,
-then reboot one member at a time. There is no trust/downgrade override. Native
-Enterprise `update check` uses this worker too; the former unreviewed
-`update install` path is refused. Off-box/no-apply consoles cannot run OTA jobs.
+| Stage is refused | Because |
+| --- | --- |
+| after a change to configuration, trust or boot identity since the check | it needs a fresh check and review |
+| with pending config changes, a remote member selected, a read-only account or a stale observation | none of these can authorize Stage |
+| from an off-box/no-apply console | it cannot run OTA jobs |
+| while the running image is an unblessed counted trial or not the next default (any slot write: CLI or UI, signed or `--allow-unsigned`) | overwriting the other slot would remove the only known-good fallback |
 
 ### Expiry and replay protection
 
@@ -66,29 +64,25 @@ Enterprise `update check` uses this worker too; the former unreviewed
 | Ledger | A check persists its highest accepted sequence and clock observation in `/var/lib/sentinel/update-trust`. |
 | Fail closed | Lower sequences, changed bytes at the same sequence, unauthorized signing-key changes and substantial clock rollback. |
 | Stage | Rechecks the exact offer before writing the inactive slot. |
+| Key and sequence scope | Per signing key, not per channel name: a new channel label must be signed by an already pinned key, at a sequence no lower than that key reached under any label. |
 
 > **Warning:** Do not delete `/var/lib/sentinel/update-trust` to clear an
 > error: that discards rollback protection. Repair the clock or obtain fresh,
-> correctly signed metadata.
+> correctly signed metadata. A missing or corrupt ledger that was once
+> published requires investigated recovery, not an automatic reset.
 
-A missing or corrupt ledger that was once published requires investigated
-recovery, not an automatic reset. A first check interrupted before its ledger
-was published (only the lock and staged files exist) is completed by the next
-check. Signing-key rotation is not yet implemented by this ledger.
+<details><summary>Interrupted first checks, key changes and old readers</summary>
 
-The key pin and sequence floor are not per channel name. A channel label the
-appliance has not used before must be signed by a key already pinned for
-another label, and its sequence must not be lower than the highest that key
-reached under any label: one signing key, one sequence space. Selecting a
-channel signed by a different key needs the same investigated recovery as a key
-rotation.
+A first check interrupted before its ledger was published (only the lock and
+staged files exist) is completed by the next check. Signing-key rotation is not
+yet implemented by this ledger, so selecting a channel signed by a different
+key needs the same investigated recovery as a key rotation.
 
-A slot write (CLI or UI, signed or `--allow-unsigned`) is refused while the
-running image is an unblessed counted trial or is not the next default:
-overwriting the other slot would remove the only known-good fallback. Older
-appliance versions without this validation must be upgraded first; new metadata
-alone cannot protect an old reader. Offline media and automatic boot fallback
-follow their own policies below.
+Older appliance versions without the slot-write validation must be upgraded
+first; new metadata alone cannot protect an old reader. Offline media and
+automatic boot fallback follow their own policies below.
+
+</details>
 
 ## Community offline/local-image updates
 
@@ -102,42 +96,40 @@ sudo sentinel update /path/to/velstra-sentinel.raw --commit
 sudo sentinel update /dev/sdX --commit --signature /mnt/release/manifest.json.sig
 ```
 
-Only the Community RAW-image writer. Native Enterprise images refuse it, also
-with `--allow-unsigned`; use the reviewed channel workflow. An offline proof
-authenticates operator-selected bytes, not their online freshness or
-subscription entitlement. Without `--commit`, the plan is printed and nothing
-is written.
+Community RAW-image writer only: native Enterprise images refuse it, also with
+`--allow-unsigned`. An offline proof authenticates operator-selected bytes, not
+their online freshness or subscription entitlement. Without `--commit` the plan
+is printed and nothing is written.
 
-A signed Community local update:
+| Step | A signed Community local update |
+| --- | --- |
+| 1 | **verifies** the image's signature (see below) |
+| 2 | **refuses** a release older than the running one unless `--allow-downgrade` (when the proof states a version) |
+| 3 | detects the **active** slot (via `/dev/mapper/usr`) |
+| 4 | reads the image once and hashes it in full against the signed digest; nothing is written unless it matches |
+| 5 | writes the new store + verity to the **inactive** slot from that same open file, re-hashed on the way, so an image that changes underneath (a rewritten file, a swapped stick) is refused before the slot is activated |
+| 6 | gives that slot the source image's verity partition types and GUIDs |
+| 7 | installs the new UKI as `sentinel-<inactive>+3.efi` with **3 boot tries** |
+| 8 | makes `loader.conf` prefer the new slot with `preferred sentinel-<inactive>*`, keeping `default sentinel-*` so an exhausted candidate can fall back |
 
-1. **verifies** the image's signature (see below);
-2. **refuses** a release older than the running one unless `--allow-downgrade`
-   (when the proof states a version);
-3. detects the **active** slot (via `/dev/mapper/usr`);
-4. reads the image once and hashes it in full against the signed digest;
-   nothing is written unless it matches;
-5. writes the new store + verity to the **inactive** slot from that same open
-   file, re-hashed on the way, so an image that changes underneath (a rewritten
-   file, a swapped stick) is refused before the slot is activated;
-6. gives that slot the source image's verity partition types and GUIDs;
-7. installs the new UKI as `sentinel-<inactive>+3.efi` with **3 boot tries**;
-8. makes `loader.conf` prefer the new slot with `preferred sentinel-<inactive>*`,
-   keeping `default sentinel-*` so an exhausted candidate can fall back.
+Before any inactive-slot write, signed and unsigned commits require the
+**running UEFI systemd-boot version 260 or newer** and no nonempty firmware
+default, preferred or one-shot entry override. An image carrying the active
+slot's verity/store GUIDs is refused before any write, unsigned sources
+included. Unplug a USB donor before reboot: it now shares the candidate's GUIDs
+and could be mistaken for the installed slot.
 
-**Bootloader precondition.** Before any inactive-slot write, signed and
-unsigned commits require the **running UEFI systemd-boot version 260 or newer**
-and no nonempty firmware default, preferred or one-shot entry override.
+<details><summary>Bootloader and identity details</summary>
+
 Older/non-systemd loaders and malformed or unreadable EFI state are refused.
 Sentinel does not silently clear firmware variables: inspect the override named
 in the error and review the suggested `bootctl` clearing command before
 retrying. Bootloader maintenance is a separate operation, not a package-manager
 update on the node. A hard per-slot `default` is unsafe: systemd-boot 260
-honors it even when its boot counter reaches zero.
+honors it even when its boot counter reaches zero. Do not re-seal the booted
+medium.
 
-**Identity.** An image carrying the active slot's verity/store GUIDs is refused
-before any write, unsigned sources included. Do not re-seal the booted medium.
-Unplug a USB donor before reboot: it now shares the candidate's GUIDs and could
-be mistaken for the installed slot.
+</details>
 
 ### Local images are signature-checked by default
 
@@ -147,35 +139,34 @@ openssl pkeyutl -sign -inkey release-priv.pem -rawin \
   -in velstra-sentinel.raw.sha256 -out velstra-sentinel.raw.sha256.sig
 ```
 
-`sentinel update <image>` verifies an Ed25519 proof before writing: it uses
-`<image>.sha256` and its detached signature when the digest file exists,
-otherwise `<image>.sig`. Name an explicit proof with `--signature <file>`.
-Pinned release keys are tried in this order:
+`sentinel update <image>` verifies an Ed25519 proof before writing:
+`<image>.sha256` with its detached signature when the digest file exists,
+otherwise `<image>.sig`, or the file named by `--signature <file>`. Missing
+keys, missing signatures and invalid proofs fail closed; a bad digest proof
+never falls back to a raw signature.
 
-1. `--pubkey <pem|file:path>` on the command line;
-2. the saved `[update]` channel's `public-key`;
-3. a release key baked into the image at `/etc/sentinel/release.pem`.
+| Key source, in order | |
+| --- | --- |
+| 1 | `--pubkey <pem\|file:path>` on the command line |
+| 2 | the saved `[update]` channel's `public-key` |
+| 3 | a release key baked into the image at `/etc/sentinel/release.pem` |
 
-Missing keys, missing signatures and invalid proofs fail closed. Publishers
-should sign a small digest for multi-GiB images, as above: direct Ed25519
-signing buffers the entire input. The digest file holds only 64 hex digits and
-an optional newline, not a filename.
-
-The updater verifies the signed digest, then hashes the entire image. A bad
-digest proof never falls back to a raw signature. Legacy direct image
-signatures work for regular files up to 64 MiB (a private copy is verified and
-installed); larger images need the signed digest. Signing belongs on the
-publisher's protected machine, not on customer nodes.
+Publishers should sign a small digest for multi-GiB images, as above (direct
+Ed25519 signing buffers the entire input), on their protected machine, not on
+customer nodes. The digest file holds only 64 hex digits and an optional
+newline, not a filename. The updater verifies the signed digest, then hashes
+the entire image. Legacy direct image signatures work for regular files up to
+64 MiB (a private copy is verified and installed); larger images need the
+signed digest.
 
 ### USB sticks and other block devices
 
-Nothing can sit "beside" `/dev/sdX`, and a stick is larger than its image, so a
-raw signature cannot say where the image ends. Prove a block device with
-`--signature` naming one of:
+A stick is larger than its image and nothing can sit "beside" `/dev/sdX`, so
+prove a block device with `--signature` naming either:
 
 - `…/manifest.json.sig`: the channel's signed release manifest (copy the
   channel directory to a second medium). It names the image's SHA-256 and the
-  release version, so the downgrade check below applies.
+  release version, so the downgrade check applies.
 - `…/velstra-sentinel.raw.sha256.sig`: the signed digest (above).
 
 The device is read up to the end of the image its own partition table describes
@@ -188,22 +179,24 @@ The device is read up to the end of the image its own partition table describes
 | Online offer, offline signed manifest | Checked against the running **OS image release**, not just the Sentinel package version. Older releases and unusable image version identities are refused. |
 | Signed digest, raw signature | Contains no release version, so cannot rule out a downgrade: refused unless `--allow-downgrade` accepts it explicitly. |
 
-Equal versions may pass the version check, but identical active partition GUIDs
-still cannot be staged. The reviewed CLI/UI workflow has no downgrade override;
-only the legacy Community writer accepts `--allow-downgrade`, as an explicit
-operator exception. Use a signed manifest for a normal offline update.
-
-Offline proofs do not consult the online expiry/sequence ledger. Online offers,
-including `file://` channel directories, must satisfy
+Use a signed manifest for a normal offline update. Only the legacy Community
+writer accepts `--allow-downgrade`, as an explicit operator exception. Equal
+versions may pass the version check, but identical active partition GUIDs still
+cannot be staged. Offline proofs do not consult the online ledger; online
+offers, including `file://` channel directories, must satisfy
 [expiry and replay protection](#expiry-and-replay-protection).
+
+`--allow-unsigned` skips local signature verification, on Community only. It
+does **not** bypass bootloader, identity or identical-image safeguards, does not
+permit re-sealing the active image, and is not an OTA trust override.
+
+<details><summary>Manifest <code>product</code> field</summary>
 
 An optional manifest `product` must equal `velstra-sentinel` when present.
 Legacy offline manifests may omit it; that compatibility is not proof of a
 current online offer.
 
-`--allow-unsigned` skips local signature verification, on Community only. It
-does **not** bypass bootloader, identity or identical-image safeguards, does not
-permit re-sealing the active image, and is not an OTA trust override.
+</details>
 
 ## Configure a signed channel
 
@@ -215,24 +208,28 @@ commit
 save
 ```
 
-| Field | Meaning |
+| Field (both required) | Meaning |
 | --- | --- |
 | `url` | The channel base: an `https://` or local `file://` directory holding `release.json` (or the compatibility manifest/signature pair) and its images. Local channel directories still require signed online freshness. |
 | `public-key` | The pinned Ed25519 release-signing key, PEM. `file:<path>` reads it from disk (so the key can live in the immutable image, not the config); an inline PEM also works. |
 
-Both fields are required. The fetch is the pinned curl with `--disable` and an
-**empty environment**: `HTTPS_PROXY`/`ALL_PROXY`, `SSLKEYLOGFILE`,
-`CURL_CA_BUNDLE`/`SSL_CERT_FILE` and `~/.curlrc` are ignored. An `https://`
-channel is checked against the system trust store; proxies are not supported.
 The whole `[update]` section is local-only: a fleet controller cannot change it
-(see the fleet documentation).
+(see the fleet documentation). An `https://` channel is checked against the
+system trust store; proxies are not supported. No channel path accepts an
+unsigned release or bypasses online freshness.
 
-Then run `sudo sentinel system update check --wait`, review the exact offer and
-Stage as above. Native Enterprise `sentinel update check` is an alias for that
-worker; `sentinel update install` is refused. Community keeps a legacy
+<details><summary>Fetch environment and the legacy adapter</summary>
+
+The fetch is the pinned curl with `--disable` and an **empty environment**:
+`HTTPS_PROXY`/`ALL_PROXY`, `SSLKEYLOGFILE`, `CURL_CA_BUNDLE`/`SSL_CERT_FILE`
+and `~/.curlrc` are ignored.
+
+Native Enterprise `sentinel update check` is an alias for the reviewed worker;
+`sentinel update install` is refused. Community keeps a legacy
 `update check`/`install` adapter, but that is not the reviewed offer/job
-workflow; do not use it as an unattended replacement. No channel path accepts
-an unsigned release or bypasses online freshness.
+workflow; do not use it as an unattended replacement.
+
+</details>
 
 ## Named channels and subscriptions
 
@@ -248,37 +245,33 @@ commit
 save
 ```
 
-Each named channel has its own URL, signing key and optional subscription
-credential. A channel name is not proof of certification; review the release's
-verification evidence.
+Each named channel pins its own `url`, `public-key` and optional subscription
+credential. `set update channel <name>` selects an existing channel; the single-channel
+configuration above is the unnamed `default` channel. A channel name is neither
+a separate trust identity (reusing a signing key shares that trust) nor proof
+of certification; review the release's verification evidence.
 
-- Pin `url` and `public-key` per channel. Reusing a signing key shares that
-  trust; the channel name does not create a separate identity.
-- `set update channel <name>` selects an existing channel. The single-channel
-  configuration above is the unnamed `default` channel.
-- `subscription-key` is a bearer secret. The read API redacts it and
-  `show subscription` masks all but its last four characters. Saved
-  configuration and local `show configuration` hold the full credential:
-  protect them.
+`subscription-key` is a bearer secret. The read API redacts it and
+`show subscription` masks all but its last four characters, but saved
+configuration and local `show configuration` hold the full credential: protect
+them.
 
 ### What an expired subscription does — and does not — do
 
-An expired or rejected subscription stops fetching new images from that
-channel. It does not disable routing, filtering, saved configuration or the
-console. Authentication failures are reported, not treated as unsigned offers.
-
-Subscription expiry is not signed **metadata expiry**: an entitled customer
-still needs a fresh, scoped offer, and a metadata refusal never disables the
-running data plane either.
+It stops fetching new images from that channel. It does not disable routing,
+filtering, saved configuration or the console. Authentication failures are
+reported, not treated as unsigned offers. Subscription expiry is not signed
+**metadata expiry**: an entitled customer still needs a fresh, scoped offer, and
+a metadata refusal never disables the running data plane either.
 
 ### `show subscription`
 
 This legacy view reads saved configuration and the legacy adapter's last-check
-record; it makes no fresh network request. Use `sentinel system status` for the
-durable worker's offers and jobs. `expiry: not reported` means **this view does
-not provide subscription entitlement expiry**. It says nothing about the
-mandatory expiry timestamp in signed online metadata; do not infer a license
-expiry date from a release's validity window.
+record, without a network request; `sentinel system status` shows the durable
+worker's offers and jobs. `expiry: not reported` means **this view does not
+provide subscription entitlement expiry**. It says nothing about the mandatory
+expiry in signed metadata; do not infer a license expiry date from a release's
+validity window.
 
 ## The rollback guarantee
 
@@ -292,28 +285,22 @@ flowchart TD
   tries -->|no good alternative| stop[Unblessed, no automatic reboot:<br/>console recovery]
 ```
 
-The candidate starts with `+3` tries. The product health gate checks saved
-configuration against live hardware, reconciled addresses, configured services,
-dataplane readiness and XDP attachment. Only a successful assessment plus the
-no-failed-units gate allows blessing; service activation alone is not success.
+The health gate checks saved configuration against live hardware, reconciled
+addresses, configured services, dataplane readiness and XDP attachment; service
+activation alone is not success. Fallback is not a guarantee against every
+firmware, storage or kernel hang, and both slots share the persisted
+configuration: falling back does not repair a bad configuration or remove an
+unavailable NIC.
 
-When a candidate fails assessment and an intact, blessed previous slot exists,
-bounded retries let systemd-boot exhaust it and select the good slot. That is
-not a guarantee against every firmware, storage or kernel hang. Both slots
-share the persisted configuration: falling back does not repair a bad
-configuration or remove an unavailable NIC.
-
-On a Community factory installation with no good alternative, a configured
-**missing NIC** consumes the counted trials, stays unblessed, and stops
-automatic reboots for console recovery. It is not treated as ordinary carrier
-loss or a temporarily absent DHCP server. Inspect with:
+On a Community factory installation, a configured **missing NIC** takes the "no
+good alternative" path; it is not treated as ordinary carrier loss or a
+temporarily absent DHCP server. Inspect, repair the saved interface
+configuration from the recovery console, then reboot explicitly and verify
+normal health and blessing:
 
 ```shell
 sudo sentinel config check --live /var/lib/sentinel/appliance.toml
 ```
-
-Repair the saved interface configuration from the recovery console, then
-reboot explicitly and verify normal health and blessing.
 
 For a deliberate recovery boot, select the verified good entry once in the boot
 menu. Do not write a hard per-slot `default`: it can override exhausted
@@ -323,8 +310,8 @@ firmware override before staging again.
 ## Reboot to activate
 
 Unlike `commit` (live, never reboots), an OS image update takes effect on the
-**next reboot** into the new slot. The running slot keeps serving until then;
-schedule the reboot when convenient.
+**next reboot** into the new slot; the running slot serves until then. Schedule
+the reboot when convenient.
 
 ## Verifying
 
@@ -338,28 +325,21 @@ nix build .#checks.x86_64-linux.missing-nic-boot -L
 | --- | --- |
 | `update` | A real donor-image A→B boot and normal product blessing. It does not replace the negative/fallback checks. |
 | `bootfallback` ([fixture](https://github.com/Velstra/sentinel/blob/main/nix/boot-fallback-test.nix)) | Three failed dataplane boots and fallback to a previously blessed image. |
-| `missing-nic-boot` ([fixture](https://github.com/Velstra/sentinel/blob/main/nix/missing-nic-boot-test.nix)) | Exhausted factory trials and product CLI repair. |
+| `missing-nic-boot` ([fixture](https://github.com/Velstra/sentinel/blob/main/nix/missing-nic-boot-test.nix)) | Exhausted factory trials and product CLI repair. Driver backdoor commands are not proof of an authenticated physical console login. |
 
-Driver backdoor commands are not proof of an authenticated physical console
-login. These are source-level VM gates: their existence, or a pass on another
+These are source-level VM gates: their existence, or a pass on another
 candidate, is not certification of the final signed release and its exact
 hashes.
 
 ## Bounded metadata and atomic channel promotion
 
-The channel reader prefers `release.json`: one JSON object with `schema = 1`,
-`manifest` (base64 of the exact signed bytes) and `signature` (base64 of the
-64-byte Ed25519 signature). The pinned key authenticates the exact manifest
-bytes before any release field is trusted; the envelope is not a new trust
-root.
-
-Only an absent endpoint (HTTP 404, or a missing local file for a file channel)
-allows compatibility fallback to `manifest.json` and `manifest.json.sig`.
-Malformed, oversized, unauthorized, timed-out or incorrectly signed envelopes
-never fall back. Publishers must keep the old root manifest/signature pair
-frozen while upgrading legacy readers, upload immutable versioned resources
-first, and promote only the single envelope object last. Both public and native
-Enterprise readers must be upgraded before production channel migration.
+The reader prefers `release.json`: `schema = 1`, `manifest` (base64 of the
+exact signed bytes) and `signature` (base64 of the 64-byte Ed25519 signature).
+The pinned key authenticates the exact manifest bytes before any release field
+is trusted; the envelope is not a new trust root. Only an absent endpoint (HTTP
+404, or a missing local file) allows fallback to `manifest.json` and
+`manifest.json.sig`; malformed, oversized, unauthorized, timed-out or
+incorrectly signed envelopes never fall back.
 
 | Limit | Value |
 | --- | --- |
@@ -372,8 +352,17 @@ Enterprise readers must be upgraded before production channel migration.
 
 Limits are enforced during transfer, chunked responses included, with
 appliance-pinned curl 8.4 or newer. Incomplete downloads are removed and
-failures leave the active slot unchanged. On Linux the curl child is killed
-automatically if its update owner exits.
+failures leave the active slot unchanged.
+
+<details><summary>Publishing a channel migration</summary>
+
+Publishers must keep the old root manifest/signature pair frozen while
+upgrading legacy readers, upload immutable versioned resources first, and
+promote only the single envelope object last. Both public and native
+Enterprise readers must be upgraded before production channel migration. On
+Linux the curl child is killed automatically if its update owner exits.
+
+</details>
 
 <details><summary>Staging space and locking</summary>
 
