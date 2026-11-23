@@ -26,8 +26,20 @@ release = load("community_release")
 protection = load("check_release_environment")
 identity = load("release_identity")
 transfer = load("release_transfer")
-with patch.dict(sys.modules, {"community_release": release}):
+with patch.dict(sys.modules, {"community_release": release, "check_release_environment": protection}):
     publisher = load("publish_community")
+
+
+def single_operator_environment(wait_timer=30, reviewers=(), prevent_self_review=False):
+    """GitHub's environment shape: one reviewer, a wait timer, custom branches."""
+    rules = [{"id": 2, "node_id": "R", "type": "required_reviewers", "prevent_self_review": prevent_self_review,
+              "reviewers": list(reviewers) if reviewers != () else
+              [{"type": "User", "reviewer": {"login": "owner", "id": 1, "type": "User"}}]},
+             {"id": 3, "node_id": "B", "type": "branch_policy"}]
+    if wait_timer is not None:
+        rules.insert(0, {"id": 1, "node_id": "W", "type": "wait_timer", "wait_timer": wait_timer})
+    return {"id": 7, "name": "community-signing", "protection_rules": rules, "can_admins_bypass": False,
+            "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
 
 
 class ReleaseTests(unittest.TestCase):
@@ -119,6 +131,91 @@ class ReleaseTests(unittest.TestCase):
                         [good | {"user": {"type": "Bot", "login": "reviewer"}}]):
             with self.subTest(history=history), self.assertRaises(ValueError):
                 protection.approval(environment, history, {"author"})
+
+    def test_two_person_mode_is_unchanged_by_single_operator_settings(self):
+        # A single-operator environment (self-review allowed) never satisfies the
+        # default two-person rule, and the default still refuses self-approval.
+        environment, branches = single_operator_environment(), {"total_count": 1,
+            "branch_policies": [{"type": "branch", "name": "main"}]}
+        with self.assertRaisesRegex(ValueError, "prevent-self-review"):
+            protection.validate(environment, branches)
+        mine = {"environments": [{"id": 7}], "state": "approved", "user": {"type": "User", "login": "owner"}}
+        with self.assertRaisesRegex(ValueError, "independent"):
+            protection.approval({"id": 7}, [mine], {"owner"})
+
+    def test_single_operator_mode_is_opt_in_by_exact_value(self):
+        for value, expected in (("true", True), ("True", False), ("1", False), ("yes", False),
+                                ("", False), ("false", False), (" true", False)):
+            with self.subTest(value=value), patch.dict(os.environ, {"RELEASE_SINGLE_OPERATOR": value}):
+                self.assertIs(protection.single_operator_enabled(), expected)
+        with patch.dict(os.environ):
+            os.environ.pop("RELEASE_SINGLE_OPERATOR", None)
+            self.assertIs(protection.single_operator_enabled(), False)
+
+    def test_single_operator_mode_accepts_reviewer_wait_timer_and_no_bypass(self):
+        self.assertEqual(protection.SINGLE_OPERATOR_MIN_WAIT_MINUTES, 30)
+        branches = {"total_count": 2, "branch_policies": [{"type": "branch", "name": "main"},
+                                                          {"type": "tag", "name": "v*"}]}
+        for environment in (single_operator_environment(),
+                            single_operator_environment(prevent_self_review=True),
+                            single_operator_environment(wait_timer=43200)):
+            with self.subTest(environment=environment):
+                protection.validate(environment, branches, single_operator=True)
+
+    def test_single_operator_mode_refuses_weakened_environments(self):
+        branches = {"total_count": 1, "branch_policies": [{"type": "branch", "name": "main"}]}
+        reviewers = single_operator_environment()["protection_rules"][0]
+        cases = {
+            "missing wait timer": single_operator_environment(wait_timer=None),
+            "short wait timer": single_operator_environment(wait_timer=29),
+            "zero wait timer": single_operator_environment(wait_timer=0),
+            "boolean wait timer": single_operator_environment(wait_timer=True),
+            "string wait timer": single_operator_environment(wait_timer="30"),
+            "two wait timers": single_operator_environment() | {"protection_rules":
+                single_operator_environment()["protection_rules"] + [{"type": "wait_timer", "wait_timer": 30}]},
+            "admin bypass": single_operator_environment() | {"can_admins_bypass": True},
+            "no reviewers": single_operator_environment(reviewers=[]),
+            "no reviewer rule": single_operator_environment() | {"protection_rules": [
+                r for r in single_operator_environment()["protection_rules"] if r["type"] != "required_reviewers"]},
+            "two reviewer rules": single_operator_environment() | {"protection_rules":
+                single_operator_environment()["protection_rules"] + [reviewers]},
+            "no protection": single_operator_environment() | {"protection_rules": []},
+        }
+        for name, environment in cases.items():
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                protection.validate(environment, branches, single_operator=True)
+        # The branch rules are exactly those of the two-person mode.
+        for policy in ({"branch_policies": [{"type": "branch", "name": "*"}]},
+                       branches | {"total_count": 101},
+                       {"total_count": 1, "branch_policies": [{"type": "tag", "name": "v*"}]}):
+            with self.subTest(policy=policy), self.assertRaises(ValueError):
+                protection.validate(single_operator_environment(), policy, single_operator=True)
+        with self.assertRaises(ValueError):
+            protection.validate(single_operator_environment() | {"deployment_branch_policy": None},
+                                branches, single_operator=True)
+
+    def test_single_operator_approval_may_be_self_but_must_exist(self):
+        environment = {"id": 7}
+        mine = {"environments": [{"id": 7}], "state": "approved", "user": {"type": "User", "login": "owner"}}
+        protection.approval(environment, [mine], {"owner"}, single_operator=True)
+        protection.approval(environment, [mine | {"user": {"type": "User", "login": "other"}}], {"owner"},
+                            single_operator=True)
+        for history in (None, [], [mine | {"state": "rejected"}], [mine | {"state": "pending"}],
+                        [mine, mine | {"state": "rejected"}],
+                        [mine | {"environments": [{"id": 8}]}], [mine | {"environments": []}],
+                        [mine | {"user": {"type": "Bot", "login": "owner"}}],
+                        [mine | {"user": {"type": "Organization", "login": "owner"}}],
+                        [mine | {"user": {"type": "User"}}], [mine | {"user": {}}], [{"environments": [{"id": 7}]}]):
+            with self.subTest(history=history), self.assertRaises(ValueError):
+                protection.approval(environment, history, {"owner"}, single_operator=True)
+
+    def test_single_operator_releases_say_so(self):
+        with patch.dict(os.environ, {"RELEASE_SINGLE_OPERATOR": "true"}):
+            statement = protection.approvals_statement()
+        self.assertEqual(statement, "Release approvals: single-operator mode "
+                                    "(one maintainer, wait timer \u2265 30 min).")
+        with patch.dict(os.environ, {"RELEASE_SINGLE_OPERATOR": "false"}):
+            self.assertIsNone(protection.approvals_statement())
 
     def test_artifact_archive_traversal_symlink_and_size_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -293,6 +390,26 @@ class PublicationContracts(unittest.TestCase):
             self.assertEqual(api.call_count, 4)
             self.assertEqual(api.call_args.kwargs["method"], "POST")
             self.assertTrue(api.call_args.args[1]["draft"])
+
+    def draft_body(self, extra):
+        with tempfile.TemporaryDirectory() as temp, patch.object(publisher, "verify_bundle"), \
+                patch.object(publisher, "source", return_value="a" * 40), \
+                patch.object(publisher, "api", side_effect=[{"status": "identical"}, None, None, {"id": 7, "draft": True, "tag_name": VERSION}]) as api, \
+                patch.object(publisher.subprocess, "run"), \
+                patch.dict(os.environ, {"RELEASE_VERSION": VERSION, "GITHUB_REPOSITORY": "Velstra/sentinel"} | extra):
+            directory = Path(temp)
+            (directory / "fixture.iso").write_bytes(b"not a real ISO")
+            with self.assertRaisesRegex(ValueError, "draft retained"):
+                publisher.publish(directory)
+            return api.call_args.args[1]["body"]
+
+    def test_release_body_records_single_operator_mode(self):
+        default = self.draft_body({"RELEASE_SINGLE_OPERATOR": ""})
+        self.assertNotIn("single-operator", default)
+        self.assertTrue(default.endswith("no physical-hardware certification is claimed."))
+        single = self.draft_body({"RELEASE_SINGLE_OPERATOR": "true"})
+        self.assertEqual(single, default + "\n\nRelease approvals: single-operator mode "
+                                           "(one maintainer, wait timer \u2265 30 min).")
 
     def test_cross_run_artifact_is_refused_before_download(self):
         metadata = {"expired": False, "workflow_run": {"id": 1, "head_sha": "a" * 40},

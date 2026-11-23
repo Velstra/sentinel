@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
+from check_release_environment import approvals_statement
 from community_release import digest, source, verify_bundle, version
 
 
@@ -61,16 +62,19 @@ def publish(directory):
             target = api(root + "/git/tags/" + target["sha"])["object"]
         if target.get("type") != "commit" or target.get("sha") != sha:
             raise ValueError("existing tag does not identify the qualified source")
+    body = ("ISO installer, QCOW2 appliance and compressed RAW disk. Verify SHA256SUMS.gpg "
+            "using the independently published release fingerprint before installing.\n\n"
+            "The live ISO currently requires Secure Boot disabled; the installed disk uses "
+            "production-signed UKIs. See INSTALL.txt and image-evidence.json. "
+            "source-sbom.cdx.json inventories source dependencies, not the complete OS. "
+            "Source regression tests and exact-disk boot tests are separately identified; "
+            "no physical-hardware certification is claimed.")
+    statement = approvals_statement()
+    if statement:
+        body += "\n\n" + statement
     created = api(root + "/releases", {
         "tag_name": release, "target_commitish": sha, "name": f"Sentinel {release}",
-        "draft": True, "prerelease": "-rc." in release,
-        "body": "ISO installer, QCOW2 appliance and compressed RAW disk. Verify SHA256SUMS.gpg "
-                "using the independently published release fingerprint before installing.\n\n"
-                "The live ISO currently requires Secure Boot disabled; the installed disk uses "
-                "production-signed UKIs. See INSTALL.txt and image-evidence.json. "
-                "source-sbom.cdx.json inventories source dependencies, not the complete OS. "
-                "Source regression tests and exact-disk boot tests are separately identified; "
-                "no physical-hardware certification is claimed."}, method="POST")
+        "draft": True, "prerelease": "-rc." in release, "body": body}, method="POST")
     if created.get("draft") is not True or created.get("tag_name") != release:
         raise ValueError("server did not create the expected draft")
     paths = sorted(directory.iterdir())
