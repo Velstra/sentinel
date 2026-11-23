@@ -49,7 +49,7 @@
 #       which is built from Wren's and the agent's named terms: this judges
 #       the product;
 #   (2) the resume at the first retransmission at or after s + P_max on the
-#       client's measured schedule (plus HA_RETRY_ANSWER_MAX): TCP's share. A
+#       client's measured schedule (plus HA_SERVER_ANSWER_MAX): TCP's share. A
 #       takeover inside its design that ends just after the 3R retry passes at
 #       7R; one beyond its design fails on (1) whatever TCP does.
 # Measured 2026-11-23 (idle builders, witness + SYN proxy, early announcement):
@@ -132,13 +132,16 @@ def ha_retry_at_or_after(sends, point):
     return when
 
 
-# The server's answer to a retransmission trails it by one round trip and
-# whatever the server's own TCP holds it for: 4-82 ms measured (idle
-# builders, witness+SYN proxy). Only the secondary assertion uses it.
-HA_RETRY_ANSWER_MAX = 0.1
+# The server's data answer to a retransmitted request. It may trail the
+# server's own ACK by ~0.1 s on a SYN-proxied connection: captured on the new
+# owner, the retransmission left towards the server in the same millisecond,
+# the server ACKed it 3 ms later and sent its data 94 ms after that; i5b
+# measured up to 101 ms, only on SYN-proxied runs. 101 ms plus a stated 50 ms
+# margin. Only the secondary assertion uses it.
+HA_SERVER_ANSWER_MAX = 0.15
 
 
-def ha_judge_takeover(s, sends, owner_frame, resumed, p_max, rtt=HA_RETRY_ANSWER_MAX):
+def ha_judge_takeover(s, sends, owner_frame, resumed, p_max, rtt=HA_SERVER_ANSWER_MAX):
     """(1) the takeover P against its design P_max: this judges the product;
     (2) the resume against the first retransmission at or after s + P_max on
     the client's measured schedule, plus one round trip: what TCP then allows."""
