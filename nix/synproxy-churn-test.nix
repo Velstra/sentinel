@@ -240,18 +240,25 @@ pkgs.testers.runNixOSTest {
     scenario("off-path forgeries do not end a live splice", attacks)
 
     def syn_flood():
-        # The attack the proxy exists for: more spoofed SYNs to the protected
-        # port, from distinct tuples, than FW_FLOWS holds (6144 here). They are
-        # answered with cookies and must create no connection state, or the
-        # flood evicts the idle connection's state and the agent's sweep then
-        # ends its splice.
+        # The attack the proxy exists for: many times more spoofed SYNs to the
+        # protected port, from distinct tuples, than FW_FLOWS holds (6144
+        # here). They are answered with cookies and must create no connection
+        # state, or the flood evicts the idle connection's state and the
+        # agent's sweep then ends its splice.
         before = entries("FW_FLOWS")
         challenged = counter("synproxy_challenged")
-        client.succeed(f"{forge} flood 10.2.0.2 2525 12000", timeout=300)
-        fw.wait_until_succeeds(
-            f"sentinel show firewall statistics | awk '/synproxy_challenged/ {{exit ($2 >= {challenged + 10000}) ? 0 : 1}}'",
-            timeout=60,
-        )
+        client.succeed(f"{forge} flood 10.2.0.2 2525 80000", timeout=300)
+        # Until the proxy has answered all that reached it.
+        answered = counter("synproxy_challenged")
+        for _ in range(30):
+            fw.sleep(2)
+            now = counter("synproxy_challenged")
+            if now == answered:
+                break
+            answered = now
+        answered -= challenged
+        print(f"the proxy answered {answered} spoofed SYNs")
+        assert answered >= 2 * 6144, f"only {answered} spoofed SYNs reached the proxy"
         after = entries("FW_FLOWS")
         print(f"FW_FLOWS holds {before} entries before the SYN flood, {after} after it")
         # Two sweep rounds and the grace, then the idle connection speaks.
