@@ -14,7 +14,7 @@ compare
 commit-confirm 2
 ```
 
-Run these commands in a configuration session with a saved baseline. From a second session, verify management access. Run `confirm` before the timer expires, then `save` to keep the change across reboot. Without confirmation, the timer reapplies the saved baseline.
+Run these in a configuration session with a saved baseline. Verify management access from a second session, then `confirm` before the timer expires and `save`.
 
 ```mermaid
 stateDiagram-v2

@@ -19,12 +19,6 @@ On the running appliance, identify the current slot and boot entry before stagin
 
 ## Follow an update
 
-| Phase | What changes |
-|---|---|
-| Stage | Write the inactive store and its verification data, then select the candidate for a counted boot. |
-| Reboot | The loader attempts the selected candidate. The previous working slot remains available. |
-| Accept or fall back | A successful boot can be marked good. A candidate that exhausts its counted attempts yields to the previous entry. |
-
 ```mermaid
 flowchart TD
   stage[Stage: write inactive store + verity,<br/>select candidate with +3 tries] --> boot[Reboot: loader tries candidate]
@@ -39,7 +33,7 @@ flowchart TD
 |---|---|---|---|---|---|---|
 | Content | ESP | verity A | store A | verity B | store B | data |
 
-The boot mechanism protects against a candidate failing to boot. An operator still has to check management connectivity and forwarding after startup. See the [update runbook](../operations/update.md).
+The previous working slot stays available throughout. The boot mechanism protects against a candidate failing to boot. An operator still has to check management connectivity and forwarding after startup. See the [update runbook](../operations/update.md).
 
 <a id="verifying-it"></a>
 
