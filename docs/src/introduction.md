@@ -12,6 +12,18 @@ Sentinel is a firewall and router for x86-64 UEFI systems. Fabric applies packet
 | Choose how an HA pair elects a primary | [Compare the two HA modes](operations/high-availability.md) | Verify the active member and how each mode handles a partition. |
 | Review an image before rollout | [Stage an update](operations/update.md) | Verify the offer and distinguish a staged image from a successful boot. |
 
+## How the parts fit
+
+```mermaid
+flowchart LR
+  op([Operator]) -->|CLI / web console| sentinel[Sentinel<br/>config + commit]
+  sentinel -->|packet policy| fabric[Fabric agent<br/>eBPF/XDP data plane]
+  sentinel -->|routing config| wren[Wren<br/>routing daemon]
+  wren -->|routes| kernel[(Kernel FIB)]
+  fabric -->|forward / drop| nic{{NICs}}
+  image[[Signed A/B image]] -.->|update| sentinel
+```
+
 ## First look on an appliance
 
 ```sh
