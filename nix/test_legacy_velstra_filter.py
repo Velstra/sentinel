@@ -100,6 +100,16 @@ class LegacyFilter(unittest.TestCase):
         self.assertEqual([(e["port"], e["mss"]) for e in entries], [(443, 1460), (8080, 1400)])
         self.assertFalse(any("policy" in e for e in entries))
 
+    def test_virtual_addresses_are_dropped_in_either_layout(self):
+        for listed in (
+            'virtual_addresses = ["10.2.0.100", "fd42:2::100"]\n',
+            'virtual_addresses = [\n    "10.2.0.100",\n    "fd42:2::100",\n]\n',
+        ):
+            out, _, _ = legacy.rewrite('default_action = "drop"\n' + listed + "fail_closed = true\n", set(), [])
+            parsed = tomllib.loads(out)
+            self.assertNotIn("virtual_addresses", parsed)
+            self.assertEqual((parsed["default_action"], parsed["fail_closed"]), ("drop", True))
+
 
 if __name__ == "__main__":
     unittest.main()

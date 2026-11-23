@@ -71,11 +71,15 @@ let
       wan.default_action = "drop";
       lan.default_action = "drop";
       control.default_action = "accept";
+      # Rules `to firewall` are what make a takeover's VIPs part of the
+      # agent's local-destination set (see the gate check below).
+      firewall.local = true;
     };
     rule = [ { name = "single-echo"; from = "lan"; proto = "tcp"; port = 8443; action = "accept"; }
       # A constant-rate UDP probe measures the forwarding gap itself; a TCP
       # stream's retransmission backoff would add to whatever it measures.
-      { name = "gap-probe"; from = "lan"; proto = "udp"; port = 8444; action = "accept"; } ];
+      { name = "gap-probe"; from = "lan"; proto = "udp"; port = 8444; action = "accept"; }
+      { name = "mgmt-ssh"; from = "lan"; to = "firewall"; proto = "tcp"; port = 22; action = "accept"; } ];
     nat.source = [ { name = "shared-snat"; zone = "wan"; to = "10.1.0.100"; } ];
     protocols.vrrp = map (vip: {
       inherit (vip) name vrid;
@@ -102,7 +106,7 @@ let
       (lib.mkForce legacyAgent);
     environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.tcpdump ];
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
-    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
+    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug,velstra::firewall=info";
     # As in ha-failover-test.nix: the test driver forwards every journal line
     # synchronously to the serial console, and a backed-up console stalls the
     # agents' logging and with it HA timing. The journal itself keeps it all.
@@ -376,6 +380,12 @@ in pkgs.testers.runNixOSTest {
         client.wait_until_succeeds("test $(wc -l < /tmp/udp-replies) -ge 20", timeout=10)
         probe_before = probe_replies()
         before = status()["count"]
+        # A takeover must never close the new owner's configuration gate
+        # (the configured VIPs are local destinations on both members).
+        # The agent logs every closure; count them from just before the
+        # fault to 3 s after promotion.
+        gate_count = "journalctl -u velstra -o cat --no-pager | grep -c 'configuration gate closed' || true"
+        gate_before = int(secondary.succeed(gate_count).strip())
         anchor = ha_bound.ha_fault_anchor(client)
         started = time.monotonic()
         primary.succeed("systemctl kill --kill-who=main --signal=SIGSTOP wren.service")
@@ -407,6 +417,7 @@ in pkgs.testers.runNixOSTest {
         # Diagnostic only: host time includes driver command and return costs.
         print("promotion observation", observation, "host elapsed", elapsed)
         assert code == 0, observation
+        promoted = time.monotonic()
         successor = json.loads(secondary.succeed("cat /run/velstra/ha/role.json"))["authority"]
         assert successor["term"] > owner["term"] and successor["policy"] == owner["policy"], (owner, successor)
         primary.succeed(py('import json,time; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==1 and r["deadline_ns"]<time.clock_gettime_ns(time.CLOCK_BOOTTIME)'))
@@ -423,6 +434,12 @@ in pkgs.testers.runNixOSTest {
         stream_gap = reply_gap(before - 1)
         print(f"in-guest forwarding gap across warm promotion {gap:.3f}s (TCP stream gap {stream_gap:.3f}s incl. retransmission backoff; host elapsed {elapsed:.3f}s)")
         assert gap <= 1.5, f"warm two-node promotion exceeded replica budget: in-guest gap {gap:.3f}s"
+        time.sleep(max(0.0, promoted + 3 - time.monotonic()))
+        gate_after = int(secondary.succeed(gate_count).strip())
+        if gate_after != gate_before:
+            print(secondary.execute("journalctl -u velstra -o short-monotonic --no-pager | grep 'configuration gate closed' | tail -n 5")[1])
+        assert gate_after == gate_before, ("the two-node takeover closed the new owner's configuration gate", gate_before, gate_after)
+        print(f"two-node takeover: the new owner's configuration gate stayed open ({gate_after} closures before and after)")
         # (a) and (b) of the shared bound. Without a witness the standby
         # takes over only once the 1000 ms peer timeout has passed, on top of
         # the lease-run-out-relative takeover budget.

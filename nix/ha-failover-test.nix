@@ -62,7 +62,7 @@ let
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance number priority);
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
-    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
+    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug,velstra::firewall=info";
   };
   # checks.ha-log-stall: on the master, wren's and the agent's stdout and
   # stderr go to FIFOs that a holder keeps open. Until /run/log-stall/stop
@@ -356,7 +356,22 @@ in pkgs.testers.runNixOSTest {
         "open('/tmp/vip-steady.json','w').write(json.dumps({'appeared':appeared,'gaps':gaps[:20]}))",
     ])
     vip_steady_s = 3
+    # A takeover must never close the new owner's configuration gate: the
+    # configured VIPs are local destinations on both members, so adding one
+    # to a link changes no rule (only LOCAL_EGRESS_ADDRS grows). While the
+    # gate is closed every attached link drops everything, the node's own
+    # witness exchanges included. The agent logs every closure.
+    def gate_closures(node):
+        return int(node.succeed("journalctl -u velstra -o cat --no-pager | grep -c 'configuration gate closed' || true").strip())
+    def assert_gate_stayed_open(node, label, before):
+        after = gate_closures(node)
+        if after != before:
+            print(node.execute("journalctl -u velstra -o short-monotonic --no-pager | grep 'configuration gate closed' | tail -n 5")[1])
+        assert after == before, (label, "the takeover closed the new owner's configuration gate", before, after)
+        print(f"{label}: the new owner's configuration gate stayed open ({after} closures before and after)")
+    gate_baseline = {}
     def vip_steady_start(node):
+        gate_baseline[node.name] = gate_closures(node)
         script = vip_steady_watch.replace("VIP_STEADY_S", str(vip_steady_s))
         node.succeed("rm -f /tmp/vip-steady.json /tmp/vip-steady.err /tmp/vip-steady.ready; echo "+base64.b64encode(script.encode()).decode()+" | base64 -d > /tmp/vip_steady.py")
         node.succeed("systemd-run --collect --unit=vip-steady-$(date +%s%N) -p StandardError=file:/tmp/vip-steady.err ${pkgs.python3}/bin/python3 /tmp/vip_steady.py")
@@ -367,6 +382,8 @@ in pkgs.testers.runNixOSTest {
         steady=json.loads(node.succeed("cat /tmp/vip-steady.json"))
         print(f"{label}: the new owner's VIPs over {vip_steady_s}s after promotion: {steady}")
         assert steady["appeared"] and not steady["gaps"], (label, "the new owner dropped its VIPs after promotion", steady)
+        # The watcher ran from before the fault to 3 s after promotion.
+        assert_gate_stayed_open(node, label, gate_baseline[node.name])
     start_all()
     ${pkgs.lib.optionalString leased ''
     witness.wait_for_unit("sentinel-witness.service")
@@ -445,6 +462,7 @@ in pkgs.testers.runNixOSTest {
     ${pkgs.lib.optionalString leased ''
     vip_steady_start(backup)
     ''}
+    ${pkgs.lib.optionalString (!leased) "gate_before=gate_closures(backup)"}
     anchor=ha_bound.ha_fault_anchor(client)
     started=time.monotonic()
     ${if leased then ''
@@ -460,8 +478,13 @@ in pkgs.testers.runNixOSTest {
         assert time.monotonic()-started < ha_bound.HA_LEASE_RUNOUT_MAX+ha_bound.HA_TAKEOVER_MAX+ha_bound.HA_DRIVER_LATENCY_MAX, "VIP promotion exceeded the takeover bound"
         time.sleep(0.01)
     elapsed=time.monotonic()-started
-    ${pkgs.lib.optionalString leased ''
+    ${if leased then ''
     vip_steady_check(backup,"owner wren SIGSTOP")
+    '' else ''
+    # From just before the fault to 3 s after promotion, as the leased
+    # variants judge it inside vip_steady_check.
+    time.sleep(vip_steady_s)
+    assert_gate_stayed_open(backup,"owner crash",gate_before)
     ''}
     backup.succeed("ip -o address show eth1 | grep -q 10.1.0.100")
     ${pkgs.lib.optionalString leased ''

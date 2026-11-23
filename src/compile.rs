@@ -120,6 +120,14 @@ pub struct VelstraConfig {
     /// security-relevant decision. Stating it every time leaves one place the
     /// answer comes from.
     pub(crate) fail_closed: bool,
+    /// Every VRRP virtual address (audit follow-up to HA takeovers). The agent
+    /// counts each as a local destination on every member, held or not, so a
+    /// takeover adding one to a link changes no `dst-local` rule and never
+    /// closes its configuration gate. Member-local: not part of the HA policy
+    /// fingerprint. Omitted when there is none, which is what the agent
+    /// assumes when the key is absent.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) virtual_addresses: Vec<std::net::IpAddr>,
     // Inline array of strings — still a scalar for TOML ordering, so it must
     // precede the `[[policy]]`/`[[interface]]` tables below.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -177,8 +185,27 @@ pub struct VelstraConfig {
 /// interface's static v4/v6 address and every VRRP virtual address. A subset
 /// of what the agent matches for `dst-local` — DHCP, SLAAC and DHCPv6
 /// addresses are only known at run time.
+/// The address part of an `address[/len]` string.
+fn host_part(cidr: &str) -> Option<std::net::IpAddr> {
+    cidr.split('/').next()?.parse().ok()
+}
+
+/// Every VRRP virtual address, sorted and without duplicates.
+fn vrrp_virtual_addresses(appliance: &Appliance) -> Vec<std::net::IpAddr> {
+    let mut out: Vec<std::net::IpAddr> = appliance
+        .protocols
+        .vrrp
+        .iter()
+        .flat_map(|v| v.virtual_address.iter())
+        .filter_map(|a| host_part(a))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 pub(crate) fn configured_local_addresses(appliance: &Appliance) -> Vec<std::net::IpAddr> {
-    let host = |cidr: &str| cidr.split('/').next()?.parse::<std::net::IpAddr>().ok();
+    let host = host_part;
     let mut out: Vec<std::net::IpAddr> = appliance
         .interfaces
         .iter()
@@ -1426,6 +1453,7 @@ fn compile_noted(
 
     VelstraConfig {
         local_hint: configured_local_addresses(appliance),
+        virtual_addresses: vrrp_virtual_addresses(appliance),
         ha: crate::ha::dataplane(appliance),
         conntrack: ConntrackOut {
             tcp_syn: fw.conntrack.tcp_syn,
@@ -1988,6 +2016,52 @@ port = 443
             dsts.contains(&"2001:db8:1::/64"),
             "the v6 subnet is missing, so the rule widens to every zone: {dsts:?}"
         );
+    }
+
+    /// Every VRRP virtual address is handed to the agent as a virtual address:
+    /// a local destination on every member whether or not it holds it, so a
+    /// takeover changes no rule. A box without VRRP emits no key at all.
+    #[test]
+    fn vrrp_virtual_addresses_reach_the_agent() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth2"
+zone = "lan"
+address = "10.2.0.1/24"
+[zone.firewall]
+local = true
+[[protocols.vrrp]]
+name = "lan"
+interface = "eth2"
+vrid = 21
+virtual-address = ["10.2.0.100", "10.2.0.101"]
+[[protocols.vrrp]]
+name = "lan6"
+interface = "eth2"
+vrid = 22
+virtual-address = ["fd42:2::100"]
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).expect("parses"));
+        let expected: Vec<std::net::IpAddr> = ["10.2.0.100", "10.2.0.101", "fd42:2::100"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        assert_eq!(cfg.virtual_addresses, expected);
+        let rendered: toml::Value = toml::from_str(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            rendered["virtual_addresses"],
+            toml::Value::Array(
+                ["10.2.0.100", "10.2.0.101", "fd42:2::100"]
+                    .iter()
+                    .map(|a| toml::Value::String(a.to_string()))
+                    .collect()
+            )
+        );
+        let plain =
+            compile(&Appliance::from_toml("[system]\nhostname = \"fw\"\n").expect("parses"));
+        assert!(!plain.to_toml().unwrap().contains("virtual_addresses"));
     }
 
     /// The local zone is the box, in both families too — and it is the box as
