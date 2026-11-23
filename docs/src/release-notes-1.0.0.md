@@ -259,5 +259,25 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
 
 ## Verification
 
-See the qualification record for this release in the changelog's 1.0.0 entry
-and the [test catalogue](reference/tests.md).
+Before tagging, every VM and build check ran under KVM. The HA checks then ran
+again, one at a time, after the last HA changes.
+
+- Of the 206 checks in the full run, 202 passed on every run. The other failures were two
+  test-fixture defects, fixed before release, and the HA takeover timing that
+  this release's HA changes address.
+- The final HA run: 34 of 35 runs passed. The one failure was 2 ms over a
+  test bound that has since been derived term by term.
+- HA takeover, measured at the client from the outage start to the new owner's
+  first frame:
+
+  | fault | measured |
+  |---|---|
+  | agent crash | 0.43–0.47 s |
+  | Wren crash | 0.21–0.28 s |
+  | owner VM paused | 0.32–0.42 s |
+
+- The eBPF data plane loads on kernels 6.6, 6.12, 6.18 and 7.0. Its largest
+  program needs 505,079 verifier instructions (on 6.18), of a 700,000 budget.
+
+The full record is in the changelog's 1.0.0 entry ("Release verification"). The
+[test catalogue](reference/tests.md) describes each check.
