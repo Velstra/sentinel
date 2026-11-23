@@ -2,32 +2,7 @@
 
 <a id="interfaces"></a>
 
-Set addresses and zones on the discovered device names. Keep the serial console or a separately connected management port available before moving a live link into a zone.
-
-## Bind physical identity before assigning zones
-
-Match the physical NIC's permanent MAC and cable role before reusing a name.
-Predictable names can change after device replacement, firmware changes or VM
-hot-plug; a new device that inherits a name must not silently inherit a trust
-decision. Use `sentinel show interfaces` and `ip -details link show` to inspect
-the inventory, then pin each physical role:
-
-```text
-set interface wan0 hw-id 52:54:00:10:00:01
-set interface wan0 zone wan
-set interface wan0 address dhcp
-```
-
-Replace the example MAC with the real permanent hardware identity. `hw-id`
-creates a `.link` name binding when the device appears; it is **not** MAC
-cloning, and a commit does not guarantee an immediate rename of an already
-active NIC. Keep console access and verify the binding after a controlled
-reboot before relying on it. Bind the management NIC separately on each HA
-member. Do not copy the primary's physical MAC bindings to the secondary.
-
-## Common fields
-
-Inspect the discovered NIC names before assigning zones, addresses or MTU. For a WAN using DHCP and a statically addressed LAN:
+A DHCP WAN and a statically addressed LAN:
 
 ```text
 set interface eth0 zone wan
@@ -37,19 +12,45 @@ set interface eth1 address 10.0.0.1/24
 set interface eth1 address6 2001:db8:0:1::1/64
 ```
 
+Set addresses and zones on the discovered device names (`sentinel show interfaces`). Keep the serial console or a separately connected management port available before moving a live link into a zone.
+
+## Bind physical identity before assigning zones
+
+Predictable names can change after device replacement, firmware changes or VM hot-plug; a new device that inherits a name must not silently inherit a trust decision. Match the NIC's permanent MAC and cable role (`sentinel show interfaces`, `ip -details link show`), then pin each physical role:
+
+```text
+set interface wan0 hw-id 52:54:00:10:00:01
+set interface wan0 zone wan
+set interface wan0 address dhcp
+```
+
+`hw-id` creates a `.link` name binding when the device appears; it is **not** MAC cloning, and a commit does not guarantee an immediate rename of an already active NIC. Keep console access and verify the binding after a controlled reboot before relying on it.
+
+> **Warning:** bind the management NIC separately on each HA member. Do not copy the primary's physical MAC bindings to the secondary.
+
+## Common fields
+
+Inspect the discovered NIC names before assigning zones, addresses or MTU. The example at the top of this page sets the common fields for a DHCP WAN and a static LAN.
+
 ## Zoned links stay down until the firewall has them
 
-Sentinel holds a zoned data interface down until the dataplane attaches. Inspect the reason with `sentinel show interfaces`. Restore the dataplane from the serial console or independent management path before treating a held port as a cabling problem.
+```mermaid
+stateDiagram-v2
+  [*] --> Held: zoned link appears
+  Held --> Up: data plane attaches
+```
+
+Sentinel holds a zoned data interface down until the data plane attaches; `sentinel show interfaces` gives the reason. Restore the data plane from the serial console or an independent management path before treating a held port as a cabling problem.
 
 ### Keep a way in that does not depend on the data plane
 
-Keep a local or serial console, or a physically independent management interface, while changing dataplane attachment.
+Keep a local or serial console, or a physically independent management interface, while changing data-plane attachment.
 
 An unzoned management interface is outside the zoned dataplane hold, not an automatic security boundary. Bind SSH and the console to its tested address and isolate the network. A local listen address does not restrict ingress: Linux can route traffic from another interface to it. Verify explicit management ACLs from every untrusted segment, including on the standby; see [management ingress](system.md#ssh-daemon).
 
 ## VLANs (802.1Q / QinQ)
 
-A tagged subinterface can infer its parent and VLAN from a name such as `eth1.20`. Set the protocol explicitly for an 802.1ad service tag.
+A name such as `eth1.20` infers the parent and VLAN. Set the protocol explicitly for an 802.1ad service tag.
 
 ```text
 set interface eth1.20 zone iot          # infers parent eth1, vlan 20
@@ -58,11 +59,11 @@ set interface eth1.20 address 10.0.20.1/24
 
 ## Virtual interface types
 
-Set the interface type and its required parent or members. Take one end-to-end hop at a time when building bridges, bonds, tagged interfaces or tunnels.
+Set the `type` and its parent or members. Build bridges, bonds, tagged interfaces and tunnels one end-to-end hop at a time.
 
 ### Bridges & bonds
 
-Use a bridge to join L2 ports. Use a bond to group physical links into one logical interface; configure the switch to match its mode.
+A bridge joins L2 ports; a bond groups physical links into one logical interface (configure the switch to match its mode).
 
 ```text
 set interface br0 type bridge
@@ -79,7 +80,7 @@ set interface bond0 member eth4
 
 ### Tunnels
 
-Configure the tunnel’s local and remote endpoints and the address of the resulting link. Verify underlay reachability first.
+Local and remote endpoints plus the tunnel link's address. Check underlay reachability first.
 
 ```text
 set interface gre1 type gre
@@ -92,7 +93,7 @@ set interface gre1 address 10.255.0.1/30
 
 ## PPPoE (VDSL / fibre)
 
-Set the physical parent and provision the ISP-assigned authentication values. Place the zone and address settings on the appropriate logical interface.
+The session runs over a physical parent with the ISP-assigned credentials; put zone and address on the appropriate logical interface.
 
 ```text
 set interface wan0 type pppoe
@@ -105,7 +106,7 @@ set interface wan0 mtu 1492
 
 ## IPv6 addressing & prefix delegation
 
-Request a delegated prefix on the upstream link, assign a downstream subnet, and verify the advertised prefix on a LAN client.
+Request a delegated prefix upstream, carve a downstream subnet, and check the advertised prefix on a LAN client.
 
 ```text
 set interface wan0 address6 dhcp
@@ -116,7 +117,7 @@ set interface eth1 pd-subnet 1
 
 ## Serving the LAN: DHCP & Router Advertisements
 
-Configure the DHCP pool and router advertisements on the LAN interface. Reserve the appliance’s own address outside the dynamic pool.
+DHCP pool and router advertisements on the LAN interface. Keep the appliance's own address outside the dynamic pool.
 
 ```text
 set interface eth1 dhcp-server enable
@@ -131,7 +132,7 @@ set interface eth1 router-advert prefix 2001:db8:0:1::/64
 
 ## Egress QoS (bufferbloat)
 
-Set the shaper bandwidth from the measured uplink rate. Test latency with background traffic before and after applying CAKE.
+Set the shaper bandwidth from the measured uplink rate, and compare latency under background traffic before and after enabling CAKE.
 
 ```text
 set interface wan0 qos discipline cake
@@ -141,11 +142,11 @@ set interface wan0 qos rtt internet
 
 ## MACsec
 
-Configure the parent, peer identity and matching keys on both ends. Provision unique keys through the site’s credential procedure. Use CLI completion under `set interface <name>` for the required MACsec fields.
+Parent, peer identity and matching keys on both ends, with unique keys from the site's credential procedure. Tab completion under `set interface <name>` lists the required MACsec fields.
 
 ## Clamping TCP MSS
 
-Use an explicit MSS or the path-MTU mode on an encapsulated path. Confirm large TCP transfers work as well as small probes.
+An explicit MSS, or path-MTU mode, on an encapsulated path. Test large TCP transfers, not only small probes.
 
 ```text
 set interface tun0 mss 1360
@@ -154,7 +155,7 @@ set interface tun0 mss pmtu
 
 ## Offload
 
-Inspect NIC driver capabilities before setting per-interface offloads. Verify the active state after applying.
+Check the NIC driver's capabilities first and the active state after applying.
 
 ```text
 set interface eth0 offload gro true
@@ -175,7 +176,7 @@ set interface eth0 router-advert dhcp6-pool end   2001:db8:1::2000
 
 ## DHCP reservations
 
-Associate a stable client MAC with a reserved address and confirm the client renews the intended lease.
+A stable client MAC gets a reserved address; confirm the client renews the intended lease.
 
 ```text
 set interface eth0 dhcp-server static-mapping printer mac 00:11:22:33:44:55
@@ -184,7 +185,7 @@ set interface eth0 dhcp-server static-mapping printer ip 10.0.0.9
 
 ## NIC hardware
 
-Apply only settings supported by the specific NIC and driver. Verify the resulting link settings on the appliance.
+Only settings the NIC and driver support; check the resulting link settings.
 
 ```text
 set interface eth3 ethernet speed 1000
@@ -197,7 +198,7 @@ set interface eth3 ethernet adaptive-tx true
 
 ## Bridge detail
 
-Configure the bridge and member-specific VLAN behavior together. Confirm tagged and untagged endpoints reach the expected segment.
+Configure the bridge and member-specific VLAN behaviour together. Confirm tagged and untagged endpoints reach the expected segment.
 
 ```text
 set interface br0 bridge stp true
@@ -212,7 +213,7 @@ set interface br0 bridge igmp-querier true
 
 ### As a port of a bridge
 
-Set port-specific bridge behavior on the member while keeping the logical L3 address on the bridge.
+Per-port settings go on the member; the L3 address stays on the bridge.
 
 ```text
 set interface eth5 bridge-port cost 100
@@ -222,7 +223,7 @@ set interface eth5 bridge-port learning false
 
 ## Bond detail
 
-Match LACP or static bond parameters on both the appliance and the connected switch.
+Match LACP or static bond parameters on the appliance and the switch.
 
 ```text
 set interface bond0 bond hash-policy layer3+4
@@ -236,7 +237,7 @@ set interface bond0 bond arp-target 10.0.0.1
 
 ## Cellular (`wwan`)
 
-Set the modem connection profile and APN supplied by the carrier. Use a management path independent of the cellular link while testing.
+The carrier's APN and IP type. Test with a management path independent of the cellular link.
 
 ```text
 set interface wwan0 type wwan
@@ -248,11 +249,11 @@ set interface wwan0 wwan ip-type ipv4v6
 
 ### What is not verified here
 
-Stubbed modem tests validate configuration rendering. Check registration, carrier addressing and reconnection with the actual modem.
+Stubbed modem tests validate configuration rendering only. Check registration, carrier addressing and reconnection with the actual modem.
 
 ## Wireless
 
-Choose the radio role and the local regulatory settings. Validate connectivity with the physical adapter and intended client.
+Radio role and local regulatory settings. Validate with the physical adapter and intended client.
 
 ```text
 set interface wlan0 type wireless
@@ -273,7 +274,7 @@ Radio settings depend on hardware, firmware, driver and regulatory support. A re
 
 ## Route-based IPsec (`vti`)
 
-Pair the VTI interface with its IPsec connection, then route the protected subnet over the interface.
+Pair the VTI with its IPsec connection, then route the protected subnet over it ([VPN recipe](vpn.md#route-based-tunnels-vti)).
 
 ```text
 set interface vti0 type vti
@@ -285,7 +286,7 @@ set interface vti0 mss pmtu
 
 ## Per-link IPv4 and IPv6 behaviour
 
-Apply family-specific settings on the intended interface. Verify both addresses and effective routes after the change.
+Family-specific settings per interface. Check both addresses and the effective routes afterwards.
 
 ```text
 set interface eth0 ip disable-forwarding true
@@ -299,7 +300,7 @@ set interface eth0 ipv6 accept-dad 2
 
 ### The ARP block
 
-Configure ARP behavior only where the link topology requires it; verify neighbor resolution from both sides.
+Only where the link topology requires it; check neighbour resolution from both sides.
 
 ```text
 set interface eth0 ip arp-filter true      # only answer for an address on this link
@@ -310,7 +311,7 @@ set interface eth0 ip arp-accept true      # learn from gratuitous ARP (faster f
 
 ## DHCP client options
 
-Configure client options on the interface that requests the lease; verify the values actually returned by the server.
+Set on the interface that requests the lease; check the values the server actually returns.
 
 ```text
 set interface wan0 address dhcp
@@ -325,7 +326,7 @@ set interface wan0 dhcp reject 192.0.2.9
 
 ## Port mirroring
 
-Select source and monitor ports explicitly. Verify the monitor receives the expected traffic without disturbing normal forwarding.
+Name source and monitor ports explicitly; the monitor should receive the traffic without disturbing forwarding.
 
 ```text
 set interface eth1 mirror-ingress mon0
