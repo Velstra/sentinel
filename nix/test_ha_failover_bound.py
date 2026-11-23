@@ -16,7 +16,7 @@ ANCHOR = 1000.0
 def stream(gap_from, gap_to, until=None, step=0.03):
     """Reply times every `step` s, with no reply between gap_from and gap_to (anchor-relative)."""
     times, t = [], ANCHOR - 1.0
-    until = gap_to + 0.5 if until is None else until
+    until = gap_to + 1.2 if until is None else until
     while t < ANCHOR + until:
         if not (ANCHOR + gap_from < t < ANCHOR + gap_to):
             times.append(round(t, 3))
@@ -48,6 +48,15 @@ class Resume(unittest.TestCase):
     def test_a_fault_that_has_not_bitten_yet_is_not_a_resume(self):
         flowing = [t for t in stream(0.3, 0.9) if t < ANCHOR + 0.25]
         self.assertIsNone(bound.ha_resume(flowing, ANCHOR, outage=True))
+
+    def test_a_short_stall_before_the_outage_is_not_its_end(self):
+        # A 0.15 s stall right after the anchor, then the real outage: the
+        # resume is the end of the longest silence, once the stream is steady.
+        times = [t for t in stream(1.0, 2.0, until=3.2) if not (ANCHOR + 0.10 < t < ANCHOR + 0.25)]
+        early = [t for t in times if t < ANCHOR + 0.6]
+        self.assertIsNone(bound.ha_resume(early, ANCHOR, outage=True))
+        resumed = bound.ha_resume(times, ANCHOR, outage=True)
+        self.assertAlmostEqual(resumed - ANCHOR, 2.02, delta=0.031)
 
     def test_without_an_expected_outage_a_flowing_stream_resumes_at_once(self):
         flowing = [t for t in stream(5.0, 6.0) if t < ANCHOR + 0.3]

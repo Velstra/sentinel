@@ -190,29 +190,40 @@ HA_STREAM_GAP = 0.1
 # Replies that must follow the end of an outage before it counts as resumed:
 # one answered retransmission alone is not a working stream.
 HA_STREAM_PROGRESS = 3
+# Steady replies after the last silence before the outage is judged over: a
+# fault takes up to HA_FAULT_COMMAND_MAX plus one lease to bite.
+HA_STREAM_SETTLE = 1.0
 
 
-def ha_resume(times, anchor, outage=True, gap=HA_STREAM_GAP, progress=HA_STREAM_PROGRESS):
-    """The instant forwarding resumed, on the client's own clock: the first
-    reply after a silence longer than `gap` that began at or after `anchor`,
-    once `progress` more replies follow it. `times` are the client stream's
-    reply times (client wall clock). None while it has not resumed.
+def ha_resume(times, anchor, outage=True, gap=HA_STREAM_GAP, progress=HA_STREAM_PROGRESS,
+              settle=HA_STREAM_SETTLE):
+    """The instant forwarding resumed, on the client's own clock: the end of the
+    longest silence longer than `gap` after `anchor`, once the stream has run
+    steadily for `settle` since its last silence (so a short stall before the
+    fault bites is not taken for its end) and `progress` replies follow it.
+    `times` are the client stream's reply times (client wall clock). None
+    while it has not resumed.
 
     With `outage` false (a handover already under way when the check starts),
-    a stream that is flowing has resumed at its first reply after the anchor,
-    and a silence spanning the anchor ends at its first reply after it."""
+    the first reply after the anchor that `progress` replies follow is the
+    resume: a silence spanning the anchor ends there."""
     previous = None
+    silences = []  # (length, end index)
     for index, when in enumerate(times):
         if when <= anchor:
             previous = when
             continue
-        silent = previous is not None and when - previous > gap
-        if silent or (not outage and previous is not None):
-            if len(times) - index - 1 >= progress:
-                return when
-            return None
+        if not outage and previous is not None:
+            return when if len(times) - index - 1 >= progress else None
+        if previous is not None and when - previous > gap:
+            silences.append((when - previous, index))
         previous = when
-    return None
+    if not silences:
+        return None
+    if times[-1] - times[silences[-1][1]] < settle:
+        return None
+    length, index = max(silences, key=lambda silence: (silence[0], -silence[1]))
+    return times[index] if len(times) - index - 1 >= progress else None
 
 
 def ha_resumed_within(resumed, anchor, bound):

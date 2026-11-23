@@ -328,7 +328,9 @@ in pkgs.testers.runNixOSTest {
         # anchor taken just before the fault. A poll that sees it late neither
         # hides a miss nor makes one. `outage` false: the handover is already
         # under way, the bound runs from the call.
-        polled_until = time.monotonic() + bound + ha_bound.HA_DRIVER_LATENCY_MAX
+        # The outage's end is judged once the stream has run steadily for
+        # HA_STREAM_SETTLE after it, so the poll may go on that much longer.
+        polled_until = time.monotonic() + bound + ha_bound.HA_DRIVER_LATENCY_MAX + ha_bound.HA_STREAM_SETTLE
         while True:
             times = json.loads(client.succeed("cat /tmp/stream-status"))["times"]
             resumed = ha_bound.ha_resume(times, anchor, outage=outage)
