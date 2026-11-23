@@ -3957,7 +3957,10 @@ const GLOBAL_FIELDS: &[Cand] = &[
         "default-action",
         "default ingress action (accept|drop|reject)",
     ),
-    ("log", "log drops and rejects by default; live view: all traffic (true|false)"),
+    (
+        "log",
+        "log drops and rejects by default; live view: all traffic (true|false)",
+    ),
     (
         "fail-closed",
         "drop packets the data plane cannot parse (true|false)",
@@ -3987,7 +3990,10 @@ const ZONE_FIELDS: &[Cand] = &[
         "default-action",
         "ingress action for this zone (accept|drop|reject)",
     ),
-    ("log", "log this zone's drops and rejects; live view: all traffic (true|false)"),
+    (
+        "log",
+        "log this zone's drops and rejects; live view: all traffic (true|false)",
+    ),
     (
         "source-validation",
         "reject spoofed sources on this zone (disable|loose|strict)",
@@ -4841,7 +4847,10 @@ const RULE_FIELDS: &[Cand] = &[
         "direction",
         "restrict to arriving (in) or leaving (out) traffic; out is IPv4 only",
     ),
-    ("log", "log this rule's drops, or each new flow it accepts (true / false)"),
+    (
+        "log",
+        "log this rule's drops, or each new flow it accepts (true / false)",
+    ),
     (
         "source",
         "source address/CIDR (e.g. 10.0.0.0/24); default any",
