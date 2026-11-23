@@ -2,23 +2,6 @@
 
 ## [Unreleased]
 
-### HA and config sync
-
-- A takeover no longer closes the new owner's configuration gate. Every VRRP
-  virtual address is now emitted to the agent (`virtual_addresses`) and counts
-  as a local destination on both members whether or not the member holds it.
-  Taking the VIPs then changes no `to firewall` rule, and the agent only adds
-  the address for its own sockets. Before, the takeover rewrote the rule set
-  with the gate closed: the new owner dropped 1 to 6 forwarded packets, and
-  could lose its own first witness renewals and with them, rarely, its fresh
-  lease (seen as a 0.13 to 0.35 s VIP gap within 3 s of a takeover). Checked in
-  `checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
-  `checks.ha-witness-synproxy-failover`, `checks.ha-failover` (plain VRRP) and
-  `checks.ha-two-node-flow`, which count the agent's gate closures from just
-  before each fault to 3 s after promotion. A VIP whose prefix length the
-  interface does not already carry (a `/32` VIP, or one outside its subnets)
-  still takes the rewrite.
-
 ## [1.0.0]
 
 The first release with a stable configuration language. The release date is
@@ -219,6 +202,20 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   witness now lets a member preempt only after the owner has held its
   authority for 10 s (Wren `PREEMPT_HOLD_MS`). Checked by the witness
   failover checks, which assert the hold.
+- A takeover no longer closes the new owner's configuration gate. Every VRRP
+  virtual address is now emitted to the agent (`virtual_addresses`) and counts
+  as a local destination on both members whether or not the member holds it.
+  Taking the VIPs then changes no `to firewall` rule, and the agent only adds
+  the address for its own sockets. Before, the takeover rewrote the rule set
+  with the gate closed: the new owner dropped 1 to 6 forwarded packets, and
+  could lose its own first witness renewals and with them, rarely, its fresh
+  lease (seen as a 0.13 to 0.35 s VIP gap within 3 s of a takeover). Checked in
+  `checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
+  `checks.ha-witness-synproxy-failover`, `checks.ha-failover` (plain VRRP) and
+  `checks.ha-two-node-flow`, which count the agent's gate closures from just
+  before each fault to 3 s after promotion. A VIP whose prefix length the
+  interface does not already carry (a `/32` VIP, or one outside its subnets)
+  still takes the rewrite.
 
 ### Updates and boot trust
 
