@@ -55,7 +55,12 @@ configure(["delete vpn ipsec qa-site"])
 
 # An independently owned route deliberately occupying the private metric must
 # be refused, not overwritten, even if it shares the same gateway and prefix.
-fw.succeed("ip route add 198.19.210.0/24 via 198.18.10.254 proto static metric 42760")
+# Independent means a protocol no daemon on the box owns: `proto static` is
+# Wren's own (it reclaims every route of its protocols that is not in the
+# current routing generation), so a route planted with it is removed by Wren's
+# next reconcile, which proves nothing about the IPsec owner. `boot` is what a
+# bare `ip route add` uses and is never Wren's.
+fw.succeed("ip route add 198.19.210.0/24 via 198.18.10.254 proto boot metric 42760")
 foreign = routes()
 saved = fw.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
 configure(primary(), refuse=True)

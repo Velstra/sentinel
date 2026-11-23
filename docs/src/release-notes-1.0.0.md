@@ -177,6 +177,11 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
 
 ## Known limitations
 
+- **Routes added by hand with a routing protocol's tag.** A route added outside
+  the configuration with a protocol Wren uses (`proto static`, `bgp`, `ospf`,
+  `rip`, `isis` or `babel`) is treated as Wren's and removed at its next
+  reconcile. Add manual routes with another protocol, such as the default `boot`
+  of a plain `ip route add` ([routing handbook](handbook/routing.md#static-routes)).
 - **SYN proxy and source-port reuse.** The proxy's record of a connection is
   removed by the agent once no live connection state claims it, within about 30 s
   of that state ending (at once after a reset, after the closing timeout after a

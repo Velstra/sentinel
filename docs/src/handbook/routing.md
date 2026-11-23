@@ -33,6 +33,12 @@ set protocols static 192.168.50.0/24 via 10.0.0.254
 set protocols static 2001:db8:50::/48 via 2001:db8:0:1::254
 ```
 
+Routes belong in the configuration. Wren owns every kernel route tagged with a
+protocol it uses (`static`, `bgp`, `ospf`, `rip`, `isis`, `babel`) and removes
+any it did not install at its next reconcile, so a route added by hand with
+`ip route add ... proto static` disappears. A route added outside the
+configuration must carry another protocol, such as the default `boot`.
+
 ## BGP
 
 Match local and remote AS numbers with the peer, then explicitly select the prefixes and policies to exchange.
