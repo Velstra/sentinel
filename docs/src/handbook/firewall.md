@@ -24,55 +24,48 @@ compare
 commit-confirm 2
 ```
 
-Zones are labels on interfaces. Each zone has a default action, rules narrow it, and NAT rewrites addresses on the way through. `sentinel trace` explains the outcome for one packet; counters and logs show real traffic.
+Zones label interfaces, each zone has a default action, rules narrow it, and NAT rewrites addresses on the way through.
 
 ## How a packet is judged
 
 ```mermaid
 flowchart LR
-  in([Packet in]) --> xdp
+  in([Packet in]) --> gate
   subgraph xdp [XDP ingress]
-    bl{Blocklist, GeoIP,<br/>source validation}
-    pol{Connection state,<br/>zone rules}
-    dnat[Port-forward /<br/>load balancer]
-    bl --> pol --> dnat
+    gate{Configuration<br/>gate} --> sv{Source<br/>validation} --> pol{State, blocklist,<br/>zone rules} --> syn[SYN proxy] --> dnat[Port-forward /<br/>load balancer]
   end
-  bl -->|listed| drop([Drop])
-  pol -->|drop / reject| drop
   dnat --> route[Kernel routing]
-  route --> tc[TC egress:<br/>direction out rules,<br/>source NAT]
-  tc --> out([Packet out])
+  subgraph tc [TC egress]
+    epol{Egress rules} --> snat[Source NAT]
+  end
+  route --> epol
+  snat --> out([Packet out])
+  gate & sv & pol & epol -->|refused| drop([Drop])
 ```
 
-Simplified: `sentinel trace` lists the exact steps for one packet.
+Zone rules judge the packet as it arrived, before destination NAT; a configured port-forward admits its own traffic. The gate closes while a commit installs a new policy ([below](#what-a-policy-commit-does-to-traffic)).
 
-> **Note:** read the [support matrix and conformance gate](../reference/dataplane-support.md) for what the data plane is qualified to do and its known limits (IPv6 fragments are not translated, the SYN proxy is port-scoped and IPv4-only). Routed traffic uses kernel forwarding plus TC egress, not an established-flow XDP redirect fast path.
+> **Note:** see the [support matrix](../reference/dataplane-support.md) for qualified features and known limits (IPv6 fragments are not translated, the SYN proxy is port-scoped and IPv4-only). Routed traffic uses kernel forwarding plus TC egress, not an established-flow XDP redirect fast path.
 
 ## Asking before you send (packet trace)
 
-Can a guest on `lan0` reach SSH on a DMZ server? (Use your own interface names and addresses.)
+Can a guest on `lan0` reach SSH on a DMZ server? With a guest-deny rule in place:
 
 ```text
-sentinel trace --in lan0 tcp 10.0.0.200 10.9.0.10 22
-```
-
-With a matching guest-deny rule, the important line reads:
-
-```text
+$ sentinel trace --in lan0 tcp 10.0.0.200 10.9.0.10 22
+...
 verdict:   drop (no-ssh-from-guests)
 ```
 
-The command reads the saved configuration by default. To test a proposed TOML file first, pass it as the candidate; `--json` exposes the verdict, deciding rule and intermediate steps:
+The trace shows the ingress zone, route, NAT translations and matched rule above the verdict. It reads the saved configuration; test a candidate file with `--config`, and get the intermediate steps as JSON with `--json`:
 
 ```sh
 sentinel trace --config ./candidate.toml --json --in lan0 tcp 10.0.0.200 10.9.0.10 22
 ```
 
-Above the verdict the trace shows the ingress zone, route, NAT translations and matched rule. It models the compiled configuration only: established connection state, dynamic routes and current multi-WAN health need live inspection. The web console has the same walk under **Policy → Packet trace**.
+It models compiled configuration only: established state, dynamic routes and current multi-WAN health need live inspection. The console has the same walk under **Policy → Packet trace**.
 
 ## Zones & posture
-
-Assign interfaces to zones first. Set the global default, then override only the zones that differ.
 
 ```text
 set firewall global default-action drop        # deny by default
@@ -81,19 +74,14 @@ set firewall zone wan block-icmp true          # quiet on the WAN
 set firewall zone lan default-action accept    # trust the LAN
 ```
 
-`block-icmp` refuses new inbound ICMP (a ping from the internet), even where a rule accepts ICMP. Answers still arrive: the echo reply to a ping the firewall or a LAN host sent, and ICMP errors about a tracked connection, packet-too-big and fragmentation-needed included, so path-MTU discovery keeps working. Outbound ICMP is not affected.
+Assign interfaces to zones first, then override only the zones that differ from the global default.
 
-IPv6 neighbour discovery and MLD always pass on every zone, whatever its default action, rules or `block-icmp` say; without them no IPv6 neighbour on that link resolves. A zone needs no ICMPv6 rule for IPv6 to work.
-
-| Packet | Stateful zone | Stateless zone |
-|---|---|---|
-| TCP/UDP with IPv4 options | dropped: it cannot be tracked, proxied or translated (RFC 7126 practice) | judged by its rules |
-
-An IPv4 address rule applies to IPv4 only, an IPv6 address rule to IPv6 only. A rule that names no address applies to both families unless `family` limits it.
+- **`block-icmp`** refuses new inbound ICMP, even where a rule accepts it. Answers still arrive: echo replies to pings the firewall or a LAN host sent, and ICMP errors about a tracked connection (packet-too-big and fragmentation-needed included, so path-MTU discovery works). Outbound ICMP is not affected.
+- **IPv6 neighbour discovery and MLD** always pass on every zone, whatever its default action, rules or `block-icmp`; a zone needs no ICMPv6 rule for IPv6 to work.
+- **TCP/UDP with IPv4 options** is dropped on stateful zones: it cannot be tracked, proxied or translated (RFC 7126 practice). A stateless zone judges it by its rules.
+- **Address family:** an IPv4 address rule applies to IPv4 only, an IPv6 one to IPv6 only; a rule with no address applies to both unless `family` limits it.
 
 ## Rules
-
-SSH from the management zone to the firewall's own addresses. `firewall` is not a reserved name: mark one zone `local` to make it mean "this appliance".
 
 ```text
 set firewall zone firewall local true
@@ -104,9 +92,9 @@ set firewall rule mgmt-ssh port 22
 set firewall rule mgmt-ssh action accept
 ```
 
-A rule's `from` zone is where the packet **arrives**:
+`firewall` is not a reserved name: `local true` makes a zone mean "this appliance". A rule's `from` zone is where the packet **arrives**:
 
-| `direction` | The rule applies to |
+| `direction` | Applies to |
 |---|---|
 | (not set) | traffic arriving through the zone |
 | `out` | traffic leaving through the zone's links, including traffic this appliance sends |
@@ -114,9 +102,9 @@ A rule's `from` zone is where the packet **arrives**:
 
 So `from wan proto tcp port 25 action drop` keeps SMTP out without stopping LAN hosts from sending mail.
 
-**A rule without `proto` is a zone default.** The data plane does not carry it: `from lan action accept` sets zone `lan`'s default to accept. It cannot be narrowed, so `source`, `destination`, groups, `family`, `direction` and `log` on it are refused, and so is the rule itself when the zone sets `default-action` explicitly (the zone's setting decides). Add a `proto` (and a `port` for TCP/UDP) to narrow it.
+**A rule without `proto` is a zone default**, not a data-plane rule: `from lan action accept` sets zone `lan`'s default to accept. It cannot be narrowed (`source`, `destination`, groups, `family`, `direction` and `log` on it are refused), and it is refused itself when the zone sets `default-action` explicitly.
 
-**Overlapping rules.** Two rules on the same zone, protocol, port and address hold one verdict in the data plane. The stricter wins (`reject`, then `drop`, then `accept`), so a `drop` for one port inside an accepted range works in either order, and `sentinel trace` reports the same rule. Where the winner's `family` or `direction` does not cover the other rule's, `config check` says which part is not enforced.
+**Overlapping rules** on the same zone, protocol, port and address hold one verdict: the stricter wins (`reject`, then `drop`, then `accept`), in either order, and `sentinel trace` reports that rule. Where the winner's `family` or `direction` does not cover the other's, `config check` says which part is not enforced.
 
 <details><summary>Zone policy IDs and upgrades</summary>
 
@@ -126,7 +114,7 @@ Zone policy IDs are derived from the zone name, so adding, removing or renaming 
 
 ### The destination zone
 
-A **local** zone matches the addresses the appliance holds while it runs: static addresses, DHCP and DHCPv6 leases, SLAAC addresses, and a VRRP address while this member holds it. A DHCP management port is therefore reachable by `to firewall` rules, and the rule never widens to other destinations. `sentinel trace` knows only the configured addresses and says so when a destination could be a run-time address.
+A **local** zone matches the addresses the appliance holds at run time: static addresses, DHCP and DHCPv6 leases, SLAAC addresses, and a VRRP address while this member holds it. So a DHCP management port is reachable by `to firewall` rules, and the rule never widens to other destinations. `sentinel trace` knows only configured addresses and says so when a destination could be a run-time address.
 
 Any other destination zone binds its configured connected prefixes, not the eventual outgoing interface; routed prefixes behind it are not automatically included.
 
@@ -140,7 +128,7 @@ A source-constrained port rule matches one address end, so its `to` label is not
 
 ### Rate limits
 
-`limit` caps newly admitted flows per second; `burst` allows a short peak.
+New flows per second (`limit`) with a short peak (`burst`):
 
 ```text
 set firewall rule ssh-in from wan
@@ -153,8 +141,6 @@ set firewall rule ssh-in burst 10
 
 ### Time-based rules
 
-A weekly schedule uses the appliance's local timezone. The rule set is re-applied at every window boundary and whenever the clock is stepped (for example when NTP first synchronises after boot) or the time zone changes. When troubleshooting, check the clock and the rule's active window.
-
 ```text
 set firewall rule guest-wifi from guest
 set firewall rule guest-wifi proto tcp
@@ -165,9 +151,9 @@ set firewall rule guest-wifi schedule start 09:00
 set firewall rule guest-wifi schedule end 17:00
 ```
 
-### ICMP message types
+The schedule uses the appliance's local timezone. Rules are re-applied at every window boundary and whenever the clock is stepped (for example when NTP first synchronises after boot) or the time zone changes.
 
-`icmp-type` allows only specific ICMP or ICMPv6 messages. Keep path-MTU and neighbour-discovery traffic working.
+### ICMP message types
 
 ```text
 # Answer pings from the management network, and nowhere else.
@@ -186,7 +172,7 @@ set firewall rule pmtu action accept
 
 ## Protocols a rule can match
 
-Choose the protocol before transport fields such as ports. Tab completion lists the accepted names.
+Tab completion lists the accepted names. Set the protocol before ports.
 
 ```text
 set firewall rule ping from wan
@@ -196,8 +182,6 @@ set firewall rule ping action accept
 
 ### One rule for both protocols
 
-`tcp_udp` makes one rule cover TCP and UDP on the same port.
-
 ```text
 set firewall rule dns-in proto tcp_udp
 set firewall rule dns-in port 53
@@ -205,26 +189,21 @@ set firewall rule dns-in port 53
 
 ## Blocking by country (GeoIP)
 
-Country codes select prefixes from the GeoIP database in the appliance image. Review its coverage and freshness before relying on a geographic rule.
-
 ```text
 set firewall zone wan geoip-block CN,RU
 ```
 
-A zone's blocklist and GeoIP countries name **sources**. `zone wan geoip-block XX`:
+Countries select prefixes from the GeoIP database in the image; review its coverage and freshness. A zone's blocklist and GeoIP countries name **sources**:
 
-- **stops** hosts in XX connecting in, and their packets to connections they started;
-- **does not stop** LAN hosts reaching addresses in XX; the answers to those connections are let back in.
+- **Stopped:** hosts in a listed country connecting in, and their packets to connections they started.
+- **Not stopped:** LAN hosts reaching listed addresses; the answers are let back in. There is no outbound blocklist in this release: use `direction out` rules for the protocols and ports concerned.
+- **Newly listed** addresses lose the connections they opened at once, but keep answering ones opened towards them. On a `stateful false` zone there is no connection to answer, so they cannot answer anything.
 
-An address added to a blocklist loses the connections it opened at once, but keeps answering ones opened towards it. On a zone with `stateful false` there is no connection to answer, so a listed address cannot answer anything.
-
-There is no outbound blocklist in this release. To keep the inside from reaching listed addresses, write `direction out` rules for the protocols and ports concerned.
-
-The global blocklist (`set firewall blocklist`) works the same way on every zone. Every zone's policy carries its own copy of the global blocklist and global GeoIP countries, so a global entry costs one data-plane entry per zone plus one; `config check` refuses a configuration whose total exceeds the data plane's 262,144 entries per address family.
+The global blocklist (`set firewall blocklist`) works the same on every zone. Each zone's policy carries its own copy of the global blocklist and global GeoIP countries, so a global entry costs one data-plane entry per zone plus one; `config check` refuses a total over the [blocklist capacity](#inspect-state-map-occupancy).
 
 ## Source validation (anti-spoofing)
 
-Source validation controls which source addresses a zone admits. Check routing symmetry before choosing `strict`.
+Check routing symmetry before choosing `strict`.
 
 ```text
 set firewall zone wan source-validation strict
@@ -232,23 +211,13 @@ set firewall zone wan source-validation strict
 
 ## IPv6 and extension headers
 
-Test both address families on an interface policy. A family-specific source prefix matches only within that family.
+A family-specific source prefix matches only within its family; test both families.
 
 ## Groups (aliases)
 
-Name a reused set once and refer to it from rules.
-
-| Group | Members | Used in the example as |
-|---|---|---|
-| `interface-group` | interfaces | `interface-group` |
-| `mac-group` | MAC addresses | `source-mac-group` |
-| `domain-group` | DNS names | `destination-group` |
-| `feed-group` | a published list (URL) | `source-group` |
-| `user-group` | authenticated users | `source-group` |
+Name a reused address, interface or port set once and refer to it from rules.
 
 ### Some of a zone, not all of it
-
-An interface group limits a rule to specific ingress links within a zone.
 
 ```text
 set firewall group interface-group trusted interface eth0,eth1
@@ -261,7 +230,7 @@ set firewall rule ssh-trusted interface-group trusted
 
 ### Devices, not addresses
 
-A MAC group matches link-layer addresses on its local segment. It classifies; a MAC address does not authenticate the device.
+A MAC group classifies devices on the local segment; a MAC address does not authenticate them.
 
 ```text
 set firewall group mac-group printers mac aa:bb:cc:dd:ee:ff,aa:bb:cc:dd:ee:01
@@ -272,7 +241,7 @@ set firewall rule no-printers action drop
 
 ### Domain groups
 
-A domain group resolves DNS names to addresses. Recheck the resolved addresses when a service changes its endpoints.
+Names resolve to addresses; recheck them when a service changes endpoints.
 
 ```text
 set firewall group domain-group trackers domain ads.example.com,metrics.example.net
@@ -286,11 +255,9 @@ set firewall rule no-trackers destination-group trackers
 
 ## Groups whose members are decided elsewhere
 
-Membership can come from a published list or from authenticated users. Know who owns the list, how it refreshes and what an empty group means.
+Know who owns the membership, how it refreshes and what an empty group means.
 
 ### Published lists
-
-Confirm the feed's source and refresh behaviour before relying on it.
 
 ```text
 set firewall group feed-group bogons url https://example.org/bogons.txt
@@ -301,11 +268,11 @@ set firewall rule drop-bogons port 22,443
 set firewall rule drop-bogons action drop
 ```
 
-A feed group is matched by port rules, so it needs a `proto` (and ports for TCP/UDP); a feed cannot block a source on every protocol at once, use the zone `blocklist` for that. Each feed member is one data-plane entry per port and protocol, so keep port sets narrow. Every commit and every refresh checks the merged feed against the data plane's capacity and keeps the running policy, with an error, if it no longer fits.
+A feed is matched by port rules, so it needs a `proto` (and ports for TCP/UDP); to block a source on every protocol, use the zone `blocklist`. Each member costs one data-plane entry per port and protocol, so keep port sets narrow. Every commit and refresh checks the merged feed against capacity and, if it no longer fits, keeps the running policy with an error.
 
 ### People
 
-A user group refers to authenticated identities instead of a fixed address list.
+Members are authenticated users, not addresses.
 
 ```text
 set firewall group user-group admins user alice,bob
@@ -318,21 +285,19 @@ set firewall rule admin-ssh action accept
 
 ## NAT
 
-Source NAT masquerades outbound traffic; destination NAT publishes a service. Check the translated address and port with `sentinel trace` before rolling out a forward.
-
 ### Source NAT (masquerade)
 
 ```text
 set nat source wan-masq zone wan            # masquerade everything leaving wan
 ```
 
-Masquerade uses the WAN interface's current IPv4 address, including a DHCP lease. Plan for roughly **31,000 concurrent connections from one public address to one remote ip:port**; the total across different remotes is limited by the state tables, not by ports.
+Masquerade uses the uplink's current IPv4 address, including a DHCP lease. Plan for roughly **31,000 concurrent connections from one public address to one remote ip:port**; across different remotes the state tables are the limit, not ports.
 
 <details><summary>How public ports are allocated, and when they run out</summary>
 
 Each connection gets its own public source port. Ports are scarce only between connections to the **same** remote address and port: each such endpoint has the whole 32768-port range (32768–65535) of the public address to itself, and connections to different endpoints never compete.
 
-A new connection examines a fixed window of 128 candidate ports, so opening it costs the same however busy the box has been. If all 128 are taken, the opening packet is dropped and counted as `egress_nat_no_candidate` in `sentinel show firewall statistics`; the client's retransmission tries again. How often depends on how full that one endpoint's range is:
+A new connection examines a fixed window of 128 candidate ports, so opening it costs the same however busy the box has been. If all 128 are taken, the opening packet is dropped and counted as `egress_nat_no_candidate` in `sentinel show firewall statistics`; the client's retransmission tries again:
 
 | Concurrent connections to one remote ip:port, per public address | Share of the range | New connections refused |
 | ---: | ---: | ---: |
@@ -348,7 +313,7 @@ When `egress_nat_no_candidate` grows, the remedy is more public addresses. In 1.
 
 #### Deterministic CGNAT
 
-A deterministic block maps each internal address to a known port range. Check pool size and subscriber capacity before applying the design.
+Each internal address gets a known port block; check pool size against subscriber count.
 
 ```text
 set nat source wan-masq zone wan
@@ -358,21 +323,19 @@ set nat source wan-masq cgnat-base-port 32768     # optional; this is the defaul
 
 ### Destination NAT (port-forward)
 
-A port-forward names the external zone, the protocol (`tcp`, `udp` or `tcp_udp`), the service port and the internal destination.
-
 ```text
 set nat destination web zone wan
-set nat destination web proto tcp
+set nat destination web proto tcp               # tcp, udp or tcp_udp
 set nat destination web port 443
 set nat destination web to 10.0.0.10:8443
 set nat destination web hairpin true
 ```
 
-Hairpin reflection needs a static IPv4 address on the external zone; on a DHCP or PPPoE uplink `config check` warns that it has no effect.
+Hairpin needs a static IPv4 address on the external zone; on a DHCP or PPPoE uplink `config check` warns that it has no effect.
 
 ### NAT64 / NPTv6
 
-NAT64 translates between address families using its prefix and pool. NPTv6 translates between IPv6 prefixes. Pick the one your addressing plan needs.
+NAT64 translates between address families with a prefix and pool; NPTv6 translates between IPv6 prefixes.
 
 ```text
 set nat nat64 enabled true
@@ -384,12 +347,10 @@ set nat nat64 dns64 true
 
 ## Load-balanced services
 
-A VIP, a protocol (`tcp`, `udp` or `tcp_udp`), a port and a backend pool. Trace a connection to the VIP to see the translation.
-
 ```text
 set load-balancer web zone wan
 set load-balancer web vip 203.0.113.10
-set load-balancer web proto tcp
+set load-balancer web proto tcp                 # tcp, udp or tcp_udp
 set load-balancer web port 443
 set load-balancer web backend 10.0.0.11:8443
 set load-balancer web backend 10.0.0.12
@@ -397,7 +358,7 @@ set load-balancer web backend 10.0.0.12
 
 ## Application-layer gateways: there are none
 
-The data plane does not rewrite protocol payloads. Plan explicit application ports, passive endpoints or NAT traversal instead.
+The data plane rewrites no protocol payloads. Use explicit application ports, passive endpoints or NAT traversal.
 
 ## SYN-flood protection (SYN proxy)
 
@@ -407,22 +368,16 @@ set firewall syn-protect 8080 mss 1400
 delete firewall syn-protect 443
 ```
 
-Enable it only for the TCP ports that need it, and test normal connections to each protected service. A protected port is proxied on the zones that **admit** it:
-
-- a zone with an accept rule for that TCP port on arriving traffic,
-- a TCP port-forward of it, or
-- a load balancer on it.
-
-A hairpin reflection does not count as admitting it. Connections other zones open to that port elsewhere (your LAN clients' outbound HTTPS under `syn-protect 443`) are not proxied. When no zone admits the port that way (the service sits behind a zone whose default action accepts), the proxy answers every IPv4 SYN to that port arriving on any zone, and `config check` says so. `config check` names the zones a port is proxied on.
+Protect only the TCP ports that need it. A protected port is proxied on the zones that **admit** it: an accept rule for that TCP port on arriving traffic, a TCP port-forward of it, or a load balancer on it (a hairpin reflection does not count). Connections other zones open to that port elsewhere, such as LAN clients' outbound HTTPS under `syn-protect 443`, are not proxied. If no zone admits the port that way (the service sits behind a zone whose default action accepts), the proxy answers every IPv4 SYN to that port on any zone. `config check` says so, and names the zones a port is proxied on.
 
 | Topic | Behaviour |
 |---|---|
-| IPv6 | Not SYN-proxied in 1.0: the proxy protects IPv4 only. Where a protected port is reachable over IPv6 (a zone with an IPv6 address whose rules admit it, or any IPv6 zone when the port is proxied everywhere), `config check` names those zones. |
+| IPv6 | Not proxied in 1.0. `config check` names zones where a protected port is reachable over IPv6 (a zone with an IPv6 address whose rules admit it, or any IPv6 zone when the port is proxied everywhere). |
 | TCP options | Proxied connections lose window scaling, SACK and timestamps. |
-| Zone | Must be stateful: `config check` refuses `syn-protect` on a zone with `stateful false`. |
-| Port-forwards | Supported, including one that changes the port (`port 8080 to 192.0.2.10:80` with `syn-protect 8080`). |
-| Servers that speak first | SMTP, FTP, POP, IMAP and SSH work through the proxy. |
-| A SYN flood | Costs one cookie reply per SYN and no connection state, so it does not displace the protected connections' state. |
+| Zone | Must be stateful; `config check` refuses `syn-protect` on `stateful false`. |
+| Port-forwards | Work, including port-changing ones (`port 8080 to 192.0.2.10:80` with `syn-protect 8080`). |
+| Servers that speak first | SMTP, FTP, POP, IMAP and SSH work. |
+| A SYN flood | Costs one cookie reply per SYN and no connection state, so it does not displace protected connections. |
 
 <details><summary>How long a proxied connection lives, and two consequences</summary>
 
@@ -435,7 +390,7 @@ A hairpin reflection does not count as admitting it. Connections other zones ope
 
 ## Stateful tracking and idle deadlines
 
-Choose connection-tracking timeouts (seconds) for the workload. Check existing flows before shortening an idle lifetime.
+Timeouts in seconds; check existing flows before shortening one.
 
 ```text
 set firewall global conntrack tcp-syn 30
@@ -448,7 +403,7 @@ set firewall global conntrack icmp 10
 
 ## A packet the filter cannot parse
 
-Check the configured default for unparseable traffic and the drop counters before changing it. An explicit fail-closed posture drops packets the data plane cannot classify.
+An explicit fail-closed posture drops packets the data plane cannot classify. Check the configured default and the drop counters before changing it.
 
 ## Inspect state-map occupancy
 
@@ -496,22 +451,19 @@ sequenceDiagram
   end
 ```
 
-A commit that changes the data-plane policy closes the configuration gate for the transaction: about 20–30 ms for up to 4,500 changed rule entries in our tests. Every attached link drops traffic meanwhile, the HA sync link included, so on an HA owner the commit also costs about one witness renewal; the owner keeps its lease ([HA handbook](ha.md)).
+Only a commit that changes the data-plane policy closes the gate. The pause is about 20–30 ms for up to 4,500 changed rule entries in our tests, on every attached link, the HA sync link included. On an HA owner the commit therefore also costs about one witness renewal; the owner keeps its lease ([HA handbook](ha.md)).
 
 ## Seeing what is on the wire
 
 ```text
 show flows                 # the live state table, with per-flow packets/bytes
 show top-talkers           # hosts ranked by the volume attributed to them
+show firewall hits         # rule-hit counters
 ```
 
 ## Which rules are doing anything
 
-Read rule-hit counters while ordinary application traffic runs. For the decision behind one packet, use the trace.
-
-```text
-show firewall hits
-```
+`show firewall hits` (above) while ordinary traffic runs; `sentinel trace` for the decision behind one packet.
 
 ## What was already refused (firewall log)
 
@@ -521,14 +473,12 @@ show firewall log 500        # a deeper read, up to 5000
 show firewall log since 6h   # a period instead of a count
 ```
 
-`log` decides what reaches this log:
-
-| Set on | Records |
+| `log true` on | Records |
 |---|---|
-| a zone or firewall-wide (`set firewall zone <zone> log true`, `set firewall global log true`) | every packet the firewall drops or rejects, with the reason |
+| a zone (`set firewall zone <zone> log true`) or everywhere (`set firewall global log true`) | every packet the firewall drops or rejects, with the reason |
 | a rule (`set firewall rule <name> log true`) | that rule's drops, and for an accepting rule each new flow it admits |
 
-Packets of flows already admitted are never logged, however busy the link: forwarding, NAT and tunnelling are counted (`show firewall statistics`), not logged. A counter reason can be shared by several rules; use a trace to find candidate matches.
+Packets of already admitted flows are never logged: forwarding, NAT and tunnelling are counted in `show firewall statistics`. A counter reason can be shared by several rules; a trace finds the candidates.
 
 <details><summary>Log rationing and the console's live view</summary>
 
@@ -546,4 +496,4 @@ sentinel show firewall log
 sentinel show nat
 ```
 
-Generate normal application traffic on an isolated test segment and compare the counters and logs with the traced decision.
+Compare counters and logs from normal traffic on an isolated test segment with the traced decision.
