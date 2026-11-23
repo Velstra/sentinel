@@ -20,7 +20,8 @@ A main-branch dispatch additionally requests production signing approval.
 subsequent jobs; start a new run instead of reusing an earlier approval.
 
 To publish, dispatch the same action with `-F publish=true`. This performs a
-new complete qualification and requires independent environment approvals;
+new complete qualification and requires independent environment approvals
+(or, in [single-operator mode](#single-operator-mode), the maintainer's own);
 it does not promote an arbitrary old artifact. Existing tags must identify
 the same commit. Existing releases are never overwritten.
 
@@ -33,6 +34,8 @@ the same commit. Existing releases are never overwritten.
   reviewer/branch API configuration and a real independent human approval for
   the current run before loading keys or publishing. It does not infer an
   approval from a job merely having started (for example through bypass).
+  A project with one maintainer uses
+  [single-operator mode](#single-operator-mode) instead.
 - Set repository `RELEASE_ARTIFACT_BYTE_BUDGET` to the reviewed maximum
   **per transfer**. The default is zero. Four large artifact copies can coexist
   for one day, in addition to check receipts. This is not an account-wide
@@ -53,6 +56,52 @@ the same commit. Existing releases are never overwritten.
   `VELSTRA_GPG_FINGERPRINT`. Publish this fingerprint independently of the
   downloadable bundle. Review enrollment material against the real firmware
   identities. Private PK/KEK keys are **not** uploaded to Actions.
+
+## Single-operator mode
+
+The default is a two-person rule: each environment must forbid self-review,
+and each approval must come from someone who did not start the run. A project
+with one maintainer can never meet it. Setting the repository variable
+`RELEASE_SINGLE_OPERATOR` to exactly `true` replaces it with this rule; any
+other value, or no variable, keeps the two-person rule.
+
+For each of `community-signing`, `community-attestation` and
+`community-publish` the action then requires:
+
+- exactly one required-reviewers rule naming at least one reviewer
+  (self-review may be allowed);
+- administrator bypass disabled;
+- a wait timer of at least 30 minutes
+  (`SINGLE_OPERATOR_MIN_WAIT_MINUTES` in `scripts/check_release_environment.py`);
+- the same branch policies as above: `main`, optionally tag `v*`.
+
+Each signing, attestation and publication job still requires a real
+`approved` review of the current run in its own environment by a GitHub
+`User` account. The maintainer may approve their own run, but the job having
+started is never taken as an approval. The release body ends with
+"Release approvals: single-operator mode (one maintainer, wait timer ≥ 30
+min).", and each environment check writes the same line as a run annotation.
+
+What it protects against: a stolen workflow-scoped or repository-write token
+cannot release on its own. It cannot approve a deployment, and the wait timer
+holds each protected job for at least 30 minutes, which gives the maintainer
+time to reject the run or cancel it. Bypass is off, so an administrator
+cannot start a waiting job past the review and the timer.
+
+What it does not protect against: there is no second person. A compromised
+maintainer account or a token with the maintainer's approval rights can
+approve its own run; the wait timer only delays it, and only helps if the
+maintainer notices the pending deployment. A repository administrator can
+also edit the environments or the variable. Every protected job rechecks its
+environment once it starts, so a timer removed while the job waits fails that
+job, but a change reverted before the job starts is not seen. Watch
+deployment-review notifications while single-operator mode is on.
+
+To switch back, once a second maintainer exists, delete the variable
+(`gh variable delete RELEASE_SINGLE_OPERATOR`) or set it to `false`, then
+enable self-review prevention on all three environments and add the
+independent reviewer. The next run enforces the two-person rule again;
+the wait timers may stay.
 
 ## What is verified
 

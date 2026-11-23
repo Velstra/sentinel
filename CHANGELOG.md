@@ -301,6 +301,8 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   target's volume under its own mapper name, so installing onto a second disk
   no longer unmounts the running box's own state; the full-screen installer
   no longer exits on a serial console that does not answer cursor queries.
+- Community release workflow: opt-in single-operator approval mode
+  (`RELEASE_SINGLE_OPERATOR`).
 
 ### Release 1.0.0 datapath
 
