@@ -28,7 +28,7 @@
     # Reviewed public integrations; update these URLs and the lock together.
     # The former appliance backports are now included upstream.
     fabric = {
-      url = "github:Velstra/fabric/698d66501c8f820d5e36f6386bb2105b306e32a3";
+      url = "github:Velstra/fabric/daa5f798e2b4712b8ed8fd23029665fe9af86969";
       flake = false;
     };
     # Test-only deployed allocator. Never advance this with the production pin:
@@ -40,7 +40,7 @@
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
     wren = {
-      url = "github:Velstra/wren/ba95bca0e3d5618f2c117a97302b4af27a87d654";
+      url = "github:Velstra/wren/ec96737c737700ae769c2fa391368daa76ea4f7e";
       flake = false;
     };
   };
@@ -433,7 +433,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-BcdedEf6sGAmxhzPSuw5sYCz6IIGg4vEZuTFuGQMit4=";
+      ebpfHash = "sha256-w2O30S1Lnb/N8jp+IFgrbIrhIGW/YQZbVezaoMaaQOo=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
