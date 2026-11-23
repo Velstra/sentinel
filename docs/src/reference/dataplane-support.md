@@ -1,10 +1,6 @@
 # Dataplane support and conformance
 
-Sentinel retains Fabric's stateful eBPF firewall. This page states what the
-1.0.0 data plane (the Fabric commit pinned in `flake.lock`) is qualified to do, how that was
-measured, and where it stops. A passing parser, host unit test or verifier
-load is not a passing packet test; every claim below names the VM check that
-exercises it on the shipped object.
+Sentinel retains Fabric's stateful eBPF firewall. This page states what the 1.0.0 data plane (the Fabric commit pinned in `flake.lock`) is qualified to do and where it stops. A passing parser, host unit test or verifier load is not a passing packet test, so every claim names the VM check that exercises it on the shipped object.
 
 ```mermaid
 flowchart LR
@@ -15,13 +11,11 @@ flowchart LR
   tc --> tx[NIC transmit]
 ```
 
-Routed traffic takes this path in 1.0.0; allowed traffic is **not** generally kernel-bypassed.
-
 ## Sentinel 1.0.0
 
 | Claim | Checks | What they prove |
 |---|---|---|
-| **Connections** | `nat-capacity-pressure`, `nat-pressure-reference` | The gate opens 20,000 masqueraded connections and requires every one to answer a later held-connection probe; the reference runs the same load through netfilter as the oracle. Connection tables are sized from the box's memory with a floor of 16,384, and a reclaimer frees expired state. This is not a hardware throughput or connections-per-second figure. |
+| **Connections** | `nat-capacity-pressure`, `nat-pressure-reference` | The gate opens 20,000 masqueraded connections and requires every one to answer a later held-connection probe; the reference runs the same load through netfilter as the oracle. Not a hardware throughput or connections-per-second figure; see *Conntrack capacity* below. |
 | **Differential conformance** | `dataplane-conformance`, `firewall-policy-conformance`, `tcp-reset-validation` | Sentinel compared with netfilter on identical topologies, fragmented UDP and echo through SNAT included; policy matching across families; out-of-window, inexact and checksum-corrupt resets leave live connections alone. |
 | **Verifier** | `ebpf-verifier-6-6`, `-6-12`, `-6-18` | Every shipped program loads on 6.6, 6.12 and 6.18 and on the CI runner's 7.0 kernel, from one object. |
 | **Restart and reconfigure** | `agent-restart-persist`, `agent-reconfigure-stall` | Keeps enforcing and keeps NAT state across an agent restart; bounds the traffic gate of a commit on a 120,000-entry blocklist. |
@@ -35,8 +29,8 @@ Routed traffic takes this path in 1.0.0; allowed traffic is **not** generally ke
 | IPv4 source NAT and destination NAT | Masquerade, static SNAT, DNAT, hairpin (client port rewritten) and load balancing pass their VM checks, with HA conntrack sync. GRE, ESP, SCTP and 6in4 are masqueraded; AH, ICMP timestamp and ICMP with options are dropped at WAN egress. |
 | Fragmented IPv4 through NAT | Translated. Non-first fragments that arrive before the first are dropped; later fragments of a port-forward reply on a masqueraded WAN are refused. |
 | ICMP errors related to flows | Delivered for tracked flows, IPv6 packet-too-big included (path-MTU discovery works). ICMPv6 errors about connections behind NPTv6, or quoting extension headers, reach the host (`v6-mss-npt-related`). |
-| IPv6 | Filtering and routed forwarding; NPTv6 and NAT64 have their own checks. IPv6 SYNs are MSS-clamped like IPv4. IPv6 fragments are not NAT-translated, and the SYN proxy is IPv4 only. |
-| Conntrack capacity | Sized from memory, floor 16,384 connections; expired state is reclaimed. The 20,000-connection gate is a VM regression bound, not a supported hardware limit. |
+| IPv6 | Filtering and routed forwarding; NPTv6 and NAT64 have their own checks. IPv6 SYNs are MSS-clamped like IPv4. IPv6 fragments are not NAT-translated; for the SYN proxy see below. |
+| Conntrack capacity | Sized from the box's memory, floor 16,384 connections; a reclaimer frees expired state. The 20,000-connection gate is a VM regression bound, not a supported hardware limit. |
 | Blocklist and GeoIP | Name sources only: they refuse what a listed address sends in, and the answers to connections the inside opened towards it pass (`blocklist-direction`). There is no outbound blocklist. The global blocklist is copied into each zone policy; `config check` refuses it past 262,144 entries in total, and there is no bulk removal command. |
 | SYN proxy | IPv4 only in 1.0; IPv6 SYNs to a protected port are not proxied, and `config check` names the zones where that applies (planned for 1.1). Scoped to the zones that admit the port (see the firewall handbook). Proxied connections lose window scaling, SACK and timestamps. |
 | Masquerade ports | About 31,000 concurrent connections to one remote ip:port per public address; a new connection examines a fixed 128-port window and is refused, counted in `egress_nat_no_candidate`, when it finds none (`nat-cps`). |
@@ -47,14 +41,13 @@ Routed traffic takes this path in 1.0.0; allowed traffic is **not** generally ke
 | HA | Experimental. The `ha-*`, `conntracksync` and `vrrp` checks cover witness and two-node election, failover with state, masquerade and SYN proxy failover; that is not clearance for every partition or witness-loss case. Rolling upgrades across a policy-digest change are not hitless (see the [1.0.0 release notes](../release-notes-1.0.0.md)). |
 | Kernel compatibility | 6.12 is the appliance kernel. 6.6 / 6.12 / 6.18 checks load the same object on real guest kernels. |
 
-An unsupported case is an open bug, not a silent success. There is no `xfail`
-list in the differential gate. No Mpps-per-core figures have been established
-for a Sentinel established-flow redirect path.
+An unsupported case is an open bug, not a silent success: the differential gate has no `xfail` list. No Mpps-per-core figures exist for a Sentinel established-flow redirect path.
 
 ## Run the oracle comparison
 
-Build workstation: Linux, Nix with flakes, writable `/dev/kvm`. Never run these
-on an installed appliance or production interfaces.
+Build workstation: Linux, Nix with flakes, writable `/dev/kvm`.
+
+> **Warning:** Never run these on an installed appliance or production interfaces.
 
 ```sh
 python3 -B -m unittest discover -s nix/conformance -v
@@ -82,17 +75,20 @@ Both have identical addresses, policies, payloads, MTUs and kernel versions.
 - The test independently validates the oracle's expected result before comparing Sentinel.
 - A failure on both sides is a setup/oracle error, **not** a pass.
 
-The initial inventory contains 17 cases: IPv4 TCP/UDP masquerade, four-MiB
-bidirectional TCP, fragmented UDP, echo and fragmented echo, RELATED ICMP
-port-unreachable, IPv6 TCP/UDP forwarding, TCP/UDP DNAT, unsolicited IPv4/IPv6
-drop, IPv4/IPv6 TCP reset, and a 1280-byte egress-MTU fault. This inventory is
-finite: it does not yet cover overlapping/out-of-order fragments, every TCP
-state, NAT exhaustion, malformed packets or full IPv6 extension-header cases.
+| Inventory | Cases |
+|---|---|
+| Covered (17) | IPv4 TCP/UDP masquerade, four-MiB bidirectional TCP, fragmented UDP, echo and fragmented echo, RELATED ICMP port-unreachable, IPv6 TCP/UDP forwarding, TCP/UDP DNAT, unsolicited IPv4/IPv6 drop, IPv4/IPv6 TCP reset, and a 1280-byte egress-MTU fault |
+| Not yet covered | Overlapping/out-of-order fragments, every TCP state, NAT exhaustion, malformed packets, full IPv6 extension-header cases |
+
+On a rejected Nix build, inspect `nix log` for `CONFORMANCE_RECEIPT`; a failed derivation is not a registered release artifact.
+
+<details><summary>What a receipt contains</summary>
 
 Receipts include kernel versions, object/config hashes, nftables rules and
 counters, observed payloads and the complete comparison. Packet captures remain
-in the VM test driver's output. On a rejected Nix build, inspect `nix log` for
-`CONFORMANCE_RECEIPT`; a failed derivation is not a registered release artifact.
+in the VM test driver's output.
+
+</details>
 
 <details><summary>14 November checkpoint</summary>
 
@@ -113,10 +109,7 @@ nix build --keep-going -L \
   .#checks.x86_64-linux.ebpf-verifier-6-18
 ```
 
-Every lane loads all shipped entry points into the guest's kernel verifier;
-receipts record the actual `uname -r`, object SHA-256 and individual programs.
-CI runs each lane independently on PRs and nightly and retains failed-load logs.
-No rejected kernel is silently replaced with 6.12 or marked as an expected pass.
+Every lane loads all shipped entry points into the guest's kernel verifier and records the actual `uname -r`, object SHA-256 and individual programs. CI runs each lane independently on PRs and nightly and keeps failed-load logs; no rejected kernel is silently replaced with 6.12 or marked as an expected pass.
 
 <details><summary>Earlier verifier receipts and RELATED-ICMP results</summary>
 
@@ -180,17 +173,18 @@ reports two additional packet-attempt counters:
 | `egress_nat_no_candidate` | The bounded NAT candidate search found no claimable/reusable binding. This can happen with an almost empty map; it does **not** mean the map is full. |
 | `egress_nat_claim_failed` | A new binding could not be reserved because the map helper returned an error other than a competing insertion. This alone does not identify a capacity failure. |
 
-These are reasons within `egress_dropped`, not additional drops to sum into it.
-Retransmissions count again; the values are not counts of failed connections.
-Reads across counters/CPUs are not atomic, and counters restart with the agent.
-Missing counters on an older image must not be interpreted as zero failures.
-They do not repair the collision/admission, ownership-reclamation or established
-state-retention limitations above, and are not evidence of final-image qualification.
+- They are reasons within `egress_dropped`, not additional drops to sum into it.
+- Retransmissions count again, so they are not counts of failed connections.
+- Reads across counters/CPUs are not atomic; counters restart with the agent.
+- Missing counters on an older image do not mean zero failures.
+- They repair none of the collision/admission, ownership-reclamation or established state-retention limitations, and are not evidence of final-image qualification.
 
 ## Established-flow redirect acceptance
 
 A router fast path must not be implemented by simply enabling Fabric's existing
 FIB redirect: that bypasses TC egress, including egress policy and source NAT.
+<details><summary>Acceptance criteria for a fast path and for performance figures</summary>
+
 Before enabling one, require all of the following:
 
 - Only fully admitted established flows; policy-generation and HA lease checks
@@ -210,6 +204,8 @@ warmup and repeated measurements. Compare identical policies against nftables
 both without and with flowtables; report loss, latency and the sustained packet
 rate per actual dataplane core. Shared QEMU timings are regression evidence,
 not hardware Mpps benchmarks.
+
+</details>
 
 ## History before 1.0.0
 
