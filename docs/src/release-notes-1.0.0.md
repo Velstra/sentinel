@@ -34,7 +34,10 @@ ingress rule (DP-15). Both are part of the shared-policy digest that decides
 whether the standby is ready. While the two members run different versions:
 
 - the standby reports `not ready: policy differs`, and conntrack sync refuses its
-  sessions (safely; nothing wrong is installed);
+  sessions (safely; nothing wrong is installed). This holds for every pair:
+  before 1.0 a rule `to firewall` also entered the digest with each member's own
+  addresses (HA-02), so no pre-1.0 member agrees with a 1.0 member while the
+  versions differ;
 - the switch-over to the upgraded member is therefore an **outage with loss of
   every established connection**, not a warm failover. Expect it once per upgrade;
 - after the upgrade, the **first commit** reloads the data plane once with fresh
@@ -51,8 +54,10 @@ Upgrade in this order, and do not leave a pair half-upgraded:
 **Never fail back onto a member that is not yet upgraded.** A masqueraded
 connection owned by a 1.0 member does not survive a takeover by a pre-1.0 peer:
 the older allocator looks for its public port in a different place and breaks the
-connection. The other direction is covered: connections the older member owns
-survive the switch-over to the upgraded one (`checks.ha-napt-mixed-version`). While the versions differ, do not change
+connection. Between members whose readiness digests agree (from 1.0 on), the other
+direction is covered: connections the older member owns survive the switch-over
+to the upgraded one (`checks.ha-napt-mixed-version`). An upgrade from 0.4.2
+does not meet that condition (above). While the versions differ, do not change
 accounts, AAA, update channels, SSH, console, BGP `update-source` or PPPoE
 `local-address` on either member ([HA handbook](handbook/ha.md#mixed-versions-during-an-upgrade)).
 
@@ -204,6 +209,12 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
 - **Rule capacity.** At most 8,192 rule-trie entries per address family; a
   larger rule set is refused at `config check` and `commit` with the capacity
   named, and a saved file over the limit boots the last-known-good configuration.
+- **A policy commit pauses the data plane briefly.** A commit that changes
+  the data-plane policy closes the configuration gate for the transaction:
+  about 20–30 ms for up to 4,500 changed rule entries in our tests. Every
+  attached link drops traffic meanwhile, the HA sync link included, so on an
+  HA owner the commit also costs about one witness renewal; the owner keeps its
+  lease ([HA handbook](handbook/ha.md)).
 - **No bulk removal of the global blocklist.** `delete firewall global block`
   takes one entry; there is no command to clear a large blocklist at once in 1.0.
   Remove entries in one batch session and commit once.

@@ -41,6 +41,21 @@
 # A takeover slower than HA_TAKEOVER_MAX fails (a) by name, a lost state
 # handoff fails (b), and HA_GAP_MAX stays as the backstop for what the
 # capture cannot see.
+#
+# Per fault class (HA_TAKEOVER_DESIGN below) the witness-mode fault stages are
+# judged in two parts, from the client's own capture and reply times, never
+# from when the test driver happened to look:
+#   (1) the takeover P, s to the new owner's first frame, within its design,
+#       which is built from Wren's and the agent's named terms: this judges
+#       the product;
+#   (2) the resume at the first retransmission at or after s + P_max on the
+#       client's measured schedule (plus HA_RETRY_ANSWER_MAX): TCP's share. A
+#       takeover inside its design that ends just after the 3R retry passes at
+#       7R; one beyond its design fails on (1) whatever TCP does.
+# Measured 2026-11-23 (idle builders, witness + SYN proxy, early announcement):
+# agent crash P 0.42-0.48 s, wren crash 0.22-0.25 s, VM pause 0.34-0.42 s.
+# HA_TAKEOVER_MAX and HA_FAULT_TO_RESUME_MAX above stay for the first stage
+# and the handovers (preemption, the witness's return), which have no class.
 import re as _ha_re
 
 HA_TAKEOVER_MAX = 0.6
@@ -68,6 +83,81 @@ HA_WATCH_MARGIN = 0.05
 HA_STALLED_AGENT_RELEASE_MAX = (
     HA_AGENT_FRESH + HA_LEASE + HA_WITNESS_IO + HA_COORDINATOR_POLL + HA_WATCH_MARGIN
 )
+# The takeover P of each fault class, by design, from the client's first
+# unanswered segment s to the new owner's first frame (its gratuitous ARP).
+# Wren and agent terms (wren-ha, velstra-app ha.rs):
+HA_AGENT_TICK = 0.02           # the agent's HA monitor tick
+HA_AGENT_ACK = 2 * HA_AGENT_TICK  # it reports the grant, then opens forwarding on the next tick
+HA_WITNESS_MARGIN = 0.02       # Wren MARGIN_MS: a member's own deadline ends this much early
+HA_TAKEOVER_MARGIN = 0.05      # stated margin on every class
+# Common tail: the standby's next request (one poll), the grant exchange (the
+# witness writes the new authority durably first, 48-74 ms measured), the
+# agent's acknowledgement, and the announcement on the coordinator's next tick.
+_HA_GRANT_AND_ANNOUNCE = HA_COORDINATOR_POLL + HA_WITNESS_IO + HA_AGENT_ACK + HA_COORDINATOR_POLL
+HA_TAKEOVER_DESIGN = {
+    # The owner stops at once (paused VM): the witness lease it last renewed
+    # before the fault runs out.
+    "vm pause": HA_LEASE + _HA_GRANT_AND_ANNOUNCE + HA_TAKEOVER_MARGIN,
+    # The agent's exit fences the owner at once, but its Wren keeps renewing on
+    # the dead agent's last report until that report is FRESH old (one more
+    # renewal may start within a poll and take an exchange); then the lease.
+    "agent crash": HA_AGENT_FRESH + HA_COORDINATOR_POLL + HA_WITNESS_IO + HA_LEASE
+    + _HA_GRANT_AND_ANNOUNCE + HA_TAKEOVER_MARGIN,
+    # The owner forwards until its own deadline, which ends at most one
+    # exchange plus the margin before the witness's lease.
+    "wren crash": HA_WITNESS_IO + HA_WITNESS_MARGIN + _HA_GRANT_AND_ANNOUNCE + HA_TAKEOVER_MARGIN,
+    # Unhealthy links stop the owner's renewals at its next poll and fence it;
+    # then the lease. Derived only: no check exercises this class yet.
+    "link loss": HA_COORDINATOR_POLL + HA_LEASE + _HA_GRANT_AND_ANNOUNCE + HA_TAKEOVER_MARGIN,
+}
+# The client's retransmission timeout R, Linux TCP_RTO_MIN up to the HA_RTO_MAX
+# above; a lost segment is retried at s+R, s+3R, s+7R without SACK.
+HA_RTO_MIN = 0.2
+# From the fault anchor (taken just before the fault command) to the fault
+# taking effect on the stream: measured 0.10-0.32 s.
+HA_FAULT_COMMAND_MAX = 0.35
+
+
+def ha_retry_at_or_after(sends, point):
+    """The lost segment's first retransmission at or after `point`: measured
+    sends first, then the doubling schedule from the last measured interval."""
+    for when in sends:
+        if when >= point:
+            return when
+    when = sends[-1]
+    interval = sends[-1] - sends[-2] if len(sends) > 1 else HA_RTO_MIN
+    while when < point:
+        interval *= 2
+        when += interval
+    return when
+
+
+# The server's answer to a retransmission trails it by one round trip and
+# whatever the server's own TCP holds it for: 4-82 ms measured (idle
+# builders, witness+SYN proxy). Only the secondary assertion uses it.
+HA_RETRY_ANSWER_MAX = 0.1
+
+
+def ha_judge_takeover(s, sends, owner_frame, resumed, p_max, rtt=HA_RETRY_ANSWER_MAX):
+    """(1) the takeover P against its design P_max: this judges the product;
+    (2) the resume against the first retransmission at or after s + P_max on
+    the client's measured schedule, plus one round trip: what TCP then allows."""
+    limit = ha_retry_at_or_after(sends, s + p_max) + rtt
+    return {"P": round(owner_frame - s, 3), "P_max": round(p_max, 3),
+            "resumed_s": round(resumed - s, 3), "resume_limit_s": round(limit - s, 3),
+            "primary": owner_frame - s <= p_max, "secondary": resumed <= limit}
+
+
+def ha_fault_to_resume_max(fault):
+    """Backstop from the fault anchor on the client's reply times, for checks
+    without a capture: the worst R decides at which retransmission a takeover
+    of design length is answered (3R if it fits below 3 R_min, else 7R)."""
+    design = HA_TAKEOVER_DESIGN[fault]
+    retries = 3 if design <= 3 * HA_RTO_MIN else 7
+    onset = HA_FAULT_COMMAND_MAX + (HA_LEASE if fault == "wren crash" else 0.0)
+    return onset + retries * HA_RTO_MAX + HA_RTT_MAX
+
+
 # A two-node pair has no witness: the standby takes over only once it has
 # not heard its peer for the configured peer timeout (1000 ms in the checks).
 HA_TWO_NODE_PEER_TIMEOUT = 1.0
@@ -85,12 +175,60 @@ def ha_capture_start(client, interface, port):
     """Capture the stream and every ARP on the client's link to the VIP."""
     client.succeed(
         "systemd-run --unit=ha-bound-capture " + HA_TCPDUMP
-        + " -p -U -w " + HA_CAPTURE + " -i " + interface
+        + " -p -U --immediate-mode -w " + HA_CAPTURE + " -i " + interface
         + " 'tcp port " + str(port) + " or arp'"
     )
     client.wait_until_succeeds(
         "journalctl -u ha-bound-capture --no-pager | grep -q 'listening on'", timeout=5
     )
+
+
+# The client stream sends one message every 20 ms and waits for its echo, so
+# a healthy stream replies every 20 ms plus one round trip. A longer silence
+# is an outage.
+HA_STREAM_GAP = 0.1
+# Replies that must follow the end of an outage before it counts as resumed:
+# one answered retransmission alone is not a working stream.
+HA_STREAM_PROGRESS = 3
+# Steady replies after the last silence before the outage is judged over: a
+# fault takes up to HA_FAULT_COMMAND_MAX plus one lease to bite.
+HA_STREAM_SETTLE = 1.0
+
+
+def ha_resume(times, anchor, outage=True, gap=HA_STREAM_GAP, progress=HA_STREAM_PROGRESS,
+              settle=HA_STREAM_SETTLE):
+    """The instant forwarding resumed, on the client's own clock: the end of the
+    longest silence longer than `gap` after `anchor`, once the stream has run
+    steadily for `settle` since its last silence (so a short stall before the
+    fault bites is not taken for its end) and `progress` replies follow it.
+    `times` are the client stream's reply times (client wall clock). None
+    while it has not resumed.
+
+    With `outage` false (a handover already under way when the check starts),
+    the first reply after the anchor that `progress` replies follow is the
+    resume: a silence spanning the anchor ends there."""
+    previous = None
+    silences = []  # (length, end index)
+    for index, when in enumerate(times):
+        if when <= anchor:
+            previous = when
+            continue
+        if not outage and previous is not None:
+            return when if len(times) - index - 1 >= progress else None
+        if previous is not None and when - previous > gap:
+            silences.append((when - previous, index))
+        previous = when
+    if not silences:
+        return None
+    if times[-1] - times[silences[-1][1]] < settle:
+        return None
+    length, index = max(silences, key=lambda silence: (silence[0], -silence[1]))
+    return times[index] if len(times) - index - 1 >= progress else None
+
+
+def ha_resumed_within(resumed, anchor, bound):
+    """Judge the resume instant itself, never the moment a poll saw it."""
+    return resumed is not None and resumed - anchor <= bound
 
 
 def ha_fault_anchor(client):
@@ -159,3 +297,59 @@ def ha_takeover(client, anchor, new_mac, vip, server_ip, port, takeover_max=HA_T
     assert arp - start <= takeover_max, ("(a) takeover exceeded " + str(takeover_max) + " s", timeline, capture_tail)
     assert answered is not None, ("(b) the first retry after the new owner's ARP was not answered", timeline, capture_tail)
     return timeline
+
+
+def _ha_lost_segment(packets, new_mac, vip, server_ip, port):
+    """The first client segment after the anchor that was sent more than once,
+    its sends, the server's first answer covering it, and the new owner's
+    first ARP for the VIP after it (None where not captured yet)."""
+    to_server = "> " + server_ip + "." + str(port) + ":"
+    from_server = server_ip + "." + str(port) + " >"
+    sent, replies = {}, []
+    for when, _mac, line in packets:
+        if when < -0.05:
+            continue
+        data = _ha_re.search(r"seq (\d+):(\d+)", line)
+        if to_server in line and data:
+            sent.setdefault(int(data.group(1)), []).append((when, int(data.group(2))))
+        elif from_server in line and data:
+            ack = _ha_re.search(r"ack (\d+)", line)
+            replies.append((when, int(ack.group(1)) if ack else 0))
+    lost = sorted((times[0][0], times) for times in sent.values() if len(times) > 1)
+    if not lost:
+        return None
+    s, times = lost[0]
+    end = times[0][1]
+    answer = next((when for when, ack in replies if when > s and ack >= end), None)
+    arps = [when for when, mac, line in packets
+            if mac == new_mac and "ARP" in line and (" " + vip + " ") in line and when > s]
+    return s, [when for when, _ in times], answer, (arps[0] if arps else None)
+
+
+def ha_takeover_split(client, anchor, new_mac, vip, server_ip, port, fault, extra=0.0, settle=5.0):
+    """The split check of one takeover from the client capture: (1) P within
+    the design of its fault class, (2) the resume at the retransmission that
+    design allows. Returns the verdict; asserts both. The capture reaches the
+    file a little after the stream resumed: read it until the answer is in."""
+    import time as _ha_time
+    until = _ha_time.monotonic() + settle
+    while True:
+        found = _ha_lost_segment(_ha_packets(client, anchor), new_mac, vip, server_ip, port)
+        if (found and found[2] is not None) or _ha_time.monotonic() > until:
+            break
+        _ha_time.sleep(0.5)
+    if not found:
+        verdict = {"fault": fault, "outage": None}
+        print("HA takeover split:", verdict)
+        return verdict
+    s, sends, answer, arp = found
+    owner_frame = arp if arp is not None else answer
+    capture_tail = client.succeed(HA_TCPDUMP + " -tt -n -e -S -r " + HA_CAPTURE + " 2>/dev/null | tail -n 60")
+    assert answer is not None and owner_frame is not None, (fault, "no answer after the lost segment", sends, capture_tail)
+    verdict = ha_judge_takeover(s, sends, owner_frame, answer, HA_TAKEOVER_DESIGN[fault] + extra)
+    verdict.update({"fault": fault, "s": round(s, 3), "sends_s": [round(w, 3) for w in sends],
+                    "owner_frame": "ARP" if arp is not None else "first answer"})
+    print("HA takeover split:", verdict)
+    assert verdict["primary"], ("(1) the takeover exceeded its design", verdict, capture_tail)
+    assert verdict["secondary"], ("(2) the client resumed after the retransmission its design allows", verdict, capture_tail)
+    return verdict

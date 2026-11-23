@@ -71,15 +71,20 @@ let
       wan.default_action = "drop";
       lan.default_action = "drop";
       control.default_action = "accept";
+    } // pkgs.lib.optionalAttrs (legacyPackage == null) {
       # Rules `to firewall` are what make a takeover's VIPs part of the
-      # agent's local-destination set (see the gate check below).
+      # agent's local-destination set (see the gate check below). Not in the
+      # mixed-version variant: its older agent can only hold such a rule
+      # expanded to its own addresses, so its policy digest would differ from
+      # the current agent's and state sync between them would be refused.
       firewall.local = true;
     };
     rule = [ { name = "single-echo"; from = "lan"; proto = "tcp"; port = 8443; action = "accept"; }
       # A constant-rate UDP probe measures the forwarding gap itself; a TCP
       # stream's retransmission backoff would add to whatever it measures.
-      { name = "gap-probe"; from = "lan"; proto = "udp"; port = 8444; action = "accept"; }
-      { name = "mgmt-ssh"; from = "lan"; to = "firewall"; proto = "tcp"; port = 22; action = "accept"; } ];
+      { name = "gap-probe"; from = "lan"; proto = "udp"; port = 8444; action = "accept"; } ]
+      ++ pkgs.lib.optionals (legacyPackage == null)
+      [ { name = "mgmt-ssh"; from = "lan"; to = "firewall"; proto = "tcp"; port = 22; action = "accept"; } ];
     nat.source = [ { name = "shared-snat"; zone = "wan"; to = "10.1.0.100"; } ];
     protocols.vrrp = map (vip: {
       inherit (vip) name vrid;

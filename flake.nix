@@ -2079,6 +2079,15 @@
           python3 ${./tests/management_tls.py} -v
           touch $out
         '';
+        # The HA VM checks' shared bound: the resume instant is the client's
+        # own reply time, judged against the bound, never the poll that saw it.
+        ha-bound-unit = pkgs.runCommand "sentinel-ha-bound-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p test
+          cp ${./nix/ha-failover-bound.py} test/ha-failover-bound.py
+          cp ${./nix/test_ha_failover_bound.py} test/test_ha_failover_bound.py
+          python3 -B -m unittest discover -s test -v
+          touch $out
+        '';
         # The mixed-version HA fixture's rewrite of velstra.toml for an older
         # agent (nix/ha-two-node-flow-test.nix): never widens a dst-local rule.
         legacy-filter-unit = pkgs.runCommand "sentinel-legacy-filter-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''

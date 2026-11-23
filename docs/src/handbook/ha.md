@@ -210,8 +210,9 @@ primary. **Never fail back onto a member that is not yet upgraded.** A
 masqueraded connection that an upgraded (1.0) member owns does not survive a
 takeover by a pre-1.0 peer. The older allocator looks for the connection's
 public port in a different place, so it does not find it and assigns a new
-one, and the connection breaks. The other direction is covered: connections
-the older member owns survive the switch-over to the upgraded one
+one, and the connection breaks. Between members whose readiness digests agree
+(from 1.0 on), the other direction is covered: connections the older member
+owns survive the switch-over to the upgraded one
 (`checks.ha-napt-mixed-version`). An upgrade from 0.4 is not hitless anyway,
 because 1.0's members compute a different readiness digest (see above).
 ## SYN-proxied connections in a pair
@@ -257,12 +258,36 @@ Established connections do not survive that path; new ones do.
 
 ## Failure behaviour (witness mode)
 
+### How long a failover takes
+
+A takeover runs from the first packet a client loses to the new owner's first
+announcement of the VIPs. How long it takes depends on what failed:
+
+| What failed on the owner | Takeover, by design | Takeover, measured |
+|---|---|---|
+| `velstra` killed (agent crash, OOM) | at most 0.68 s | 0.42–0.48 s |
+| `wren` killed | at most 0.32 s | 0.22–0.25 s |
+| the member's VM paused | at most 0.47 s | 0.34–0.42 s |
+| its data links lost | at most 0.50 s | not measured yet |
+
+An agent crash takes longest: the owner is fenced at once, but its `wren`
+keeps renewing the lease until the dead agent's last report is 100 ms old, and
+the standby then waits for that lease (250 ms) to end. After a `wren` crash
+the owner keeps forwarding until its own lease ends, so clients lose nothing
+before that.
+
+An established TCP connection does not resume the moment the takeover ends,
+but on its next retransmission of the lost packet. These come about 0.2, 0.6
+and 1.4 s after the loss (a 0.2 s retransmission timeout, doubling). So a
+connection typically resumes 0.8–1.1 s after the fault, and up to about 1.7 s
+when the takeover ends just after a retransmission. Through HA WireGuard a
+client may also have to wait for one handshake retry (about 5 s).
+
 These cases are exercised by `checks.ha-witness-failover`:
 
 - **Data-plane agent crash on the active member** (`velstra` killed, OOM): the
   kernel fence closes the old member at once; the ready standby takes over and
-  established flows continue (the check bounds the gap at 3 s; about 1 s was
-  measured in the VM check). The crashed
+  established flows continue (see the table above). The crashed
   member restarts empty, imports the new owner's state and rejoins.
 - **Routing daemon crash** (`wren` killed): the lease lapses and the standby
   takes over the same way.
@@ -372,6 +397,21 @@ Fenced) ends with a warning that names this member, the current owner and the
 term; the commit still applies here and replicates. If the role cannot be read
 before the commit, the warning says so instead. Check the member role and
 pending synchronization state before changing policy.
+
+A commit on the owner that changes the firewall policy starts a new authority
+term: the witness grants the owner a new term for the new policy and the owner
+announces its VIPs again (gratuitous ARP and neighbour advertisements). This is
+expected and does not move ownership.
+
+Such a commit also closes the member's configuration gate for the length of the
+data-plane transaction: about 20–30 ms for up to 4,500 changed rule entries in
+our tests. While the gate is closed every attached link drops traffic, the HA
+sync link included, so an owner commit costs a few packets and about one witness
+renewal; the owner keeps its lease.
+
+After a policy commit on the owner the pair has no failover until the standby
+has the new policy and the owner's state for the new term: about 1–3 s in our
+tests.
 
 ## Regression entry points
 
