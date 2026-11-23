@@ -36,6 +36,16 @@ qemu-system-x86_64 -enable-kvm -machine q35 -cpu host -smp 2 -m 4096 \
 
 In the installer, choose the new empty virtual disk, create an administrator, set the first NIC to DHCP and the second to `192.168.50.1/24`. Check the device before confirming erasure. Eject the ISO, remove the `-cdrom` option and boot the same VM with `-boot order=c`. For Proxmox, use q35/OVMF, two VirtIO NICs, a 32 GiB disk and 4 GiB RAM.
 
+```mermaid
+flowchart LR
+  user[(QEMU user net)] --- wan[First NIC: WAN, DHCP<br/>52:54:00:10:00:01]
+  host([Workstation<br/>127.0.0.1:8443]) -->|hostfwd| lan[Second NIC: LAN<br/>192.168.50.1/24, :8443<br/>52:54:00:10:00:02]
+  subgraph vm[Sentinel VM]
+    wan
+    lan
+  end
+```
+
 ## Configure WAN, LAN and management
 
 On the appliance, compare the NIC addresses with the MACs in the QEMU command. Transfer the [quickstart command file](https://github.com/Velstra/sentinel/blob/main/examples/quickstart.cli) to the appliance; adapt `eth0` and `eth1` to the names you observed. Apply it from the local console to preserve the installer-created accounts.

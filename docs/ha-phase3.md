@@ -4,7 +4,7 @@ Use this reference with two matching appliances and one independent witness. Kee
 
 ## Prepare and pair
 
-1. Set distinct member control addresses and configure the secondary’s HTTPS management endpoint. Give the two members their site-issued enrollment secret of at least 32 bytes. Keep the control path independent of fenced data interfaces, including bridge and VLAN dependencies.
+1. Set distinct member control addresses and configure the secondary’s HTTPS management endpoint. Generate the enrollment secret with `sentinel ha secret generate` (32 random bytes as 64 hex digits) and set it as `system config-sync secret` on both members. A short, patterned or word-like secret is refused at commit; see [the HA secret](https://velstra.github.io/sentinel/handbook/ha.html#the-ha-secret). Keep the control path independent of fenced data interfaces, including bridge and VLAN dependencies.
 2. On a member, run `sentinel ha witness-key`. Supply the enrollment credential at the prompt. On the witness, configure only the derived key and cluster identifier. Allow both members’ control addresses and restrict the witness port at the host firewall.
 3. On the primary, prepare the witness address with HA disabled. Run `sentinel ha pair <secondary-control-address>:<https-port>` and enter the credential at the prompt. Use the actual endpoint for that secondary.
 
