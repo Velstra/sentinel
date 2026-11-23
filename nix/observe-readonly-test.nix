@@ -102,14 +102,15 @@ in pkgs.testers.runNixOSTest {
     def capacity(text):
         # Capacity report v2 (DP-06): the tables are sized from memory, for
         # `connections_sized_for` connections: FW_FLOWS 6x, CONNTRACK 2x,
-        # SYN_FLOWS half of it.
+        # SYN_FLOWS 2x (fabric's SYN_ENTRIES_PER_CONNECTION: a proxied
+        # connection holds its splice record for its whole lifetime).
         value = json.loads(text)
         assert value["version"] == 2 and value["status"] != "unavailable", value
         maps = {row["name"]: row for row in value["maps"]}
         assert set(maps) == {"CONNTRACK", "FW_FLOWS", "SYN_FLOWS"}, value
         sized = value["connections_sized_for"]
         assert sized >= 16384, value
-        expected = {"FW_FLOWS": 6 * sized, "CONNTRACK": 2 * sized, "SYN_FLOWS": sized // 2}
+        expected = {"FW_FLOWS": 6 * sized, "CONNTRACK": 2 * sized, "SYN_FLOWS": 2 * sized}
         for name, row in maps.items():
             assert row["error"] is None and row["age_ms"] is not None, row
             assert row["max_entries"] == expected[name], row
