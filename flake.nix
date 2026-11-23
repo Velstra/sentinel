@@ -433,7 +433,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-UEUpPm9qP+LJhEvn3gA18HXZSToeuHRx1F8DEgvPsNU=";
+      ebpfHash = "sha256-0HIQtq2GVlyqK4ZoGeeneMJXRQDM3XwZQtAAZNjNYOg=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
@@ -9247,6 +9247,26 @@
             assert counter("synproxy_spliced") > banner_before, (
                 "the server-first exchange was not proxied:\n" + stats
             )
+
+            # A client reusing a source port. The proxy's record of a
+            # connection outlives it until the agent's splice sweep finds no
+            # live connection state claiming it (two reclaim rounds, a few
+            # seconds on this box's table size); the second connection, made
+            # after that, must be admitted afresh, not translated with the
+            # first connection's sequence offset into a connection the server
+            # no longer has (the i3 synproxy failure's signature: a challenged
+            # SYN, no admission, every later segment dropped downstream).
+            stats = fw.succeed("sentinel show firewall statistics")
+            reuse_before = counter("synproxy_admitted")
+            client.succeed("python3 ${./nix/synproxy-banner.py} reuse 10.2.0.2 2525 40123 15", timeout=60)
+            for _ in range(15):
+                stats = fw.succeed("sentinel show firewall statistics")
+                if counter("synproxy_admitted") >= reuse_before + 2:
+                    break
+                fw.sleep(2)
+            assert counter("synproxy_admitted") >= reuse_before + 2, (
+                "the second connection on a reused tuple was not admitted:\n" + stats
+            )
           '';
         };
 
@@ -9522,11 +9542,19 @@
         #   nix build .#checks.x86_64-linux.conntracksync -L
         ha-kernel = import ./nix/ha-kernel-test.nix { inherit pkgs velstra-ha-tests; };
         ha-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; };
+        # The same with conntrack-sync pushing every 2 s instead of 50 ms: a
+        # splice and the state claiming it then reach the standby far apart.
+        ha-synproxy-failover-slow-sync = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; syncInterval = 2; };
         # C15 SYN proxy on a deny-by-default masquerading edge box: remapping
         # port-forwards, servers that speak first, and syn-protect surviving
         # save, an unrelated commit and a reboot (DP-31). See the file.
         #   nix build .#checks.x86_64-linux.synproxy-edge -L
         synproxy-edge = import ./nix/synproxy-edge-test.nix { inherit pkgs self; };
+        # A proxied connection's record lives exactly as long as the connection:
+        # idle ones survive more short ones than SYN_FLOWS holds, ended ones
+        # leave nothing, and no off-path forgery ends a live one. See the file.
+        #   nix build .#checks.x86_64-linux.synproxy-churn -L
+        synproxy-churn = import ./nix/synproxy-churn-test.nix { inherit pkgs self; };
         ha-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; };
         ha-masquerade-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; masquerade = true; };
         ha-wireguard-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; wireguard = true; };

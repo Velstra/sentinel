@@ -1,6 +1,6 @@
-{ pkgs, self, synproxy ? false, leased ? false, wireguard ? false, masquerade ? false, logStall ? false }:
+{ pkgs, self, synproxy ? false, leased ? false, wireguard ? false, masquerade ? false, logStall ? false, syncInterval ? null }:
 let
-  name = if logStall then "sentinel-ha-log-stall" else if masquerade then "sentinel-ha-masquerade-failover" else if wireguard then "sentinel-ha-wireguard-failover" else if leased && synproxy then "sentinel-ha-witness-synproxy-failover" else if leased then "sentinel-ha-witness-failover" else if synproxy then "sentinel-ha-synproxy-failover" else "sentinel-ha-failover";
+  name = (if syncInterval != null then (n: "${n}-slow-sync") else (n: n)) (if logStall then "sentinel-ha-log-stall" else if masquerade then "sentinel-ha-masquerade-failover" else if wireguard then "sentinel-ha-wireguard-failover" else if leased && synproxy then "sentinel-ha-witness-synproxy-failover" else if leased then "sentinel-ha-witness-failover" else if synproxy then "sentinel-ha-synproxy-failover" else "sentinel-ha-failover");
   secret = "3495f763f76345f694398991ac86dc4f1b6c48ab2334e10f5b4a3ddd1fc4bd50";
   appliance = number: priority: (pkgs.formats.toml {}).generate "ha-appliance.toml" {
     system = {
@@ -9,7 +9,7 @@ let
       conntrack-sync = {
         listen = "10.3.0.${number}:5429";
         peer = [ "10.3.0.${if number == "1" then "2" else "1"}:5429" ];
-      };
+      } // pkgs.lib.optionalAttrs (syncInterval != null) { interval = syncInterval; };
     } // pkgs.lib.optionalAttrs leased {ha={enabled=true;cluster="vm-cluster-0123456789";node=pkgs.lib.toInt number;witness="10.3.0.3:5440";sync-interface="eth3";inherit priority;preempt=true;};};
     interface = [
       ({ name = "eth1"; zone = "wan"; address = "10.1.0.${number}/24"; } // pkgs.lib.optionalAttrs leased {address6="fd42:1::${number}/64";})

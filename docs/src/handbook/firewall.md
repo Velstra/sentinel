@@ -286,6 +286,17 @@ set firewall syn-protect 8080 mss 1400
 delete firewall syn-protect 443
 ```
 
+A protected port can sit behind a port-forward, including one that changes the port (`port 8080 to 192.0.2.10:80` with `syn-protect 8080`), and servers that speak first (SMTP, FTP, POP, IMAP, SSH) work through the proxy. A protected zone must be stateful (`config check` refuses `syn-protect` on a zone with `stateful false`).
+
+**A proxied connection lives exactly as long as its connection state**, like every other connection through the box. The proxy keeps one record per proxied connection (its sequence offset), and the agent removes it once no live firewall or NAT state claims it: within about 30 s of that state ending, and only on the active member of an HA pair. So a proxied connection ends when its state does — idle longer than `tcp-established` (`set firewall global conntrack tcp-established`, 24 h by default), half-closed and idle longer than the half-close allowance (at least 120 s), or evicted when the state table is full — and idle proxied connections keep their records however many others come and go.
+
+A SYN flood against a protected port costs the box one cookie reply per SYN and no connection state, so it does not displace the protected connections' state. Ending records costs the agent a pass over the connection-state tables every few seconds while a port is SYN-proxied.
+
+Two consequences:
+
+- **A client reusing a source port too soon.** After a connection ends, its record stays until the agent removes it: at once plus up to about 30 s after a reset, the closing timeout (`set firewall global conntrack tcp-closing`, 30 s by default) plus that after a normal close, or the half-close allowance (at least 120 s) when the box recorded only one side's FIN, as it does for a connection through a port-forward. A new connection from the same client address and port, inside that window, to a protected service whose server uses the same port (the same service, or another one forwarded to that port) is not admitted, and its own attempts keep the old record claimed while they last; the client's next attempt after that succeeds.
+- **Half-closed connections after an HA failover.** A proxied connection that one side had half-closed (sent its FIN while the other kept sending) is treated as closing with the ordinary closing timeout instead of the longer half-close allowance, because the FIN history does not replicate. If it then idles longer than that, the new active member ends it. Fully open connections are not affected.
+
 ## Application-layer gateways: there are none
 
 The dataplane does not rewrite protocol payloads through application-layer gateways. Plan explicit application ports, passive endpoints or NAT traversal as appropriate.

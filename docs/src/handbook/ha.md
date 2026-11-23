@@ -214,6 +214,20 @@ one, and the connection breaks. The other direction is covered: connections
 the older member owns survive the switch-over to the upgraded one
 (`checks.ha-napt-mixed-version`). An upgrade from 0.4 is not hitless anyway,
 because 1.0's members compute a different readiness digest (see above).
+## SYN-proxied connections in a pair
+
+A SYN-proxied connection lives as long as its connection state, and its
+proxy record is ended by the member that owns that state. With a lease
+(`witness` or `two-node`) only the lease owner ends records; the standby keeps
+the records it imported and applies the owner's removals. Without a lease (a
+legacy VRRP deployment with `system conntrack-sync`) a member never ends a
+record it imported from its peer, but it still ends the records it created
+itself once its own copy of their state expires. Its copy no longer follows
+the peer after a failover, so a proxied connection carried across one lives at
+most `tcp-established` (24 h by default) after the failover, even while
+active. Records imported from a peer that never returns stay until the record
+table reclaims its least recently used entries.
+
 ## Standby readiness
 
 `sentinel show ha` on the standby must read plain `HA Backup`. A reason in
