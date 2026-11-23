@@ -720,7 +720,7 @@ in pkgs.testers.runNixOSTest {
     master.succeed("${pkgs.python3}/bin/python3 /tmp/stall_watch.py")
     stall=json.loads(master.succeed("cat /tmp/stall-release.json"))
     print(f"velstra SIGSTOP on the owner: VIPs released {stall}, bound {ha_bound.HA_STALLED_AGENT_RELEASE_MAX:.3f}s")
-    assert stall["released"] and stall["after_s"] <= ha_bound.HA_STALLED_AGENT_RELEASE_MAX, ("a stalled agent's owner kept its VIPs past the lease", stall)
+    assert ha_bound.ha_stall_released_within(stall), ("a stalled agent's owner kept its VIPs past the lease", stall)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     vip_steady_check(backup,"velstra SIGSTOP on the owner")
     master.succeed("systemctl kill --kill-who=main --signal=SIGCONT velstra.service")
