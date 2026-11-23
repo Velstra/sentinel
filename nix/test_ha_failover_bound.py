@@ -90,6 +90,16 @@ class Takeover(unittest.TestCase):
         self.assertTrue(verdict["primary"], verdict)
         self.assertFalse(verdict["secondary"], verdict)
 
+    def test_a_server_answer_held_like_the_measured_one_passes_a_slower_one_fails(self):
+        # Measured: a SYN-proxied server ACKs the 3R retransmission at once and
+        # sends its data answer up to 101 ms later.
+        retry = self.SENDS[2]
+        held = bound.ha_judge_takeover(0.30, self.SENDS, owner_frame=0.30 + 0.37, resumed=retry + 0.101, p_max=0.47)
+        self.assertTrue(held["secondary"], held)
+        slower = bound.ha_judge_takeover(0.30, self.SENDS, owner_frame=0.30 + 0.37, resumed=retry + 0.16, p_max=0.47)
+        self.assertFalse(slower["secondary"], slower)
+        self.assertAlmostEqual(bound.HA_SERVER_ANSWER_MAX, 0.15)
+
     def test_retransmissions_beyond_the_capture_follow_the_doubling(self):
         self.assertAlmostEqual(bound.ha_retry_at_or_after([0.30, 0.51], 1.0), 1.77, places=6)
         self.assertAlmostEqual(bound.ha_retry_at_or_after(self.SENDS, 0.60), 0.93, places=6)
