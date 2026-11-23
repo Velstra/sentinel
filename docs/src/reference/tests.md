@@ -2,14 +2,27 @@
 
 <a id="test-suite-nixostests"></a><a id="also-here"></a><a id="also-here-1"></a>
 
+```sh
+nix eval --json .#checks.x86_64-linux --apply builtins.attrNames   # what exists
+nix build .#checks.x86_64-linux.quickstart -L                      # run one VM check
+```
+
 Run these commands from the repository root. Test counts change with the source;
-the commands below, not a number copied into this handbook, define the suite.
+the commands, not a number copied into this handbook, define the suite.
 A configured check is not a passing test or a release certificate.
 
-This inventory includes development fixtures whose flake wiring and dependency
-pins are still being integrated. Query the checked-out flake before selecting a
-name; a fixture file or a standalone receipt does not mean that the published
-package exposes it or uses the same tested dependency cohort.
+```mermaid
+flowchart LR
+  src[Source checks<br/>cargo, npm] --> eval[Flake evaluation<br/>no VM runs]
+  eval --> vm[VM check<br/>needs KVM]
+  vm --> all[Full check set]
+  all -.->|does not replace| final[Acceptance + SBOM/CVE<br/>of the final signed image]
+```
+
+> **Note:** This inventory includes development fixtures whose flake wiring and dependency
+> pins are still being integrated. Query the checked-out flake before selecting a
+> name; a fixture file or a standalone receipt does not mean that the published
+> package exposes it or uses the same tested dependency cohort.
 
 ## Source checks
 
@@ -47,7 +60,7 @@ evaluates them: it does **not** execute the VM tests or prove that images boot.
 ## Run a real VM check
 
 Use an x86_64 Linux host with usable `/dev/kvm` and enough RAM for the selected
-topology. Each command below builds its dependencies and executes that check:
+topology. Each command builds its dependencies and executes that check:
 
 ```sh
 nix build .#checks.x86_64-linux.quickstart -L
@@ -96,8 +109,9 @@ nix flake check -L
 ```
 
 This can build images and run many multi-VM topologies. Allow substantial disk,
-memory and time. A failure, timeout, interrupted check or unexecuted check is not
-a pass. Save logs and output paths before removing build artifacts.
+memory and time. Save logs and output paths before removing build artifacts.
+
+> **Warning:** A failure, timeout, interrupted check or unexecuted check is not a pass.
 
 ## Release evidence
 
@@ -120,6 +134,8 @@ the exact object into each target kernel in a privileged test VM. The
 from passing receipts; an unexecuted lane is not support for that kernel.
 
 ## Additional fixture catalog
+
+Jump to: [Image & boot](#image--boot-integrity) · [Config & management](#config-lifecycle--management) · [Firewall](#firewall-ebpf-data-plane) · [NAT](#nat) · [Routing](#routing-wren-control-plane) · [Interfaces & L2](#interfaces--l2) · [Address & name services](#address--name-services) · [WAN & shaping](#wan--shaping) · [VPN](#vpn) · [Services](#services)
 
 This catalog preserves the existing task lookup for protocol and service fixtures. It is not a passing-results ledger. Some fixtures or wiring may differ in the current checkout; the attribute query above and the fixture source are authoritative. Rendering, adjacency and replication checks do not by themselves prove full service interoperability or failover. Experimental-feature limits still apply.
 
