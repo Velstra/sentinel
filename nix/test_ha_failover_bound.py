@@ -96,5 +96,22 @@ class Takeover(unittest.TestCase):
         )
 
 
+class Capture(unittest.TestCase):
+    LOST = "1.0 a > b, x: 10.2.0.10.5 > 10.1.0.10.8443: Flags [P.], seq 100:105, ack 1, length 5"
+    ARP = "1.0 nm > ff, ARP, Request who-has 10.2.0.100 tell 10.2.0.100, length 28"
+    ANSWER = "1.0 s > a, x: 10.1.0.10.8443 > 10.2.0.10.5: Flags [P.], seq 1:6, ack 105, length 5"
+
+    def test_the_lost_segment_its_sends_the_owners_arp_and_the_answer(self):
+        packets = [(0.10, "m", self.LOST), (0.31, "m", self.LOST), (0.50, "nm", self.ARP),
+                   (0.73, "m", self.LOST), (0.76, "s", self.ANSWER)]
+        found = bound._ha_lost_segment(packets, "nm", "10.2.0.100", "10.1.0.10", 8443)
+        self.assertEqual(found, (0.10, [0.10, 0.31, 0.73], 0.76, 0.50))
+
+    def test_an_answer_not_yet_in_the_capture_is_none_not_a_miss(self):
+        packets = [(0.10, "m", self.LOST), (0.31, "m", self.LOST)]
+        found = bound._ha_lost_segment(packets, "nm", "10.2.0.100", "10.1.0.10", 8443)
+        self.assertIsNone(found[2])
+
+
 if __name__ == "__main__":
     unittest.main()

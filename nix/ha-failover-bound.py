@@ -175,7 +175,7 @@ def ha_capture_start(client, interface, port):
     """Capture the stream and every ARP on the client's link to the VIP."""
     client.succeed(
         "systemd-run --unit=ha-bound-capture " + HA_TCPDUMP
-        + " -p -U -w " + HA_CAPTURE + " -i " + interface
+        + " -p -U --immediate-mode -w " + HA_CAPTURE + " -i " + interface
         + " 'tcp port " + str(port) + " or arp'"
     )
     client.wait_until_succeeds(
@@ -288,11 +288,10 @@ def ha_takeover(client, anchor, new_mac, vip, server_ip, port, takeover_max=HA_T
     return timeline
 
 
-def ha_takeover_split(client, anchor, new_mac, vip, server_ip, port, fault, extra=0.0):
-    """The split check of one takeover from the client capture: (1) P within
-    the design of its fault class, (2) the resume at the retransmission that
-    design allows. Returns the verdict; asserts both."""
-    packets = _ha_packets(client, anchor)
+def _ha_lost_segment(packets, new_mac, vip, server_ip, port):
+    """The first client segment after the anchor that was sent more than once,
+    its sends, the server's first answer covering it, and the new owner's
+    first ARP for the VIP after it (None where not captured yet)."""
     to_server = "> " + server_ip + "." + str(port) + ":"
     from_server = server_ip + "." + str(port) + " >"
     sent, replies = {}, []
@@ -307,21 +306,38 @@ def ha_takeover_split(client, anchor, new_mac, vip, server_ip, port, fault, extr
             replies.append((when, int(ack.group(1)) if ack else 0))
     lost = sorted((times[0][0], times) for times in sent.values() if len(times) > 1)
     if not lost:
-        verdict = {"fault": fault, "outage": None}
-        print("HA takeover split:", verdict)
-        return verdict
+        return None
     s, times = lost[0]
     end = times[0][1]
-    sends = [when for when, _ in times]
     answer = next((when for when, ack in replies if when > s and ack >= end), None)
     arps = [when for when, mac, line in packets
             if mac == new_mac and "ARP" in line and (" " + vip + " ") in line and when > s]
-    owner_frame = arps[0] if arps else answer
+    return s, [when for when, _ in times], answer, (arps[0] if arps else None)
+
+
+def ha_takeover_split(client, anchor, new_mac, vip, server_ip, port, fault, extra=0.0, settle=5.0):
+    """The split check of one takeover from the client capture: (1) P within
+    the design of its fault class, (2) the resume at the retransmission that
+    design allows. Returns the verdict; asserts both. The capture reaches the
+    file a little after the stream resumed: read it until the answer is in."""
+    import time as _ha_time
+    until = _ha_time.monotonic() + settle
+    while True:
+        found = _ha_lost_segment(_ha_packets(client, anchor), new_mac, vip, server_ip, port)
+        if (found and found[2] is not None) or _ha_time.monotonic() > until:
+            break
+        _ha_time.sleep(0.5)
+    if not found:
+        verdict = {"fault": fault, "outage": None}
+        print("HA takeover split:", verdict)
+        return verdict
+    s, sends, answer, arp = found
+    owner_frame = arp if arp is not None else answer
     capture_tail = client.succeed(HA_TCPDUMP + " -tt -n -e -S -r " + HA_CAPTURE + " 2>/dev/null | tail -n 60")
     assert answer is not None and owner_frame is not None, (fault, "no answer after the lost segment", sends, capture_tail)
     verdict = ha_judge_takeover(s, sends, owner_frame, answer, HA_TAKEOVER_DESIGN[fault] + extra)
     verdict.update({"fault": fault, "s": round(s, 3), "sends_s": [round(w, 3) for w in sends],
-                    "owner_frame": "ARP" if arps else "first answer"})
+                    "owner_frame": "ARP" if arp is not None else "first answer"})
     print("HA takeover split:", verdict)
     assert verdict["primary"], ("(1) the takeover exceeded its design", verdict, capture_tail)
     assert verdict["secondary"], ("(2) the client resumed after the retransmission its design allows", verdict, capture_tail)
