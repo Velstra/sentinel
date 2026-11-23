@@ -258,6 +258,18 @@ pkgs.testers.runNixOSTest {
         assert left < 16, f"{left} SYN_FLOWS records outlive their connections"
     scenario("ended connections leave no splice", drained)
 
+    def stateless_refused():
+        # A proxied connection lives as long as its connection state; a
+        # stateless zone keeps none, so the agent's validator refuses it and
+        # the commit with it, leaving the running configuration as it was.
+        status, out = fw.execute(
+            "su admin -c \"printf '%s\\n' 'set firewall global stateful false' commit exit "
+            "| sentinel configure\" 2>&1"
+        )
+        assert status != 0 and "not stateful" in out, f"stateless syn-protect accepted ({status}):\n{out}"
+        fw.fail("grep -q '^stateful = false' /run/sentinel/velstra.toml")
+    scenario("syn-protect on a stateless zone is refused", stateless_refused)
+
     print(fw.succeed("sentinel show firewall statistics"))
     assert not failures, "SYN-proxy splice lifetime scenarios failed:\n  " + "\n  ".join(failures)
   '';

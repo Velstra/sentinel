@@ -9542,6 +9542,9 @@
         #   nix build .#checks.x86_64-linux.conntracksync -L
         ha-kernel = import ./nix/ha-kernel-test.nix { inherit pkgs velstra-ha-tests; };
         ha-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; };
+        # The same with conntrack-sync pushing every 2 s instead of 50 ms: a
+        # splice and the state claiming it then reach the standby far apart.
+        ha-synproxy-failover-slow-sync = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; syncInterval = 2; };
         # C15 SYN proxy on a deny-by-default masquerading edge box: remapping
         # port-forwards, servers that speak first, and syn-protect surviving
         # save, an unrelated commit and a reboot (DP-31). See the file.
