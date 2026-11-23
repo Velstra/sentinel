@@ -166,8 +166,9 @@ pinned tables (pinned state never survives the upgrade's reboot either).
   removed by the agent once no live connection state claims it, two passes of the
   state tables after that state is gone (seconds on a small box, minutes on one
   sized for millions of connections). A client that reconnects from the same
-  address and port to the same protected service inside that window is not
-  admitted until it retries after it ([firewall handbook](handbook/firewall.md)).
+  address and port inside that window, to a protected service whose server uses
+  the same port, is not admitted until it retries after it
+  ([firewall handbook](handbook/firewall.md)).
 
 - **IPv6 is not SYN-proxied in 1.0.** The SYN proxy protects IPv4 only (DP-35).
   Where a protected port is reachable over IPv6, `config check` names the zones.
