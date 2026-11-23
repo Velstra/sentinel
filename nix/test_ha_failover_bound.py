@@ -132,5 +132,22 @@ class Capture(unittest.TestCase):
         self.assertIsNone(found[2])
 
 
+class StalledAgent(unittest.TestCase):
+    def test_the_measured_worst_release_passes_and_ten_ms_past_the_bound_fails(self):
+        self.assertTrue(bound.ha_stall_released_within({"released": True, "after_s": 0.507}))
+        late = bound.HA_STALLED_AGENT_RELEASE_DESIGN + bound.HA_STALL_MARGIN + 0.010
+        self.assertFalse(bound.ha_stall_released_within({"released": True, "after_s": late}))
+        self.assertFalse(bound.ha_stall_released_within({"released": False, "after_s": 0.3}))
+
+    def test_the_bound_is_its_named_terms_plus_the_stated_margin(self):
+        terms = (bound.HA_AGENT_FRESH + bound.HA_LEASE - bound.HA_WITNESS_MARGIN
+                 + bound.HA_COORDINATOR_POLL + bound.HA_WITNESS_IO
+                 + bound.HA_VIP_RELEASE + bound.HA_WATCH_POLL + bound.HA_WATCH_FORK)
+        self.assertAlmostEqual(bound.HA_STALLED_AGENT_RELEASE_DESIGN, terms, places=9)
+        self.assertAlmostEqual(
+            bound.HA_STALLED_AGENT_RELEASE_MAX,
+            bound.HA_STALLED_AGENT_RELEASE_DESIGN + bound.HA_STALL_MARGIN, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()
