@@ -216,6 +216,17 @@ Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
   before each fault to 3 s after promotion. A VIP whose prefix length the
   interface does not already carry (a `/32` VIP, or one outside its subnets)
   still takes the rewrite.
+- With a lease, an owner now holds its VIPs on the lease alone. Wren renews
+  the lease only while the data-plane agent's report is fresh (100 ms) and
+  eligible. A stalled or ineligible agent therefore gives up the VIPs when the
+  lease ends, at most about 0.45 s after it stops. One late report no longer
+  withdraws them: before, Wren withdrew the VIPs at the first stale report.
+  The leased failover checks
+  (`checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
+  `checks.ha-witness-synproxy-failover`, `checks.ha-masquerade-failover`,
+  `checks.ha-log-stall`) stop the owner's agent. Inside the owner they time
+  how long until both VIPs are gone. They also assert that the standby takes
+  over and keeps the VIPs for 3 s.
 
 ### Updates and boot trust
 

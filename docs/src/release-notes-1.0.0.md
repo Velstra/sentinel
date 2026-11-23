@@ -131,6 +131,16 @@ configuration on the old image and stage the update again.
   so one fault cost two handovers (3.95 s of outage). The hold is fixed in 1.0 and cannot be configured. The witness
   enforces it, so a pair gets it once its witness runs 1.0, whatever version
   the members run. Two-node mode (no witness) is unchanged.
+- **A takeover no longer drops packets on the new owner:** every VRRP virtual
+  address now counts as a local destination on both members, whether or not
+  the member holds it. So taking the VIPs no longer rewrites the rule set with
+  the configuration gate closed, which dropped 1 to 6 forwarded packets. A VIP
+  whose prefix length the interface does not already carry (a `/32` VIP, or
+  one outside its subnets) still takes the rewrite.
+- **VIPs follow the lease:** with a lease, a member renews it only while its
+  data-plane agent reports fresh (100 ms) and eligible. It gives up its VIPs
+  when the lease ends, at most about 0.45 s after the agent stops. One late
+  report no longer withdraws them.
 
 ### Credentials and management
 
