@@ -373,6 +373,11 @@ term; the commit still applies here and replicates. If the role cannot be read
 before the commit, the warning says so instead. Check the member role and
 pending synchronization state before changing policy.
 
+A commit on the owner that changes the firewall policy starts a new authority
+term: the witness grants the owner a new term for the new policy and the owner
+announces its VIPs again (gratuitous ARP and neighbour advertisements). This is
+expected and does not move ownership.
+
 ## Regression entry points
 
 ```sh
