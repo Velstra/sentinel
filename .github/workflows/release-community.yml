@@ -25,6 +25,8 @@ concurrency:
 env:
   # Explicit per-transfer cap; leave unset to prevent large artifact storage.
   RELEASE_ARTIFACT_BYTE_BUDGET: ${{ vars.RELEASE_ARTIFACT_BYTE_BUDGET || '0' }}
+  # Opt-in single-operator approvals (docs/releases.md); only exactly `true` enables it.
+  RELEASE_SINGLE_OPERATOR: ${{ vars.RELEASE_SINGLE_OPERATOR || 'false' }}
 
 jobs:
   plan:
