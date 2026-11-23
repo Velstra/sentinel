@@ -261,6 +261,8 @@ pkgs.testers.runNixOSTest {
         assert answered >= 2 * 6144, f"only {answered} spoofed SYNs reached the proxy"
         after = entries("FW_FLOWS")
         print(f"FW_FLOWS holds {before} entries before the SYN flood, {after} after it")
+        # Without the fix the flood fills the table (6,000 entries and more).
+        assert after <= before + 100, f"the SYN flood created {after - before} FW_FLOWS entries"
         # Two sweep rounds and the grace, then the idle connection speaks.
         fw.sleep(8)
         speaks("/tmp/flooded")
