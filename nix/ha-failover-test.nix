@@ -637,8 +637,31 @@ in pkgs.testers.runNixOSTest {
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     wait_forwarding("witness outage: the master owns again",time.monotonic(),handover_bound)
     # SIGSTOP the data-plane userspace: the independent guard must still expire.
-    master.succeed("systemctl kill --kill-who=main --signal=SIGSTOP velstra.service")
+    # Wren then stops renewing (the agent's report goes stale) and drops the
+    # VIPs when the lease it last renewed ends: never earlier on a single late
+    # report, never later than HA_STALLED_AGENT_RELEASE_MAX. Stopped and timed
+    # from inside the owner; the backup must take over without a flap.
+    stall_watch = "\n".join([
+        "import json,os,signal,subprocess,time",
+        "def held():",
+        "    v4=subprocess.run(['${pkgs.iproute2}/bin/ip','-o','-4','addr','show'],capture_output=True,text=True).stdout",
+        "    return '10.1.0.100/' in v4 or '10.2.0.100/' in v4",
+        "pid=int(subprocess.check_output(['systemctl','show','-p','MainPID','--value','velstra.service']).strip())",
+        "assert held(), 'the owner holds no VIP before the stop'",
+        "start=time.monotonic()",
+        "os.kill(pid, signal.SIGSTOP)",
+        "while held() and time.monotonic()-start<5:",
+        "    time.sleep(0.005)",
+        "open('/tmp/stall-release.json','w').write(json.dumps({'released': not held(), 'after_s': round(time.monotonic()-start,3)}))",
+    ])
+    vip_steady_start(backup)
+    master.succeed("rm -f /tmp/stall-release.json; echo "+base64.b64encode(stall_watch.encode()).decode()+" | base64 -d > /tmp/stall_watch.py")
+    master.succeed("${pkgs.python3}/bin/python3 /tmp/stall_watch.py")
+    stall=json.loads(master.succeed("cat /tmp/stall-release.json"))
+    print(f"velstra SIGSTOP on the owner: VIPs released {stall}, bound {ha_bound.HA_STALLED_AGENT_RELEASE_MAX:.3f}s")
+    assert stall["released"] and stall["after_s"] <= ha_bound.HA_STALLED_AGENT_RELEASE_MAX, ("a stalled agent's owner kept its VIPs past the lease", stall)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
+    vip_steady_check(backup,"velstra SIGSTOP on the owner")
     master.succeed("systemctl kill --kill-who=main --signal=SIGCONT velstra.service")
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
     # The preemption is a handover with the same bound as any other: a

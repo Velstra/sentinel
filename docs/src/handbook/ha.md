@@ -266,6 +266,14 @@ These cases are exercised by `checks.ha-witness-failover`:
   member restarts empty, imports the new owner's state and rejoins.
 - **Routing daemon crash** (`wren` killed): the lease lapses and the standby
   takes over the same way.
+- **Data-plane agent stalled or ineligible** (`velstra` stopped or wedged, or
+  reporting itself not ready): `wren` renews its lease only while the agent's
+  report is fresh (100 ms) and eligible, so it stops renewing, and the member
+  gives up its VIPs when that lease ends: at most 100 ms plus one lease
+  (250 ms) after the agent's last fresh report. The data plane does not wait
+  for that. An exited agent is fenced at once, an ineligible one closes its own
+  kernel deadline, and a wedged one stops extending it. One late report does
+  not move the VIPs; only the lease does.
 - **Failback** (`preempt = true` on the higher-priority member): a member that
   recovers takes ownership back only after the new owner has held it for
   10 s. Expect the VIPs to move back about 10 s after a failover, not at once.
