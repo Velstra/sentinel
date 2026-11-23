@@ -430,10 +430,13 @@ in pkgs.testers.runNixOSTest {
     backup.succeed("ip -6 -o address show eth2 | grep fd42:2::100 | grep -v tentative")
     # The new owner's unsolicited neighbour advertisement moves the client's
     # entry for the VIP; until it has, a ping still goes to the old owner's
-    # MAC. Wait for the move (it is what is under test), then ping once.
+    # MAC. Wait for the move (it is what is under test), then for the new
+    # owner to answer. A single ping right after the move failed once, with
+    # the entry already on the new MAC: it is a handover, so it gets the
+    # handover bound, not one 2 s probe.
     new_mac=backup.succeed("cat /sys/class/net/eth2/address").strip()
     client.wait_until_succeeds(f"ip -6 neigh show fd42:2::100 | grep -q {new_mac}",timeout=3)
-    client.succeed("ping -6 -c1 -W2 fd42:2::100")
+    client.wait_until_succeeds("ping -6 -c1 -W1 fd42:2::100",timeout=int(handover_bound))
     ''}
     time.sleep(2)
     after=json.loads(client.succeed("cat /tmp/stream-status"))
