@@ -430,10 +430,13 @@ in pkgs.testers.runNixOSTest {
     backup.succeed("ip -6 -o address show eth2 | grep fd42:2::100 | grep -v tentative")
     # The new owner's unsolicited neighbour advertisement moves the client's
     # entry for the VIP; until it has, a ping still goes to the old owner's
-    # MAC. Wait for the move (it is what is under test), then ping once.
+    # MAC. Wait for the move (it is what is under test), then for the new
+    # owner to answer. A single ping right after the move failed once, with
+    # the entry already on the new MAC: it is a handover, so it gets the
+    # handover bound, not one 2 s probe.
     new_mac=backup.succeed("cat /sys/class/net/eth2/address").strip()
     client.wait_until_succeeds(f"ip -6 neigh show fd42:2::100 | grep -q {new_mac}",timeout=3)
-    client.succeed("ping -6 -c1 -W2 fd42:2::100")
+    client.wait_until_succeeds("ping -6 -c1 -W1 fd42:2::100",timeout=int(handover_bound))
     ''}
     time.sleep(2)
     after=json.loads(client.succeed("cat /tmp/stream-status"))
@@ -509,14 +512,51 @@ in pkgs.testers.runNixOSTest {
     def owner_now(node):
         # This member holds a live grant and its VIPs (Wren's role file).
         return python_command('import json,time; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==r["node"] and r["deadline_ns"]>time.clock_gettime_ns(time.CLOCK_BOOTTIME) and r["vips_ready"], r')
+    # The VIPs a takeover adds change the new owner's local address set (the
+    # fixture has `to firewall` rules), which the agent applies with its
+    # datapath gate closed. It must have applied them by the time it reports
+    # forwarding: a rewrite after that drops whatever arrives during it, and a
+    # dropped WireGuard handshake waits 5 s for its retry. Watch from inside
+    # the new owner, at the instant its agent acknowledges the new term.
+    import base64
+    vip_local_watch = "\n".join([
+        "import json,struct,subprocess,time",
+        "def agent():",
+        "    return json.load(open('/run/velstra/ha/agent.json'))",
+        "start=agent()['forwarding_term']",
+        "open('/tmp/vip-local.ready','w').write(str(start))",
+        "want=list(struct.pack('=I',int(open('/sys/class/net/eth1/ifindex').read())))+[10,1,0,100]",
+        "end=time.time()+20",
+        "term=start",
+        "while time.time()<end:",
+        "    try:",
+        "        term=agent()['forwarding_term']",
+        "    except (OSError,ValueError):",
+        "        continue",
+        "    if term and term!=start:",
+        "        break",
+        "    time.sleep(0.002)",
+        "rows=json.loads(subprocess.check_output(['${pkgs.bpftools}/bin/bpftool','-j','map','dump','name','LOCAL_EGRESS_AD']))",
+        "present=want in [[int(b,16) for b in r['key']] for r in rows]",
+        "open('/tmp/vip-local.json','w').write(json.dumps({'start':start,'term':term,'present':present}))",
+    ])
     for service in ("velstra.service","wren.service"):
         # The fault is meant to hit a pair with a warm standby: after the
         # previous preemption the standby needs the new owner's complete
         # snapshot before it may take over.
         backup.wait_until_succeeds(agent_caught_up(backup),timeout=20)
+        backup.succeed("rm -f /tmp/vip-local.json /tmp/vip-local.err /tmp/vip-local.ready; echo "+base64.b64encode(vip_local_watch.encode()).decode()+" | base64 -d > /tmp/vip_local.py")
+        backup.succeed("systemd-run --collect --unit=vip-local-$(date +%s%N) -p StandardError=file:/tmp/vip-local.err ${pkgs.python3}/bin/python3 /tmp/vip_local.py")
+        # The watcher must have read the standby's term before the fault.
+        backup.wait_until_succeeds("test -e /tmp/vip-local.ready",timeout=10)
         started=time.monotonic()
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
         wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
+        backup.wait_until_succeeds("test -s /tmp/vip-local.json || test -s /tmp/vip-local.err",timeout=25)
+        print(backup.execute("cat /tmp/vip-local.err 2>/dev/null")[1])
+        vip_local=json.loads(backup.succeed("cat /tmp/vip-local.json"))
+        print(f"{service} SIGKILL on the owner: VIP in the new owner's local set when it acknowledged forwarding: {vip_local}")
+        assert vip_local["term"]!=vip_local["start"] and vip_local["present"], (service, vip_local)
         backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
         check_stream(service+" abrupt exit")
         # Judge the return by the authority the master holds, not by its
