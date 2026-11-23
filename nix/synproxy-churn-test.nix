@@ -233,8 +233,12 @@ pkgs.testers.runNixOSTest {
 
     def churn():
         before = counter("synproxy_admitted")
-        client.succeed("python3 ${banner} churn 10.2.0.2 2525 ${toString churn} 40", timeout=600)
-        client.succeed("python3 ${banner} churn 10.1.0.1 8025 150 40", timeout=600)
+        # Distinct source ports for the two services: a splice is keyed by the
+        # port the server uses (2525 for both), so one client port reused
+        # across them inside the sweep window is the documented limitation,
+        # not what this measures.
+        client.succeed("python3 ${banner} churn 10.2.0.2 2525 ${toString churn} 40 20000", timeout=600)
+        client.succeed("python3 ${banner} churn 10.1.0.1 8025 150 40 30000", timeout=600)
         admitted = counter("synproxy_admitted") - before
         assert admitted >= ${toString churn} + 150, f"only {admitted} churn connections were proxied"
         print(f"SYN_FLOWS holds {entries('SYN_FLOWS')} records after {admitted} short connections")

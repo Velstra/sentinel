@@ -112,14 +112,20 @@ def hold(host, port, marker):
         raise
 
 
-def churn(host, port, count, per_second):
-    """`count` short connections at about `per_second`: every other one ends
-    normally (QUIT, the server closes, FIN both ways), the rest with a reset."""
+def churn(host, port, count, per_second, first_port):
+    """`count` short connections at about `per_second`, from source ports
+    `first_port` upward, each used once: every other one ends normally (QUIT,
+    the server closes, FIN both ways), the rest with a reset."""
     import time
 
     for n in range(count):
         started = time.monotonic()
-        with socket.create_connection((host, port), timeout=8) as connection:
+        connection = socket.socket()
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        connection.bind(("0.0.0.0", first_port + n))
+        connection.settimeout(8)
+        connection.connect((host, port))
+        with connection:
             connection.settimeout(8)
             banner = read_line(connection)
             assert banner == BANNER, f"connection {n}: banner {banner!r}"
@@ -148,8 +154,8 @@ if __name__ == "__main__":
     elif sys.argv[1] == "hold":
         hold(sys.argv[2], int(sys.argv[3]), sys.argv[4])
     elif sys.argv[1] == "churn":
-        churn(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5]))
+        churn(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5]), int(sys.argv[6]))
     elif sys.argv[1] == "reuse":
         reuse(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5]))
     else:
-        sys.exit(f"usage: {sys.argv[0]} serve PORT... | probe HOST PORT | reuse HOST PORT LPORT PAUSE | hold HOST PORT MARKER | churn HOST PORT N RATE")
+        sys.exit(f"usage: {sys.argv[0]} serve PORT... | probe HOST PORT | reuse HOST PORT LPORT PAUSE | hold HOST PORT MARKER | churn HOST PORT N RATE FIRST_PORT")
