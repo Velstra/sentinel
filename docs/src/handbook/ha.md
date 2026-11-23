@@ -378,6 +378,12 @@ term: the witness grants the owner a new term for the new policy and the owner
 announces its VIPs again (gratuitous ARP and neighbour advertisements). This is
 expected and does not move ownership.
 
+Such a commit also closes the member's configuration gate for the length of the
+data-plane transaction: about 20–30 ms for up to 4,500 changed rule entries in
+our tests. While the gate is closed every attached link drops traffic, the HA
+sync link included, so an owner commit costs a few packets and about one witness
+renewal; the owner keeps its lease.
+
 ## Regression entry points
 
 ```sh

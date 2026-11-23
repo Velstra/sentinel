@@ -199,6 +199,12 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
 - **Rule capacity.** At most 8,192 rule-trie entries per address family; a
   larger rule set is refused at `config check` and `commit` with the capacity
   named, and a saved file over the limit boots the last-known-good configuration.
+- **A policy commit pauses the data plane briefly.** A commit that changes
+  the data-plane policy closes the configuration gate for the transaction:
+  about 20–30 ms for up to 4,500 changed rule entries in our tests. Every
+  attached link drops traffic meanwhile, the HA sync link included, so on an
+  HA owner the commit also costs about one witness renewal; the owner keeps its
+  lease ([HA handbook](handbook/ha.md)).
 - **No bulk removal of the global blocklist.** `delete firewall global block`
   takes one entry; there is no command to clear a large blocklist at once in 1.0.
   Remove entries in one batch session and commit once.
