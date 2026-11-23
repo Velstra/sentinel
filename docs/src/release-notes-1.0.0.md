@@ -69,6 +69,7 @@ stated per item.
 | Control characters (tab, CR, NEL, U+2028/2029) in any string, and malformed values in fields that reach daemon configuration files: SSH log level, DHCP host-name, bond hash policy and LACP rate, dynamic-DNS login and password, NTP `allow-from`, PPPoE subscribers and client password, update subscription key, sysctl keys, DNS TXT records (CTRL-02, -03, -08, -13, -16 to -18, -29) | yes | the setting or service is switched off with an error line; the rest boots |
 | A config-sync secret shorter than 32 bytes or guessable (CTRL-01) | every change is refused until it is rotated | boots and keeps pairing; warns at every apply |
 | A `drop`/`reject` rule with a non-local `to` zone, when the rule, a zone or an interface changes | yes | unchanged rules still load |
+| `syn-protect` on a zone that is not stateful (`set firewall global stateful false`, or a zone's own `stateful false`): a proxied connection lives exactly as long as its connection state, and a stateless zone keeps none | yes | boots the last-known-good or management-only configuration and says so |
 
 **If the saved file fails validation at the first boot of 1.0.0**, there is no
 last-known-good file yet (1.0.0 records it after its first healthy boot), so
@@ -163,12 +164,11 @@ pinned tables (pinned state never survives the upgrade's reboot either).
 ## Known limitations
 
 - **SYN proxy and source-port reuse.** The proxy's record of a connection is
-  removed by the agent once no live connection state claims it, two passes of the
-  state tables after that state is gone (seconds on a small box, minutes on one
-  sized for millions of connections). A client that reconnects from the same
-  address and port inside that window, to a protected service whose server uses
-  the same port, is not admitted until it retries after it
-  ([firewall handbook](handbook/firewall.md)).
+  removed by the agent once no live connection state claims it, within about 30 s
+  of that state ending (at once after a reset, after the closing timeout after a
+  normal close). A client that reconnects from the same address and port inside
+  that window, to a protected service whose server uses the same port, is not
+  admitted until it retries after it ([firewall handbook](handbook/firewall.md)).
 
 - **IPv6 is not SYN-proxied in 1.0.** The SYN proxy protects IPv4 only (DP-35).
   Where a protected port is reachable over IPv6, `config check` names the zones.
