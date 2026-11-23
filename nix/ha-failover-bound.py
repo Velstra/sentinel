@@ -54,6 +54,20 @@ HA_WIREGUARD_EXTRA = 5.0 + 1.0 / 3.0
 # A driver-side observation (polling a VM over the test driver's channel)
 # trails the client capture by 0.15-0.25 s (measured).
 HA_DRIVER_LATENCY_MAX = 0.3
+# A stalled data-plane agent on the owner (SIGSTOP, a wedged process). Wren's
+# request carries the agent's report only while it is fresh, so it stops
+# renewing once the last report is FRESH old; the VIPs go when the lease it
+# last renewed ends, at the decision after the exchange in flight, on its next
+# poll. Measured inside the owner from the stop to both VIPs gone; the watch
+# itself polls every 5 ms and runs `ip`.
+HA_AGENT_FRESH = 0.1      # Wren FRESH_NS
+HA_LEASE = 0.25           # Wren TTL_MS, the default lease
+HA_WITNESS_IO = 0.08      # Wren IO_MS, one exchange
+HA_COORDINATOR_POLL = 0.025  # Wren POLL_MS
+HA_WATCH_MARGIN = 0.05
+HA_STALLED_AGENT_RELEASE_MAX = (
+    HA_AGENT_FRESH + HA_LEASE + HA_WITNESS_IO + HA_COORDINATOR_POLL + HA_WATCH_MARGIN
+)
 # A two-node pair has no witness: the standby takes over only once it has
 # not heard its peer for the configured peer timeout (1000 ms in the checks).
 HA_TWO_NODE_PEER_TIMEOUT = 1.0

@@ -18,6 +18,10 @@ unknown keys, so this rewrites exactly the constructs that postdate it:
 * ``[[synproxy]]`` entries scoped by ``policy`` (DP-31) lose the key and are
   folded into one entry per port: the older agent proxies a port on every
   zone, a superset of the zones written, and refuses a port listed twice.
+* the top-level ``virtual_addresses`` list (VRRP/HA VIPs counted as local
+  destinations whether held or not) is dropped: the older agent then counts a
+  VIP as local only while it holds it, and closes its configuration gate when
+  a takeover adds one, which is what it always did.
 
 Anything else the older agent rejects still crash-loops it and fails the
 check: the list of rewrites is explicit on purpose.
@@ -33,6 +37,7 @@ import tomllib
 
 DST_LOCAL = "dst-local = true"
 INGRESS_ONLY = "blocklist_ingress_only = true"
+VIRTUAL_ADDRESSES = "virtual_addresses"
 
 
 def host_addresses(ip_json):
@@ -86,10 +91,27 @@ def unscoped_synproxy(lines, seen_ports):
     return [l for l in lines if not l.strip().startswith("policy =")]
 
 
+def without_virtual_addresses(lines):
+    """The top-level block without its ``virtual_addresses`` key, whether the
+    array is written on one line or spread over several."""
+    out, inside = [], False
+    for line in lines:
+        if not inside and line.strip().startswith(VIRTUAL_ADDRESSES):
+            inside = "]" not in line
+            continue
+        if inside:
+            inside = "]" not in line
+            continue
+        out.append(line)
+    return out
+
+
 def rewrite(text, names, addresses):
     kept, stripped, expanded, synproxy_ports = [], [], 0, set()
     for header, lines in blocks(text):
         lines = [l for l in lines if l.strip() != INGRESS_ONLY]
+        if header is None:
+            lines = without_virtual_addresses(lines)
         if header is not None and not header.startswith("[["):
             if header.strip("[]").strip() in names:
                 stripped.append(header)
@@ -106,6 +128,7 @@ def rewrite(text, names, addresses):
     parsed = tomllib.loads(out)
     assert not names & parsed.keys(), f"named tables survived the filter: {names & parsed.keys()}"
     assert "blocklist_ingress_only" not in parsed, "blocklist_ingress_only survived the filter"
+    assert "virtual_addresses" not in parsed, "virtual_addresses survived the filter"
     for policy in parsed.get("policy", []):
         assert "blocklist_ingress_only" not in policy, f"survived the filter: {policy}"
         for rule in policy.get("port_rule", []):

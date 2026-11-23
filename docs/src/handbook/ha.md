@@ -266,6 +266,25 @@ These cases are exercised by `checks.ha-witness-failover`:
   member restarts empty, imports the new owner's state and rejoins.
 - **Routing daemon crash** (`wren` killed): the lease lapses and the standby
   takes over the same way.
+- **Data-plane agent stalled or ineligible** (`velstra` stopped or wedged, or
+  reporting itself not ready): `wren` renews its lease only while the agent's
+  report is fresh (100 ms) and eligible, so it stops renewing, and the member
+  gives up its VIPs when that lease ends: at most 100 ms plus one lease
+  (250 ms) after the agent's last fresh report. The data plane does not wait
+  for that. An exited agent is fenced at once, an ineligible one closes its own
+  kernel deadline, and a wedged one stops extending it. One late report does
+  not move the VIPs; only the lease does.
+- **A takeover does not pause the new owner's data plane.** Every VRRP
+  virtual address is a local destination (rules `to firewall`) on both
+  members, held or not. So taking the VIPs changes no rule: the new owner only
+  records the new address for its own sockets, without closing its
+  configuration gate. While that gate is closed, which a commit still does,
+  every attached link drops everything, the member's own witness exchanges
+  included. This holds in witness, two-node and plain VRRP mode alike. One
+  exception: a virtual address whose prefix length is not one the interface
+  already carries (a `/32` VIP, or one outside the interface's subnets) still
+  takes the full rewrite at a takeover, so the new owner's data plane pauses
+  for the length of that rewrite.
 - **Failback** (`preempt = true` on the higher-priority member): a member that
   recovers takes ownership back only after the new owner has held it for
   10 s. Expect the VIPs to move back about 10 s after a failover, not at once.

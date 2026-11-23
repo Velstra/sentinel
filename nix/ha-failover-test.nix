@@ -62,7 +62,7 @@ let
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance number priority);
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
-    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
+    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug,velstra::firewall=info";
   };
   # checks.ha-log-stall: on the master, wren's and the agent's stdout and
   # stderr go to FIFOs that a holder keeps open. Until /run/log-stall/stop
@@ -273,7 +273,7 @@ in pkgs.testers.runNixOSTest {
 
   };
   testScript = if logStall then logStallScript else ''
-    import time, json, shlex
+    import base64, time, json, shlex
     import importlib.util
     # The one failover bound every HA check uses; formula and measurements
     # are in nix/ha-failover-bound.py.
@@ -332,6 +332,58 @@ in pkgs.testers.runNixOSTest {
         # Eligible again, holding the cluster's current generation: what the
         # witness needs to hand this member authority at the next failure.
         return python_command('import json; a=json.load(open("/run/velstra/ha/agent.json")); r=json.load(open("/run/velstra/ha/role.json")); assert a["eligible"] and a["ready_term"]==r["authority"]["term"]>0 and a["policy"]==r["authority"]["policy"], (a,r["authority"])')
+    # A new owner keeps its VIPs once it has them. Watched from inside the
+    # member every 10 ms, since a withdrawal and re-promotion can last well
+    # under the test driver's own command latency.
+    vip_steady_watch = "\n".join([
+        "import json,subprocess,time",
+        "def held():",
+        "    v4=subprocess.run(['${pkgs.iproute2}/bin/ip','-o','-4','addr','show'],capture_output=True,text=True).stdout",
+        "    return '10.1.0.100/' in v4 and '10.2.0.100/' in v4",
+        "open('/tmp/vip-steady.ready','w').write('1')",
+        "end=time.time()+20",
+        "appeared=False",
+        "while time.time()<end:",
+        "    if held():",
+        "        appeared=True",
+        "        break",
+        "    time.sleep(0.005)",
+        "gaps=[]; start=time.monotonic()",
+        "while appeared and time.monotonic()-start<VIP_STEADY_S:",
+        "    if not held():",
+        "        gaps.append(round(time.monotonic()-start,3))",
+        "    time.sleep(0.01)",
+        "open('/tmp/vip-steady.json','w').write(json.dumps({'appeared':appeared,'gaps':gaps[:20]}))",
+    ])
+    vip_steady_s = 3
+    # A takeover must never close the new owner's configuration gate: the
+    # configured VIPs are local destinations on both members, so adding one
+    # to a link changes no rule (only LOCAL_EGRESS_ADDRS grows). While the
+    # gate is closed every attached link drops everything, the node's own
+    # witness exchanges included. The agent logs every closure.
+    def gate_closures(node):
+        return int(node.succeed("journalctl -u velstra -o cat --no-pager | grep -c 'configuration gate closed' || true").strip())
+    def assert_gate_stayed_open(node, label, before):
+        after = gate_closures(node)
+        if after != before:
+            print(node.execute("journalctl -u velstra -o short-monotonic --no-pager | grep 'configuration gate closed' | tail -n 5")[1])
+        assert after == before, (label, "the takeover closed the new owner's configuration gate", before, after)
+        print(f"{label}: the new owner's configuration gate stayed open ({after} closures before and after)")
+    gate_baseline = {}
+    def vip_steady_start(node):
+        gate_baseline[node.name] = gate_closures(node)
+        script = vip_steady_watch.replace("VIP_STEADY_S", str(vip_steady_s))
+        node.succeed("rm -f /tmp/vip-steady.json /tmp/vip-steady.err /tmp/vip-steady.ready; echo "+base64.b64encode(script.encode()).decode()+" | base64 -d > /tmp/vip_steady.py")
+        node.succeed("systemd-run --collect --unit=vip-steady-$(date +%s%N) -p StandardError=file:/tmp/vip-steady.err ${pkgs.python3}/bin/python3 /tmp/vip_steady.py")
+        node.wait_until_succeeds("test -e /tmp/vip-steady.ready",timeout=10)
+    def vip_steady_check(node, label):
+        node.wait_until_succeeds("test -s /tmp/vip-steady.json || test -s /tmp/vip-steady.err",timeout=30)
+        print(node.execute("cat /tmp/vip-steady.err 2>/dev/null")[1])
+        steady=json.loads(node.succeed("cat /tmp/vip-steady.json"))
+        print(f"{label}: the new owner's VIPs over {vip_steady_s}s after promotion: {steady}")
+        assert steady["appeared"] and not steady["gaps"], (label, "the new owner dropped its VIPs after promotion", steady)
+        # The watcher ran from before the fault to 3 s after promotion.
+        assert_gate_stayed_open(node, label, gate_baseline[node.name])
     start_all()
     ${pkgs.lib.optionalString leased ''
     witness.wait_for_unit("sentinel-witness.service")
@@ -407,6 +459,10 @@ in pkgs.testers.runNixOSTest {
     time.sleep(2)
     before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
     # No priority-zero advert, service shutdown or graceful address removal.
+    ${pkgs.lib.optionalString leased ''
+    vip_steady_start(backup)
+    ''}
+    ${pkgs.lib.optionalString (!leased) "gate_before=gate_closures(backup)"}
     anchor=ha_bound.ha_fault_anchor(client)
     started=time.monotonic()
     ${if leased then ''
@@ -422,6 +478,14 @@ in pkgs.testers.runNixOSTest {
         assert time.monotonic()-started < ha_bound.HA_LEASE_RUNOUT_MAX+ha_bound.HA_TAKEOVER_MAX+ha_bound.HA_DRIVER_LATENCY_MAX, "VIP promotion exceeded the takeover bound"
         time.sleep(0.01)
     elapsed=time.monotonic()-started
+    ${if leased then ''
+    vip_steady_check(backup,"owner wren SIGSTOP")
+    '' else ''
+    # From just before the fault to 3 s after promotion, as the leased
+    # variants judge it inside vip_steady_check.
+    time.sleep(vip_steady_s)
+    assert_gate_stayed_open(backup,"owner crash",gate_before)
+    ''}
     backup.succeed("ip -o address show eth1 | grep -q 10.1.0.100")
     ${pkgs.lib.optionalString leased ''
     backup.wait_until_succeeds(python_command('import json; frames=[json.loads(line[5:]) for line in open("/tmp/live-management") if line.startswith("data:")]; assert any(frame.get("ha",{}).get("role")=="Master" for frame in frames if frame.get("ha"))'),timeout=15)
@@ -518,7 +582,6 @@ in pkgs.testers.runNixOSTest {
     # forwarding: a rewrite after that drops whatever arrives during it, and a
     # dropped WireGuard handshake waits 5 s for its retry. Watch from inside
     # the new owner, at the instant its agent acknowledges the new term.
-    import base64
     vip_local_watch = "\n".join([
         "import json,struct,subprocess,time",
         "def agent():",
@@ -549,9 +612,11 @@ in pkgs.testers.runNixOSTest {
         backup.succeed("systemd-run --collect --unit=vip-local-$(date +%s%N) -p StandardError=file:/tmp/vip-local.err ${pkgs.python3}/bin/python3 /tmp/vip_local.py")
         # The watcher must have read the standby's term before the fault.
         backup.wait_until_succeeds("test -e /tmp/vip-local.ready",timeout=10)
+        vip_steady_start(backup)
         started=time.monotonic()
         master.succeed(f"systemctl kill --kill-who=all --signal=SIGKILL {service}")
         wait_forwarding(service+" SIGKILL on the owner",started,handover_bound)
+        vip_steady_check(backup,service+" SIGKILL on the owner")
         backup.wait_until_succeeds("test -s /tmp/vip-local.json || test -s /tmp/vip-local.err",timeout=25)
         print(backup.execute("cat /tmp/vip-local.err 2>/dev/null")[1])
         vip_local=json.loads(backup.succeed("cat /tmp/vip-local.json"))
@@ -595,8 +660,31 @@ in pkgs.testers.runNixOSTest {
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     wait_forwarding("witness outage: the master owns again",time.monotonic(),handover_bound)
     # SIGSTOP the data-plane userspace: the independent guard must still expire.
-    master.succeed("systemctl kill --kill-who=main --signal=SIGSTOP velstra.service")
+    # Wren then stops renewing (the agent's report goes stale) and drops the
+    # VIPs when the lease it last renewed ends: never earlier on a single late
+    # report, never later than HA_STALLED_AGENT_RELEASE_MAX. Stopped and timed
+    # from inside the owner; the backup must take over without a flap.
+    stall_watch = "\n".join([
+        "import json,os,signal,subprocess,time",
+        "def held():",
+        "    v4=subprocess.run(['${pkgs.iproute2}/bin/ip','-o','-4','addr','show'],capture_output=True,text=True).stdout",
+        "    return '10.1.0.100/' in v4 or '10.2.0.100/' in v4",
+        "pid=int(subprocess.check_output(['systemctl','show','-p','MainPID','--value','velstra.service']).strip())",
+        "assert held(), 'the owner holds no VIP before the stop'",
+        "start=time.monotonic()",
+        "os.kill(pid, signal.SIGSTOP)",
+        "while held() and time.monotonic()-start<5:",
+        "    time.sleep(0.005)",
+        "open('/tmp/stall-release.json','w').write(json.dumps({'released': not held(), 'after_s': round(time.monotonic()-start,3)}))",
+    ])
+    vip_steady_start(backup)
+    master.succeed("rm -f /tmp/stall-release.json; echo "+base64.b64encode(stall_watch.encode()).decode()+" | base64 -d > /tmp/stall_watch.py")
+    master.succeed("${pkgs.python3}/bin/python3 /tmp/stall_watch.py")
+    stall=json.loads(master.succeed("cat /tmp/stall-release.json"))
+    print(f"velstra SIGSTOP on the owner: VIPs released {stall}, bound {ha_bound.HA_STALLED_AGENT_RELEASE_MAX:.3f}s")
+    assert stall["released"] and stall["after_s"] <= ha_bound.HA_STALLED_AGENT_RELEASE_MAX, ("a stalled agent's owner kept its VIPs past the lease", stall)
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
+    vip_steady_check(backup,"velstra SIGSTOP on the owner")
     master.succeed("systemctl kill --kill-who=main --signal=SIGCONT velstra.service")
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=20)
     # The preemption is a handover with the same bound as any other: a
