@@ -369,9 +369,22 @@ in pkgs.testers.runNixOSTest {
             print(node.execute("journalctl -u velstra -o short-monotonic --no-pager | grep 'configuration gate closed' | tail -n 5")[1])
         assert after == before, (label, "the takeover closed the new owner's configuration gate", before, after)
         print(f"{label}: the new owner's configuration gate stayed open ({after} closures before and after)")
+    # A member that just gave its VIPs back (a preemption at the end of the
+    # previous stage) rewrites on its next host poll, up to 2 s later: wait
+    # until no closure is pending, or that release would be counted against
+    # the next takeover.
+    def gate_settled(node):
+        last = gate_closures(node)
+        for _ in range(4):
+            time.sleep(2.5)
+            now = gate_closures(node)
+            if now == last:
+                return now
+            last = now
+        raise AssertionError((node.name, "configuration gate closures did not settle", last))
     gate_baseline = {}
     def vip_steady_start(node):
-        gate_baseline[node.name] = gate_closures(node)
+        gate_baseline[node.name] = gate_settled(node)
         script = vip_steady_watch.replace("VIP_STEADY_S", str(vip_steady_s))
         node.succeed("rm -f /tmp/vip-steady.json /tmp/vip-steady.err /tmp/vip-steady.ready; echo "+base64.b64encode(script.encode()).decode()+" | base64 -d > /tmp/vip_steady.py")
         node.succeed("systemd-run --collect --unit=vip-steady-$(date +%s%N) -p StandardError=file:/tmp/vip-steady.err ${pkgs.python3}/bin/python3 /tmp/vip_steady.py")
