@@ -286,6 +286,13 @@ set firewall syn-protect 8080 mss 1400
 delete firewall syn-protect 443
 ```
 
+A protected port can sit behind a port-forward, including one that changes the port (`port 8080 to 192.0.2.10:80` with `syn-protect 8080`), and servers that speak first (SMTP, FTP, POP, IMAP, SSH) work through the proxy. The proxy keeps one record per proxied connection, and the agent removes it once no live connection state (firewall or NAT) claims it any more, checked over two complete passes of the state tables; idle connections keep theirs however many others come and go.
+
+Two consequences of that lifetime:
+
+- **A client reusing a source port too soon.** After a connection ends, its record stays until two passes after its connection state is gone: at once after a reset, after the closing timeout (`set firewall global conntrack tcp-closing`, 30 s by default) after a normal close. One pass takes about one second per 65,536 entries of the firewall state table (`sentinel show firewall capacity` lists its size), so a few seconds on a small box and a few minutes on one sized for millions of connections. A new connection from the same client address and port to the same protected service inside that window is not admitted, and its own attempts keep the old record claimed while they last; the client's next attempt after that succeeds.
+- **Half-closed connections after an HA failover.** A proxied connection that one side had half-closed (sent its FIN while the other kept sending) is treated as closing with the ordinary closing timeout instead of the longer half-close allowance, because the FIN history does not replicate. If it then idles longer than that, the new active member ends it. Fully open connections are not affected.
+
 ## Application-layer gateways: there are none
 
 The dataplane does not rewrite protocol payloads through application-layer gateways. Plan explicit application ports, passive endpoints or NAT traversal as appropriate.

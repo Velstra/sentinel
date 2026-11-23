@@ -155,9 +155,19 @@ Sentinel now asks the data plane to persist its hooks and state tables
 keeps enforcing and keeps NAT sessions, and zoned links are no longer held down
 while it restarts. Connection-state tables are sized from the box's memory and
 hold at least 16,384 connections, so a larger box
-uses more kernel memory for them than before (DP-06).
+uses more kernel memory for them than before (DP-06). The SYN proxy's table is
+sized for one record per connection, so the tables' layout changed: the **first
+agent restart after the upgrade starts with fresh state** instead of adopting the
+pinned tables (pinned state never survives the upgrade's reboot either).
 
 ## Known limitations
+
+- **SYN proxy and source-port reuse.** The proxy's record of a connection is
+  removed by the agent once no live connection state claims it, two passes of the
+  state tables after that state is gone (seconds on a small box, minutes on one
+  sized for millions of connections). A client that reconnects from the same
+  address and port to the same protected service inside that window is not
+  admitted until it retries after it ([firewall handbook](handbook/firewall.md)).
 
 - **IPv6 is not SYN-proxied in 1.0.** The SYN proxy protects IPv4 only (DP-35).
   Where a protected port is reachable over IPv6, `config check` names the zones.
