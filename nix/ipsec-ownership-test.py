@@ -42,9 +42,14 @@ def add(name, subnet="198.19.210.0/24"):
         "psk public-ephemeral-ipsec-failclosed-fixture", "start-action none")]
 
 
-def ready():
+def ready(ipsec=True):
     fw.wait_for_unit("sentinel-boot-late.service")
-    fw.wait_for_unit("strongswan-swanctl.service")
+    if ipsec:
+        fw.wait_for_unit("strongswan-swanctl.service")
+    else:
+        # IPsec is opt-in: a box whose saved configuration has no tunnel must
+        # boot without a factory IKE listener.
+        fw.fail("systemctl is-active --quiet strongswan-swanctl.service")
     assert fw.succeed("readlink -f /run/current-system/sw/bin/sentinel").strip() == "__SENTINEL__"
 
 
@@ -83,7 +88,7 @@ assert saved_hash() == before and table() == foreign
 fw.fail("test -e /run/sentinel/ipsec-guards.json")
 assert table("inet qa_independent_shunt_owner") == independent
 fw.reboot()
-ready()
+ready(ipsec=False)
 fw.fail(NFT + " list table " + TABLE)
 configure(add("qa-site"))
 owned = table()

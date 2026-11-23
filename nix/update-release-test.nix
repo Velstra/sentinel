@@ -3,7 +3,7 @@
 { pkgs, sentinel }:
 let
   publish = pkgs.writeText "publish-version-gate-fixture.py" ''
-    import base64, hashlib, json, os, pathlib, subprocess, sys
+    import base64, hashlib, json, os, pathlib, platform, subprocess, sys, time
     os.umask(0o077)
     root = pathlib.Path('/run/qa-release')
     root.mkdir(mode=0o700, exist_ok=True)
@@ -17,6 +17,17 @@ let
     manifest = {'version':sys.argv[1], 'image':image.name,
                 'sha256':hashlib.sha256(image.read_bytes()).hexdigest(),
                 'product':'velstra-sentinel'}
+    # Signed online metadata carries a freshness policy (scope, sequence, a
+    # lifetime of at most 14 days); an offer without one is refused. Like a
+    # publisher, every publish signs the next sequence: the appliance refuses
+    # a sequence below one it has seen, or reused for other bytes. This keeps
+    # the freshness ledger out of the way of the VERSION gate tested here.
+    counter = root/'sequence'
+    sequence = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(sequence))
+    now = int(time.time())
+    manifest['freshness'] = {'schema':1, 'channel':'default', 'arch':platform.machine(),
+                             'sequence':sequence, 'issued_at':now, 'expires_at':now + 86400}
     body = json.dumps(manifest,separators=(',',':')).encode()
     (root/'manifest.json').write_bytes(body)
     subprocess.run(['${pkgs.openssl}/bin/openssl','pkeyutl','-sign','-rawin','-inkey',str(key),

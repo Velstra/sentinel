@@ -10,6 +10,7 @@ create-missing = false
 
 [output.html]
 additional-css = ["sentinel.css"]
+additional-js = ["mermaid/mermaid.min.js", "mermaid/mermaid-init.js"]
 default-theme = "light"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/Velstra/sentinel"

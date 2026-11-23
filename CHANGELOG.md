@@ -2,12 +2,243 @@
 
 ## [Unreleased]
 
-Nothing below has been released. The 1.0.0 candidate is under remediation after
-the independent release audit of 2026-11-18/19 (run 8b6181), whose verdict was
-No-Go for both editions. No `v1.0.0` tag exists, and none should be cut until
-the audit's blocking findings are closed and requalified.
+## [1.0.0]
 
-### Audit 8b6181 remediation (image, release gates and docs)
+The first release with a stable configuration language. The release date is
+the date of the signed `v1.0.0` tag. It follows 0.4.2 and supersedes the 1.0.0
+candidate of 2026-10-26, which was never released. The independent release
+audit of 2026-11-18/19 (run 8b6181) found blocking issues in both editions;
+every finding cited below was fixed, or is listed as a known limitation in the
+[release notes](docs/src/release-notes-1.0.0.md).
+
+### Upgrade warnings
+
+Read the [release notes](docs/src/release-notes-1.0.0.md) before upgrading.
+
+- **HA pairs are not upgraded hitlessly.** Stable zone identifiers (DP-13) and
+  ingress-only direction-less rules (DP-15) change the shared-policy digest:
+  while the members run different versions the standby is not ready and
+  conntrack sync refuses its sessions, so the switch-over is one outage with
+  connection loss per upgrade, and the first commit afterwards reloads the
+  data plane once with fresh state. Upgrade the standby, fail over to it, then
+  upgrade the old primary; never fail back onto a member that is not yet
+  upgraded, because masqueraded connections a 1.0 member owns do not survive
+  a takeover by a pre-1.0 peer.
+- **IPv4 options:** TCP and UDP whose IPv4 header carries options are dropped
+  on stateful zones (DP-34).
+- **New refusals:** port forwards and load balancers other than
+  `tcp`/`udp`/`tcp_udp` (DP-18), data-plane capacity (DP-17, DP-29, PERF-03),
+  inert or over-qualified proto-less accepts (DP-14), control characters and
+  malformed daemon-bound fields (CTRL-08 and others), weak config-sync secrets
+  (CTRL-01). A saved file that fails validation at the first boot of 1.0.0
+  fails that trial boot, and the update falls back to the previous image.
+- **Changed matching:** a rule without `direction` is ingress-only, and
+  blocklists and GeoIP name sources only, so they no longer stop the inside
+  reaching a listed address (DP-15); `syn-protect` proxies a port only on the
+  zones that admit it (DP-31); IPv4 rules no longer match IPv6 (DP-11);
+  `block-icmp` refuses new inbound ICMP only and never neighbour discovery
+  (DP-10).
+- **Update channels:** signed channel metadata must carry a freshness policy
+  (sequence, at most 14 days of validity); local proofs without a release
+  version need `--allow-downgrade` (CTRL-26). `save` never confirms a pending
+  `commit-confirm`.
+- **Credentials:** the config-sync secret is no longer an API bearer, and the
+  API token file is re-minted if it held the secret (CTRL-01, CTRL-07); config
+  sync no longer carries accounts, AAA, update, SSH or console settings
+  (CTRL-09, CTRL-10); `save` refuses uncommitted edits (CTRL-14).
+
+### Data plane (Fabric)
+
+- Masqueraded TCP no longer freezes about a second into a transfer (DP-02,
+  PERF-01).
+- RSTs are validated against the tracked sequence window; XMAS, NULL, FIN-only
+  and out-of-state packets are dropped on stateful zones; retransmitted
+  SYN-ACKs, tuple reuse and half-closed connections are tolerated (DP-03,
+  DP-25, DP-37). Non-SYN TCP no longer creates NAT state (DP-08).
+- Masquerade no longer leaks private sources: GRE, ESP, SCTP and 6in4 are
+  translated, AH, ICMP timestamp and ICMP with options are dropped at WAN
+  egress (DP-04). IPv4 fragments are translated through NAT (DP-05).
+- Connection tables are sized from memory with a floor of 16,384 and a
+  reclaimer frees expired state, removing the ~16,250-connection ceiling and
+  the eviction of live flows (DP-06, DP-07). The agent returns freed
+  memory after a reconfigure (PERF-04).
+- ICMPv6 neighbour discovery and MLD always pass; `block-icmp` refuses new
+  inbound ICMP only; RELATED ICMP errors, including IPv6 packet-too-big, are
+  delivered (DP-10, DP-21).
+- An IPv4 rule on `0.0.0.0/…` no longer applies to IPv6 (DP-11). MAC-group
+  rules and per-rule rate limits enforce on IPv6 too (DP-19, DP-20).
+- Under fail-closed, non-IP EtherTypes outside an allow-list are dropped
+  (DP-22).
+- Hairpin NAT rewrites the client port (DP-23); concurrent NAT claims no longer
+  overwrite each other (DP-24). Each new masqueraded connection examines a
+  fixed window of 128 ports, so masquerade no longer collapses to a few
+  hundred new connections per second after one ICMP echo or port-forward
+  (DP-26, PERF-02; `checks.nat-cps`, 2 x 20,000 opens at 2,000/s). The
+  remaining ceiling is about 31,000 concurrent connections to one remote
+  ip:port per public address, counted in `egress_nat_no_candidate`.
+- Zone and global blocklists and GeoIP countries name sources only: the inside
+  can reach a listed address and receive its answers, and whatever a listed
+  address starts is refused (DP-15; `checks.blocklist-direction`).
+- `syn-protect` proxies a port only on the zones that admit it (an accept
+  rule, a port-forward or a load balancer); outbound connections from other
+  zones to that port are no longer proxied (DP-31). IPv6 SYNs are MSS-clamped
+  like IPv4, and ICMPv6 errors about connections behind NPTv6 or quoting
+  extension headers reach the host (`checks.v6-mss-npt-related`).
+- `velstra verify-ebpf`, and so the `ebpf-verifier` checks, refuse a program
+  that needs more than 700,000 verifier instructions.
+- An agent restart keeps hooks, tail-call tables and state pinned, so it
+  neither fails open nor drops NAT sessions (DP-12, DP-27). A reconfigure
+  rewrites only the entries that changed, so a commit no longer stalls traffic
+  in proportion to the configuration size (DP-28).
+- A torn netlink dump no longer blocks the data plane (DP-32); a truncated TCP
+  header at a reject rule is dropped (DP-33); TCP and UDP with IPv4 options
+  are refused on stateful zones (DP-34); IPv6 UDP reject sends ICMPv6
+  port-unreachable (DP-35); raw-IP links are no longer parsed as Ethernet
+  (DP-36); `expire-state` no longer gates the data plane (DP-41); a zero UDP
+  checksum is written as 0xFFFF after NAT (DP-42); the MSS clamp writes a
+  correct TCP checksum (DP-09); reject sends a valid TCP RST (EDGE-02).
+- The pinned agent carries no known Rust advisories (STATIC-02); Fabric gained
+  a supply-chain policy and pins its aya revision (STATIC-05).
+
+### Firewall compilation and validation
+
+- `to firewall` is compiled symbolically, so the agent matches the box's live
+  addresses, DHCP and SLAAC leases and held VRRP addresses: DHCP management no
+  longer locks itself out (DP-16, HA-01, PROV-03). `sentinel trace` on the box
+  judges `to firewall` against the same live addresses.
+- Zone policy identifiers are stable hashes, not alphabetical ranks (DP-13).
+  Rules without `direction` compile as ingress rules (DP-15).
+- `config check`, `commit`, `save`, the boot apply and the periodic refresh
+  check every data-plane capacity the agent enforces — rule tries, MAC rules,
+  rate-limited rules, the per-zone copies of the global blocklist, forwards,
+  services, backends, SYN proxy entries (DP-17, DP-29, PERF-03) — and run the
+  image's own agent validator on the compiled configuration before anything
+  live changes (DP-01 class).
+- Port forwards and load balancers accept only `tcp`, `udp` and `tcp_udp`
+  (DP-18). A proto-less accept that cannot be enforced as written is refused
+  (DP-14). Two rules on one key hold the stricter verdict, as `trace` reports
+  (DP-30).
+- `config check` names the zones a SYN-protected port is proxied on, says when
+  no zone admits it (then it is proxied everywhere), and names the zones where
+  it is reachable over IPv6 without the proxy (DP-31, DP-35); `commit` warns
+  about hairpin on a DHCP or PPPoE WAN (DP-39); time-based rules are re-evaluated after a clock or
+  time-zone change (DP-40); handbook examples and the GeoIP budget match the
+  code (DP-43, IMG-10).
+
+### Configuration, commit and boot
+
+- A saved configuration the data plane refuses no longer boots the box dark:
+  boot falls back to the last-known-good configuration or a management-only
+  reduction, and says so in the journal, the console, `show system` and the
+  configure banner (DP-01, PERF-06).
+- `rollback N` becomes the running configuration (CTRL-04); `save` writes the
+  committed running configuration and refuses uncommitted edits (CTRL-14); a
+  commit interrupted by a signal, I/O error or panic finishes or rolls back
+  (CTRL-15); runtime files are replaced atomically (CTRL-20); routing reloads
+  after addresses are set at boot (CTRL-19).
+- One validator for the CLI, the API document path and config sync, with
+  control characters refused everywhere (CTRL-08); daemon-bound fields are
+  shape-checked, closing command and directive injection through dynamic DNS,
+  the SSH log level, Wi-Fi, DHCP options, chrony, bonding and PPPoE
+  (CTRL-02, CTRL-03, CTRL-12, CTRL-13, CTRL-16, CTRL-17, CTRL-18, CTRL-29). A
+  saved file with such a value still boots, with that setting switched off.
+- An operator's on-box `configure` session escalates once instead of once per
+  privileged step: an unchanged commit as `admin` took 21-31 s with 76 sudo
+  round trips; it now takes 4.6 s against 4.0 s as root
+  (`checks.commit-latency`).
+- The read-write admin reads the protected saved configuration without sudo
+  (PROV-05).
+- Found in qualification: an escalated `configure` session judged "the account
+  running this commit" by its effective uid (root), so an operator could
+  delete and retire their own account; it now uses the sudo-authenticated
+  operator. A commit that creates the agent's uplink (a new VLAN, for example)
+  keeps the old uplink until the link exists. Runtime directories are
+  traversable whatever the umask, so PPPoE and BNG start under umask 077.
+
+### Management plane and API
+
+- The config-sync secret is a scoped peer credential, not a full-access token;
+  weak secrets are refused, `sentinel ha secret generate` makes one, and HA
+  proofs, sign-in and bearer failures are rate-limited per source (CTRL-01,
+  CTRL-07, CTRL-27).
+- Per-source, per-network and total connection caps with header and body
+  deadlines stop a slowloris from taking down the API, console and sync
+  (CTRL-05); HA pairing no longer blocks the API runtime (CTRL-06).
+- The commit-confirm timer forwards only an environment allow-list (CTRL-21);
+  `show`/`clear` words are validated and `lookup` is bounded (CTRL-28);
+  sessions are bounded under clock jumps and HSTS is sent (CTRL-29).
+
+### HA and config sync
+
+- The standby becomes ready: the readiness digest no longer contains
+  member-local addresses (HA-02, HA-03); a stale standby goes cold after 5 s,
+  so killing the active member's agent fails over instead of leaving both
+  members backup (HA-04); conntrack sync replicates sessions again.
+- A config-sync peer can no longer manage the receiving member: accounts,
+  groups, AAA, update, SSH and console stay local, and sender-local addresses
+  are not copied (CTRL-09, CTRL-10). A commit on the backup member warns.
+- Wren no longer withdraws a healthy owner's addresses after a slow witness
+  exchange (pinned Wren ba95bca).
+- WireGuard through an HA pair follows a takeover in about a second, also when
+  the new owner was VM-paused: its wall clock lagged, and the remote peers
+  dropped its handshakes as replays until the lag had passed (6 s to beyond
+  15 s measured). The owner now replicates its clock to standbys that
+  announce support, and a member that takes over steps its clock forward to
+  its predecessor's after taking the VIPs and before reconfiguring WireGuard.
+  The socket-activated `wren-ha-clock-step` helper takes the step; it holds
+  only `CAP_SYS_TIME`, and Wren keeps `ProtectClock` and no clock capability.
+  The step is forward-only and logged: at most 10 minutes, at most 60 seconds
+  between two NTP-synchronised clocks, never by an NTP-synchronised member
+  from an unsynchronised peer, and at most 10 minutes in total per boot. The
+  helper reads the predecessor's clock from where the agent publishes it,
+  outside Wren's reach. A refused step is reported by
+  `sentinel show health` (`ha-clock-behind-peer`) until NTP resolves it.
+  Checked by `checks.ha-wireguard-failover`.
+- A recovering higher-priority member no longer preempts a takeover that is
+  still in progress. After the owner's Wren was killed, its restarted
+  coordinator took the pair back 3 to 4 s after the fault; a WireGuard
+  takeover still waiting for a handshake retry lost the pair before it
+  forwarded, so one fault cost two handovers (3.95 s of outage). The
+  witness now lets a member preempt only after the owner has held its
+  authority for 10 s (Wren `PREEMPT_HOLD_MS`). Checked by the witness
+  failover checks, which assert the hold.
+- A takeover no longer closes the new owner's configuration gate. Every VRRP
+  virtual address is now emitted to the agent (`virtual_addresses`) and counts
+  as a local destination on both members whether or not the member holds it.
+  Taking the VIPs then changes no `to firewall` rule, and the agent only adds
+  the address for its own sockets. Before, the takeover rewrote the rule set
+  with the gate closed: the new owner dropped 1 to 6 forwarded packets, and
+  could lose its own first witness renewals and with them, rarely, its fresh
+  lease (seen as a 0.13 to 0.35 s VIP gap within 3 s of a takeover). Checked in
+  `checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
+  `checks.ha-witness-synproxy-failover`, `checks.ha-failover` (plain VRRP) and
+  `checks.ha-two-node-flow`, which count the agent's gate closures from just
+  before each fault to 3 s after promotion. A VIP whose prefix length the
+  interface does not already carry (a `/32` VIP, or one outside its subnets)
+  still takes the rewrite.
+- With a lease, an owner now holds its VIPs on the lease alone. Wren renews
+  the lease only while the data-plane agent's report is fresh (100 ms) and
+  eligible. A stalled or ineligible agent therefore gives up the VIPs when the
+  lease ends, at most about 0.45 s after it stops. One late report no longer
+  withdraws them: before, Wren withdrew the VIPs at the first stale report.
+  The leased failover checks
+  (`checks.ha-witness-failover`, `checks.ha-wireguard-failover`,
+  `checks.ha-witness-synproxy-failover`, `checks.ha-masquerade-failover`,
+  `checks.ha-log-stall`) stop the owner's agent. Inside the owner they time
+  how long until both VIPs are gone. They also assert that the standby takes
+  over and keeps the VIPs for 3 s.
+
+### Updates and boot trust
+
+- No slot can be written during an unblessed trial boot (CTRL-11); an
+  interrupted first freshness check no longer refuses updates forever
+  (CTRL-23); a new channel label inherits the key pin and sequence floor
+  (CTRL-24); `sha256:` digests are accepted consistently (CTRL-25); an
+  unversioned local proof needs `--allow-downgrade` and raw-signature copies are
+  bounded (CTRL-26); a prior boot's retry time no longer defers recovery
+  (CTRL-22).
+
+### Image and supply chain
 
 - DP-34: IPv4 packets with options are refused on stateful zones (TCP and
   UDP whose IPv4 header carries options cannot be tracked or translated).
@@ -28,6 +259,16 @@ the audit's blocking findings are closed and requalified.
   The gate's remaining 21 findings and 171 kernel matches have PROPOSED,
   unreviewed waivers in `scripts/cve-waivers.json`; the gate fails until a
   person reviews them.
+- Release CVE review: the image ships Linux 6.12.118 (the pin's recipe at the
+  newer 6.12.y source, `nix/kernel.nix`), HAProxy 3.4.8, glibc 2.42-113 (the
+  release/2.42 branch head), gzip 1.15, krb5 1.22.3 and hostapd 2.12, and
+  patched GLib (CVE-2026-58016) and sudo (CVE-2026-35535); cyrus-sasl is
+  built without SRP; lego, dnsproxy and libcap's captree are built with Go
+  1.26.11. Backports also rewrite bare store hashes after whole base names,
+  which GLib's own binaries require. `checks.image-security-floor`
+  fails the build when the image closure falls below a recorded version
+  floor, when a backport did not replace the package it backports, or when
+  the `sqlite3` shell or `ocspcheck` ships.
 - IMG-05: an image-level CVE gate with a maintained Nix-to-NVD CPE table
   (`scripts/nix_cpe_map.json`), the kernel cataloger and vulnix as a second
   source; it fails when a critical package cannot be matched.
@@ -41,7 +282,8 @@ the audit's blocking findings are closed and requalified.
   date from 2098, and `sentinel --version`, `show version` and the OpenAPI
   info report the source revision.
 - IMG-12: the unprivileged-user-namespace builder prerequisite is documented.
-- STATIC-03: this changelog and the README no longer claim a 1.0.0 release.
+- STATIC-03: the changelog, README, SECURITY.md and operator guide describe
+  the release as it is.
 - STATIC-07 / STATIC-08: the console browser suite resolves the pinned password
   helper (or stops with a clear message) and removes its Chromium profiles on
   every exit path.
@@ -54,8 +296,128 @@ the audit's blocking findings are closed and requalified.
 - PROV-02 / HA-00: the data filesystem is checked and grown offline before its
   check and mount, and a failed grow no longer fails the boot.
 - PROV-04: `sentinel config check` warns for zoned NICs without `hw-id`.
+- Found in qualification: the ESP is mounted `noatime`, so read-only update
+  checks no longer write the boot partition; an encrypted install opens the
+  target's volume under its own mapper name, so installing onto a second disk
+  no longer unmounts the running box's own state; the full-screen installer
+  no longer exits on a serial console that does not answer cursor queries.
 
-### Changes since the 2026-10-26 candidate
+### Release 1.0.0 datapath
+
+- DP-15: zone and global blocklists and GeoIP countries name sources only.
+  The LAN can reach a listed address and receive its answers; whatever a
+  listed address starts is still refused. There is no outbound blocklist.
+  Checked by `checks.blocklist-direction`.
+- DP-31: `syn-protect` proxies a port only on the zones that admit it (an
+  accept rule, a port-forward or a load balancer). Outbound connections from
+  other zones to that port are no longer proxied. A port no zone admits that
+  way stays proxied everywhere, and `config check` says so.
+- Known limitation: IPv6 is not SYN-proxied in 1.0; the SYN proxy protects
+  IPv4 only. `config check` names every zone where a protected port is
+  reachable over IPv6. The IPv6 proxy is planned for 1.1
+  (`docs/design/dp35-ipv6-synproxy.md`).
+- IPv6 SYNs are MSS-clamped like IPv4 (PPPoE included). ICMPv6 errors about
+  connections behind NPTv6, or quoting extension headers, now reach the host.
+  Checked by `checks.v6-mss-npt-related`.
+- `velstra verify-ebpf` (and so the `ebpf-verifier` checks) refuses a program
+  that uses more than 700,000 verifier instructions.
+- PERF-02: masquerade no longer collapses to a few hundred new connections per
+  second after one ICMP echo or port-forward. Each new connection examines a
+  fixed window of 128 ports, whatever the box has seen before. The handbook
+  states the remaining ceiling: about 31,000 concurrent connections to one
+  remote ip:port per public address, with refusals counted in
+  `egress_nat_no_candidate`. Checked by `checks.nat-cps` (2 x 20,000 opens at
+  2000/s) and `checks.nat-domain-cgnat`.
+- Known limitation, documented (HA rolling upgrade): masqueraded connections
+  that a 1.0 member owns do not survive a takeover by a pre-1.0 peer. The
+  older allocator cannot find their ports. This is unchanged by PERF-02.
+  Upgrade the standby, fail over to it, then upgrade the old primary, and
+  never fail back onto a peer that is not yet upgraded. The 1.0 readiness
+  digest change (DP-13/DP-15) already makes the 0.4 to 1.0 upgrade
+  non-hitless.
+- Known limitation, documented: a NIC that strips VLAN tags in hardware makes
+  the parent's zone judge VLAN traffic under native XDP (DP-22); turn
+  `offload rxvlan` off on such a parent.
+
+### Release verification
+
+Every `checks.x86_64-linux.*` check (207) is run under KVM, with Fabric and
+Wren built from clean source archives, and the release is not tagged unless
+each one passes or is listed here with its reason. Result (2026-11-22/23):
+
+- The full run covered the 206 checks of the time: 202 passed on every run.
+  `checks.ha-bound-unit` (the 207th) came with the HA changes below and passed
+  in every later run. Two failures were defects in test fixtures, fixed
+  before release: `checks.ipsec-route-ownership` planted its foreign route
+  with Wren's own `static` protocol, and
+  `checks.observe-readonly` expected the SYN-proxy table at half its size.
+  `checks.ha-witness-synproxy-failover` failed 2 of 5 runs on takeover timing,
+  which the HA changes in this release address. `checks.source-cohort`
+  compares the `flake.lock` pins with the sources, so it runs on the re-pinned
+  release commit.
+- After the HA changes, 47 checks were run again and all passed: agent
+  lifecycle and configuration, forwarding, image, console, API, every routing
+  protocol, and the verifier on every kernel. The host test suites of Fabric
+  and Wren passed too. The HA checks then ran one at a time on idle builders.
+  On the release trees, 34 of 35 runs passed:
+
+  | check | passed |
+  |---|---|
+  | `ha-witness-synproxy-failover` | 8 of 8 |
+  | `ha-witness-failover` | 5 of 5 |
+  | `ha-wireguard-failover` | 4 of 5 |
+  | `ha-failover`, `ha-synproxy-failover` | 3 of 3 each |
+  | `ha-napt-mixed-version`, `ha-log-stall` | 3 of 3 each |
+  | `ha-pair`, `ha-two-node`, `ha-two-node-flow` | 1 of 1 each |
+
+  The one failure released a stalled agent's VIPs after 0.507 s, against the
+  0.505 s bound of the time. That bound has since been derived term by term
+  and is 0.54 s.
+- HA takeover, from the client's own capture: the time from the outage start
+  to the new owner's first frame, against its design.
+
+  | fault | measured | design |
+  |---|---|---|
+  | agent crash | 0.43–0.47 s | 0.675 s |
+  | Wren crash | 0.21–0.28 s | 0.32 s |
+  | owner VM paused | 0.32–0.42 s | 0.47 s |
+
+- The data plane loads under the verifier on kernels 6.6, 6.12, 6.18 and the
+  CI runner's 7.0. The largest program per kernel, against the
+  700,000-instruction budget of `velstra verify-ebpf`:
+
+  | kernel | program | instructions |
+  |---|---|---|
+  | 6.6 | `velstra_egress_v6` | 486,883 |
+  | 6.12 | `velstra_egress_v6` | 478,284 |
+  | 6.18 | `velstra_egress_v6` | 505,079 |
+  | 7.0 | `velstra_v4_state` | 309,389 |
+
+  On 7.0 all 24 programs verify, and the IPv4 handoff probe passes 54 of 54.
+- After that, the release trees changed only in documentation and test bounds.
+  On the final trees these all pass: the `velstra-ebpf` build against the
+  pinned `ebpfHash`, `checks.ebpf-verifier-6-12`, `checks.ha-bound-unit`,
+  `checks.commit` and the documentation build. Every check evaluates.
+  `checks.source-cohort` is the exception, since it needs the re-pinned
+  `flake.lock`.
+
+Defects found by qualification and fixed before release, beyond the audit
+findings above:
+
+- An update fence missed a same-size rewrite of a protected file within one
+  kernel timestamp tick (pre-6.13 kernels stamp writes from the coarse
+  clock); a fence now records a file's stamp only once that tick has passed.
+- The once-a-second recovery timer held the configuration locks even with
+  nothing to recover, so an update check or the API's update admission could
+  be refused as busy at random; an idle tick no longer locks.
+- An escalated `configure` session let an operator retire their own account;
+  installing onto a second disk could unmount the running box's state; the
+  full-screen installer exited on a serial console; read-only update checks
+  wrote the boot partition (see the sections above).
+
+### Earlier work in this release
+
+#### From the 2026-10-26 candidate to the audit
 
 Summarised from the commit history between the 1.0.0 candidate date and the
 start of the remediation (102 commits); see `git log` for detail.
@@ -89,13 +451,13 @@ start of the remediation (102 commits); see `git log` for detail.
   tasks, focused setup guides, branding, contribution templates and private
   security reporting.
 
-## [1.0.0] — candidate dated 2026-10-26, never released
+#### The 2026-10-26 candidate
 
-This entry was written for a 1.0.0 release on 2026-10-26. That release was not
-tagged or published; the entry is kept as the record of what the candidate
-contained at that date. Later work is under [Unreleased].
+This was written for a 1.0.0 release on 2026-10-26. That release was not
+tagged or published; it is kept as the record of what the candidate
+contained at that date.
 
-### Added
+#### Added
 
 - Optional declarative fleet management with provisioned mTLS identity,
   independent Ed25519 command signatures, challenge/target binding and durable
@@ -106,14 +468,14 @@ contained at that date. Later work is under [Unreleased].
 - Verified network samples and an account-preserving CLI batch, a QEMU/Proxmox
   quickstart, and pinned QEMU firmware for the installer workflow.
 
-### Fixed
+#### Fixed
 
 - DHCP WAN acquisition and address replacement refresh Fabric's live SNAT
   targets without restarting the agent or clearing established connection state.
 - Enrollment rotation rejects late telemetry acknowledgements as well as late
   signed commands, preserving the new identity's replay-protection state.
 
-### Release verification
+#### Release verification
 
 - Rust formatting, check, warning-free clippy and workspace tests; full browser
   console/field coverage; real mTLS, network, HA and recovery VM regressions.
@@ -121,7 +483,7 @@ contained at that date. Later work is under [Unreleased].
   checks. Deployment-specific hardware and firmware trust remain operator-owned.
 
 
-### Added
+#### Added
 
 - **The firewall log is searchable, and reaches back further than fifty lines.**
   `show firewall log` took no arguments and printed the last fifty lines, which
@@ -136,7 +498,7 @@ contained at that date. Later work is under [Unreleased].
   decided, so the tracer is the honest way from a line to a rule. The old
   read-only *Firewall → Recent log* panel is gone; this replaces it.
 
-### Fixed
+#### Fixed
 
 - **The packet trace and the packet capture no longer cover their own answer.**
   Both put their query form in a `.card.addpanel`, which the console styles as a
@@ -187,7 +549,7 @@ contained at that date. Later work is under [Unreleased].
   eBGP routes at all. The key is written both ways now; `checks.bgp` is the
   proof, run against the current Wren.
 
-### Added
+#### Added
 
 - **The appliance reports up.** `sentinel report --controller <url>` hands a
   Velstra controller what this box is carrying — per-link rx/tx, the data

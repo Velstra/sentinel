@@ -99,6 +99,8 @@ jobs:
           python3 -B -m unittest discover -s tests -p 'test_community_release.py' -v
           python3 -B -m unittest discover -s tests -p 'test_release_image_boot.py' -v
           python3 scripts/check_repository_hygiene.py --history
+      - name: Policy files agree and the CLA workflow cannot run pull request code
+        run: python3 -B -m unittest discover -s tests -p 'test_policy_files.py' -v
 
   rust:
     runs-on: ubuntu-latest

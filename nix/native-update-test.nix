@@ -132,6 +132,14 @@ pkgs.testers.runNixOSTest {
             print("NATIVE_READBACK",command,machine.execute(command),flush=True)
         print(machine.execute("journalctl -b -u 'sentinel-update-*' -u sentinel-api --no-pager"),flush=True)
         print(machine.execute("cat /var/lib/sentinel/qa-native-progress.json"),flush=True)
+        # Browser failures leave their panel/controller state and a screenshot;
+        # print both (the screenshot as base64, bounded) since $out is lost.
+        for action in ["check","stage"]:
+            report=machine.execute("cat /var/lib/sentinel/qa-native-ui-"+action+"-failure.json")
+            if report[0] == 0:
+                print("NATIVE_UI_FAILURE_REPORT",action,report[1],flush=True)
+                png=machine.execute("head -c 2000000 /var/lib/sentinel/qa-native-ui-"+action+"-failure.png | base64 -w0")
+                print("NATIVE_UI_FAILURE_PNG",action,png[1],flush=True)
         raise
     print(text,flush=True)
     result=json.loads(text)

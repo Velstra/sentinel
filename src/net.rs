@@ -2193,7 +2193,8 @@ pub(crate) fn verify_observer_login(name: &str, uid: u32) -> Result<()> {
 }
 
 fn preflight_login_lifecycle(appliance: &Appliance, registry: &LoginRegistry) -> Result<()> {
-    let caller_uid = unsafe { libc::geteuid() };
+    // The operator, also when their session runs as root through sudo.
+    let caller_uid = system::commit_caller_uid();
     for (name, record) in &registry.accounts {
         let actual = system::local_login_uid(name)?;
         validate_managed_login_identity(record.uid, actual)
@@ -3956,6 +3957,12 @@ fn agent_uplink(appliance: &Appliance) -> Option<String> {
         .find(|n| present.iter().any(|p| p == *n))
         .or(zoned.first())
         .map(|n| n.to_string())
+}
+
+/// Whether the link [`agent_uplink`] picks exists on the box right now. It may
+/// not when the only zoned links are ones the current apply is about to create.
+pub(crate) fn agent_uplink_present(appliance: &Appliance) -> bool {
+    agent_uplink(appliance).is_some_and(|iface| system::discover_interfaces().contains(&iface))
 }
 
 /// Tell the agent's unit which link to attach to, and restart it when that

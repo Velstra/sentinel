@@ -97,6 +97,16 @@ def disk_rows():
     return json.loads(run(["sfdisk", "--json", "/dev/vda"]))["partitiontable"]
 
 
+# The appliance's configured channel label (native-update-test.nix).
+CHANNEL = "qa-enterprise"
+FRESHNESS_LIFETIME = 13 * 86400  # Under Sentinel's 14-day maximum.
+
+
+def freshness(now):
+    return {"schema": 1, "channel": CHANNEL, "arch": "x86_64", "sequence": 1,
+            "issued_at": now, "expires_at": now + FRESHNESS_LIFETIME}
+
+
 def inactive():
     return {str(n): digest("/dev/vda" + str(n)) for n in (4, 5)}
 
@@ -134,7 +144,10 @@ def main(sentinel, client):
     image = json.loads((resources / "image.json").read_bytes())
     manifest = {"version": descriptor["version"], "image": "sentinel_v1.0.0-lts.raw",
         "sha256": image["sha256"], "product": "velstra-sentinel",
-        "sysupdate": {"schema": 1, "resources": descriptor["resources"]}}
+        "sysupdate": {"schema": 1, "resources": descriptor["resources"]},
+        # Online offers must carry signed freshness (CTRL-26); without it
+        # Sentinel refuses even a correctly signed manifest as metadata-refused.
+        "freshness": freshness(int(time.time()))}
     scratch = Path("/run/qa-native-signing")
     scratch.mkdir(mode=0o700)
 
@@ -149,8 +162,12 @@ def main(sentinel, client):
             "signature": base64.b64encode(signature).decode()}).encode()
 
     body = json.dumps(manifest, separators=(",", ":")).encode()
+    # A release that changes between review and staging is a newer signed
+    # offer (a higher sequence). Reusing sequence 1 for different bytes would
+    # be refused by the rollback ledger before the conflict path is reached.
+    newer = {**manifest, "freshness": {**manifest["freshness"], "sequence": 2}}
     envelopes = {"valid": envelope(body), "bad-signature": envelope(body, True),
-        "swapped": envelope(json.dumps(manifest, indent=2).encode())}
+        "swapped": envelope(json.dumps(newer, indent=2).encode())}
     mode = {"kind": "valid", "swapped": False, "pause": False}
     entered, release = threading.Event(), threading.Event()
     release.set()
@@ -237,7 +254,16 @@ def main(sentinel, client):
             assert refused.returncode != 0 and not refused.stdout, refused
             assert disk_rows() == original_table and inactive() == original_bytes
             return json.loads(run([sentinel, "system", "update", "stage", "--offer", state["offer"]["id"]]))
-        code, job = request("/system/updates/stage", payload(state, True))
+        # Busy is a documented, write-free refusal: the once-per-second
+        # sentinel-apply-recovery timer briefly holds the configuration writer
+        # lock. Retry it a bounded number of times, as check() does.
+        for _ in range(5):
+            code, job = request("/system/updates/stage", payload(state, True))
+            if code != 409 or "busy" not in str(job.get("error", "")):
+                break
+            assert disk_rows() == original_table and inactive() == original_bytes
+            time.sleep(1)
+            state = until(available)
         assert code == 202, (code, job)
         return job
 
@@ -255,6 +281,9 @@ def main(sentinel, client):
             assert done["phase"] == "failed" and done["error"] == error, done
             assert disk_rows() == original_table and inactive() == original_bytes
             record(kind + "-refused-before-go", done)
+            if kind == "metadata-change":
+                # The ledger now holds sequence 2; the channel keeps serving it.
+                envelopes["valid"] = envelopes["swapped"]
         mode.update(kind="valid", swapped=False, pause=True)
         browser = json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "check"], timeout=120))
         assert browser["passed"] and until(lambda: terminal(browser["job"]["id"]))["phase"] == "checked"

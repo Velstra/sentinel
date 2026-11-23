@@ -239,16 +239,19 @@ impl Observer {
         let age = cache
             .observed_at
             .map(|at| now.saturating_duration_since(at));
+        // A value within FRESH_FOR stays fresh while a newer one is collected:
+        // nearly every console poll starts that background refresh, and the
+        // write itself is decided by the worker's compare-and-swap against the
+        // live snapshot, not by this label. Only an expired value waits.
         let state = if cache.value.is_some() {
-            if cache.invalidated
-                || cache.error.is_some()
-                || age.is_none_or(|value| value > FRESH_FOR)
-            {
+            if cache.invalidated || cache.error.is_some() {
                 Freshness::Stale
+            } else if age.is_some_and(|value| value <= FRESH_FOR) {
+                Freshness::Fresh
             } else if cache.running {
                 Freshness::Refreshing
             } else {
-                Freshness::Fresh
+                Freshness::Stale
             }
         } else if cache.error.is_some()
             || cache
@@ -429,6 +432,37 @@ mod tests {
             assert!(writable.status.can_check && writable.status.can_stage);
             assert!(writable.status.mutation_context.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn observer_poll_that_starts_a_refresh_still_reports_its_fresh_value() {
+        // The console polls every 3 s and a poll starts a background refresh
+        // once 2 s have passed, so nearly every poll starts one. Reporting
+        // that poll as "refreshing" disabled every action until an operator
+        // happened to press Refresh inside the 2 s cooldown.
+        let observer = seeded();
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let view = observer.observe_with(true, move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(2)).unwrap();
+            Ok(sample("next"))
+        });
+        assert!(view.observation.refresh_in_progress);
+        assert_eq!(view.observation.state, Freshness::Fresh);
+        assert!(view.status.can_check && view.status.can_stage);
+        assert!(view.status.mutation_context.is_some());
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        // An expired value is not made fresh by a refresh in flight.
+        let later = observer.view(true, Instant::now() + FRESH_FOR + Duration::from_secs(1));
+        assert_eq!(later.observation.state, Freshness::Refreshing);
+        assert!(!later.status.can_check && !later.status.can_stage);
+        assert!(later.status.mutation_context.is_none());
+        release.send(()).unwrap();
+        idle(&observer, true).await;
+        let done = observer.view(true, Instant::now());
+        assert_eq!(done.observation.state, Freshness::Fresh);
+        assert_eq!(done.status.generation.as_deref(), Some("next"));
     }
 
     #[test]

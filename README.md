@@ -41,6 +41,6 @@ cargo test --workspace --locked
 
 ## Release status
 
-Sentinel 1.0.0 is a release candidate under remediation. It has not been released: no `v1.0.0` tag exists, and the independent release audit of 2026-11-18/19 found blocking issues in both editions that are still being fixed (see the [changelog](CHANGELOG.md)). Do not treat any build of this tree as a production release. HA remains experimental. Review the [dataplane support matrix](docs/src/reference/dataplane-support.md) and [test evidence requirements](docs/src/reference/tests.md) before deployment. Development signing keys are not production trust identities.
+Sentinel 1.0.0 is the current release; the signed `v1.0.0` tag identifies it. Read the [1.0.0 release notes](docs/src/release-notes-1.0.0.md) before upgrading: HA pairs are not upgraded hitlessly, and 1.0.0 refuses some configurations earlier releases accepted. The [changelog](CHANGELOG.md) lists every change and the audit findings it closes. HA remains experimental; keep independent management access. Review the [dataplane support matrix](docs/src/reference/dataplane-support.md) and [test evidence requirements](docs/src/reference/tests.md) before deployment. Development signing keys are not production trust identities.
 
 Maintainers: [build, qualify and publish downloadable images](docs/releases.md).

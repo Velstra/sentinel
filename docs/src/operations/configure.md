@@ -22,6 +22,14 @@ commit-confirm 2
 
 Inspect the diff before applying. If the change prevents a new SSH or HTTPS session, let the timer expire. The CLI returns to the saved configuration.
 
+```mermaid
+flowchart LR
+  set[set ...] --> compare --> cc[commit-confirm 2]
+  cc --> test{New session<br/>works?}
+  test -->|yes| keep[confirm, then save]
+  test -->|no: timer expires| back[Saved configuration<br/>restored]
+```
+
 ## Confirm and persist
 
 Reconnect over the path you intend to keep. If it works, enter the following in the configuration session before expiry:

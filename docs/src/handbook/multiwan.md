@@ -18,6 +18,12 @@ set multiwan uplink eth1 gateway 192.0.2.1
 set multiwan uplink eth1 check target 9.9.9.9
 ```
 
+```mermaid
+flowchart LR
+  chk{eth0 health<br/>check 1.1.1.1} -->|passing| p10[Use eth0<br/>priority 10]
+  chk -->|failing| p20[Use eth1<br/>priority 20]
+```
+
 ## Software updates
 
 Update channels are a separate lifecycle. See [review and stage an appliance update](../operations/update.md) to check trust, inspect a specific offer and verify the new boot slot.

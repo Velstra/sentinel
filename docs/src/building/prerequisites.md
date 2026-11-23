@@ -41,7 +41,15 @@ or keep the restriction and give the Nix daemon and its build users an AppArmor 
 
 ## Size the build host
 
-Measured on a 16 vCPU / 32 GB builder: a cold `nix build .#sentinel-image` takes about 10 minutes, a rebuild with cached dependencies about 8 minutes (the Rust unit tests run inside the build). The appliance closure is about 1.5 GiB and must fit the 2.5 GiB store slot; the raw image is about 5.6 GiB apparent (1.7 GiB allocated). Allow tens of GiB of free disk for the Nix store, and more for the VM checks.
+Measured on a 16 vCPU / 32 GB builder:
+
+| Item | Size or time |
+|---|---|
+| Cold `nix build .#sentinel-image` | about 10 minutes |
+| Rebuild with cached dependencies | about 8 minutes (the Rust unit tests run inside the build) |
+| Appliance closure | about 1.5 GiB; must fit the 2.5 GiB store slot |
+| Raw image | about 5.6 GiB apparent (1.7 GiB allocated) |
+| Free disk | tens of GiB for the Nix store, and more for the VM checks |
 
 ## Check VM support
 

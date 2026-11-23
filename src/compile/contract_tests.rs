@@ -547,10 +547,206 @@ hairpin = true
     assert!(w.contains("hairpin"), "{w}");
 }
 
+// ---- DP-31: the SYN proxy is scoped to the zones that admit the port --------
+
+fn synproxy(cfg: &toml::Value) -> Vec<&toml::Value> {
+    cfg.get("synproxy")
+        .and_then(toml::Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default()
+}
+
+fn policy_id(cfg: &toml::Value, zone: &str) -> i64 {
+    policy(cfg, zone)["id"].as_integer().expect("policy id")
+}
+
+const WEB_FORWARD: &str = r#"
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "192.168.50.10:443"
+"#;
+
 #[test]
-fn dp31_syn_protect_says_it_applies_to_every_zone() {
-    let w = warnings(&with("[[firewall.syn-protect]]\nport = 443\n"));
+fn dp31_a_forwarded_port_is_proxied_for_the_forwarding_zone_only() {
+    let text = with(&format!(
+        "{WEB_FORWARD}[[firewall.syn-protect]]\nport = 443\n"
+    ));
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let entries = synproxy(&cfg);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["port"].as_integer(), Some(443));
+    assert_eq!(
+        entries[0].get("policy").and_then(toml::Value::as_integer),
+        Some(policy_id(&cfg, "wan")),
+        "{cfg:?}"
+    );
+    let w = warnings(&text);
+    assert!(w.contains("arriving on zone wan"), "{w}");
+}
+
+#[test]
+fn dp31_a_port_opened_by_a_rule_is_proxied_for_that_zone() {
+    let text = with(
+        r#"
+[[rule]]
+name = "web-in"
+from = "wan"
+proto = "tcp"
+port = 443
+action = "accept"
+[[firewall.syn-protect]]
+port = 443
+mss = 1400
+"#,
+    );
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let entries = synproxy(&cfg);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0].get("policy").and_then(toml::Value::as_integer),
+        Some(policy_id(&cfg, "wan")),
+        "{cfg:?}"
+    );
+    assert_eq!(entries[0]["mss"].as_integer(), Some(1400));
+}
+
+/// A LAN client dialling the public address through a hairpin is an inside
+/// client: its zone's reflection entry must not make the proxy answer every
+/// LAN SYN to that port.
+#[test]
+fn dp31_a_hairpin_reflection_does_not_proxy_the_inside() {
+    let text = with(&format!(
+        "{WEB_FORWARD}hairpin = true\n[[firewall.syn-protect]]\nport = 443\n"
+    ));
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let lan = policy_id(&cfg, "lan");
+    let entries = synproxy(&cfg);
+    assert!(!entries.is_empty());
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.get("policy").and_then(toml::Value::as_integer) != Some(lan)),
+        "{entries:?}"
+    );
+}
+
+/// Nothing admits the port explicitly (a default-accept zone serves it): the
+/// proxy stays on for every zone rather than silently protecting nothing, and
+/// says what that costs.
+#[test]
+fn dp31_a_port_no_zone_admits_is_proxied_everywhere_and_says_so() {
+    let text = with("[[firewall.syn-protect]]\nport = 443\n");
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let entries = synproxy(&cfg);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(entries[0].get("policy").is_none(), "{entries:?}");
+    let w = warnings(&text);
     assert!(w.contains("syn-protect") && w.contains("any zone"), "{w}");
+}
+
+// ---- DP-35: the SYN proxy is IPv4 only, and says so where it matters --------
+
+fn with_v6_wan(extra: &str) -> String {
+    with(extra).replace(
+        "address = \"198.51.100.2/24\"\n",
+        "address = \"198.51.100.2/24\"\naddress6 = \"2001:db8:51::2/64\"\n",
+    )
+}
+
+const WEB_RULE: &str = r#"
+[[rule]]
+name = "web-in"
+from = "wan"
+proto = "tcp"
+port = 443
+action = "accept"
+[[firewall.syn-protect]]
+port = 443
+"#;
+
+#[test]
+fn dp35_a_protected_port_reachable_over_ipv6_says_ipv6_is_not_proxied() {
+    let text = with_v6_wan(WEB_RULE);
+    assert!(
+        text.contains("address6"),
+        "the fixture gained its IPv6 address"
+    );
+    let w = warnings(&text);
+    assert!(
+        w.contains("syn-protect 443: TCP 443 is reachable over IPv6 on zone wan")
+            && w.contains("IPv6 SYNs to it are not proxied"),
+        "{w}"
+    );
+}
+
+#[test]
+fn dp35_no_ipv6_note_where_the_port_cannot_be_reached_over_ipv6() {
+    // The zone has no IPv6 address.
+    let w = warnings(&with(WEB_RULE));
+    assert!(w.contains("syn-protect 443"), "{w}");
+    assert!(!w.contains("over IPv6"), "{w}");
+    // The zone has one, but the only rule admitting 443 is IPv4-only.
+    let v4_only = WEB_RULE.replace(
+        "action = \"accept\"\n",
+        "action = \"accept\"\nfamily = \"ipv4\"\n",
+    );
+    let w = warnings(&with_v6_wan(&v4_only));
+    assert!(!w.contains("over IPv6"), "{w}");
+}
+
+#[test]
+fn dp35_a_port_proxied_everywhere_names_the_ipv6_zones() {
+    let w = warnings(&with_v6_wan("[[firewall.syn-protect]]\nport = 443\n"));
+    assert!(w.contains("reachable over IPv6 on zone wan"), "{w}");
+}
+
+// ---- DP-15: blocklists and GeoIP name sources only -------------------------
+
+#[test]
+fn dp15_a_zone_blocklist_is_emitted_as_source_only() {
+    let text = with("").replace(
+        "[zone.wan]\ndefault_action = \"drop\"\n",
+        "[zone.wan]\ndefault_action = \"drop\"\nblocklist = [\"203.0.113.0/24\"]\n",
+    );
+    assert!(
+        text.contains("blocklist"),
+        "the fixture gained its blocklist"
+    );
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    let wan = policy(&cfg, "wan");
+    assert_eq!(
+        wan.get("blocklist_ingress_only")
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "{wan:?}"
+    );
+    // A policy without a blocklist has nothing to scope and carries no key, so
+    // an unchanged configuration's emitted policy is unchanged.
+    assert!(policy(&cfg, "lan").get("blocklist_ingress_only").is_none());
+}
+
+#[test]
+fn dp15_the_global_blocklist_is_source_only_for_every_policy() {
+    let text = format!("[firewall]\nblocklist = [\"203.0.113.7\"]\n{}", with(""));
+    let cfg = emitted(&Appliance::from_toml(&text).unwrap());
+    assert_eq!(
+        cfg.get("blocklist_ingress_only")
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "{cfg:?}"
+    );
+    for zone in ["wan", "lan"] {
+        assert_eq!(
+            policy(&cfg, zone)
+                .get("blocklist_ingress_only")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "{zone}"
+        );
+    }
 }
 
 #[test]

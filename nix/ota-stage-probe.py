@@ -14,6 +14,23 @@ import urllib.request
 import uuid
 
 
+# Signed release metadata carries a freshness policy (scope, sequence, a
+# lifetime of at most 14 days); an offer without one is refused.
+FRESHNESS = {"schema": 1, "channel": "default", "arch": "x86_64", "sequence": 1,
+             "issued_at": int(time.time()), "expires_at": int(time.time()) + 86400}
+
+# One Stage case moves the whole 1.4 GB donor from the read-only USB stick
+# through loopback TLS (113-151 s per transfer measured in qual runs under
+# nested KVM), verifies it, re-reads the channel and, when admitted, writes and
+# publishes the inactive slot. The bound catches a hung worker; it is not a
+# throughput target, and a refusal still has to be the expected one.
+STAGE_SECONDS = 600
+# A management API call answers from local state, but under nested KVM a
+# transient-unit start can stall it for seconds; 4 s cut the probe short with
+# a read timeout before any case had been judged.
+API_SECONDS = 20
+
+
 def run(args, *, timeout=15):
     value = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     if value.returncode:
@@ -39,7 +56,7 @@ def request(path, body=None):
     value = urllib.request.Request("https://127.0.0.1:8080/api/v1" + path, headers=headers,
         data=None if body is None else json.dumps(body).encode())
     try:
-        response = urllib.request.urlopen(value, context=ssl._create_unverified_context(), timeout=4)
+        response = urllib.request.urlopen(value, context=ssl._create_unverified_context(), timeout=API_SECONDS)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -82,6 +99,7 @@ def inactive_identity():
 
 
 def main(sentinel, publication_failure=False):
+    started = time.monotonic()
     proof = json.loads(Path("/etc/qa-stage-proof/info.json").read_bytes())
     assert Path("/dev/sda").is_block_device()
     assert run(["findmnt", "-n", "-o", "SOURCE", "/var/lib/sentinel"]).strip() == "/dev/vda6"
@@ -108,16 +126,34 @@ def main(sentinel, publication_failure=False):
 
     body = {"version": "3.0.0", "image": "sentinel_3.0.0.raw", "sha256": proof["sha256"],
             "product": "velstra-sentinel"}
-    normal = json.dumps(body, separators=(",", ":")).encode()
-    envelopes = {"valid": envelope(normal), "invalid-signature": envelope(normal, corrupt=True),
-                 "changed": envelope(json.dumps(body, indent=2).encode()),
-                 "wrong-digest": envelope(json.dumps({**body, "sha256": "0" * 64}).encode())}
+    # The channel behaves like a publisher: every time it starts serving
+    # different metadata it signs it with the next sequence number, because the
+    # appliance refuses a sequence reused for other bytes and any sequence
+    # below one it has seen. A corrupt signature never reaches that ledger.
+    published = {"kind": None, "sequence": 0, "data": b""}
+    publish_lock = threading.Lock()
+
+    def served(kind):
+        with publish_lock:
+            content = "valid" if kind in ("valid", "invalid-signature") else kind
+            if (content, kind) != published["kind"]:
+                if content != (published["kind"] or (None,))[0]:
+                    published["sequence"] += 1
+                doc = {**body, "freshness": {**FRESHNESS, "sequence": published["sequence"]}}
+                if content == "wrong-digest":
+                    doc["sha256"] = "0" * 64
+                text = json.dumps(doc, indent=2) if content == "changed" else json.dumps(doc, separators=(",", ":"))
+                published.update(kind=(content, kind),
+                                 data=envelope(text.encode(), corrupt=kind == "invalid-signature"))
+            return published["data"]
     mode = {"value": "valid", "download_complete": False, "pause": False}
     entered, release = threading.Event(), threading.Event()
     release.set()
     paths, errors, results = [], [], []
 
     def record(value):
+        # Elapsed probe time per completed case: the evidence for the budgets.
+        value["probe_seconds"] = round(time.monotonic() - started, 1)
         results.append(value)
         Path("/run/qa-real-stage-progress.json").write_text(json.dumps(results))
 
@@ -129,7 +165,7 @@ def main(sentinel, publication_failure=False):
             paths.append(self.path)
             if self.path == "/current/release.json":
                 selected = "changed" if mode["value"] == "metadata-change" and mode["download_complete"] else mode["value"]
-                data = envelopes.get(selected, envelopes["valid"])
+                data = served(selected if selected in ("valid", "invalid-signature", "changed", "wrong-digest") else "valid")
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -202,7 +238,7 @@ def main(sentinel, publication_failure=False):
             checked = check()
             assert checked["phase"] == "checked", checked
             accepted = stage()
-            failed = until(lambda: terminal(accepted["id"]), seconds=180)
+            failed = until(lambda: terminal(accepted["id"]), seconds=STAGE_SECONDS)
             assert failed["phase"] == "failed" and failed["error"] == expected, failed
             assert inactive_identity() == before, "refused Stage changed inactive partition bytes or GUIDs"
             assert until(available)["current"] == initial["current"]
@@ -223,7 +259,7 @@ def main(sentinel, publication_failure=False):
             checked = check()
             assert checked["phase"] == "checked", checked
             accepted = stage()
-            failed = until(lambda: terminal(accepted["id"]), seconds=180)
+            failed = until(lambda: terminal(accepted["id"]), seconds=STAGE_SECONDS)
             assert failed["phase"] == "failed" and failed["error"] == "write-outcome-unknown", failed
             assert failed.get("staged") is None, failed
             after = inactive_identity()
@@ -317,7 +353,7 @@ def main(sentinel, publication_failure=False):
         assert run(["systemctl", "show", "-p", "MainPID", "--value", name]).strip() == worker
         assert inactive_identity() == before, "paused download changed a target"
         release.set()
-        staged = until(lambda: terminal(accepted["id"]), seconds=180)
+        staged = until(lambda: terminal(accepted["id"]), seconds=STAGE_SECONDS)
         assert staged["phase"] == "staged" and staged["error"] is None, staged
         identity = staged["staged"]
         assert identity["active_slot"] == "sentinel-a" and identity["staged_slot"] == "sentinel-b", identity

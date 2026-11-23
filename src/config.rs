@@ -5088,6 +5088,21 @@ fn default_true() -> bool {
     true
 }
 
+/// Whether `value` serializes exactly as `T::default()` — the value a
+/// `#[serde(default)]` field takes back when its table is absent, so omitting
+/// it from a saved file loses nothing. Derived from the serializer so a field
+/// added later is counted the day it is added; a value that cannot be
+/// serialized is never treated as default.
+fn serializes_as_default<T: Serialize + Default>(value: &T) -> bool {
+    match (
+        toml::Value::try_from(value),
+        toml::Value::try_from(T::default()),
+    ) {
+        (Ok(value), Ok(default)) => value == default,
+        _ => false,
+    }
+}
+
 fn default_drop() -> Action {
     Action::Drop
 }
@@ -5113,17 +5128,13 @@ impl Default for Firewall {
 impl Firewall {
     /// True when this is exactly the default posture — used to omit `[firewall]`
     /// from saved configs that never touched it.
+    ///
+    /// Asked of the serializer, not of a field list: the list fell behind once
+    /// (`syn_protect`, DP-31-persist), and an omitted table takes every setting
+    /// in it along — the proxy kept running after `commit` and was gone from
+    /// `running.toml`, the saved file and the next boot.
     pub fn is_default(&self) -> bool {
-        self.conntrack.is_default()
-            && self.stateful
-            && !self.block_icmp
-            && self.blocklist.is_empty()
-            && self.default_action == Action::Drop
-            && !self.log
-            && self.fail_closed
-            && self.source_validation == SourceValidation::Disable
-            && self.geoip_block.is_empty()
-            && self.group.is_empty()
+        serializes_as_default(self)
     }
 }
 
@@ -11722,27 +11733,8 @@ impl Appliance {
                 ));
             }
         }
-        // The data plane keys its SYN proxy on the TCP port alone.
-        if !self.firewall.syn_protect.is_empty() {
-            let ports = self
-                .firewall
-                .syn_protect
-                .iter()
-                .map(|s| s.port.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push(format!(
-                "firewall syn-protect {ports}: the SYN proxy answers every IPv4 TCP SYN to \
-                 {} arriving on any zone, including connections this network's own clients \
-                 open outward to that port elsewhere; those connections lose window scaling, \
-                 SACK and timestamps. IPv6 SYNs are not proxied",
-                if self.firewall.syn_protect.len() == 1 {
-                    "that port"
-                } else {
-                    "those ports"
-                }
-            ));
-        }
+        // The SYN proxy's scope (DP-31) is decided where the zones' rules and
+        // forwards are compiled, and reported from there (`rule_key_warnings`).
         out
     }
 
@@ -14049,6 +14041,33 @@ to = "10.0.0.10:8443"
         let b = Appliance::from_toml(&out).expect("re-parses");
         assert_eq!(b.nat.source[0].zone, "wan");
         assert_eq!(b.nat.destination[0].to, "10.0.0.10:8443");
+    }
+
+    /// DP-31-persist: a firewall whose only non-default setting is a SYN proxy
+    /// must keep it through a save. `[firewall]` was omitted whenever its
+    /// global posture was default, so the proxy ran after `commit` and was gone
+    /// from `running.toml`, the saved file and the next boot.
+    #[test]
+    fn a_firewall_holding_only_syn_protect_survives_a_round_trip() {
+        let toml = r#"
+[system]
+hostname = "fw"
+
+[[firewall.syn-protect]]
+port = 8080
+
+[[firewall.syn-protect]]
+port = 9443
+mss = 1400
+"#;
+        let a = Appliance::from_toml(toml).expect("syn-protect config parses + validates");
+        assert_eq!(a.firewall.syn_protect.len(), 2);
+        let out = a.to_toml().unwrap();
+        let b = Appliance::from_toml(&out).expect("re-parses");
+        assert_eq!(
+            b.firewall.syn_protect, a.firewall.syn_protect,
+            "saved:\n{out}"
+        );
     }
 
     #[test]

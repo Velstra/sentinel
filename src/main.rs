@@ -31,6 +31,7 @@ mod configsync;
 mod confirm;
 mod diff;
 mod domain;
+mod escalate;
 mod feed;
 mod fieldcheck;
 mod fleet;
@@ -816,7 +817,10 @@ async fn main() -> Result<()> {
         } => ha::watch(&config),
         Command::UpdateJob { id } => update_jobs::run_worker(&id).map_err(Into::into),
         Command::System { command } => update_cli::run(command),
-        Command::Configure { config, no_apply } => configure(&config, no_apply),
+        Command::Configure { config, no_apply } => {
+            escalate::reexec_configure(&config, no_apply)?;
+            configure(&config, no_apply)
+        }
         Command::ServiceReadiness { unit } => repl::service_readiness(&unit),
         Command::SyncConfig => configsync::flush(),
         Command::RefreshFirewall => refresh_firewall(),
@@ -834,7 +838,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let appliance = Appliance::load(&config)?;
-            let answer = trace::trace(
+            let held = trace_held_addresses(&config);
+            let answer = trace::trace_holding(
                 &appliance,
                 &trace::Query {
                     in_interface,
@@ -845,6 +850,7 @@ async fn main() -> Result<()> {
                     src_mac,
                     icmp_type,
                 },
+                &held,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&answer)?);
@@ -1135,6 +1141,24 @@ fn confirm_rollback(
     confirm::rollback(&live_apply(true), config, from_timer, original)
 }
 
+/// What the box's links hold live, for a trace of the box's own saved
+/// configuration on the box; nothing for a candidate file or off the box,
+/// where the running addresses say nothing about that configuration.
+fn trace_held_addresses(config: &std::path::Path) -> Vec<(String, std::net::IpAddr)> {
+    if config != std::path::Path::new(DEFAULT_CONFIG)
+        || !std::path::Path::new("/run/sentinel").is_dir()
+    {
+        return Vec::new();
+    }
+    network_reconcile::held_addresses().unwrap_or_else(|error| {
+        eprintln!(
+            "warning: the box's live addresses could not be read ({error:#}); `to firewall` \
+             is traced against the configured addresses only"
+        );
+        Vec::new()
+    })
+}
+
 /// The interactive configuration session — a VyOS/JunOS-style edit context.
 /// On a terminal it uses rustyline (history + tab-completion); for piped input
 /// (scripts/tests) it reads plain stdin lines. Both run `repl::exec_line`.
@@ -1196,7 +1220,11 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
             rustyline::KeyEvent(rustyline::KeyCode::Char('?'), rustyline::Modifiers::NONE),
             rustyline::Cmd::Complete,
         );
-        let user = std::env::var("USER").unwrap_or_else(|_| "admin".into());
+        let user = escalate::operator_name(
+            std::env::var("USER").ok(),
+            std::env::var("SUDO_USER").ok(),
+            system::is_root(),
+        );
         let mut ctx: Vec<String> = Vec::new();
         loop {
             // Refresh the names the completer offers (interfaces/rules can change

@@ -106,9 +106,25 @@ impl Trace {
 /// Fails only when the question itself is malformed — a link that does not
 /// exist, a protocol the grammar has no word for. A packet that would be dropped
 /// is an answer, not an error.
+#[cfg(test)]
 pub fn trace(appliance: &Appliance, q: &Query) -> anyhow::Result<Trace> {
+    trace_holding(appliance, q, &[])
+}
+
+/// [`trace`] on the box itself, where `held` is what each link holds right
+/// now (`(link, address)`): a DHCP lease, a SLAAC address, a VRRP address the
+/// box owns. The data plane matches `to firewall` against exactly those
+/// (DP-16), so a walk that knew only the configured addresses reported
+/// `drop (default)` for traffic the box accepted.
+pub fn trace_holding(
+    appliance: &Appliance,
+    q: &Query,
+    held: &[(String, IpAddr)],
+) -> anyhow::Result<Trace> {
     let cfg = compile(appliance);
-    Walk::new(appliance, &cfg, q)?.run()
+    let mut walk = Walk::new(appliance, &cfg, q)?;
+    walk.held = held.to_vec();
+    walk.run()
 }
 
 /// Whether an ICMPv6 message of `kind` from `src` is link control the data
@@ -148,6 +164,8 @@ struct Walk<'a> {
     ingress_zone: Option<String>,
     egress_interface: Option<String>,
     egress_zone: Option<String>,
+    /// Addresses the box's links hold live; see [`trace_holding`].
+    held: Vec<(String, IpAddr)>,
 }
 
 /// What a stage decided, when it decided anything.
@@ -191,6 +209,7 @@ impl<'a> Walk<'a> {
             ingress_zone: None,
             egress_interface: None,
             egress_zone: None,
+            held: Vec::new(),
         })
     }
 
@@ -789,7 +808,21 @@ impl<'a> Walk<'a> {
     /// Whether `addr` is one of this box's own addresses, as far as the
     /// configuration says. The agent matches what the box holds live.
     fn is_local(&self, addr: IpAddr) -> bool {
-        self.cfg.local_hint.contains(&addr)
+        self.cfg.local_hint.contains(&addr) || self.held_by_configured_link(addr).is_some()
+    }
+
+    /// The enabled, configured link that holds `addr` live, if any.
+    fn held_by_configured_link(&self, addr: IpAddr) -> Option<String> {
+        self.held
+            .iter()
+            .filter(|(_, held)| *held == addr)
+            .find(|(link, _)| {
+                self.appliance
+                    .interfaces
+                    .iter()
+                    .any(|i| !i.disabled && &i.name == link)
+            })
+            .map(|(link, _)| link.clone())
     }
 
     /// The ports the operator wrote for the rule a compiled entry came from —
@@ -826,6 +859,7 @@ impl<'a> Walk<'a> {
                     .any(|a| a == addr)
             })
             .map(|i| i.name.clone())
+            .or_else(|| self.held_by_configured_link(addr))
     }
 
     fn policy_route(&self) -> Option<(String, u32)> {
@@ -1157,6 +1191,34 @@ to = "10.9.0.10:80"
             },
         )
         .unwrap()
+    }
+
+    /// HA-01/DP-16/PROV-03: `to firewall` reaches what the box holds live, a
+    /// DHCP lease included, and the trace must say what the data plane does.
+    #[test]
+    fn to_firewall_accepts_a_dhcp_learned_address_the_box_holds() {
+        let text = BOX.replace("address = \"198.51.100.2/24\"", "address = \"dhcp\"")
+            + "\n[zone.firewall]\nlocal = true\n"
+            + "\n[[rule]]\nname = \"ssh-to-box\"\nfrom = \"wan\"\nto = \"firewall\"\nproto = \"tcp\"\nport = 22\naction = \"accept\"\n";
+        let appliance = Appliance::from_toml(&text).unwrap();
+        let q = Query {
+            in_interface: "wan0".into(),
+            proto: "tcp".into(),
+            src: "203.0.113.20".parse().unwrap(),
+            dst: "192.0.2.50".parse().unwrap(),
+            port: 22,
+            src_mac: None,
+            icmp_type: None,
+        };
+        let held = [("wan0".to_string(), "192.0.2.50".parse().unwrap())];
+        let t = trace_holding(&appliance, &q, &held).unwrap();
+        assert_eq!(t.verdict, "pass", "{t:?}");
+        assert_eq!(t.decided_by, "ssh-to-box");
+        assert!(stage(&t, "route").contains("own address on wan0"), "{t:?}");
+        // The same address held by no configured link is not the box's.
+        let elsewhere = [("docker0".to_string(), "192.0.2.50".parse().unwrap())];
+        let t = trace_holding(&appliance, &q, &elsewhere).unwrap();
+        assert_ne!(t.decided_by, "ssh-to-box", "{t:?}");
     }
 
     fn stage<'a>(t: &'a Trace, s: &str) -> &'a str {

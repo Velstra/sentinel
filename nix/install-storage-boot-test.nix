@@ -93,6 +93,10 @@ in pkgs.testers.runNixOSTest {
                 old = installer.succeed(f"blkid -s PARTUUID -o value /dev/vda{number}").strip()
                 assert installer.succeed(f"blkid -s PARTUUID -o value {target}{number}").strip() == old
         assert [installer.succeed(cmd) for cmd in gpt_reads] == source_gpt
+        # The box the install ran on keeps its own state and services: a target
+        # volume opened during the install must not take the LABEL=data alias
+        # this box mounts /var/lib/sentinel by.
+        installer.succeed("systemctl is-active var-lib-sentinel.mount sshd.service velstra.service wren.service")
         assert installer.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == source_config
         installer.shutdown()
 
@@ -139,7 +143,12 @@ in pkgs.testers.runNixOSTest {
                             fragment = installed.get_console_log()[baseline:]
                             refusal = f"attempt {attempt}/3 failed"
                             assert "data volume unlocked" not in fragment, fragment
-                            if refusal in fragment and "Unlock the Sentinel data volume" in fragment.split(refusal,1)[1]:
+                            # Two writers share the serial console: the password
+                            # agent prints the next prompt itself, journald forwards
+                            # the refusal line. Either can land first, so the fresh
+                            # prompt is any prompt after the wrong key was sent (the
+                            # previous one was already on screen at the baseline).
+                            if refusal in fragment and "Unlock the Sentinel data volume" in fragment:
                                 invalid_count += 1
                                 password_trace.append({"attempt":attempt,"explicit_refusal":True,"unlocked_before_correct_key":False})
                                 break

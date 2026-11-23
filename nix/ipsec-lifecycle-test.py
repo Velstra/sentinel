@@ -92,8 +92,14 @@ with subtest("normal correct-key recovery and active deletion keep the unrelated
 
 with subtest("deleting the final established responder leaves no loaded config or kernel SA"):
     configure(["delete vpn ipsec qa-keep"])
-    assert counts() == 0 and not fw.succeed("swanctl --list-sas").strip()
-    assert not fw.succeed("swanctl --list-conns").strip()
+    assert counts() == 0, "the last removed tunnel retained kernel SAs"
+    # With no tunnel left, the product stops the idle daemon rather than keep
+    # factory IKE listeners and credentials resident: no daemon is the
+    # strongest form of "no loaded configuration". Its rendered connection and
+    # secrets files are gone too, so a restarted daemon could load nothing.
+    fw.fail("systemctl is-active --quiet strongswan-swanctl.service")
+    fw.fail("test -e /run/sentinel/swanctl/swanctl.conf")
+    fw.fail("test -e /run/sentinel/swanctl/secrets.conf")
     fw.fail("test -e /run/sentinel/ipsec-guards.json")
     observation["last_established_tunnel_removed_without_global_SA_flush"] = True
 

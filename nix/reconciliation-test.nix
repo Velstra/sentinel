@@ -126,27 +126,30 @@ pkgs.testers.runNixOSTest {
         configure([])
         first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
 
-    with subtest("a crashed agent puts its raised zoned links back into the hold"):
-        # The XDP program dies with the agent, so a zoned link left up would
-        # forward with nothing on it until the restart hooks it again. The
-        # unit's ExecStopPost takes it down; the restarted agent raises it.
-        # The journal line is the proof: Restart=on-failure brings the agent
-        # back within seconds, so sampling the link state alone could race.
+    with subtest("a crashed agent leaves its zoned links up under its pinned hooks"):
+        # The agent persists its hooks (DP-12): its XDP and egress programs
+        # stay attached and pinned when it dies, so a zoned link keeps being
+        # filtered and the hold leaves it up instead of taking it down; the
+        # restarted agent adopts the pins. Holding it down would only add the
+        # outage persistence removes. The journal line is the proof, because
+        # Restart=on-failure brings the agent back within seconds.
         #
         # A crash kills the agent alone. Killing the whole unit kills the
-        # ExecStopPost with it, so for that the next start's ExecStartPre
-        # repeats the hold before the agent runs; either way the line appears.
+        # ExecStopPost with it, so then the next start's ExecStartPre makes
+        # the same decision; either way the line appears.
         for whom in ("main", "all"):
             cursor = fw.succeed("journalctl -n 0 --show-cursor | sed -n 's/^-- cursor: //p'").strip()
             fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
             fw.succeed(f"systemctl kill --kill-whom={whom} -s KILL velstra.service")
             fw.wait_until_succeeds(
                 f"journalctl --after-cursor='{cursor}' -u velstra.service "
-                "| grep -q 'hold-links-down: tenant0 held until the data plane hooks it again'",
+                "| grep -q 'hold-links-down: tenant0 kept up: its pinned datapath hooks are still attached'",
                 timeout=30,
             )
+            journal = fw.succeed(f"journalctl --after-cursor='{cursor}' -u velstra.service")
+            assert "tenant0 held until the data plane hooks it again" not in journal, journal
             fw.wait_until_succeeds("systemctl is-active velstra.service", timeout=30)
-            fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+            fw.succeed("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'")
             fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
             assert "held:" not in fw.succeed("sentinel show interfaces")
 

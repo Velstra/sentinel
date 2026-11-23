@@ -455,6 +455,21 @@ pub fn data_mapper_path() -> String {
     format!("/dev/mapper/{DATA_MAPPER}")
 }
 
+/// The device-mapper name the installer opens a TARGET's new encrypted data
+/// volume under, to make its filesystem and to seed it — never [`DATA_MAPPER`].
+///
+/// The box the installer runs on mounts its own state by LABEL=data, and the
+/// target's ext4 carries that label too. Under the disk rules the open target
+/// took over `/dev/disk/by-label/data`, and closing it removed the alias under
+/// the running box's mount: systemd stopped `/var/lib/sentinel` and every
+/// service needing it, SSH included. The image's udev rule
+/// (`udev/12-sentinel-install-target.rules`) gives this one name no disk links.
+const INSTALL_MAPPER: &str = "sentinel-install-data";
+
+fn install_mapper_path() -> String {
+    format!("/dev/mapper/{INSTALL_MAPPER}")
+}
+
 /// The A/B GPT layout: 1=ESP, 2=store-verity-A, 3=store-A, 4=store-verity-B,
 /// 5=store-B, 6=data. Data is last so it can grow to fill the disk.
 pub const DATA_PART: u32 = 6;
@@ -542,7 +557,7 @@ fn run_stdin(cmd: &str, args: &[&str], input: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Format `dev` as a fresh LUKS2 container and open it as [`DATA_MAPPER`], with
+/// Format `dev` as a fresh LUKS2 container and open it as [`INSTALL_MAPPER`], with
 /// the passphrase fed on stdin (never on argv). LUKS2 is the modern default:
 /// Argon2id key derivation, a resilient on-disk header. The mapped device that
 /// comes back is where the data filesystem is then made.
@@ -576,23 +591,23 @@ fn luks_format_open(dev: &str, passphrase: &str) -> Result<()> {
     luks_open(dev, passphrase)
 }
 
-/// Open an existing LUKS2 volume on `dev` as [`DATA_MAPPER`], passphrase on stdin.
+/// Open an existing LUKS2 volume on `dev` as [`INSTALL_MAPPER`], passphrase on stdin.
 fn luks_open(dev: &str, passphrase: &str) -> Result<()> {
     run_stdin(
         "cryptsetup",
-        &["open", "--key-file", "-", dev, DATA_MAPPER],
+        &["open", "--key-file", "-", dev, INSTALL_MAPPER],
         passphrase.as_bytes(),
     )
     .with_context(|| format!("opening the LUKS2 volume on {dev}"))
 }
 
-/// Close the [`DATA_MAPPER`] device when dropped, so an encrypted install leaves
-/// nothing unlocked behind it however it returns.
+/// Close the [`INSTALL_MAPPER`] device when dropped, so an encrypted install
+/// leaves nothing unlocked behind it however it returns.
 struct CryptGuard;
 impl Drop for CryptGuard {
     fn drop(&mut self) {
         let _ = Command::new(system::bin("cryptsetup"))
-            .args(["close", DATA_MAPPER])
+            .args(["close", INSTALL_MAPPER])
             .status();
     }
 }
@@ -751,7 +766,7 @@ pub fn execute(
                 run("udevadm", &["settle"]).ok();
                 run(
                     "mkfs.ext4",
-                    &["-q", "-F", "-L", "data", &data_mapper_path()],
+                    &["-q", "-F", "-L", "data", &install_mapper_path()],
                 )?;
                 drop(guard); // close the volume now, not at end of scope
             }
@@ -1382,7 +1397,7 @@ pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str, crypto: &Crypto) -
         Crypto::None => (existing_data_base(targets, raid), None),
         Crypto::Luks { passphrase } => {
             luks_open(&existing_data_base(targets, raid), passphrase)?;
-            (data_mapper_path(), Some(CryptGuard))
+            (install_mapper_path(), Some(CryptGuard))
         }
     };
     let mnt = std::path::Path::new("/run/sentinel-seed");
@@ -2617,6 +2632,34 @@ mod tests {
     fn the_unlocked_data_volume_has_a_stable_name() {
         assert_eq!(data_mapper_path(), "/dev/mapper/data");
         assert_eq!(DATA_MAPPER, "data");
+    }
+
+    /// The installer's unlock of a target must not be the running box's own
+    /// volume name, and the image's udev rule must hide exactly that name from
+    /// the disk rules (no by-label/data alias), sorted between the rule that
+    /// names a device-mapper device and the one that links it.
+    #[test]
+    fn the_install_target_volume_never_claims_the_running_boxs_state_label() {
+        assert_ne!(INSTALL_MAPPER, DATA_MAPPER);
+        assert_eq!(install_mapper_path(), "/dev/mapper/sentinel-install-data");
+        let rule = include_str!("../udev/12-sentinel-install-target.rules");
+        let active: Vec<&str> = rule
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .collect();
+        assert_eq!(active.len(), 1, "{rule}");
+        let line = active[0];
+        assert!(
+            line.contains(&format!("ENV{{DM_NAME}}==\"{INSTALL_MAPPER}\"")),
+            "{line}"
+        );
+        assert!(
+            line.contains("ENV{DM_UDEV_DISABLE_DISK_RULES_FLAG}=\"1\""),
+            "{line}"
+        );
+        assert!(!line.contains(&format!("==\"{DATA_MAPPER}\"")), "{line}");
+        assert!("10-dm.rules" < "12-sentinel-install-target.rules");
+        assert!("12-sentinel-install-target.rules" < "13-dm-disk.rules");
     }
 
     #[test]

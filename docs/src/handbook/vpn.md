@@ -2,11 +2,7 @@
 
 <a id="vpn--pki"></a>
 
-Choose the tunnel type first. Assign addresses, routing policy and firewall zones explicitly; a successful handshake alone does not establish forwarding to a protected subnet.
-
-## IPsec (site-to-site, IKEv2)
-
-Configure the two IKEv2 endpoints and matching protected subnets. Provision independent site credentials through an approved local process.
+A site-to-site IKEv2 tunnel between `10.0.0.0/24` and `10.1.0.0/24`:
 
 ```text
 set vpn ipsec branch local 203.0.113.1
@@ -14,11 +10,34 @@ set vpn ipsec branch remote 198.51.100.1
 set vpn ipsec branch local-subnet 10.0.0.0/24
 set vpn ipsec branch remote-subnet 10.1.0.0/24
 set vpn ipsec branch psk <pre-shared-key>
+compare
+commit-confirm 2
 ```
+
+Assign addresses, routing policy and firewall zones explicitly: a successful handshake alone does not establish forwarding to a protected subnet.
+
+## Which VPNs this appliance carries, and which it will not
+
+| Use case | Choose |
+|---|---|
+| a key-based peer | [WireGuard](#wireguard) |
+| IPsec interoperability | [IKEv2](#ipsec-site-to-site-ikev2), policy- or [route-based](#route-based-tunnels-vti) |
+| a compatible TLS remote-access client | [OpenConnect](#openconnect-road-warrior) |
+
+## IPsec (site-to-site, IKEv2)
+
+Match the two IKEv2 endpoints and the protected subnets at both ends (the example above). Provision independent site credentials through an approved local process.
 
 ### Route-based tunnels (VTI)
 
-Bind a VTI to its IPsec tunnel and install routes over the VTI for the remote networks.
+```mermaid
+flowchart LR
+  lan([LAN host]) --> rt[static route<br/>10.1.0.0/24 dev vti0]
+  rt --> vti[vti0<br/>vti-key 42]
+  vti --> sa[IPsec branch] -->|encrypted| peer([198.51.100.1])
+```
+
+Bind a VTI to its IPsec tunnel, then route the remote networks over the VTI.
 
 ```text
 set interface vti0 type vti
@@ -37,7 +56,7 @@ set protocols static 10.1.0.0/24 dev vti0
 
 ## WireGuard
 
-Define the logical interface, local tunnel address, peer public key and allowed prefixes. Confirm the peer endpoint can be reached through the underlay.
+The interface, its tunnel address, and each peer's public key and allowed prefixes. The peer endpoint must be reachable through the underlay.
 
 ```text
 set interface wg0 type wireguard
@@ -52,7 +71,7 @@ set vpn wireguard wg0 peer <peer-pubkey> keepalive 25
 
 ## OpenConnect (road-warrior)
 
-Set the VPN server certificate, client address pool, DNS and permitted routes. Provision a separate credential for each intended user.
+The server certificate, client address pool, DNS and permitted routes. Give each user a separate credential.
 
 ```text
 set vpn openconnect certificate vpn-cert
@@ -65,7 +84,7 @@ set vpn openconnect user alice password <secret>
 
 ## PKI
 
-Create a local CA and issue a certificate with the intended subject, alternate names and usage. Review issuance and expiration with `sentinel show pki`. For a public ACME service, use the separately documented ACME path.
+A local CA and a certificate with the intended subject, alternate names and usage. Review issuance and expiry with `sentinel show pki`. For a public ACME service, use the separately documented ACME path.
 
 ```text
 set pki ca lab-ca common-name "Lab CA"
@@ -77,7 +96,7 @@ set pki certificate vpn-cert usage server
 
 ### ACME issuance
 
-Use a reachable challenge host and check the certificate’s names and expiry after issuance. For an internal CA, distribute the issuing CA through your own trust policy.
+The challenge host must be reachable; check the certificate's names and expiry after issuance. For an internal CA, distribute the issuing CA through your own trust policy.
 
 ```text
 set firewall rule acme-challenge from wan
@@ -85,10 +104,6 @@ set firewall rule acme-challenge action accept
 set firewall rule acme-challenge proto tcp
 set firewall rule acme-challenge port 80
 ```
-
-## Which VPNs this appliance carries, and which it will not
-
-Choose WireGuard for a key-based peer, IKEv2 for IPsec interoperability or OpenConnect for a compatible TLS remote-access client.
 
 ## Check the result
 
@@ -98,4 +113,4 @@ sentinel show pki
 sentinel show ip route
 ```
 
-For IPsec, inspect the active security associations and verify the remote subnet from an authorized client. Check certificate expiry for TLS-based services.
+For IPsec, check the active security associations and reach the remote subnet from an authorized client. Check certificate expiry for TLS-based services.

@@ -284,8 +284,10 @@ await test("what a create panel stages is a command the appliance parses", async
   const cases = [
     ["interfaces", null, "toggleiface", "addifacepanel", "eth9", { "Zone": "lan" }],
     ["routing", "static", "toggleroute", "addroutepanel", "0.0.0.0/0", { "Via": "192.0.2.1" }],
+    // A rule names a protocol: a proto-less accept is the zone's default
+    // posture, which the fixture's `wan` already sets (DP-14 refuses it).
     ["rules", null, "togglerule", "addrulepanel", "probe-rule",
-      { "From zone": "wan", "To zone": "lan", "Action": "accept" }],
+      { "From zone": "wan", "To zone": "lan", "Action": "accept", "Protocol": "tcp", "Port": "443" }],
     ["groups", null, "togglegroup", "addgrouppanel", "offices", { "Addresses": "10.0.0.0/8" }],
     ["synproxy", null, "togglesyn", "addsynpanel", "8443", { "MSS": "1400" }],
     ["nat", null, "togglesnat", "addsnatpanel", "wan-masq", { "Zone": "wan" }],

@@ -4,6 +4,8 @@
 //! common apply lock. Readers never initialize a missing generation. Expensive
 //! parsing, hashing, probes and networking run outside the final checkpoint;
 //! only nonblocking flock and descriptor/path metadata comparisons run inside.
+//! Metadata identifies content only if a rewrite gets a new stamp, so a token
+//! records a file's stamp only once the kernel's write clock has passed it.
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -159,6 +161,61 @@ impl From<&Metadata> for Stamp {
     }
 }
 
+/// The clock the kernel stamps file writes from on kernels without
+/// fine-grained timestamps (before 6.13).
+fn coarse_now() -> Result<(i64, i64)> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    ensure!(
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) } == 0,
+        "reading the coarse real-time clock: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok((ts.tv_sec, ts.tv_nsec))
+}
+
+/// How far ahead of the coarse clock a timestamp may sit and still be the
+/// current tick: kernels with fine-grained timestamps (6.13+) stamp ahead of
+/// the coarse clock by up to one tick. Anything further out is a stepped-back
+/// clock, where a later write is stamped earlier and so differs anyway.
+const RACY_AHEAD_NS: i128 = 1_000_000_000;
+/// Longest a token waits for its file's timestamps to fall into the past.
+const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn nanos((secs, nsec): (i64, i64)) -> i128 {
+    i128::from(secs) * 1_000_000_000 + i128::from(nsec)
+}
+
+/// A timestamp the coarse clock has not yet passed: a write now could be
+/// stamped identically, so a same-size in-place rewrite would be invisible.
+fn racy(stamp: (i64, i64), now: (i64, i64)) -> bool {
+    let ahead = nanos(stamp) - nanos(now);
+    (0..=RACY_AHEAD_NS).contains(&ahead)
+}
+
+/// The descriptor's metadata once the coarse clock has passed its mtime and
+/// ctime, so any later write gets a different stamp. Kernels before 6.13 stamp
+/// writes from that clock, at its tick (1-10 ms); waiting for one tick is the
+/// difference between "unchanged" and "rewritten within the same tick".
+fn settled_metadata(file: &File, path: &Path) -> Result<Metadata> {
+    let deadline = std::time::Instant::now() + SETTLE_LIMIT;
+    loop {
+        let m = file.metadata()?;
+        let now = coarse_now()?;
+        if !racy((m.mtime(), m.mtime_nsec()), now) && !racy((m.ctime(), m.ctime_nsec()), now) {
+            return Ok(m);
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "protected file {} keeps changing; try again",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 struct Token {
     path: PathBuf,
     follow: bool,
@@ -187,7 +244,7 @@ impl Token {
             }
             Err(error) => return Err(error).context("opening protected update context"),
         };
-        let m = file.metadata()?;
+        let m = settled_metadata(&file, path)?;
         ensure!(
             m.is_file() && m.uid() == owner && m.mode() & 0o022 == 0 && (follow || m.nlink() == 1),
             "protected update context must be an owner-controlled regular file"
@@ -490,6 +547,40 @@ mod tests {
             }
             assert!(observation.check(true).is_err(), "operation {operation}");
         }
+    }
+
+    #[test]
+    fn mutation_token_opens_only_once_its_timestamps_are_in_the_past() {
+        // The kernel stamps writes from a coarse clock. While that clock still
+        // reads a recorded timestamp's tick, a same-size in-place rewrite gets
+        // the identical stamp and the fence cannot see it. A token must not be
+        // handed out before every timestamp it recorded is strictly past.
+        let owner = unsafe { libc::geteuid() };
+        let scratch = crate::update::Scratch::new().unwrap();
+        for round in 0..20 {
+            let path = scratch.join(&format!("config-{round}"));
+            std::fs::write(&path, "same bytes").unwrap();
+            let token = Token::open(&path, false, false, owner).unwrap();
+            let stamp = token.stamp.clone().unwrap();
+            let now = coarse_now().unwrap();
+            assert!(
+                !racy(stamp.mtime, now) && !racy(stamp.ctime, now) && stamp.mtime < now,
+                "round {round}: stamp {stamp:?} not before coarse now {now:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_racy_timestamps_are_the_current_tick_and_just_ahead_only() {
+        let now = (1_000, 500_000_000);
+        assert!(racy((1_000, 500_000_000), now));
+        assert!(racy((1_000, 510_000_000), now));
+        assert!(racy((1_001, 400_000_000), now));
+        assert!(!racy((1_000, 499_999_999), now));
+        assert!(!racy((999, 900_000_000), now));
+        // Far in the future (a clock stepped back): a later write is stamped
+        // earlier, so it differs anyway, and waiting for it would never end.
+        assert!(!racy((1_005, 0), now));
     }
 
     #[test]

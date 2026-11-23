@@ -47,7 +47,16 @@ async function fresh(width){
 }
 async function clean(page){
  check(!page.thrown.length&&!page.consoleMessages.some(row=>row.level==='error'),page.thrown.join('\n'));
- check(!page.responses.some(row=>row.url.startsWith(process.env.CONSOLE_URL)&&row.status>=400),'Actual fixture HTTP error');
+ // A live-state pane (`GET /api/v1/show/*`) reads privileged daemons; the
+ // sandbox's unprivileged API cannot run them (no sudo, no charon), so such a
+ // read fails here whatever the fixture does. The page renders that as a
+ // "Status unavailable" pane, asynchronously, and an uncaught error from it
+ // would still fail the check above. Any other failed request is a fixture or
+ // staging error.
+ const failed=page.responses.filter(row=>row.url.startsWith(process.env.CONSOLE_URL)&&row.status>=400);
+ const said=await page.evaluate(`[...document.querySelectorAll('[data-diagnostic-for]')].map(n=>n.getAttribute('data-diagnostic-for')+': '+n.textContent.trim())`);
+ const unexplained=failed.filter(row=>!row.url.slice(process.env.CONSOLE_URL.length).startsWith('api/v1/show/'));
+ check(!unexplained.length,'Actual fixture HTTP error: '+JSON.stringify(unexplained.map(row=>[row.status,row.url.slice(process.env.CONSOLE_URL.length)]))+' '+said.join(' | '));
  check(await page.evaluate('!management.getSnapshot().pending&&stagedCommands().length===0'),'Test left a staged/provisional change');
 }
 function rule(o,name,seq){return o.kind==='prefix-list'?`set policy prefix-list ${name} rule ${seq} prefix 198.51.100.0/24`:`set policy route-map ${name} rule ${seq} action permit`;}

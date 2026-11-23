@@ -1,4 +1,11 @@
-{ pkgs, self, legacyPackage ? null }:
+# legacyNode = 2 runs the reverse upgrade window (the current agent owns the
+# flow, the older one takes over). That direction is a known, documented
+# limitation (handbook "Mixed versions during an upgrade"): the older
+# allocator cannot find the current one's binding, so it is not a wired
+# check. Reproduce with an `ha-napt-mixed-version-reverse` entry in flake.nix
+# beside `ha-napt-mixed-version`, passing `legacyNode = 2`; on fabric 0422e3a
+# and 1f76ea4 alike the stream times out after takeover (WAN port 59268).
+{ pkgs, self, legacyPackage ? null, legacyNode ? 1 }:
 let
   # Test-only. On a real box Sentinel and the agent ship in one image (and an
   # A/B rollback boots both old); only this fixture pairs the CURRENT compiler
@@ -64,11 +71,20 @@ let
       wan.default_action = "drop";
       lan.default_action = "drop";
       control.default_action = "accept";
+    } // pkgs.lib.optionalAttrs (legacyPackage == null) {
+      # Rules `to firewall` are what make a takeover's VIPs part of the
+      # agent's local-destination set (see the gate check below). Not in the
+      # mixed-version variant: its older agent can only hold such a rule
+      # expanded to its own addresses, so its policy digest would differ from
+      # the current agent's and state sync between them would be refused.
+      firewall.local = true;
     };
     rule = [ { name = "single-echo"; from = "lan"; proto = "tcp"; port = 8443; action = "accept"; }
       # A constant-rate UDP probe measures the forwarding gap itself; a TCP
       # stream's retransmission backoff would add to whatever it measures.
-      { name = "gap-probe"; from = "lan"; proto = "udp"; port = 8444; action = "accept"; } ];
+      { name = "gap-probe"; from = "lan"; proto = "udp"; port = 8444; action = "accept"; } ]
+      ++ pkgs.lib.optionals (legacyPackage == null)
+      [ { name = "mgmt-ssh"; from = "lan"; to = "firewall"; proto = "tcp"; port = 22; action = "accept"; } ];
     nat.source = [ { name = "shared-snat"; zone = "wan"; to = "10.1.0.100"; } ];
     protocols.vrrp = map (vip: {
       inherit (vip) name vrid;
@@ -91,11 +107,15 @@ let
     networking.firewall.enable = lib.mkForce false;
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance node);
-    services.velstra.package = lib.mkIf (node == 1 && legacyPackage != null)
+    services.velstra.package = lib.mkIf (node == legacyNode && legacyPackage != null)
       (lib.mkForce legacyAgent);
     environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.tcpdump ];
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
-    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
+    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug,velstra::firewall=info";
+    # As in ha-failover-test.nix: the test driver forwards every journal line
+    # synchronously to the serial console, and a backed-up console stalls the
+    # agents' logging and with it HA timing. The journal itself keeps it all.
+    services.journald.extraConfig = lib.mkAfter "MaxLevelConsole=warning\n";
   };
   echo = pkgs.writeText "two-node-single-connection-echo.py" ''
     import json, socket, threading
@@ -213,7 +233,7 @@ let
             time.sleep(0.02)
   '';
 in pkgs.testers.runNixOSTest {
-  name = "sentinel-ha-two-node-established-snat-flow${pkgs.lib.optionalString (legacyPackage != null) "-mixed-version"}";
+  name = "sentinel-ha-two-node-established-snat-flow${pkgs.lib.optionalString (legacyPackage != null) "-mixed-version"}${pkgs.lib.optionalString (legacyPackage != null && legacyNode == 2) "-legacy-takes-over"}";
   nodes = {
     primary = member 1;
     secondary = member 2;
@@ -246,6 +266,14 @@ in pkgs.testers.runNixOSTest {
   };
   testScript = ''
     import json, re, shlex, time
+    import importlib.util
+    # The one failover bound every HA check uses; formula and measurements
+    # are in nix/ha-failover-bound.py.
+    ha_spec = importlib.util.spec_from_file_location("ha_failover_bound", "${./ha-failover-bound.py}")
+    assert ha_spec is not None and ha_spec.loader is not None
+    ha_bound = importlib.util.module_from_spec(ha_spec)
+    ha_spec.loader.exec_module(ha_bound)
+    ha_bound.ha_use_tcpdump("${pkgs.tcpdump}/bin/tcpdump")
 
     def py(source):
         return "${pkgs.python3}/bin/python3 -c " + shlex.quote(source)
@@ -291,7 +319,18 @@ in pkgs.testers.runNixOSTest {
             print(node.name, node.execute("ip route; ip -s neigh; cat /tmp/stream-status /tmp/accepted 2>/dev/null; journalctl -u ha-flow-stream -u ha-flow-echo --no-pager -n 40")[1])
             print(node.execute("systemctl stop ha-flow-packets; ${pkgs.tcpdump}/bin/tcpdump -nn -tt -e -S -r /tmp/flow.pcap 2>/dev/null | tail -n 100")[1])
 
-    start_all()
+    # The primary must own the pair before its peer exists. Booted together,
+    # whichever member's agent comes up first promotes itself (a two-node
+    # pair has no preemption), and a secondary that booted 3 s earlier once
+    # took term 1 and failed the VIP wait below. Staged, the test decides
+    # the owner, not the boot order.
+    for node in (primary, client, server):
+        node.start()
+    primary.wait_for_unit("velstra.service")
+    primary.wait_for_unit("wren.service")
+    primary.wait_until_succeeds("ip -o address show eth1 | grep -q 10.1.0.100 && ip -o address show eth2 | grep -q 10.2.0.100", timeout=90)
+    primary.wait_until_succeeds(py('import json; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==1 and r["authority"]["term"]>0'), timeout=30)
+    secondary.start()
     primary_alive = True
     try:
         # Exactly two HA appliances and two traffic endpoints: no witness or
@@ -313,6 +352,7 @@ in pkgs.testers.runNixOSTest {
         for node in (client, server):
             node.succeed("systemd-run --unit=ha-flow-packets ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/flow.pcap -i eth1 tcp port 8443")
             node.wait_until_succeeds("journalctl -u ha-flow-packets --no-pager | grep -q 'listening on eth1'", timeout=5)
+        ha_bound.ha_capture_start(client, "eth1", 8443)
         client.succeed("systemd-run --unit=ha-flow-stream ${pkgs.python3}/bin/python3 ${stream}")
         client.wait_until_succeeds("test -s /tmp/stream-status", timeout=8)
         baseline = progress(0, 50, "before fault")
@@ -324,12 +364,17 @@ in pkgs.testers.runNixOSTest {
             # Actual old agent/object on owner, current object on standby.
             # Keep Python indentation literal, not stripped by a nested Nix
             # indented string. No test-written NAT or replacement program.
-            old_command = primary.succeed("systemctl show velstra.service -p ExecStart --value")
-            new_command = secondary.succeed("systemctl show velstra.service -p ExecStart --value")
+            # legacyNode 1: the old agent owns the flow and the current one
+            # takes over. legacyNode 2: the reverse, a fail-back onto a peer
+            # not yet upgraded.
+            old_node, new_node = (primary, secondary) if ${toString legacyNode} == 1 else (secondary, primary)
+            old_command = old_node.succeed("systemctl show velstra.service -p ExecStart --value")
+            new_command = new_node.succeed("systemctl show velstra.service -p ExecStart --value")
             assert "${legacyPath}/bin/velstra" in old_command, old_command
             assert "${self.packages.x86_64-linux.velstra}/bin/velstra" in new_command, new_command
             assert "${legacyPath}" != "${self.packages.x86_64-linux.velstra}"
-            assert translated["port"] == 47009, translated
+            if ${toString legacyNode} == 1:
+                assert translated["port"] == 47009, translated
         owner = json.loads(primary.succeed("cat /run/velstra/ha/role.json"))["authority"]
         # A flow entry AND a fresh complete matching-generation snapshot must
         # already exist on the real standby before disrupting its owner.
@@ -340,6 +385,13 @@ in pkgs.testers.runNixOSTest {
         client.wait_until_succeeds("test $(wc -l < /tmp/udp-replies) -ge 20", timeout=10)
         probe_before = probe_replies()
         before = status()["count"]
+        # A takeover must never close the new owner's configuration gate
+        # (the configured VIPs are local destinations on both members).
+        # The agent logs every closure; count them from just before the
+        # fault to 3 s after promotion.
+        gate_count = "journalctl -u velstra -o cat --no-pager | grep -c 'configuration gate closed' || true"
+        gate_before = int(secondary.succeed(gate_count).strip())
+        anchor = ha_bound.ha_fault_anchor(client)
         started = time.monotonic()
         primary.succeed("systemctl kill --kill-who=main --signal=SIGSTOP wren.service")
         # Both VIPs and actual data-plane acknowledgement, not desired election
@@ -370,6 +422,7 @@ in pkgs.testers.runNixOSTest {
         # Diagnostic only: host time includes driver command and return costs.
         print("promotion observation", observation, "host elapsed", elapsed)
         assert code == 0, observation
+        promoted = time.monotonic()
         successor = json.loads(secondary.succeed("cat /run/velstra/ha/role.json"))["authority"]
         assert successor["term"] > owner["term"] and successor["policy"] == owner["policy"], (owner, successor)
         primary.succeed(py('import json,time; r=json.load(open("/run/velstra/ha/role.json")); assert r["authority"]["owner"]==1 and r["deadline_ns"]<time.clock_gettime_ns(time.CLOCK_BOOTTIME)'))
@@ -386,6 +439,18 @@ in pkgs.testers.runNixOSTest {
         stream_gap = reply_gap(before - 1)
         print(f"in-guest forwarding gap across warm promotion {gap:.3f}s (TCP stream gap {stream_gap:.3f}s incl. retransmission backoff; host elapsed {elapsed:.3f}s)")
         assert gap <= 1.5, f"warm two-node promotion exceeded replica budget: in-guest gap {gap:.3f}s"
+        time.sleep(max(0.0, promoted + 3 - time.monotonic()))
+        gate_after = int(secondary.succeed(gate_count).strip())
+        if gate_after != gate_before:
+            print(secondary.execute("journalctl -u velstra -o short-monotonic --no-pager | grep 'configuration gate closed' | tail -n 5")[1])
+        assert gate_after == gate_before, ("the two-node takeover closed the new owner's configuration gate", gate_before, gate_after)
+        print(f"two-node takeover: the new owner's configuration gate stayed open ({gate_after} closures before and after)")
+        # (a) and (b) of the shared bound. Without a witness the standby
+        # takes over only once the 1000 ms peer timeout has passed, on top of
+        # the lease-run-out-relative takeover budget.
+        ha_bound.ha_takeover(client, anchor, secondary.succeed("cat /sys/class/net/eth2/address").strip(),
+                             "10.2.0.100", "10.1.0.10", 8443,
+                             takeover_max=ha_bound.HA_TAKEOVER_MAX + ha_bound.HA_TWO_NODE_PEER_TIMEOUT)
         server.succeed("systemd-run --unit=old-mac-capture ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/old-mac.pcap -i eth1 'tcp src port 41001 and tcp dst port 8443'")
         server.wait_until_succeeds("journalctl -u old-mac-capture --no-pager | grep -q 'listening on eth1'", timeout=5)
         # Raw Ethernet targets the old MAC without changing the live stream's

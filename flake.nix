@@ -28,7 +28,7 @@
     # Reviewed public integrations; update these URLs and the lock together.
     # The former appliance backports are now included upstream.
     fabric = {
-      url = "github:Velstra/fabric/698d66501c8f820d5e36f6386bb2105b306e32a3";
+      url = "github:Velstra/fabric/daa5f798e2b4712b8ed8fd23029665fe9af86969";
       flake = false;
     };
     # Test-only deployed allocator. Never advance this with the production pin:
@@ -40,7 +40,7 @@
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
     wren = {
-      url = "github:Velstra/wren/ba95bca0e3d5618f2c117a97302b4af27a87d654";
+      url = "github:Velstra/wren/ec96737c737700ae769c2fa391368daa76ea4f7e";
       flake = false;
     };
   };
@@ -75,7 +75,22 @@
             prev.fetchurl args;
       };
 
-      pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
+      # The appliance kernel (nix/kernel.nix). The overlay makes every check
+      # that asks for pkgs.linuxPackages_6_12 boot the kernel the image ships.
+      sentinelKernel = import ./nix/kernel.nix;
+      kernelOverlay = final: prev: {
+        linuxPackages_6_12 = sentinelKernel prev;
+        linux_6_12 = (sentinelKernel prev).kernel;
+      } // replaceOverlay final prev;
+      # system.replaceDependencies with a store-hash rewrite
+      # (nix/replace-direct-dependencies.nix). Only build-support changes, so
+      # no package rebuilds; nix/security-backports.nix requires it.
+      replaceOverlay = final: _: {
+        replaceDirectDependencies =
+          final.callPackage ./nix/replace-direct-dependencies.nix { } // { rewritesStoreHashes = true; };
+      };
+
+      pkgs = ((nixpkgs.legacyPackages.${system}.extend crateSource).extend kernelOverlay).extend
         (import ./nix/compact-tests.nix);
       # Only the fixed-output eBPF object is built from this set (see inputs).
       pkgsEbpf = nixpkgs-ebpf.legacyPackages.${system};
@@ -170,16 +185,20 @@
         withMongo = false; withCzmq = false; withRabbitmq = false; withHiredis = false;
       };
 
-      # HAProxy 3.4.1 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
+      # HAProxy 3.4 (IMG-04): the 3.3 branch has no fix for CVE-2026-55203
       # (FCGI record-length overflow) and CVE-2026-55204 (HPACK NULL deref
-      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixes
-      # both. A leaf package, so it is substituted directly where it is used.
+      # under memory pressure, reachable from any HTTP/2 client); 3.4.1 fixed
+      # both. 3.4.8 is the newest 3.4 release and also fixes CVE-2026-90678
+      # (HTTP/3, fixed in 3.4.5): the recipe builds USE_QUIC, even though
+      # Sentinel renders no QUIC bind. A leaf package, so it is substituted
+      # directly where it is used; nix/security-floor.json holds the floor.
       haproxyFor = p: assert p.haproxy.version == "3.3.17";
         p.haproxy.overrideAttrs (_: {
-          version = "3.4.1";
+          version = "3.4.8";
           src = p.fetchurl {
-            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.1.tar.gz";
-            sha256 = "1y12pjsja0cgbd3cidvql1b48ib32r1qdr8prz3knzfp9z7c8qif";
+            url = "https://www.haproxy.org/download/3.4/src/haproxy-3.4.8.tar.gz";
+            # = haproxy-3.4.8.tar.gz.sha256 published beside the tarball.
+            hash = "sha256-AkvVIabLvjK0JoUxR+a71qibEHxaNBRIRhk/7lt8btE=";
           };
         });
 
@@ -414,7 +433,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its measured output hash. The source stamp below also prevents
       # reusing a cached object after advancing the userspace source pin.
-      ebpfHash = "sha256-f91maVNI2z/wLCgYtNJYmIF/P0SE+qwchJqlZmUWDic=";
+      ebpfHash = "sha256-w2O30S1Lnb/N8jp+IFgrbIrhIGW/YQZbVezaoMaaQOo=";
       ebpfSourceIdentity = builtins.hashString "sha256" (toString fabric);
       ebpfSourceStamp = ''
         printf '%s' '${ebpfSourceIdentity}' > source-id
@@ -625,13 +644,17 @@
       # NOTE: `.#sentinel-image` by contrast builds a raw DISK IMAGE (flashable,
       # no run script) — that's why `./result/bin/run-*-vm` doesn't exist after
       # building it. Use this app to *boot*; build the image to *flash*.
-      apps.${system}.seed-image = {
-        type = "app";
-        program = "${seedImage}/bin/sentinel-seed-image";
-      };
-      apps.${system}.vm = {
-        type = "app";
-        program = "${self.nixosConfigurations.appliance.config.system.build.vm}/bin/run-${applianceData.system.hostname}-vm";
+      # One attribute set: Nix refuses a second `apps.${system}.<name>` binding
+      # ("dynamic attribute already defined"), which broke every `nix run`.
+      apps.${system} = {
+        seed-image = {
+          type = "app";
+          program = "${seedImage}/bin/sentinel-seed-image";
+        };
+        vm = {
+          type = "app";
+          program = "${self.nixosConfigurations.appliance.config.system.build.vm}/bin/run-${applianceData.system.hostname}-vm";
+        };
       };
 
       # The appliance: the base config + the Velstra data-plane service. The
@@ -651,7 +674,8 @@
         {
           # Retain the appliance's LTS kernel ABI across base upgrades. The
           # separate three-kernel verifier matrix does not change the image ABI.
-          boot.kernelPackages = lib.mkDefault pkgs.linuxPackages_6_12;
+          # nix/kernel.nix: the pin's 6.12 recipe at a newer stable release.
+          boot.kernelPackages = lib.mkDefault (sentinelKernel pkgs);
           fileSystems."/sys/fs/bpf" = { device = "bpffs"; fsType = "bpf"; options = [ "nosuid" "nodev" "noexec" ]; };
           imports = [
             ./nix/appliance.nix
@@ -1789,6 +1813,7 @@
           # everything above libcap/libxcrypt, and image-booting checks that
           # run host store paths inside the guest would no longer find them.
           ./nix/security-backports.nix
+          { nixpkgs.overlays = [ replaceOverlay ]; }
           # The verity image build reads `config.nixpkgs.hostPlatform` (efiArch);
           # define it explicitly (this nixpkgs' `nixosSystem` doesn't set it from
           # the `system` arg).
@@ -1850,9 +1875,11 @@
           kernelPackages = pkgs.linuxPackages_6_6;
           label = "6-6";
         };
+        # The image's own kernel, not a look-alike: the object must load on
+        # exactly what ships.
         ebpf-verifier-6-12 = import ./nix/ebpf-verifier-test.nix {
           inherit pkgs self;
-          kernelPackages = pkgs.linuxPackages_6_12;
+          kernelPackages = self.nixosConfigurations.sentinel-image.config.boot.kernelPackages;
           label = "6-12";
         };
         ebpf-verifier-6-18 = import ./nix/ebpf-verifier-test.nix {
@@ -1878,6 +1905,15 @@
         update-release = import ./nix/update-release-test.nix { inherit pkgs sentinel; };
         update-capacity = import ./nix/update-capacity-test.nix { inherit pkgs self; };
         napt-concurrency = import ./nix/napt-test.nix { inherit pkgs self; };
+        # PERF-02: masqueraded new-connection rate after a non-allocator NAT write.
+        nat-cps = import ./nix/nat-cps-test.nix { inherit pkgs self; };
+        # `log` logs decisions, never the packets of admitted flows, and a flood
+        # of logged drops does not stall the box.
+        log-fastpath = import ./nix/log-fastpath-test.nix { inherit pkgs self; };
+        # CGNAT: a 65-port (non-power-of-two) block holds 65 sockets; the 66th is refused.
+        nat-domain-cgnat = import ./nix/nat-domain-cgnat-test.nix { inherit pkgs self; };
+        # A reused client tuple's binding holds its public port through the server's TIME_WAIT.
+        nat-port-reopen = import ./nix/nat-port-reopen-test.nix { inherit pkgs self; };
         ipsec-failclosed = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; };
         ipsec-provenance = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllDirections = true; };
         ipsec-full-selectors = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllSelectors = true; };
@@ -1927,6 +1963,12 @@
         dhcp-late-client = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; };
         dhcp-late-client-stateless = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; stateful = false; };
         local-destination = import ./nix/local-destination-test.nix { inherit pkgs self; };
+        # DP-15 blocklist half: blocklists name sources; the LAN reaches a
+        # listed address and a listed address still cannot start a connection.
+        blocklist-direction = import ./nix/blocklist-direction-test.nix { inherit pkgs self; };
+        # IPv6 parity: the MSS clamp, and ICMPv6 errors behind NPTv6 / quoting
+        # extension headers reach the host that has to act on them.
+        v6-mss-npt-related = import ./nix/v6-mss-npt-related-test.nix { inherit pkgs self; };
         install-boot-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; };
         install-boot-luks-retry = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; invalidAttempts = 2; };
         install-boot-raid1 = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1"; };
@@ -1958,8 +2000,38 @@
           cp ${./tests/test_image_cve_gate.py} tests/test_image_cve_gate.py
           cp ${./tests/test_image_closure.py} tests/test_image_closure.py
           python3 -B -m unittest discover -s tests -p 'test_image_c*.py' -v
+          mkdir -p nix
+          cp ${./scripts/check_security_floor.py} scripts/check_security_floor.py
+          cp ${./nix/security-floor.json} nix/security-floor.json
+          cp ${./tests/test_security_floor.py} tests/test_security_floor.py
+          python3 -B -m unittest discover -s tests -p 'test_security_floor.py' -v
           touch $out
         '';
+        # The security fixes ship: the image closure meets every version floor
+        # in nix/security-floor.json (the kernel among them), and every
+        # security-backports.nix replacement took — no replaced path left, no
+        # backport whose package the image never contains. The sqlite3 shell
+        # (CVE-2026-119586, `.recover`) and libressl's ocspcheck
+        # (CVE-2026-118374) carry CVEs of their own and are never run: only
+        # the libraries ship, and this keeps it that way.
+        image-security-floor =
+          let
+            image = self.nixosConfigurations.sentinel-image.config;
+            replacements = pkgs.writeText "sentinel-security-replacements.json" (builtins.toJSON (map
+              (r: { old = "${r.oldDependency}"; new = "${r.newDependency}"; })
+              image.system.replaceDependencies.replacements));
+          in
+          pkgs.runCommand "sentinel-image-security-floor" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            mkdir -p scripts
+            cp ${./scripts/check_image_closure.py} scripts/check_image_closure.py
+            cp ${./scripts/check_security_floor.py} scripts/check_security_floor.py
+            python3 -B scripts/check_security_floor.py \
+              --floors ${./nix/security-floor.json} \
+              --replacements ${replacements} \
+              --forbid-program sqlite3 --forbid-program ocspcheck \
+              ${pkgs.closureInfo { rootPaths = [ image.system.build.toplevel ]; }}/store-paths
+            touch $out
+          '';
         # PROV-01 seeding tool, end to end against real e2fsprogs.
         seed-image-unit = pkgs.runCommand "sentinel-seed-image-unit" {
           nativeBuildInputs = [ pkgs.python3 ];
@@ -1976,6 +2048,14 @@
           cp ${./tests/test_seed_image.py} tests/test_seed_image.py
           python3 -B -m unittest discover -s tests -p 'test_seed_image.py' -v 2>&1 | tee log
           ! grep -q "skipped" log
+          touch $out
+        '';
+        # The documented entry points `nix run .#seed-image` / `.#vm` must evaluate: the
+        # seeding tool is the only supported cloud provisioning path (PROV-01). Referencing
+        # the vm app's type only, so this check does not build a VM.
+        apps-evaluate = pkgs.runCommand "sentinel-apps-evaluate" { } ''
+          test -x ${self.apps.${system}.seed-image.program}
+          test "${self.apps.${system}.vm.type}" = app
           touch $out
         '';
         # STATIC-08: the console harness reaps its browser and profile on every path.
@@ -1997,6 +2077,15 @@
           SENTINEL_BIN = "${sentinel}/bin/sentinel";
         } ''
           python3 ${./tests/management_tls.py} -v
+          touch $out
+        '';
+        # The HA VM checks' shared bound: the resume instant is the client's
+        # own reply time, judged against the bound, never the poll that saw it.
+        ha-bound-unit = pkgs.runCommand "sentinel-ha-bound-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p test
+          cp ${./nix/ha-failover-bound.py} test/ha-failover-bound.py
+          cp ${./nix/test_ha_failover_bound.py} test/test_ha_failover_bound.py
+          python3 -B -m unittest discover -s test -v
           touch $out
         '';
         # The mixed-version HA fixture's rewrite of velstra.toml for an older
@@ -2860,8 +2949,29 @@
           # A zone posture and a NAT entry, through the same command path the
           # console's forms use. These are the two surfaces most consoles get
           # wrong by growing a second config model beside the real one.
+          #
+          # The box still carries the PUT's broad `web` accept (no proto) from
+          # wan. Under an explicit `default-action drop` that rule opens
+          # nothing, and commit refuses the pair rather than keep an inert
+          # accept (DP-14) — on this path too: by name, with nothing applied.
           machine.succeed(
               "printf '%s\n' "
+              "'set firewall zone wan default-action drop' "
+              "commit save > /tmp/inert"
+          )
+          inert = machine.succeed(
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/inert https://127.0.0.1:8080/api/v1/configure"
+          )
+          assert "has no effect" in inert and "web" in inert, inert
+          assert json.loads(machine.succeed(
+              f"curl -fsSk -H 'Authorization: Bearer {token}' "
+              "https://127.0.0.1:8080/api/v1/config/transaction"
+          ))["pending"] is None, inert
+          # Retiring the inert accept in the same script admits the posture.
+          machine.succeed(
+              "printf '%s\n' "
+              "'delete firewall rule web' "
               "'set interface eth0 zone wan' "
               "'set firewall zone wan default-action drop' "
               "'set nat source console-masq zone wan' "
@@ -2871,6 +2981,9 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/zones https://127.0.0.1:8080/api/v1/configure"
           )
+          # A refusal would otherwise surface only as "expected a provisional
+          # API revision", with the reason this response carries lost.
+          assert '"pending"' in zones, zones
           confirm_pending()
           cfg = machine.succeed(
               "curl -fsSk -H 'Authorization: Bearer " + token + "' "
@@ -3651,7 +3764,9 @@
         nodes.fw =
           { lib, pkgs, ... }:
           {
-            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
+            # The shipped closure's backports: the access point must come up
+            # on the hostapd the image carries (2.12), not the pin's 2.11.
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ./nix/security-backports.nix ];
             networking.hostName = lib.mkForce "fw";
             networking.firewall.enable = lib.mkForce false;
             virtualisation.vlans = [ 1 ];
@@ -3671,6 +3786,10 @@
           fw.wait_for_unit("sentinel-boot.service")
           fw.wait_until_succeeds("ip link show wlan0", timeout=60)
           fw.wait_until_succeeds("ip link show wlan1", timeout=60)
+          # `hostapd -v` prints its version and exits non-zero; read the output
+          # without discarding the status of anything else.
+          _, version = fw.execute("hostapd -v 2>&1")
+          assert "hostapd v2.12" in version, version
 
           # Inspect systemd's effective property, not just the Nix source. This
           # option belongs to [Unit]; [Service] silently ignored the old value.
@@ -4788,6 +4907,15 @@
               systemd.services.sentinel-boot.environment.SENTINEL_GEOIP_DIR =
                 "/etc/geoip-test";
               environment.variables.SENTINEL_GEOIP_DIR = "/etc/geoip-test";
+              # An operator's `configure` re-executes itself once through sudo
+              # (one escalation per session), and sudo's environment reset
+              # drops the override above, so the root session would compile
+              # against the image's real database. Keep this one test-only
+              # data variable across that escalation; the session still takes
+              # the shipped sudo path.
+              security.sudo.extraConfig = ''
+                Defaults env_keep += "SENTINEL_GEOIP_DIR"
+              '';
               environment.systemPackages = [ pkgs.iputils ];
             };
         };
@@ -5739,7 +5867,12 @@
             for m in (n1, n2):
                 m.wait_for_unit("multi-user.target")
                 # The appliance's own agent would hold eth1; this test needs it.
+                # A stopped agent deliberately leaves its pinned hooks enforcing
+                # (DP-12), so release those pins too, and prove eth1 is bare
+                # before the test's own agents attach to it.
                 m.succeed("systemctl stop velstra.service")
+                m.succeed("rm -rf /sys/fs/bpf/velstra")
+                m.wait_until_fails("ip -d link show eth1 | grep -q xdp", timeout=10)
 
             # Each locator is a routed /64, so the two ends can actually reach each
             # other. Asserted before anything is sent: a green run against a dead
@@ -6345,8 +6478,14 @@
           # The rule goes in through a file rather than a nested quoting cascade:
           # a Suricata rule contains quotes, spaces and `->`, and what is being
           # tested is the detector, not the test's own escaping.
+          # The watched link carries a zone. Blocking is the data plane's job,
+          # and a commit that leaves no interface zoned stops the agent (DP-12):
+          # `show ids blocks` would then have nothing to ask. Accept by default
+          # so the detector, not the policy, decides what this test sees.
           fw.succeed(
               """cat > /tmp/ids.cfg <<'CFG'
+          set interface eth1 zone lan
+          set firewall zone lan default-action accept
           set services ids interface eth1
           set services ids rule alert icmp any any -> any any (msg:"velstra ids echo request"; itype:8; sid:1000001; rev:1;)
           set services ids ruleset /var/lib/sentinel/absent.rules
@@ -6357,6 +6496,8 @@
           )
           fw.succeed("sed -i 's/^          //' /tmp/ids.cfg")
           fw.succeed("su admin -c 'sentinel configure < /tmp/ids.cfg'")
+          fw.wait_for_unit("velstra.service")
+          fw.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
           fw.succeed("test -e /run/sentinel/suricata.yaml")
           fw.wait_for_unit("sentinel-ids.service")
 
@@ -7016,7 +7157,9 @@
                   # Partition 6 is a LUKS2 container, not a bare ext4.
                   fstype = machine.succeed("blkid -s TYPE -o value /dev/vdb6").strip()
                   assert fstype == "crypto_LUKS", f"data partition should be LUKS, got {fstype!r}"
-                  # The install closed the volume: nothing is left unlocked.
+                  # The install closed the volume: nothing is left unlocked,
+                  # under the installer's own name or the appliance's.
+                  machine.fail("test -e /dev/mapper/sentinel-install-data")
                   machine.fail("test -e /dev/mapper/data")
 
               with subtest("the passphrase opens it and the ext4 (LABEL=data) is inside"):
@@ -7255,8 +7398,10 @@
             with subtest("the target's data partition is a LUKS2 container"):
                 fstype = machine.succeed("blkid -s TYPE -o value /dev/vdb6").strip()
                 assert fstype == "crypto_LUKS", f"data partition should be LUKS, got {fstype!r}"
-                # The install closed the volume behind it — nothing left unlocked.
-                assert "/dev/mapper/data" not in machine.succeed("ls /dev/mapper")
+                # The install closed the volume behind it — nothing left unlocked,
+                # under the installer's own name or the appliance's.
+                mapped = machine.succeed("ls /dev/mapper").split()
+                assert "sentinel-install-data" not in mapped and "data" not in mapped, mapped
 
             with subtest("the passphrase opens it and the seeded config is inside"):
                 machine.succeed(
@@ -7376,26 +7521,34 @@
                 ];
                 system.name = "machine";
                 # The release proof for the donor, as an operator would carry
-                # it on a second medium: the image's SHA-256 signed by a release
-                # key, and that key's public half to pin. Built from the donor's
-                # raw image, so it vouches for exactly the bytes on the stick.
+                # it on a second medium: the release's signed manifest (its
+                # version and the image's SHA-256) signed by a release key, and
+                # that key's public half to pin. Built from the donor's raw
+                # image, so it vouches for exactly the bytes on the stick. The
+                # bare signed digest stays as the unversioned proof a local
+                # update refuses without --allow-downgrade (CTRL-26).
                 environment.etc."sentinel-update-proof".source =
                   let
                     raw = "${nodes.donor.system.build.finalImage}/${nodes.donor.image.filePath}";
+                    version = lib.escapeShellArg nodes.donor.system.image.version;
                   in
                   pkgs.runCommand "sentinel-update-proof" { nativeBuildInputs = [ pkgs.openssl ]; } ''
                     mkdir -p $out
                     openssl genpkey -algorithm ed25519 -out release.pem
                     openssl pkey -in release.pem -pubout -out $out/release-pub.pem
-                    sha256sum ${raw} | cut -d ' ' -f 1 > $out/velstra-sentinel.raw.sha256
-                    openssl pkeyutl -sign -rawin -inkey release.pem \
-                      -in $out/velstra-sentinel.raw.sha256 -out $out/velstra-sentinel.raw.sha256.sig
+                    sha=$(sha256sum ${raw} | cut -d ' ' -f 1)
+                    manifest() {
+                      printf '{"version":"%s","image":"velstra-sentinel.raw","sha256":"%s","product":"velstra-sentinel"}' \
+                        ${version} "$2" > $out/$1.json
+                      openssl pkeyutl -sign -rawin -inkey release.pem -in $out/$1.json -out $out/$1.json.sig
+                    }
+                    manifest manifest "$sha"
                     # A proof for some OTHER image, to show a stick is held to
                     # its own digest and not to whatever proof is at hand.
-                    echo 0000000000000000000000000000000000000000000000000000000000000000 \
-                      > $out/other.raw.sha256
+                    manifest other 0000000000000000000000000000000000000000000000000000000000000000
+                    printf '%s\n' "$sha" > $out/velstra-sentinel.raw.sha256
                     openssl pkeyutl -sign -rawin -inkey release.pem \
-                      -in $out/other.raw.sha256 -out $out/other.raw.sha256.sig
+                      -in $out/velstra-sentinel.raw.sha256 -out $out/velstra-sentinel.raw.sha256.sig
                   '';
                 virtualisation = {
                   vlans = [ 1 ];
@@ -7525,19 +7678,24 @@
               with subtest("a USB stick is refused without a proof, and against another image's proof"):
                   status, out = machine.execute(f"sentinel update --commit {signed} {donor_disk} 2>&1")
                   assert status != 0 and "block device" in out, out
+                  # The donor's own signed digest is genuine but states no
+                  # release, so it cannot rule out a downgrade (CTRL-26).
                   status, out = machine.execute(
-                      f"sentinel update --commit {signed} --signature {proof}/other.raw.sha256.sig {donor_disk} 2>&1")
+                      f"sentinel update --commit {signed} --signature {proof}/velstra-sentinel.raw.sha256.sig {donor_disk} 2>&1")
+                  assert status != 0 and "states no release version" in out, out
+                  status, out = machine.execute(
+                      f"sentinel update --commit {signed} --signature {proof}/other.json.sig {donor_disk} 2>&1")
                   assert status != 0 and "does not match its signed SHA-256" in out, out
                   # Refused after hashing, before writing: slot B is untouched.
                   assert guid(disk, 4) != guid(donor_disk, 2), "a refused update stamped slot B"
 
               with subtest("update writes + verity-types the inactive slot B from the SIGNED donor"):
                   # The stick carries no signature of its own; the release's
-                  # signed digest comes from another medium via --signature.
+                  # signed manifest comes from another medium via --signature.
                   # The stick is hashed in full against it, then the slot is
                   # written from the same open device, re-hashed on the way.
                   out = machine.succeed(
-                      f"sentinel update --commit {signed} --signature {proof}/velstra-sentinel.raw.sha256.sig {donor_disk} 2>&1")
+                      f"sentinel update --commit {signed} --signature {proof}/manifest.json.sig {donor_disk} 2>&1")
                   assert "signature verified" in out and "image SHA-256 verified" in out, out
                   machine.succeed("udevadm settle")
                   usr = "8484680c-9521-48c6-9c11-b0720656f69e"
@@ -7627,6 +7785,9 @@
             ];
           };
           testScript = ''
+            import json
+            import shlex
+
             machine.wait_for_unit("multi-user.target")
             # Boot seeded the editable config, so `set update …` layers onto it.
             machine.wait_for_unit("sentinel-boot.service")
@@ -7647,12 +7808,28 @@
                     "openssl dgst -sha256 /tmp/chan/sentinel-99.0.0.img | awk '{print $NF}'"
                 ).strip()
 
+                # Signed online metadata carries a freshness policy (scope,
+                # sequence, a lifetime of at most 14 days); an offer without one
+                # is refused. Like a publisher, every publish signs the next
+                # sequence: the appliance refuses a sequence below one it has
+                # seen, or one reused for other bytes.
+                sequence = [0]
+
                 def publish(version, product="velstra-sentinel"):
+                    sequence[0] += 1
+                    now = int(machine.succeed("date +%s"))
+                    manifest = {
+                        "version": version, "image": "sentinel-99.0.0.img",
+                        "sha256": sha, "product": product,
+                        "freshness": {"schema": 1, "channel": "default",
+                                      "arch": machine.succeed("uname -m").strip(),
+                                      "sequence": sequence[0], "issued_at": now,
+                                      "expires_at": now + 86400},
+                    }
                     machine.succeed(
                         "printf '%s' "
-                        "'{\"version\":\"" + version + "\",\"image\":\"sentinel-99.0.0.img\","
-                        "\"sha256\":\"" + sha + "\",\"product\":\"" + product + "\"}' "
-                        "> /tmp/chan/manifest.json"
+                        + shlex.quote(json.dumps(manifest, separators=(",", ":")))
+                        + " > /tmp/chan/manifest.json"
                     )
                     # Detached Ed25519 signature over the EXACT manifest bytes.
                     machine.succeed(
@@ -7663,12 +7840,15 @@
                 publish("99.0.0")
 
             with subtest("pin the channel in the appliance config"):
+                # `--no-apply` saves offline and never escalates, so the file's
+                # owner (root) writes it; this check is about the update gate,
+                # not about live apply.
                 machine.succeed(
-                    "su admin -c \"printf '%s\\n' "
+                    "printf '%s\\n' "
                     "'set update url file:///tmp/chan' "
                     "'set update public-key file:/tmp/pub.pem' "
                     "commit save exit "
-                    "| sentinel configure --no-apply\""
+                    "| sentinel configure --no-apply"
                 )
                 machine.succeed("grep -q 'file:///tmp/chan' /var/lib/sentinel/appliance.toml")
 
@@ -7780,10 +7960,19 @@
                     "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
                     "-in /tmp/img.raw -out /tmp/img.raw.sig"
                 )
+                # A raw signature vouches for bytes, not for a release, so it
+                # cannot rule out a downgrade (CTRL-26): verified, then refused
+                # before the writer unless the operator accepts that.
+                status, out = machine.execute(
+                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem 2>&1"
+                )
+                assert status != 0 and "signature verified" in out.lower(), out
+                assert "states no release version" in out, out
+                assert "could not resolve the source disk" not in out, out
                 # No A/B disk here, so the writer fails at find_source_disk — but
                 # ONLY a signature-verified image gets that far, which is the proof.
                 status, out = machine.execute(
-                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem 2>&1"
+                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem --allow-downgrade 2>&1"
                 )
                 assert status != 0, f"expected the writer to fail without a disk: {out}"
                 assert "signature verified" in out.lower(), (
@@ -7823,12 +8012,14 @@
                     "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
                     "-in /tmp/img.raw -out /tmp/img.raw.sig"
                 )
+                # `--no-apply` saves offline and never escalates: the file's
+                # owner (root) writes it.
                 machine.succeed(
-                    "su admin -c \"printf '%s\\n' "
+                    "printf '%s\\n' "
                     "'set update url file:///tmp/chan' "
                     "'set update public-key file:/tmp/pub.pem' "
                     "commit save exit "
-                    "| sentinel configure --no-apply\""
+                    "| sentinel configure --no-apply"
                 )
                 status, out = machine.execute("sentinel update /tmp/img.raw 2>&1")
                 assert status != 0, out
@@ -7845,9 +8036,11 @@
                     "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
                     "-in /tmp/proof.sha256 -out /tmp/proof.sha256.sig"
                 )
-                status, out = machine.execute(
-                    f"sentinel update {dev} --pubkey file:/tmp/pub.pem --signature /tmp/proof.sha256.sig 2>&1"
-                )
+                digest = f"sentinel update {dev} --pubkey file:/tmp/pub.pem --signature /tmp/proof.sha256.sig"
+                # A signed digest is unversioned too (CTRL-26).
+                status, out = machine.execute(f"{digest} 2>&1")
+                assert status != 0 and "states no release version" in out, out
+                status, out = machine.execute(f"{digest} --allow-downgrade 2>&1")
                 assert "signature verified" in out.lower(), out
                 assert "could not resolve the source disk" in out, (
                     f"a signed device must reach the slot-writer: {out}"
@@ -7966,6 +8159,9 @@
               security.pki.certificateFiles = [ "${tls}/cert.pem" ];
             };
             testScript = ''
+              import json
+              import shlex
+
               machine.wait_for_unit("multi-user.target")
               machine.wait_for_unit("sentinel-boot.service")
               machine.succeed("test -f /var/lib/sentinel/appliance.toml")
@@ -7979,10 +8175,20 @@
                   sha = machine.succeed(
                       "openssl dgst -sha256 /tmp/chan/sentinel-99.0.0.img | awk '{print $NF}'"
                   ).strip()
+                  # Online metadata names the product and carries a freshness
+                  # policy scoped to the channel it is served on.
+                  now = int(machine.succeed("date +%s"))
+                  manifest = {
+                      "version": "99.0.0", "image": "sentinel-99.0.0.img", "sha256": sha,
+                      "product": "velstra-sentinel",
+                      "freshness": {"schema": 1, "channel": "enterprise",
+                                    "arch": machine.succeed("uname -m").strip(),
+                                    "sequence": 1, "issued_at": now, "expires_at": now + 86400},
+                  }
                   machine.succeed(
                       "printf '%s' "
-                      "'{\"version\":\"99.0.0\",\"image\":\"sentinel-99.0.0.img\",\"sha256\":\"'"
-                      + sha + "'\"}' > /tmp/chan/manifest.json"
+                      + shlex.quote(json.dumps(manifest, separators=(",", ":")))
+                      + " > /tmp/chan/manifest.json"
                   )
                   machine.succeed(
                       "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
@@ -7994,14 +8200,16 @@
                   machine.wait_for_open_port(8443)
 
               with subtest("pin the channel with a WRONG subscription key"):
+                  # `--no-apply` saves offline and never escalates: the file's
+                  # owner (root) writes it.
                   machine.succeed(
-                      "su admin -c \"printf '%s\\n' "
+                      "printf '%s\\n' "
                       "'set update channel enterprise url https://localhost:8443' "
                       "'set update channel enterprise public-key file:/tmp/pub.pem' "
                       "'set update channel enterprise subscription-key wrong-key-0000' "
                       "'set update channel enterprise' "
                       "commit save exit "
-                      "| sentinel configure --no-apply\""
+                      "| sentinel configure --no-apply"
                   )
                   machine.succeed(
                       "grep -q 'https://localhost:8443' /var/lib/sentinel/appliance.toml"
@@ -8042,10 +8250,10 @@
 
               with subtest("the RIGHT key is served the signed release"):
                   machine.succeed(
-                      "su admin -c \"printf '%s\\n' "
+                      "printf '%s\\n' "
                       "'set update channel enterprise subscription-key velstra-ent-a1b2c3d4' "
                       "commit save exit "
-                      "| sentinel configure --no-apply\""
+                      "| sentinel configure --no-apply"
                   )
                   out = machine.succeed("sentinel update check")
                   assert "99.0.0" in out, f"check should report the signed version: {out}"
@@ -8745,6 +8953,16 @@
                   ];
                 };
                 environment.systemPackages = [ pkgs.curl pkgs.python3 ];
+                # A service of the client's own on the protected port, for the
+                # DP-31 half: the LAN server dials OUT to it.
+                systemd.services.outside-web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/out && echo hello-from-outside > /srv/out/index.html
+                    exec ${pkgs.python3}/bin/python3 -m http.server 443 --directory /srv/out
+                  '';
+                };
                 environment.etc."synproxy-dscp.py".text = ''
                   import socket
 
@@ -8785,6 +9003,13 @@
                     address = "10.2.0.1";
                     interface = "eth1";
                   };
+                };
+                environment.systemPackages = [ pkgs.curl ];
+                # A service whose server speaks first (SMTP-like), for DP-31.
+                systemd.services.banner = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = "exec ${pkgs.python3}/bin/python3 ${./nix/synproxy-banner.py} serve 2525";
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
@@ -8840,14 +9065,24 @@
 
             # Both segments zoned, both directions permitted, and tcp/443
             # syn-protected. The zones accept by default so that what the check
-            # proves is the proxy, not the rule engine.
+            # proves is the proxy, not the rule engine; the WAN zone admits 443
+            # by a rule as well, which is what scopes the proxy to it (DP-31).
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
                 "'set interface eth2 zone lan' "
                 "'set firewall zone wan default-action accept' "
                 "'set firewall zone lan default-action accept' "
+                "'set firewall rule web-in from wan' "
+                "'set firewall rule web-in proto tcp' "
+                "'set firewall rule web-in port 443' "
+                "'set firewall rule web-in action accept' "
+                "'set firewall rule banner-in from wan' "
+                "'set firewall rule banner-in proto tcp' "
+                "'set firewall rule banner-in port 2525' "
+                "'set firewall rule banner-in action accept' "
                 "'set firewall syn-protect 443' "
+                "'set firewall syn-protect 2525' "
                 "commit save exit "
                 "| sentinel configure\" 2>&1"
             )
@@ -8978,6 +9213,70 @@
             # cost the legitimate traffic nothing.
             client.succeed(
                 "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected"
+            )
+
+            # DP-31: the proxy shields 443 from the zone that admits it, not
+            # from the inside. A LAN host dialling OUT to some other port-443
+            # service must reach it unproxied — no cookie SYN-ACK from the box,
+            # so its connection keeps window scaling, SACK and timestamps. Keyed
+            # by port alone, the proxy answered this SYN too.
+            client.wait_for_unit("outside-web.service")
+            client.wait_until_succeeds("ss -ltn | grep -q ':443 '", timeout=20)
+            # The counters are read live from the agent, so before/after is exact.
+            stats = fw.succeed("sentinel show firewall statistics")
+            outward_before = counter("synproxy_challenged")
+            for _ in range(3):
+                server.succeed(
+                    "curl -s --max-time 10 http://10.1.0.9:443/ | grep -q hello-from-outside"
+                )
+            stats = fw.succeed("sentinel show firewall statistics")
+            assert counter("synproxy_challenged") == outward_before, (
+                "an outbound LAN connection to the protected port was proxied:\n" + stats
+            )
+            # …while the zone that admits 443 is still proxied: the scope is
+            # narrower, not off.
+            client.succeed(
+                "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected"
+            )
+            stats = fw.succeed("sentinel show firewall statistics")
+            assert counter("synproxy_challenged") == outward_before + 1, stats
+
+            # DP-31: a server that speaks first. The proxy acknowledges the
+            # server's SYN-ACK itself, so no egress hook sees that ACK; unless
+            # the firewall learns of it, every server segment is refused as
+            # invalid until the client happens to send one — and a client
+            # waiting for a banner never does.
+            server.wait_for_unit("banner.service")
+            stats = fw.succeed("sentinel show firewall statistics")
+            banner_before = counter("synproxy_spliced")
+            client.succeed("python3 ${./nix/synproxy-banner.py} probe 10.2.0.2 2525")
+            for _ in range(15):
+                stats = fw.succeed("sentinel show firewall statistics")
+                if counter("synproxy_spliced") > banner_before:
+                    break
+                fw.sleep(2)
+            assert counter("synproxy_spliced") > banner_before, (
+                "the server-first exchange was not proxied:\n" + stats
+            )
+
+            # A client reusing a source port. The proxy's record of a
+            # connection outlives it until the agent's splice sweep finds no
+            # live connection state claiming it (two reclaim rounds, a few
+            # seconds on this box's table size); the second connection, made
+            # after that, must be admitted afresh, not translated with the
+            # first connection's sequence offset into a connection the server
+            # no longer has (the i3 synproxy failure's signature: a challenged
+            # SYN, no admission, every later segment dropped downstream).
+            stats = fw.succeed("sentinel show firewall statistics")
+            reuse_before = counter("synproxy_admitted")
+            client.succeed("python3 ${./nix/synproxy-banner.py} reuse 10.2.0.2 2525 40123 15", timeout=60)
+            for _ in range(15):
+                stats = fw.succeed("sentinel show firewall statistics")
+                if counter("synproxy_admitted") >= reuse_before + 2:
+                    break
+                fw.sleep(2)
+            assert counter("synproxy_admitted") >= reuse_before + 2, (
+                "the second connection on a reused tuple was not admitted:\n" + stats
             )
           '';
         };
@@ -9254,6 +9553,19 @@
         #   nix build .#checks.x86_64-linux.conntracksync -L
         ha-kernel = import ./nix/ha-kernel-test.nix { inherit pkgs velstra-ha-tests; };
         ha-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; };
+        # The same with conntrack-sync pushing every 2 s instead of 50 ms: a
+        # splice and the state claiming it then reach the standby far apart.
+        ha-synproxy-failover-slow-sync = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; syncInterval = 2; };
+        # C15 SYN proxy on a deny-by-default masquerading edge box: remapping
+        # port-forwards, servers that speak first, and syn-protect surviving
+        # save, an unrelated commit and a reboot (DP-31). See the file.
+        #   nix build .#checks.x86_64-linux.synproxy-edge -L
+        synproxy-edge = import ./nix/synproxy-edge-test.nix { inherit pkgs self; };
+        # A proxied connection's record lives exactly as long as the connection:
+        # idle ones survive more short ones than SYN_FLOWS holds, ended ones
+        # leave nothing, and no off-path forgery ends a live one. See the file.
+        #   nix build .#checks.x86_64-linux.synproxy-churn -L
+        synproxy-churn = import ./nix/synproxy-churn-test.nix { inherit pkgs self; };
         ha-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; };
         ha-masquerade-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; masquerade = true; };
         ha-wireguard-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; wireguard = true; };
@@ -9265,6 +9577,10 @@
           legacyPackage = legacy-napt-velstra;
         };
         ha-witness-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; };
+        # A log output that stops reading must not move HA ownership: the
+        # master's wren and agent write into FIFOs nobody reads, term fixed
+        # for 60 s, both dropped-line counters above zero.
+        ha-log-stall = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; logStall = true; };
         ha-witness-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; synproxy = true; };
 
         conntracksync = import ./nix/conntracksync-test.nix { inherit pkgs self; };
@@ -9885,18 +10201,22 @@
 
             # Zone the WAN nic; add a logged DROP on tcp/9999 and a logged PASS on
             # tcp/9997. The policy-wide log is left off, so anything that appears
-            # in the journal got there via the rule's own log bit.
+            # in the journal got there via the rule's own log bit. The traffic is
+            # addressed to the box itself, so the rules name the local zone: a
+            # deny `to wan` would be refused at commit, because a non-local `to`
+            # zone does not match the routed egress interface.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
+                "'set firewall zone firewall local true' "
                 "'set firewall rule watch-drop from wan' "
-                "'set firewall rule watch-drop to wan' "
+                "'set firewall rule watch-drop to firewall' "
                 "'set firewall rule watch-drop action drop' "
                 "'set firewall rule watch-drop proto tcp' "
                 "'set firewall rule watch-drop port 9999' "
                 "'set firewall rule watch-drop log true' "
                 "'set firewall rule watch-pass from wan' "
-                "'set firewall rule watch-pass to wan' "
+                "'set firewall rule watch-pass to firewall' "
                 "'set firewall rule watch-pass action accept' "
                 "'set firewall rule watch-pass proto tcp' "
                 "'set firewall rule watch-pass port 9997' "
@@ -10331,16 +10651,18 @@
             client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.5", timeout=20)
 
             # The client is 10.1.0.5, so every one of these blocks contains it.
+            # It knocks on the box's own address, hence `to firewall`.
             cases = [("24", "10.1.0.0/24", 9924),
                      ("30", "10.1.0.4/30", 9930),
                      ("31", "10.1.0.4/31", 9931),
                      ("32", "10.1.0.5/32", 9932)]
 
             lines = ["set interface eth1 zone wan",
-                     "set firewall zone wan default-action accept"]
+                     "set firewall zone wan default-action accept",
+                     "set firewall zone firewall local true"]
             for name, cidr, port in cases:
                 lines += [f"set firewall rule len{name} from wan",
-                          f"set firewall rule len{name} to wan",
+                          f"set firewall rule len{name} to firewall",
                           f"set firewall rule len{name} action drop",
                           f"set firewall rule len{name} proto tcp",
                           f"set firewall rule len{name} port {port}",
@@ -10416,19 +10738,21 @@
 
             # Zone the WAN nic; add a logged DROP tcp/9999 whose source MATCHES the
             # client (10.1.0.2/32), and a logged DROP tcp/9997 whose source is a
-            # foreign block (10.9.9.9/32) the client can never match.
+            # foreign block (10.9.9.9/32) the client can never match. Both are
+            # `to firewall`: the client knocks on the box's own address.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
+                "'set firewall zone firewall local true' "
                 "'set firewall rule match-src from wan' "
-                "'set firewall rule match-src to wan' "
+                "'set firewall rule match-src to firewall' "
                 "'set firewall rule match-src action drop' "
                 "'set firewall rule match-src proto tcp' "
                 "'set firewall rule match-src port 9999' "
                 "'set firewall rule match-src source 10.1.0.2/32' "
                 "'set firewall rule match-src log true' "
                 "'set firewall rule foreign-src from wan' "
-                "'set firewall rule foreign-src to wan' "
+                "'set firewall rule foreign-src to firewall' "
                 "'set firewall rule foreign-src action drop' "
                 "'set firewall rule foreign-src proto tcp' "
                 "'set firewall rule foreign-src port 9997' "
@@ -12116,6 +12440,10 @@
             # the DHCP relay to the back-segment server. ONE `set` per line.
             relay.succeed(
                 "su admin -c \"printf '%s\\n' "
+                # eth1, where velstra lives, keeps a zone: a commit that leaves
+                # no interface zoned stops the agent (DP-12), and the relayed
+                # segments stay unzoned so the relay, not a policy, is tested.
+                "'set interface eth1 zone mgmt' "
                 "'set interface eth2 address 10.1.0.1/24' "
                 "'set services dhcp-relay interface eth2' "
                 "'set services dhcp-relay server 10.2.0.2' "
@@ -12123,6 +12451,7 @@
                 "| sentinel configure\""
             )
             relay.wait_for_unit("velstra.service")
+            relay.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
 
             # Sentinel rendered the dnsmasq relay config + unit.
             relay.wait_until_succeeds(
@@ -12258,6 +12587,10 @@
             # the DHCPv6 relay to the back-segment server. ONE `set` per line.
             relay.succeed(
                 "su admin -c \"printf '%s\\n' "
+                # eth1, where velstra lives, keeps a zone: a commit that leaves
+                # no interface zoned stops the agent (DP-12), and the relayed
+                # segments stay unzoned so the relay, not a policy, is tested.
+                "'set interface eth1 zone mgmt' "
                 "'set interface eth2 address6 2001:db8:1::1/64' "
                 "'set services dhcp-relay interface eth2' "
                 "'set services dhcp-relay server6 2001:db8:2::2' "
@@ -12265,6 +12598,7 @@
                 "| sentinel configure\""
             )
             relay.wait_for_unit("velstra.service")
+            relay.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
 
             # Sentinel rendered the dnsmasq v6 relay line + unit.
             relay.wait_until_succeeds(
@@ -12379,6 +12713,10 @@
             # on the mDNS reflector between them. ONE `set` per line.
             relay.succeed(
                 "su admin -c \"printf '%s\\n' "
+                # eth1, where velstra lives, keeps a zone: a commit that leaves
+                # no interface zoned stops the agent (DP-12), and the relayed
+                # segments stay unzoned so the relay, not a policy, is tested.
+                "'set interface eth1 zone mgmt' "
                 "'set interface eth2 address 10.1.0.1/24' "
                 "'set interface eth3 address 10.2.0.1/24' "
                 "'set services mdns interface eth2' "
@@ -12387,6 +12725,7 @@
                 "| sentinel configure\""
             )
             relay.wait_for_unit("velstra.service")
+            relay.wait_until_succeeds("ip -details link show eth1 | grep -q xdp", timeout=30)
 
             # Sentinel rendered the avahi reflector config + unit.
             relay.wait_until_succeeds(
@@ -13347,6 +13686,7 @@
         quickstart = import ./nix/quickstart-test.nix { inherit pkgs self; };
         reconciliation = import ./nix/reconciliation-test.nix { inherit pkgs self; };
         phase2-dataplane = import ./nix/phase2-dataplane-test.nix { inherit pkgs self; };
+        commit-latency = import ./nix/commit-latency-test.nix { inherit pkgs self; };
 
         l2 = pkgs.testers.runNixOSTest {
           name = "sentinel-l2";
@@ -15200,6 +15540,17 @@
             machine.wait_for_unit("sentinel-boot.service")
             machine.wait_for_unit("velstra.service")
 
+            def rolled_back(hostname, timeout=60):
+                # The previous active configuration is live and recorded again,
+                # and the rollback service has finished without failing.
+                machine.wait_until_succeeds(
+                    f"hostname | grep -x {hostname}"
+                    f" && grep -q '{hostname}' /run/sentinel/running.toml"
+                    " && ! systemctl is-active --quiet sentinel-confirm.service",
+                    timeout=timeout,
+                )
+                machine.fail("systemctl is-failed --quiet sentinel-confirm.service")
+
             # Baseline: a valid config with a known hostname, SAVED so
             # commit-confirm has a known-good config to revert to. Everything but
             # the hostname stays constant across the test, so the hostname alone
@@ -15218,29 +15569,35 @@
             # A failed snapshot publication is NOT a successful commit. The
             # actual CLI must return failure while retaining its armed safety
             # timer; the saved baseline stays unchanged. This is a real atomic
-            # rename failure, not a mocked apply or systemd response.
+            # rename failure, not a mocked apply or systemd response: a copy of
+            # the running file is bind-mounted over it, so every read before the
+            # apply still finds the valid, root-owned active configuration (a
+            # non-regular file there is refused before anything is applied),
+            # and only the final rename onto the mount point fails (EBUSY).
             saved_hash = machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
             machine.succeed(
-                "mv /run/sentinel/running.toml /run/sentinel/running-before-publication.toml; "
-                "mkdir -m 0700 /run/sentinel/running.toml"
+                "cp -a /run/sentinel/running.toml /run/sentinel-running-pin.toml; "
+                "mount --bind /run/sentinel-running-pin.toml /run/sentinel/running.toml"
             )
             refused = machine.fail(
                 "su admin -c \"printf '%s\\n' "
                 "'set system hostname fw-unrecorded' 'commit-confirm 10' exit "
                 "| sentinel configure 2>&1\""
             )
-            assert "candidate applied and rollback timer armed" in refused, refused
-            assert "recording the running configuration failed" in refused, refused
+            assert "candidate applied and rollback armed" in refused, refused
+            assert "recording active intent failed" in refused, refused
             machine.succeed("hostname | grep -x fw-unrecorded")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             assert machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == saved_hash
+            machine.succeed("grep -q fw-base /run/sentinel/running.toml")
             machine.succeed(
-                "rmdir /run/sentinel/running.toml; "
-                "mv /run/sentinel/running-before-publication.toml /run/sentinel/running.toml"
+                "umount /run/sentinel/running.toml; rm /run/sentinel-running-pin.toml"
             )
+            # With a trial armed, a manual rollback starts the timer's own bound
+            # service and returns ("rollback scheduled"); restoration completes
+            # in that service, so wait for it rather than for the command.
             machine.succeed("sentinel confirm-rollback")
-            machine.succeed("hostname | grep -x fw-base")
-            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
+            rolled_back("fw-base")
 
             # --- commit-confirm + confirm (keep the change) ---------------------
             # A 10-minute window: the new hostname is applied live AND the
@@ -15275,16 +15632,17 @@
             machine.succeed("grep -q 'fw-c2' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             # Forcing the revert (the exact command the timer runs) restores the
-            # saved config and disarms the timer.
+            # previous ACTIVE configuration — fw-c1, confirmed above and live
+            # though unsaved — not the saved one, and disarms the timer.
             machine.succeed("sentinel confirm-rollback")
-            machine.succeed("hostname | grep -x fw-base")
-            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
+            rolled_back("fw-c1")
             machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
 
             # --- the real timer fires and auto-reverts (the headline) -----------
             # A 1-minute window with NO confirm: the transient systemd timer runs
             # `sentinel confirm-rollback` on its own and the box returns to the
-            # saved config — the lock-yourself-out safety net, proven end to end.
+            # configuration it ran before (fw-c1) — the lock-yourself-out safety
+            # net, proven end to end.
             machine.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set system hostname fw-c3' 'commit-confirm 1' exit "
@@ -15293,8 +15651,8 @@
             machine.succeed("hostname | grep -x fw-c3")
             machine.succeed("grep -q 'fw-c3' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
-            machine.wait_until_succeeds("hostname | grep -x fw-base", timeout=120)
-            machine.wait_until_succeeds("grep -q 'fw-base' /run/sentinel/running.toml", timeout=20)
+            rolled_back("fw-c1", timeout=150)
+            # Nothing in this check saved after the baseline.
             machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
           '';
         };

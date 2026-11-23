@@ -752,6 +752,23 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Clear the whole console and make the next frame redraw every cell.
+///
+/// Not `Terminal::clear`: ratatui saves and restores the cursor around it with
+/// a cursor-position query (ESC[6n). A console that never answers one — a
+/// serial line with nothing emulating a terminal on the far end — stalls for
+/// two seconds and then fails, and the installer would exit before drawing.
+/// A full-screen frame has no cursor to keep; resizing the viewport to the
+/// console's size clears the screen and resets the back buffer without asking.
+fn clear_screen<B: Backend>(term: &mut Terminal<B>) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    let size = term.size().context("reading the console size")?;
+    term.resize(Rect::new(0, 0, size.width, size.height))
+        .context("clearing the console")
+}
+
 /// Run the guided installer. `Ok(None)` means the operator left without
 /// choosing to install; nothing has been touched in that case.
 pub fn run(disks: &[Disk], nic_names: &[String]) -> Result<Option<Answers>> {
@@ -762,7 +779,7 @@ pub fn run(disks: &[Disk], nic_names: &[String]) -> Result<Option<Answers>> {
         .context("starting the full-screen installer")?;
     // The Linux virtual console has no alternate screen, so the switch above did
     // nothing there and the boot messages are still on it. Clear explicitly.
-    term.clear().context("clearing the console")?;
+    clear_screen(&mut term)?;
 
     let mut app = App::new(disks, nic_names);
     app.load_nic();
@@ -776,8 +793,8 @@ pub fn run(disks: &[Disk], nic_names: &[String]) -> Result<Option<Answers>> {
         if let Some((cols, rows)) = console_size() {
             let want = Rect::new(0, 0, cols, rows);
             if sized != Some(want) {
+                // Resizing also clears the screen (see `clear_screen`).
                 term.resize(want).ok();
-                term.clear().ok();
                 sized = Some(want);
             }
         }
@@ -792,7 +809,7 @@ pub fn run(disks: &[Disk], nic_names: &[String]) -> Result<Option<Answers>> {
         let key = match event::read().context("reading the keyboard")? {
             Event::Key(k) => k,
             Event::Resize(..) => {
-                term.clear().ok();
+                clear_screen(&mut term).ok();
                 continue;
             }
             _ => continue,
@@ -1606,6 +1623,80 @@ fn draw_review(f: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::{ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
+
+    /// A console that never answers a cursor-position query (ESC[6n): a serial
+    /// line with nothing emulating a terminal on the far end, or a pty under
+    /// `expect`. Everything else is drawn into a [`TestBackend`].
+    struct SilentConsole(TestBackend);
+
+    impl Backend for SilentConsole {
+        type Error = std::io::Error;
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.0.draw(content).map_err(|never| match never {})
+        }
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.0.hide_cursor().map_err(|never| match never {})
+        }
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.0.show_cursor().map_err(|never| match never {})
+        }
+        fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "The cursor position could not be read within a normal duration",
+            ))
+        }
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+            self.0
+                .set_cursor_position(position)
+                .map_err(|never| match never {})
+        }
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.0.clear().map_err(|never| match never {})
+        }
+        fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
+            self.0
+                .clear_region(clear_type)
+                .map_err(|never| match never {})
+        }
+        fn size(&self) -> std::io::Result<Size> {
+            self.0.size().map_err(|never| match never {})
+        }
+        fn window_size(&mut self) -> std::io::Result<WindowSize> {
+            self.0.window_size().map_err(|never| match never {})
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush().map_err(|never| match never {})
+        }
+    }
+
+    #[test]
+    fn the_installer_clears_a_console_that_never_reports_its_cursor() {
+        let mut term = Terminal::new(SilentConsole(TestBackend::new(20, 4))).unwrap();
+        term.draw(|f| f.render_widget(Paragraph::new("boot messages"), f.area()))
+            .unwrap();
+        clear_screen(&mut term).expect("clearing needs no cursor report");
+        assert!(
+            term.backend()
+                .0
+                .buffer()
+                .content()
+                .iter()
+                .all(|c| c.symbol() == " "),
+            "the screen is blank after the clear"
+        );
+        // The back buffer was reset too: the same frame is drawn again in full,
+        // not skipped as unchanged.
+        term.draw(|f| f.render_widget(Paragraph::new("boot messages"), f.area()))
+            .unwrap();
+        assert_eq!(term.backend().0.buffer()[(0, 0)].symbol(), "b");
+    }
 
     fn disk(name: &str, gib: u64) -> Disk {
         Disk {

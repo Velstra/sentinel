@@ -1774,7 +1774,7 @@ pub(crate) fn retire_login_account(
         "managed login UID changed; refusing to retire a different identity"
     );
     anyhow::ensure!(
-        actual_uid != unsafe { libc::geteuid() },
+        actual_uid != commit_caller_uid(),
         "cannot retire the account running this commit; use another administrator or the root recovery console"
     );
     run_priv("usermod", &["-L", "-e", "1970-01-02", user])?;
@@ -2153,16 +2153,52 @@ pub fn remove_file(path: &Path) -> Result<()> {
     sudo("rm", &["-f", p])
 }
 
-/// Ensure a directory exists, escalating to `sudo mkdir -p` if a direct create
-/// is denied.
+/// Ensure a runtime directory exists and every level it creates is
+/// traversable (0755), escalating each level to `sudo mkdir` if a direct
+/// create is denied.
+///
+/// The mode is explicit because the caller's umask is not ours to inherit. An
+/// operator's login umask is 077 on NixOS, sudo combines it with its own, and
+/// a plain `mkdir -p` then made `/run/sentinel/ppp` 0700 root: the very next
+/// step of the same commit, run as the operator, could no longer look inside
+/// it, and a PPPoE uplink failed to commit with "Permission denied". A
+/// directory that must be private says so with [`ensure_dir_mode`].
 pub fn ensure_dir(dir: &Path) -> Result<()> {
-    if dir.is_dir() || std::fs::create_dir_all(dir).is_ok() {
-        return Ok(());
+    for level in missing_levels(dir, |p| p.is_dir()) {
+        if create_traversable(&level).is_ok() {
+            continue;
+        }
+        let Some(d) = level.to_str() else {
+            bail!("non-UTF-8 path");
+        };
+        // `-m` applies to the last component only, and `level`'s parent exists,
+        // so this creates exactly one level, with exactly this mode. `-p`
+        // accepts a level that exists but was invisible to the caller.
+        sudo("mkdir", &["-p", "-m", "0755", "--", d])?;
     }
-    let Some(d) = dir.to_str() else {
-        bail!("non-UTF-8 path");
-    };
-    sudo("mkdir", &["-p", d])
+    Ok(())
+}
+
+/// The levels of `dir` that do not exist yet, outermost first.
+fn missing_levels(dir: &Path, is_dir: impl Fn(&Path) -> bool) -> Vec<std::path::PathBuf> {
+    let mut missing: Vec<std::path::PathBuf> = dir
+        .ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .take_while(|p| !is_dir(p))
+        .map(Path::to_path_buf)
+        .collect();
+    missing.reverse();
+    missing
+}
+
+/// Create one directory level directly, 0755 whatever the umask.
+fn create_traversable(level: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::create_dir(level) {
+        Ok(()) => std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o755)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && level.is_dir() => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Ensure a directory exists with an explicit mode (privileged `mkdir -m <mode>
@@ -2801,6 +2837,35 @@ pub fn is_root() -> bool {
     (unsafe { libc::geteuid() }) == 0
 }
 
+/// The account running this commit: the effective user, or — in a root
+/// process sudo started — the operator sudo authenticated (`SUDO_UID`).
+///
+/// An operator's `configure` re-executes itself once through sudo (see
+/// `escalate`), so its effective uid is 0 while the commit is still that
+/// operator's. Guards that refuse to retire or demote "the account running
+/// this commit" must judge that operator, not root. Only a canonical managed
+/// login uid is taken; anything else falls back to the effective uid. A root
+/// process can set `SUDO_UID` itself, but that only makes the guard refuse
+/// more, never less.
+pub(crate) fn commit_caller_uid() -> u32 {
+    commit_caller_uid_from(
+        unsafe { libc::geteuid() },
+        std::env::var("SUDO_UID").ok().as_deref(),
+    )
+}
+
+fn commit_caller_uid_from(euid: u32, sudo_uid: Option<&str>) -> u32 {
+    if euid != 0 {
+        return euid;
+    }
+    sudo_uid
+        .and_then(|value| {
+            let uid: u32 = value.parse().ok()?;
+            (value == uid.to_string() && managed_login_uid(uid)).then_some(uid)
+        })
+        .unwrap_or(euid)
+}
+
 fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
     run_priv_with(cmd, &bin(cmd), args, is_root(), |program, arguments| {
         Command::new(program)
@@ -2859,6 +2924,24 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_escalated_session_runs_as_the_operator_sudo_authenticated() {
+        assert_eq!(super::commit_caller_uid_from(0, Some("1001")), 1001);
+        assert_eq!(super::commit_caller_uid_from(0, None), 0, "root console");
+        assert_eq!(
+            super::commit_caller_uid_from(1001, Some("1002")),
+            1001,
+            "a non-root process is its own effective user"
+        );
+        for invalid in ["", "x", "01001", "+1001", "0", "999", "65534", "4294967295"] {
+            assert_eq!(
+                super::commit_caller_uid_from(0, Some(invalid)),
+                0,
+                "SUDO_UID {invalid:?} is not a managed login"
+            );
+        }
+    }
+
     use super::*;
 
     /// boothealth: removing the last zone binding stops a persisting agent;
@@ -3764,6 +3847,61 @@ mod tests {
             assert!(stdout.contains("1 passed; 0 failed; 0 ignored"), "{stdout}");
             assert_eq!(mask(), original_mask, "child changed the parent mask");
         }
+    }
+
+    #[test]
+    fn ensure_dir_creates_only_the_missing_levels_outermost_first() {
+        let existing = |p: &Path| {
+            p == Path::new("/run/sentinel") || p == Path::new("/run") || p == Path::new("/")
+        };
+        assert_eq!(
+            missing_levels(Path::new("/run/sentinel/ppp/peers"), existing),
+            [
+                Path::new("/run/sentinel/ppp"),
+                Path::new("/run/sentinel/ppp/peers")
+            ]
+        );
+        assert!(missing_levels(Path::new("/run/sentinel"), existing).is_empty());
+    }
+
+    #[test]
+    fn ensure_dir_makes_every_created_level_traversable_under_a_private_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        if std::env::args().next().as_deref() == Some("sentinel-ensure-dir-umask-child") {
+            let root =
+                std::env::temp_dir().join(format!("sentinel-ensure-dir-{}", std::process::id()));
+            let leaf = root.join("ppp").join("peers");
+            ensure_dir(&leaf).unwrap();
+            for level in [&root, &root.join("ppp"), &leaf] {
+                let mode = std::fs::metadata(level).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(mode, 0o755, "{} is {mode:o}", level.display());
+            }
+            ensure_dir(&leaf).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.arg0("sentinel-ensure-dir-umask-child").args([
+            "--exact",
+            "system::tests::ensure_dir_makes_every_created_level_traversable_under_a_private_umask",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        // SAFETY: after fork, only the child's mask changes, with one libc call.
+        unsafe {
+            child.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -17,7 +17,12 @@ lsblk -d -o NAME,SIZE,MODEL
 sentinel install /dev/vdb
 ```
 
-This example previews a single disk. Replace `/dev/vdb` with the disk you have identified. Only add `--commit` after reviewing the plan. For a mirror, select two independent disks and use `--raid mirror`.
+This example previews a single disk. Replace `/dev/vdb` with the disk you have identified. Only add `--commit` after reviewing the plan. For a mirror, select two independent disks and use `--raid mirror`; `--encrypt` is described below:
+
+```sh
+sentinel install /dev/vdb /dev/vdc --raid mirror --encrypt            # preview the plan
+sentinel install /dev/vdb /dev/vdc --raid mirror --encrypt --commit   # erase and write
+```
 
 <a id="unlocking-at-boot"></a>
 

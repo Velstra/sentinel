@@ -126,7 +126,14 @@ in pkgs.testers.runNixOSTest {
             except queue.Empty:
                 break
         machine.start(allow_reboot=True)
-        deadline = time.monotonic() + 420
+        # Each failed trial runs to its health verdict before the loader
+        # counts it: the boot (up to ~60 s, including sentinel-boot-verify
+        # trying the last-good and management-only fallbacks against the
+        # broken agent), velstra-boot-verify (TimeoutStartSec 90 s) and the
+        # reboot. Measured 117-127 s per trial on a shared builder; three
+        # trials plus the fallback boot exceed the old 420 s budget. 600 s is
+        # three 160 s trials plus a 120 s fallback boot.
+        deadline = time.monotonic() + 600
         failed_boots, fallback, recent = set(), False, []
         while time.monotonic() < deadline and not fallback:
             try:

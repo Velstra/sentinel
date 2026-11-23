@@ -1,0 +1,15 @@
+# The installer's temporary unlock of a TARGET's encrypted data volume.
+#
+# `sentinel install --encrypt` opens the new LUKS volume on the target disk as
+# /dev/mapper/sentinel-install-data, makes the LABEL=data ext4 inside it, and
+# closes it again (`sentinel install` and the wizard's configuration seed). The
+# box it runs on mounts its own state by that same label. Left to the disk rules,
+# the open target briefly owned /dev/disk/by-label/data; when it closed, the
+# alias went away under the running box's /var/lib/sentinel, systemd stopped the
+# mount (its fsck unit is bound to that device) and with it every service that
+# needs the state partition.
+#
+# Sorted after 10-dm.rules (which names the device) and before 13-dm-disk.rules
+# (which would add the by-label/by-uuid links): no disk links and no systemd
+# device unit for this one mapper name. Its /dev/mapper node is unaffected.
+SUBSYSTEM=="block", KERNEL=="dm-*", ENV{DM_NAME}=="sentinel-install-data", ENV{DM_UDEV_DISABLE_DISK_RULES_FLAG}="1", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}="1"

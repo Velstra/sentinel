@@ -9,6 +9,16 @@ Two Sentinel appliances can form an active/standby pair on their own. Add an ind
 | Two-node | The peers elect the active member using authenticated heartbeats. | Each can conclude that the other is down. Both can become active. Independent heartbeat paths reduce this risk. |
 | Witness | A third system grants a time-limited lease to one member. | A member needs a valid lease to keep forwarding. The kernel blocks its guarded data interfaces after expiry. If neither member can reach the witness, both can end up fenced. |
 
+```mermaid
+flowchart LR
+  C([Clients]) --> V((VIP)) --> P[Primary<br/>owner]
+  P <-->|control path, sync| S[Secondary<br/>192.0.2.12:8080]
+  P <-.->|lease| W[Witness<br/>192.0.2.13:5440]
+  S <-.->|ready standby| W
+```
+
+Two-node mode is the same picture without the witness.
+
 ## Prepare the control path
 
 Use two matching appliances with distinct control addresses, matching logical data-interface names, and working console access. Keep the control path out of the fenced data interfaces and their underlying links. Configure the secondary’s HTTPS management endpoint and enrollment credential.

@@ -64,6 +64,59 @@ pub struct Clock {
     /// A path this appliance wrote whose timestamp lies in the future of `now`,
     /// with that timestamp — corroboration, never the reason for a verdict.
     pub newer_state: Option<(&'static str, i64)>,
+    /// What the last HA WireGuard promotion found about this member's clock
+    /// against the previous owner's (`None` when it found nothing to report).
+    pub ha_peer: Option<HaPeerLag>,
+}
+
+/// Where the HA clock-step helper records its decisions at WireGuard
+/// takeovers (wren-ha `clock::align`), in its own directory.
+const HA_CLOCK_STATUS: &str = "/run/velstra-ha-clock-step/status.json";
+
+/// A lag behind the HA peer that the takeover stepped away or could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaPeerLag {
+    pub behind_ms: u64,
+    /// The clock was stepped forward to the peer's.
+    pub stepped: bool,
+    /// Why it was not stepped, when it was not.
+    pub reason: Option<String>,
+    /// This member's clock was not NTP-synchronised when the helper decided.
+    pub decided_unsynchronised: bool,
+}
+
+impl HaPeerLag {
+    /// The lag the helper's record still holds open: its `unresolved` entry,
+    /// the latest refusal or failed step that no step and no in-step decision
+    /// on a fresh reading has settled. A later unknown decision keeps it.
+    pub fn parse(text: &str) -> Option<Self> {
+        let record: serde_json::Value = serde_json::from_str(text).ok()?;
+        let value = record.get("unresolved").filter(|v| v.is_object())?;
+        let behind_ms = value["behind_ns"].as_u64()? / 1_000_000;
+        let stepped = value["stepped"].is_array();
+        let reason = match value["action"].as_str()? {
+            "step" if stepped => None,
+            "step" => value["error"].as_str().map(String::from),
+            "refuse" => value["reason"].as_str().map(String::from),
+            _ => return None,
+        };
+        Some(Self {
+            behind_ms,
+            stepped,
+            reason,
+            decided_unsynchronised: value["local_synchronised"] == false,
+        })
+    }
+
+    /// Whether the lag can still stall tunnels, judged against whether the
+    /// clock is NTP-synchronised now. A step settled it. NTP settles a lag that
+    /// was found while this clock was not synchronised once it is. A lag found
+    /// while it already was (the peer is unsynchronised, or two synchronised
+    /// clocks disagree) is a fault NTP will not clear, and is reported until a
+    /// newer takeover supersedes the record.
+    pub fn unresolved(&self, synchronised_now: Option<bool>) -> bool {
+        !self.stepped && !(self.decided_unsynchronised && synchronised_now == Some(true))
+    }
 }
 
 /// Ask the kernel, then look for corroboration.
@@ -78,6 +131,9 @@ pub fn current() -> Clock {
         synchronised: kernel_sync(),
         now,
         newer_state: newest_state_after(now),
+        ha_peer: std::fs::read_to_string(HA_CLOCK_STATUS)
+            .ok()
+            .and_then(|text| HaPeerLag::parse(&text)),
     }
 }
 
@@ -179,6 +235,56 @@ fn mtime(path: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use super::HaPeerLag;
+
+    #[test]
+    fn the_helpers_record_reports_the_unresolved_lag_and_nothing_else() {
+        let failed = HaPeerLag::parse(
+            r#"{"action":"step","behind_ns":2000000000,"error":"EPERM","local_synchronised":false,"unresolved":{"action":"step","behind_ns":2000000000,"error":"EPERM","local_synchronised":false}}"#,
+        )
+        .unwrap();
+        assert!(!failed.stepped && failed.reason.as_deref() == Some("EPERM"));
+        assert!(failed.decided_unsynchronised && failed.behind_ms == 2_000);
+        let refused = r#"{"action":"refuse","behind_ns":61000000000,"reason":"both clocks are NTP-synchronised and disagree by more than 60 s","local_synchronised":true}"#;
+        let refused = HaPeerLag::parse(&format!(
+            r#"{{"action":"unknown","reason":"the peer clock reading is stale","local_synchronised":true,"unresolved":{refused}}}"#
+        ))
+        .unwrap();
+        // An unknown decision after a refusal still reports the refusal.
+        assert!(!refused.stepped && !refused.decided_unsynchronised && refused.behind_ms == 61_000);
+        for nothing in [
+            r#"{"action":"step","behind_ns":9140000000,"stepped":[1,2],"local_synchronised":false}"#,
+            r#"{"action":"in-step","local_synchronised":true}"#,
+            r#"{"action":"refuse","behind_ns":1,"reason":"r","local_synchronised":true}"#,
+            "not json",
+        ] {
+            assert_eq!(HaPeerLag::parse(nothing), None, "{nothing}");
+        }
+    }
+
+    #[test]
+    fn ntp_resolves_a_lag_found_unsynchronised_but_not_a_synchronised_fault() {
+        let found_unsynced = HaPeerLag {
+            behind_ms: 9_000,
+            stepped: false,
+            reason: Some("EPERM".into()),
+            decided_unsynchronised: true,
+        };
+        assert!(found_unsynced.unresolved(Some(false)));
+        assert!(found_unsynced.unresolved(None));
+        assert!(!found_unsynced.unresolved(Some(true)));
+        let synced_fault = HaPeerLag {
+            decided_unsynchronised: false,
+            ..found_unsynced.clone()
+        };
+        assert!(synced_fault.unresolved(Some(true)));
+        let stepped = HaPeerLag {
+            stepped: true,
+            ..found_unsynced
+        };
+        assert!(!stepped.unresolved(Some(false)));
+    }
+
     /// The verdict is the error bound, and `STA_UNSYNC` has no vote.
     ///
     /// Both of those halves were learned from the test box rather than reasoned
@@ -230,6 +336,7 @@ mod tests {
             synchronised: Some(true),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert_eq!(c.describe(), "2021-01-14 03:22:57 UTC — synchronised");
     }
@@ -242,6 +349,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         let line = c.describe();
         assert!(
@@ -259,6 +367,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: Some(("/var/lib/sentinel/appliance.toml", 1_786_000_000)),
+            ha_peer: None,
         };
         let line = c.describe();
         assert!(line.contains("/var/lib/sentinel/appliance.toml"), "{line}");
@@ -284,6 +393,7 @@ mod tests {
             synchronised: None,
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert!(c.describe().contains("unknown"), "{}", c.describe());
         assert!(c.schedule_warning(&scheduled(1, false)).is_none());
@@ -297,6 +407,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         let w = bad
             .schedule_warning(&scheduled(2, false))
@@ -320,6 +431,7 @@ mod tests {
             synchronised: Some(false),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert!(bad.schedule_warning(&scheduled(0, false)).is_none());
 
@@ -327,6 +439,7 @@ mod tests {
             synchronised: Some(true),
             now: SLOW,
             newer_state: None,
+            ha_peer: None,
         };
         assert!(good.schedule_warning(&scheduled(1, false)).is_none());
     }

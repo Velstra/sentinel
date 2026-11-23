@@ -1,0 +1,51 @@
+{
+ "schema": "velstra-security-floor/1",
+ "note": "Minimum versions the shipped image closure must carry (checks.image-security-floor). Each floor names what it fixes. A floor that matches no store path fails the check: remove it rather than keep it. Same-version patch backports (glib, sudo, net-snmp, ...) are proven by the replacement half of the check instead.",
+ "floors": [
+  {
+   "package": "linux",
+   "minimum": "6.12.118",
+   "fixes": "linux-6.12.y stable fixes after 6.12.117 (nix/kernel.nix)"
+  },
+  {
+   "package": "haproxy",
+   "minimum": "3.4.5",
+   "fixes": "CVE-2026-90678 HTTP/3; CVE-2026-55203, CVE-2026-55204 (flake.nix haproxyFor)"
+  },
+  {
+   "package": "glibc",
+   "minimum": "2.42-113",
+   "fixes": "CVE-2026-84243, CVE-2026-100290, CVE-2026-115819, CVE-2026-121758 (release/2.42 head)"
+  },
+  {
+   "package": "gzip",
+   "minimum": "1.15",
+   "fixes": "CVE-2026-41991, CVE-2026-41992 in a released version"
+  },
+  {
+   "package": "krb5",
+   "minimum": "1.22.3",
+   "fixes": "CVE-2026-40355, CVE-2026-40356, CVE-2026-107778 and the other 1.22.3 fixes"
+  },
+  {
+   "package": "hostapd",
+   "minimum": "2.12",
+   "fixes": "CVE-2026-58374 Wi-Fi 7 MLO"
+  },
+  {
+   "package": "sqlite",
+   "minimum": "3.54.1",
+   "fixes": "the three High advisories fixed in 3.54.0"
+  },
+  {
+   "package": "libcap",
+   "minimum": "2.78",
+   "fixes": "CVE-2026-4878"
+  },
+  {
+   "package": "suricata",
+   "minimum": "8.0.7",
+   "fixes": "the 8.0.3-8.0.6 advisories"
+  }
+ ]
+}
