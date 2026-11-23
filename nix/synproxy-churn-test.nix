@@ -250,8 +250,15 @@ pkgs.testers.runNixOSTest {
 
     def drained():
         # Connections that ended (FIN and RST alike, routed and forwarded)
-        # leave no record behind: removed, not merely evicted.
-        fw.sleep(8)
+        # leave no record behind: removed, not merely evicted. A record lives
+        # as long as its connection state, and a forwarded connection's FIN
+        # close leaves its client-zone state half-closed for the half-close
+        # allowance (120 s; the server's FIN is not recorded there), so allow
+        # that plus the sweep's 30 s.
+        for _ in range(80):
+            if entries("SYN_FLOWS") < 16:
+                break
+            fw.sleep(2)
         left = entries("SYN_FLOWS")
         if left >= 16:
             print(fw.succeed("bpftool -j map dump name SYN_FLOWS | head -c 4000; echo; bpftool -j map dump name FW_FLOWS | head -c 6000"))
