@@ -28,6 +28,19 @@ The diff shows the hostname change. Discarding it leaves the running configurati
 | `show system commit`, `compare N` | List saved revisions or compare against revision N. |
 | `rollback N` | Apply and persist an archived revision. `0` is the newest. |
 
+```mermaid
+stateDiagram-v2
+  [*] --> Candidate: set / delete
+  Candidate --> [*]: discard
+  Candidate --> Running: commit
+  Candidate --> Provisional: commit-confirm N
+  Provisional --> Running: confirm
+  Provisional --> Saved: timer expires, saved baseline reapplied
+  Running --> Saved: save
+```
+
+`commit` alone does not survive a reboot: a future boot still reads the saved file.
+
 <a id="operational-commands-run-show--show"></a>
 
 ## Inspect the running appliance
