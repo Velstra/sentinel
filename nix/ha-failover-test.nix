@@ -156,33 +156,58 @@ let
     master.succeed("touch /run/log-stall/stop")
     master.wait_until_succeeds("journalctl -u log-stall-holder --no-pager | grep -q 'no longer reading'",timeout=10)
     # wren is quiet when nothing changes; each routing reload logs its
-    # admission. The agent prints its statistics table every 5 s.
-    master.succeed("systemd-run --unit=log-stall-load --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'for i in $(seq 400); do timeout 2 wren --socket /run/wren/wren.sock reload >/dev/null 2>&1; done'")
-    # Then make the lease task itself log: 10 s in, once the pipes are full,
-    # delay the master's packets on its control link (eth3, to the witness)
-    # by 21 ms for 3 s. A witness exchange waits on three of them (connect,
-    # handshake, request), about 65 ms: inside the 80 ms I/O budget, so every
-    # renewal still succeeds, but past the 60 ms threshold of the "close to
-    # its I/O budget" warning, which the lease task writes. Blocking, that
-    # write never returns and the lease lapses; lossy, the line is dropped.
-    master.succeed("systemd-run --unit=log-stall-slow --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'sleep 10; tc qdisc add dev eth3 root netem delay 21ms; sleep 3; tc qdisc del dev eth3 root'")
+    # admission. The agent prints its statistics table every 5 s. The load
+    # runs until stopped: how long it takes to fill a pipe depends on the
+    # host, so the check waits for that, rather than for a fixed count.
+    master.succeed("systemd-run --unit=log-stall-load --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'n=0; while [ ! -e /run/log-stall/load-stop ]; do timeout 2 wren --socket /run/wren/wren.sock reload >/dev/null 2>&1; n=$((n+1)); echo $n > /run/log-stall/reloads; done'")
+    def dropped():
+        wren_metrics=master.execute("timeout 5 wren --socket /run/wren/wren.sock show metrics")[1]
+        agent_stats=master.execute("timeout 5 sentinel show firewall statistics")[1]
+        count=lambda text, name: next((int(line.split()[1]) for line in text.splitlines() if line.split()[:1]==[name] and len(line.split())>1 and line.split()[1].isdigit()), 0)
+        return count(wren_metrics,"wren_log_lines_dropped_total"), count(agent_stats,"log_lines_dropped"), wren_metrics, agent_stats
+    term_sample=lambda: tuple(int(n.succeed(python_command(term_script)).strip()) for n in (master,backup))
+    def restore_and_dump():
+        master.succeed("touch /run/log-stall/load-stop; rm -f /run/log-stall/stop")
+        time.sleep(3)
+        print(master.execute("journalctl -u log-stall-holder --no-pager -n 80 -o cat")[1])
+        print(backup.execute("journalctl -u wren --no-pager -n 40 -o cat")[1])
+    # The precondition: both daemons' outputs full, both counting dropped
+    # lines. The terms are sampled from the stop on, so the safety window
+    # below covers the whole stall, this phase included.
     seen=set()
+    filled_by=time.monotonic()+120
+    while True:
+        seen.add(term_sample())
+        wren_dropped, agent_dropped, wren_metrics, agent_stats = dropped()
+        if wren_dropped>0 and agent_dropped>0:
+            break
+        if time.monotonic()>filled_by:
+            reloads=master.execute("cat /run/log-stall/reloads; systemctl status log-stall-load --no-pager | head -n 5")[1]
+            restore_and_dump()
+            raise AssertionError(("log-stall precondition not reached: the blocked outputs did not fill both daemons' pipes within 120 s; this is not an HA failure", {"wren": wren_dropped, "agent": agent_dropped}, reloads, wren_metrics[-600:]))
+        time.sleep(1)
+    print("log-stall pipes full", {"wren": wren_dropped, "agent": agent_dropped})
+    # Then make the lease task itself log, with its pipe full: delay the
+    # master's packets on its control link (eth3, to the witness) by 21 ms
+    # for 3 s. A witness exchange waits on three of them (connect, handshake,
+    # request), about 65 ms: inside the 80 ms I/O budget, so every renewal
+    # still succeeds, but past the 60 ms threshold of the "close to its I/O
+    # budget" warning, which the lease task writes. Blocking, that write never
+    # returns and the lease lapses; lossy, the line is dropped.
+    master.succeed("systemd-run --unit=log-stall-slow --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'sleep 2; tc qdisc add dev eth3 root netem delay 21ms; sleep 3; tc qdisc del dev eth3 root'")
     quiet_end=time.monotonic()+60
     while time.monotonic()<quiet_end:
-        seen.add(tuple(int(n.succeed(python_command(term_script)).strip()) for n in (master,backup)))
+        seen.add(term_sample())
         time.sleep(1)
     terms_after={n.name:int(n.succeed(python_command(term_script)).strip()) for n in (master,backup)}
     print("log-stall terms", terms_before, terms_after, sorted(seen))
     if not (terms_after==terms_before and seen=={(terms_before["master"],terms_before["backup"])}):
-        master.succeed("rm -f /run/log-stall/stop")
-        time.sleep(3)
-        print(master.execute("journalctl -u log-stall-holder --no-pager -n 80 -o cat")[1])
-        print(backup.execute("journalctl -u wren --no-pager -n 40 -o cat")[1])
+        restore_and_dump()
         raise AssertionError(("HA ownership moved while the log output was blocked", terms_before, terms_after, sorted(seen)))
     master.succeed("sentinel show ha | grep -qx 'HA Master'")
+    master.succeed("touch /run/log-stall/load-stop")
     # Both daemons reached the drop path and count it.
-    wren_dropped=int(master.succeed("timeout 5 wren --socket /run/wren/wren.sock show metrics | awk '/^wren_log_lines_dropped_total / {print $2}'").strip() or 0)
-    agent_dropped=int(master.succeed("timeout 5 sentinel show firewall statistics | awk '/log_lines_dropped/ {print $2}'").strip() or 0)
+    wren_dropped, agent_dropped, _, _ = dropped()
     print("log-stall dropped", {"wren": wren_dropped, "agent": agent_dropped})
     assert wren_dropped>0 and agent_dropped>0, (wren_dropped, agent_dropped)
   '';
