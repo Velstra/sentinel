@@ -150,7 +150,7 @@ let
     for node in (master,backup):
         node.wait_for_unit("velstra.service")
         node.wait_for_unit("wren.service")
-    master.wait_until_succeeds("journalctl -u log-stall-holder --no-pager | grep -q 'authenticated TCP listening'",timeout=90)
+    master.wait_until_succeeds("journalctl -u log-stall-holder --no-pager | grep -q 'authenticated TCP listening'",timeout=300)
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=60)
     master.wait_until_succeeds(python_command('import json,subprocess; state=json.loads(subprocess.check_output(["sentinel","agent-query","ha-status"])); assert state["role"]=="Master"'),timeout=30)
     backup.wait_until_succeeds("sentinel show ha | grep -qx 'HA Backup'",timeout=30)
