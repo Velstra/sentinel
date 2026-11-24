@@ -117,17 +117,17 @@
     "wren": {
       "flake": false,
       "locked": {
-        "lastModified": 1795459562,
-        "narHash": "sha256-DuTOwNg6R5rrs/BPdYzTu3pUxNubfC11oizbCz165cM=",
+        "lastModified": 1795540576,
+        "narHash": "sha256-tjYoN5x81z7sJXo8785BHpA/jthAvxlQbINdgoWk5Ow=",
         "owner": "Velstra",
         "repo": "wren",
-        "rev": "ec96737c737700ae769c2fa391368daa76ea4f7e",
+        "rev": "298f27e53ae221910db9b2c784bfa5b80ac2ffc2",
         "type": "github"
       },
       "original": {
         "owner": "Velstra",
         "repo": "wren",
-        "rev": "ec96737c737700ae769c2fa391368daa76ea4f7e",
+        "rev": "298f27e53ae221910db9b2c784bfa5b80ac2ffc2",
         "type": "github"
       }
     }
