@@ -252,6 +252,9 @@ def require_visible_mount(target: str, source: str) -> None:
     # A systemd autofs mount and the actual filesystem can share a target.
     # stat resolves the filesystem actually serving this path. Compare kernel
     # device numbers, not presentation names or all stacked mount-table rows.
+    # stat itself never triggers an automount: after the idle timeout it sees
+    # the autofs. Listing the directory mounts the filesystem again first.
+    os.listdir(target)
     mounted = os.stat(target)
     device = os.stat(source)
     require(stat.S_ISDIR(mounted.st_mode) and os.path.ismount(target),
