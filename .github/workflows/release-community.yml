@@ -66,12 +66,17 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 16
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Allow the unprivileged user namespaces image builds need
+        # Ubuntu 24.04 runners restrict them through AppArmor; the image
+        # derivations unshare a user namespace and fail with
+        # "write failed /proc/self/uid_map: Operation not permitted".
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
         with:
           enable_kvm: true
@@ -99,6 +104,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Allow the unprivileged user namespaces image builds need
+        # Ubuntu 24.04 runners restrict them through AppArmor; the image
+        # derivations unshare a user namespace and fail with
+        # "write failed /proc/self/uid_map: Operation not permitted".
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
       - name: Build the versioned factory intermediate (not a distributable release)
         env:
@@ -165,6 +175,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Allow the unprivileged user namespaces image builds need
+        # Ubuntu 24.04 runners restrict them through AppArmor; the image
+        # derivations unshare a user namespace and fail with
+        # "write failed /proc/self/uid_map: Operation not permitted".
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
       - name: Recheck protection and obtain the exact intermediate
         env:
@@ -218,6 +233,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Allow the unprivileged user namespaces image builds need
+        # Ubuntu 24.04 runners restrict them through AppArmor; the image
+        # derivations unshare a user namespace and fail with
+        # "write failed /proc/self/uid_map: Operation not permitted".
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
         with:
           enable_kvm: true
