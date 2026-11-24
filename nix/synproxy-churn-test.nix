@@ -164,6 +164,8 @@ pkgs.testers.runNixOSTest {
             # Retire it, and wait until it has finished either way.
             client.succeed(f"touch {name}.go")
             client.wait_until_succeeds(f"test -e {name}.ok -o -e {name}.fail", timeout=30)
+            outcome = client.succeed(f"cat {name}.fail 2>/dev/null || echo completed").strip()
+            print(f"{name} was not proxied and is retired: {outcome}")
             fw.sleep(2)
         raise AssertionError(f"the idle connection to {host}:{port} was never proxied")
 
