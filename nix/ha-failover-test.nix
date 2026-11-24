@@ -121,6 +121,9 @@ let
       requires = [ "log-stall-holder.service" ];
       after = [ "log-stall-holder.service" ];
       environment.WREN_LOG_QUEUE_LINES = "1";
+      # The load below makes wren log through its main loop ("SIGHUP received"
+      # at info), which the fixture's "wren::vrrp=debug" alone would not show.
+      environment.RUST_LOG = lib.mkForce "info,wren::vrrp=debug";
       serviceConfig.StandardOutput = lib.mkForce "file:/run/log-stall/wren.fifo";
       serviceConfig.StandardError = lib.mkForce "file:/run/log-stall/wren.fifo";
     };
@@ -155,11 +158,13 @@ let
     terms_before={n.name:int(n.succeed(python_command(term_script)).strip()) for n in (master,backup)}
     master.succeed("touch /run/log-stall/stop")
     master.wait_until_succeeds("journalctl -u log-stall-holder --no-pager | grep -q 'no longer reading'",timeout=10)
-    # wren is quiet when nothing changes; each routing reload logs its
-    # admission. The agent prints its statistics table every 5 s. The load
-    # runs until stopped: how long it takes to fill a pipe depends on the
-    # host, so the check waits for that, rather than for a fixed count.
-    master.succeed("systemd-run --unit=log-stall-load --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'n=0; while [ ! -e /run/log-stall/load-stop ]; do timeout 2 wren --socket /run/wren/wren.sock reload >/dev/null 2>&1; n=$((n+1)); echo $n > /run/log-stall/reloads; done'")
+    # wren is quiet when nothing changes, and a control-socket reload of an
+    # unchanged configuration writes nothing at all (under CPU contention
+    # 2225 of them filled nothing in 120 s). Each SIGHUP writes "SIGHUP
+    # received; reloading configuration" through wren's main loop, so the
+    # load sends SIGHUPs until stopped. The agent prints its statistics
+    # table every 5 s.
+    master.succeed("systemd-run --unit=log-stall-load --setenv=PATH=/run/current-system/sw/bin /run/current-system/sw/bin/sh -c 'n=0; while [ ! -e /run/log-stall/load-stop ]; do kill -HUP $(systemctl show -p MainPID --value wren.service); n=$((n+1)); echo $n > /run/log-stall/reloads; sleep 0.1; done'")
     def dropped():
         wren_metrics=master.execute("timeout 5 wren --socket /run/wren/wren.sock show metrics")[1]
         agent_stats=master.execute("timeout 5 sentinel show firewall statistics")[1]
