@@ -45,6 +45,8 @@ fw.wait_for_unit("sentinel-boot-late.service")
 peer.wait_for_unit("strongswan-swanctl.service")
 peer.wait_for_unit("qa-target.service")
 peer.wait_for_unit("qa-keep-target.service")
+peer.wait_until_succeeds("ss -Hltn 'sport = :9102' | grep -qF '198.19.210.9:9102'", timeout=60)
+peer.wait_until_succeeds("ss -Hltn 'sport = :9105' | grep -qF '198.19.211.9:9105'", timeout=60)
 assert fw.succeed("readlink -f /run/current-system/sw/bin/sentinel").strip() == "__SENTINEL__"
 configure(["set vpn ipsec qa-site start-action none"] + ["set vpn ipsec qa-keep " + setting for setting in [
     "local 198.18.10.100", "remote 198.18.10.254", "local-subnet 198.18.20.0/24",

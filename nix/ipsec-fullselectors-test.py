@@ -13,7 +13,10 @@ fw.wait_for_unit("sentinel-boot-late.service")
 fw.wait_for_unit("strongswan-swanctl.service")
 peer.wait_for_unit("strongswan-swanctl.service")
 peer.wait_for_unit("qa-target.service")
+# Active is not listening: on a slow runner the target bound its socket after the probe.
+peer.wait_until_succeeds("ss -Hltn 'sport = :9102' | grep -qF '198.19.210.9:9102'", timeout=60)
 client.wait_for_unit("qa-client-target.service")
+client.wait_until_succeeds("ss -Hltn 'sport = :9103' | grep -qF '198.18.20.50:9103'", timeout=60)
 assert fw.succeed("readlink -f /run/current-system/sw/bin/sentinel").strip() == "__SENTINEL__"
 fw.execute("swanctl --terminate --ike conn-qa-site --timeout 15")
 peer.execute("swanctl --terminate --ike reference-peer --timeout 15")

@@ -74,6 +74,7 @@ in pkgs.testers.runNixOSTest {
         node.wait_for_unit("multi-user.target")
     fw.wait_for_unit("velstra.service")
     server.wait_for_unit("phase2-echo.service")
+    server.wait_until_succeeds("ss -Hltn 'sport = :9090' | grep -q .", timeout=60)
     client.succeed("ip -6 route get 2001:db8:102::2 | grep -q 'dev eth1'")
 
     def python(node, code):

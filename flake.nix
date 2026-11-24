@@ -8465,6 +8465,7 @@
             fw.wait_for_unit("multi-user.target")
             fw.wait_for_unit("velstra.service")
             server.wait_for_unit("web.service")
+            server.wait_until_succeeds("ss -Hltn 'sport = :80' | grep -q .", timeout=60)
 
             # Configure the appliance: zone both NICs, allow the LAN to forward
             # replies, and expose the server on the WAN ip:8080 -> server:80.
@@ -8864,6 +8865,7 @@
             fw.wait_for_unit("multi-user.target")
             fw.wait_for_unit("velstra.service")
             server.wait_for_unit("web.service")
+            server.wait_until_succeeds("ss -Hltn 'sport = :8443' | grep -q .", timeout=60)
 
             # Sentinel owns both addresses + zones + the hairpin port-forward. The
             # WAN address must be in the config for the compiler to resolve the
@@ -8907,6 +8909,7 @@
             # they share one server-side tuple and the second steals the first's
             # replies; each must still receive exactly its own echo.
             server.wait_for_unit("echo.service")
+            server.wait_until_succeeds("ss -Hltn 'sport = :9000' | grep -q .", timeout=60)
             client.succeed("systemd-run --unit=hold-a ${pkgs.python3}/bin/python3 ${holdClient} A")
             client.wait_until_succeeds("test -e /tmp/hold-ready", timeout=30)
             client2.succeed("${pkgs.python3}/bin/python3 ${holdClient} B")
@@ -9247,6 +9250,7 @@
             # invalid until the client happens to send one — and a client
             # waiting for a banner never does.
             server.wait_for_unit("banner.service")
+            server.wait_until_succeeds("ss -Hltn 'sport = :2525' | grep -q .", timeout=60)
             stats = fw.succeed("sentinel show firewall statistics")
             banner_before = counter("synproxy_spliced")
             client.succeed("python3 ${./nix/synproxy-banner.py} probe 10.2.0.2 2525")

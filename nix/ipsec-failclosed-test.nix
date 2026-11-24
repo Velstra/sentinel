@@ -311,6 +311,8 @@ pkgs.testers.runNixOSTest {
         client.wait_until_succeeds("ip -4 address show eth1 | grep -q 198.18.20.50/24",timeout=30)
         client.wait_for_unit("qa-client-target.service")
         fw.wait_for_unit("qa-local-target.service")
+        client.wait_until_succeeds("ss -Hltn 'sport = :9103' | grep -qF '198.18.20.50:9103'", timeout=60)
+        fw.wait_until_succeeds("ss -Hltn 'sport = :9104' | grep -qF '198.18.20.1:9104'", timeout=60)
         client.succeed("curl --fail --silent --max-time 3 http://198.18.20.50:9103/")
         fw.succeed("curl --fail --silent --max-time 3 http://198.18.20.1:9104/")
         fw.succeed("sentinel config check /var/lib/sentinel/appliance.toml")

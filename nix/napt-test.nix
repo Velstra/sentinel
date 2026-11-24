@@ -82,6 +82,8 @@ in pkgs.testers.runNixOSTest {
     fw.wait_for_unit("sentinel-boot.service")
     fw.wait_for_unit("velstra.service")
     backend.wait_for_unit("qa-peer.service")
+    backend.wait_until_succeeds("ss -Hltn 'sport = :9101' | grep -qF '198.18.10.254:9101'", timeout=60)
+    backend.wait_until_succeeds("ss -Hltn 'sport = :10920' | grep -qF '198.18.10.254:10920'", timeout=60)
     fw.succeed("sentinel config check /var/lib/sentinel/appliance.toml")
     fw.wait_until_succeeds("ip -4 address show eth1 | grep -q 198.18.10.100/24",timeout=30)
     fw.wait_until_succeeds("ip -4 address show eth2 | grep -q 198.18.20.1/24",timeout=30)
