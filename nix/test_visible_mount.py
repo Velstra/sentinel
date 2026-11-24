@@ -41,9 +41,32 @@ class VisibleMountTests(unittest.TestCase):
         with patch.object(observer.os, "stat", side_effect=[
                 SimpleNamespace(st_mode=stat.S_IFDIR, st_dev=2049),
                 SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=2049)]) as probe, \
-                patch.object(observer.os.path, "ismount", return_value=True):
+                patch.object(observer.os.path, "ismount", return_value=True), \
+                patch.object(observer.os, "listdir", return_value=[]):
             observer.require_visible_mount("/boot", "/dev/vda1")
         self.assertEqual([call.args for call in probe.call_args_list], [("/boot",), ("/dev/vda1",)])
+
+    def test_an_idle_unmounted_automount_is_mounted_before_it_is_compared(self):
+        # /boot is a systemd automount with an idle timeout. Once it has
+        # expired, a bare stat sees the autofs (st_dev 42); only an access
+        # below the mountpoint mounts the ESP again (st_dev 2049).
+        state = {"mounted": False}
+
+        def listdir(path):
+            self.assertEqual(path, "/boot")
+            state["mounted"] = True
+            return []
+
+        def fake_stat(path):
+            if path == "/boot":
+                return SimpleNamespace(st_mode=stat.S_IFDIR, st_dev=2049 if state["mounted"] else 42)
+            return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=2049)
+
+        with patch.object(observer.os, "listdir", side_effect=listdir), \
+                patch.object(observer.os, "stat", side_effect=fake_stat), \
+                patch.object(observer.os.path, "ismount", return_value=True):
+            observer.require_visible_mount("/boot", "/dev/vda1")
+        self.assertTrue(state["mounted"])
 
     def test_foreign_autofs_unmounted_and_nonblock_sources_refused(self):
         for dev, target_mode, source_mode, mounted in (
@@ -56,7 +79,8 @@ class VisibleMountTests(unittest.TestCase):
                     patch.object(observer.os, "stat", side_effect=[
                         SimpleNamespace(st_mode=target_mode, st_dev=dev),
                         SimpleNamespace(st_mode=source_mode, st_rdev=2049)]), \
-                    patch.object(observer.os.path, "ismount", return_value=mounted):
+                    patch.object(observer.os.path, "ismount", return_value=mounted), \
+                    patch.object(observer.os, "listdir", return_value=[]):
                 with self.assertRaises(ValueError):
                     observer.require_visible_mount("/boot", "/dev/vda1")
 
