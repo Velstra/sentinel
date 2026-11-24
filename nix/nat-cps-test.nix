@@ -126,6 +126,7 @@ pkgs.testers.runNixOSTest {
     import json
     import os
     import re
+    import time
     from pathlib import Path
     from typing import Any
 
@@ -269,6 +270,10 @@ pkgs.testers.runNixOSTest {
     )
     client.wait_until_succeeds("test -s /tmp/held.ready", timeout=60)
 
+    # A client socket the probe has closed retransmits its FIN at most this
+    # many times (0 means the kernel's built-in 8).
+    orphan_retries = int(client.succeed("sysctl -n net.ipv4.tcp_orphan_retries").strip()) or 8
+    receipt["client_orphan_retries"] = orphan_retries
     receipt["server_listen"] = {
         "sysctl": backend.succeed("sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_syncookies").strip(),
         "sockets": backend.succeed("ss -ltn 'sport = :9200'").strip(),
@@ -294,13 +299,23 @@ pkgs.testers.runNixOSTest {
         ))
         after = egress_runtime()
         result["phase"] = phase
-        result["counters"] = delta(counters, stats())
         result["path"] = path_delta(path, path_counters())
         result["hop_loss"] = hop_loss(result["path"])
+        # Late repeated server RSTs are still refused after the probe returns,
+        # and the drop log trails the counters. Read both until the refusals
+        # the counters hold match the ones logged, so the two describe the
+        # same packets; then stop the RST capture, which then holds every
+        # RST behind a counted refusal.
+        for _ in range(40):
+            refused = refusals(cursor)
+            result["counters"] = delta(counters, stats())
+            if len(refused) == result["counters"].get("dropped_default", 0):
+                break
+            time.sleep(0.5)
+        result["refusals"] = refused
         result["dataplane_drops"] = {k: result["counters"][k] for k in DATAPLANE_DROPS if result["counters"].get(k)}
         result["nat_drops"] = {k: result["counters"][k] for k in NAT_DROPS if result["counters"].get(k)}
         backend.succeed("systemctl stop server-resets-" + phase)
-        result["refusals"] = refusals(cursor)
         result["server_resets"] = server_resets(capture)
         runs = after[1] - runtime[1]
         result["egress_runs"] = runs
@@ -337,9 +352,11 @@ pkgs.testers.runNixOSTest {
         assert result["wan_ports_shared_by_client_ports"] == 0, (name, result)
         # What the firewall owns. It forwards what it receives: received on
         # one NIC minus sent on the other is the few packets of sampling skew
-        # between the two counter reads (and the odd ARP), not a loss.
-        dropped = sum(result["dataplane_drops"].values())
-        assert abs(result["hop_loss"]["fw lan>wan"]) <= 4, (name, result["hop_loss"])
+        # between the two counter reads (and the odd ARP), not a loss, once
+        # the refusals below are taken off their direction.
+        egress = result["counters"].get("egress_dropped", 0)
+        dropped = sum(result["dataplane_drops"].values()) - egress
+        assert abs(result["hop_loss"]["fw lan>wan"] - egress) <= 4, (name, result["hop_loss"], egress)
         assert abs(result["hop_loss"]["fw wan>lan"] - dropped) <= 4, (name, result["hop_loss"], dropped)
         # The one refusal this load legitimately causes: when a client
         # retransmission reaches a server that has already closed, the server
@@ -348,7 +365,7 @@ pkgs.testers.runNixOSTest {
         # WAN default drop. Every refusal must be exactly that: logged, from
         # the server, TCP, dropped_default, to a WAN port that received more
         # server RSTs than refusals. Anything else is a real drop.
-        assert set(result["dataplane_drops"]) <= {"dropped_default"}, (name, result["dataplane_drops"])
+        assert set(result["dataplane_drops"]) <= {"dropped_default", "egress_dropped"}, (name, result["dataplane_drops"])
         assert len(result["refusals"]) == dropped, (name, "a refusal was not logged", result["refusals"], dropped)
         per_port: dict[int, int] = {}
         for source, proto, port, reason in result["refusals"]:
@@ -356,6 +373,19 @@ pkgs.testers.runNixOSTest {
             per_port[port] = per_port.get(port, 0) + 1
         for port, count in per_port.items():
             assert count < result["server_resets"].get(port, 0), (name, "not a repeated RST", port, count, result["server_resets"].get(port, 0))
+        # The same closure seen from the LAN: the server's first RST ended the
+        # binding, and when that RST is then lost on its way to the client,
+        # the client retransmits its FIN into a binding that is gone. DP-08
+        # refuses that rather than letting a non-opener allocate. Every egress
+        # drop must be exactly that refusal, and only a flow a server RST
+        # closed whose RST never reached the client can cause one, at most
+        # once per FIN retransmission the client's kernel makes for a closed
+        # socket. Such RSTs are among the flows the capture saw reset and
+        # among the packets lost on the fw>client link. The egress drop is
+        # not logged per flow, so it is bounded by those, not attributed.
+        assert egress == result["counters"].get("nat_opener_required", 0), (name, "an egress drop that is not a NAT opener refusal", result["counters"])
+        lost_resets = min(len(result["server_resets"]), max(result["hop_loss"]["fw>client"], 0))
+        assert egress <= orphan_retries * lost_resets, (name, "more opener refusals than lost server RSTs explain", egress, orphan_retries, lost_resets, result["server_resets"])
         assert result["nat_drops"] == {}, (name, result["nat_drops"])
         # A tripwire for the PERF-02 collapse, which left most new connections
         # retransmitting their SYN: 99.5 % of them never completed. The test
