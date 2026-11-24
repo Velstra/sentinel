@@ -40,7 +40,7 @@
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
     wren = {
-      url = "github:Velstra/wren/ec96737c737700ae769c2fa391368daa76ea4f7e";
+      url = "github:Velstra/wren/298f27e53ae221910db9b2c784bfa5b80ac2ffc2";
       flake = false;
     };
   };
