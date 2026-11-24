@@ -203,6 +203,25 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
   normal close). A client that reconnects from the same address and port inside
   that window, to a protected service whose server uses the same port, is not
   admitted until it retries after it ([firewall handbook](handbook/firewall.md)).
+- **Switching the SYN proxy on or off cuts that port's open connections.** The
+  proxy admits a connection only through its own handshake and keeps a record
+  of each one it admitted. A connection already open when `set firewall
+  syn-protect <port>` is committed has no record: its next segments are refused
+  as forged handshake replies, and it stalls until the client gives up and
+  reconnects. Removing `syn-protect` likewise ends the connections the proxy
+  had admitted, because their sequence numbers are no longer translated. The
+  same applies to proxied connections whenever the agent starts with fresh
+  state instead of its pinned tables, as on the first restart after this
+  upgrade. Connections opened afterwards are proxied normally. Change
+  `syn-protect` in a maintenance window, or expect that port's clients to
+  reconnect.
+- **A commit can be refused while the box is starved of CPU.** A commit that
+  restarts the data-plane agent waits for it to report ready, and each check
+  of that is bounded to a few seconds. On an appliance whose CPU is saturated
+  (for example during a flood) one check can run out of time. The commit is
+  then refused with `readiness probe timed out` and rolled back to the previous
+  running configuration, so nothing is left half-applied. Repeat the commit
+  once the load has dropped.
 
 - **IPv6 is not SYN-proxied in 1.0.** The SYN proxy protects IPv4 only (DP-35).
   Where a protected port is reachable over IPv6, `config check` names the zones.

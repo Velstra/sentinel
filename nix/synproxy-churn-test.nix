@@ -139,26 +139,41 @@ pkgs.testers.runNixOSTest {
     def entries(table):
         return int(fw.succeed(f"bpftool -j map dump name {table} | grep -o '\"key\"' | wc -l").strip())
 
+    # The files each held connection answers under: one name per attempt, so
+    # an attempt given up on can never answer for the connection that
+    # replaced it. (A connection opened before the proxy was in effect is not
+    # proxied, and its first segment after that is refused as a forged
+    # handshake ACK: retired, it times out 8 s later. With one shared name
+    # that late failure landed in the files of the next, proxied attempt.)
+    held = {}
+
     def hold(marker, host, port):
         # One idle connection, proxied: its handshake was challenged and admitted.
-        for _ in range(15):
+        for attempt in range(15):
+            name = f"{marker}-{attempt}"
             base = counter("synproxy_admitted")
-            client.succeed(f"rm -f {marker}.*")
+            client.succeed(f"rm -f {name}.*")
             client.succeed(
-                f"setsid -f ${pkgs.python3}/bin/python3 ${banner} hold {host} {port} {marker} "
-                f"> {marker}.log 2>&1 < /dev/null"
+                f"setsid -f ${pkgs.python3}/bin/python3 ${banner} hold {host} {port} {name} "
+                f"> {name}.log 2>&1 < /dev/null"
             )
-            client.wait_until_succeeds(f"test -e {marker}.ready", timeout=30)
+            client.wait_until_succeeds(f"test -e {name}.ready", timeout=30)
             if counter("synproxy_admitted") > base:
-                return int(client.succeed(f"cat {marker}.port").strip())
-            client.succeed(f"touch {marker}.go; sleep 1")
+                held[marker] = name
+                return int(client.succeed(f"cat {name}.port").strip())
+            # Retire it, and wait until it has finished either way.
+            client.succeed(f"touch {name}.go")
+            client.wait_until_succeeds(f"test -e {name}.ok -o -e {name}.fail", timeout=30)
+            outcome = client.succeed(f"cat {name}.fail 2>/dev/null || echo completed").strip()
+            print(f"{name} was not proxied and is retired: {outcome}")
             fw.sleep(2)
         raise AssertionError(f"the idle connection to {host}:{port} was never proxied")
 
     def speaks(marker):
-        client.succeed(f"touch {marker}.go")
-        client.wait_until_succeeds(f"test -e {marker}.ok -o -e {marker}.fail", timeout=30)
-        failure = client.succeed(f"cat {marker}.fail 2>/dev/null || true").strip()
+        name = held[marker]
+        client.succeed(f"touch {name}.go")
+        client.wait_until_succeeds(f"test -e {name}.ok -o -e {name}.fail", timeout=30)
+        failure = client.succeed(f"cat {name}.fail 2>/dev/null || true").strip()
         assert not failure, (
             f"the idle proxied connection {marker} died: {failure}\n"
             + fw.succeed("sentinel show firewall statistics")
@@ -205,6 +220,14 @@ pkgs.testers.runNixOSTest {
         "bpftool -j map show name SYN_FLOWS | grep -Eq '\"max_entries\":(1024|2048)'", timeout=60
     )
     fw.fail("journalctl -u velstra.service | grep -q 'Error: loading'")
+    # Hold only once the restarted agent is live. Its maps exist earlier, but
+    # until then a connection may be opened through a data plane the proxy is
+    # not yet in effect in, and every such attempt has to be retired.
+    fw.wait_until_succeeds(
+        "journalctl -o cat _SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value velstra.service) "
+        "| grep -q 'Velstra is live'",
+        timeout=120,
+    )
 
     flooded = hold("/tmp/flooded", "10.2.0.2", 2525)
     routed = hold("/tmp/routed", "10.2.0.2", 2525)
