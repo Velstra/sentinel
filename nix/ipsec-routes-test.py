@@ -36,6 +36,7 @@ def static_route(rows):
 start_all()
 fw.wait_for_unit("sentinel-boot-late.service")
 peer.wait_for_unit("qa-target.service")
+peer.wait_until_succeeds("ss -Hltn 'sport = :9102' | grep -qF '198.19.210.9:9102'", timeout=60)
 assert fw.succeed("readlink -f /run/current-system/sw/bin/sentinel").strip() == "__SENTINEL__"
 configure(["set protocols static 198.19.210.0/24 via 198.18.10.254"])
 coexisting = routes()

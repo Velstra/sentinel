@@ -167,6 +167,7 @@ pkgs.testers.runNixOSTest {
     start_all()
     fw.wait_for_unit("velstra.service")
     server.wait_for_unit("banner.service")
+    server.wait_until_succeeds("ss -Hltn 'sport = :2525' | grep -q .", timeout=60)
     client.wait_for_unit("multi-user.target")
     fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=30)
 

@@ -208,6 +208,9 @@ pkgs.testers.runNixOSTest {
     boot()
     server.wait_for_unit("web.service")
     server.wait_for_unit("banner.service")
+    server.wait_until_succeeds("ss -Hltn 'sport = :80' | grep -q .", timeout=60)
+    server.wait_until_succeeds("ss -Hltn 'sport = :25' | grep -q .", timeout=60)
+    server.wait_until_succeeds("ss -Hltn 'sport = :9443' | grep -q .", timeout=60)
     client.wait_for_unit("multi-user.target")
 
     configure([
