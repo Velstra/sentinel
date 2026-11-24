@@ -215,6 +215,13 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
   upgrade. Connections opened afterwards are proxied normally. Change
   `syn-protect` in a maintenance window, or expect that port's clients to
   reconnect.
+- **A commit can be refused while the box is starved of CPU.** A commit that
+  restarts the data-plane agent waits for it to report ready, and each check
+  of that is bounded to a few seconds. On an appliance whose CPU is saturated
+  (for example during a flood) one check can run out of time. The commit is
+  then refused with `readiness probe timed out` and rolled back to the previous
+  running configuration, so nothing is left half-applied. Repeat the commit
+  once the load has dropped.
 
 - **IPv6 is not SYN-proxied in 1.0.** The SYN proxy protects IPv4 only (DP-35).
   Where a protected port is reachable over IPv6, `config check` names the zones.
