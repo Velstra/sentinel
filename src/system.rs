@@ -4776,35 +4776,26 @@ mod ha_curl_tests {
     /// and `--disable` is its first argument, the only place curl honours it.
     #[test]
     fn credentialed_curl_runs_with_an_empty_environment_and_no_curlrc() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("sentinel-curl-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("curl");
-        std::fs::write(&fake, "#!/bin/sh\nprintf 'first=%s\\n' \"$1\"\nenv\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Written by a child shell, so no fork in another test thread can hold
+        // it open for writing when it runs (ETXTBSY); see `test_exec`.
+        crate::test_exec::write_executable(
+            &fake,
+            "#!/bin/sh\nprintf 'first=%s\\n' \"$1\"\nenv\n",
+            0o755,
+        );
         // SAFETY: test-only; nothing else in the test binary spawns curl, the
         // only reader of these two variables.
         unsafe {
             std::env::set_var("HTTPS_PROXY", "http://proxy.attacker.example:3128");
             std::env::set_var("SSLKEYLOGFILE", "/tmp/stolen-keys");
         }
-        // Another test thread may fork while this one still holds the stub's
-        // write descriptor; the forked child keeps it until its own exec, and
-        // exec of a file open for writing fails with ETXTBSY. The window is
-        // that short, so retry rather than fail the release build on it.
-        let mut attempts = 0;
-        let out = loop {
-            match curl_command_for(fake.to_str().unwrap())
-                .arg("https://peer.example")
-                .output()
-            {
-                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                other => break other.unwrap(),
-            }
-        };
+        let out = curl_command_for(fake.to_str().unwrap())
+            .arg("https://peer.example")
+            .output()
+            .unwrap();
         unsafe {
             std::env::remove_var("HTTPS_PROXY");
             std::env::remove_var("SSLKEYLOGFILE");

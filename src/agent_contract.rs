@@ -195,9 +195,8 @@ mod tests {
     /// a TOML source excerpt that quotes the offending line, and a cause line
     /// that echoes a configured credential.
     fn fake_validator(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("velstra");
-        std::fs::write(
+        crate::test_exec::write_executable(
             &path,
             "#!/bin/sh\n\
              [ \"$1\" = validate ] || exit 64\n\
@@ -212,9 +211,8 @@ mod tests {
              exit 1\n\
              fi\n\
              echo 'Configuration is valid:'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         path
     }
 
