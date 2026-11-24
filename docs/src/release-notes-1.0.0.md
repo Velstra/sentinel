@@ -203,6 +203,18 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
   normal close). A client that reconnects from the same address and port inside
   that window, to a protected service whose server uses the same port, is not
   admitted until it retries after it ([firewall handbook](handbook/firewall.md)).
+- **Switching the SYN proxy on or off cuts that port's open connections.** The
+  proxy admits a connection only through its own handshake and keeps a record
+  of each one it admitted. A connection already open when `set firewall
+  syn-protect <port>` is committed has no record: its next segments are refused
+  as forged handshake replies, and it stalls until the client gives up and
+  reconnects. Removing `syn-protect` likewise ends the connections the proxy
+  had admitted, because their sequence numbers are no longer translated. The
+  same applies to proxied connections whenever the agent starts with fresh
+  state instead of its pinned tables, as on the first restart after this
+  upgrade. Connections opened afterwards are proxied normally. Change
+  `syn-protect` in a maintenance window, or expect that port's clients to
+  reconnect.
 
 - **IPv6 is not SYN-proxied in 1.0.** The SYN proxy protects IPv4 only (DP-35).
   Where a protected port is reachable over IPv6, `config check` names the zones.
