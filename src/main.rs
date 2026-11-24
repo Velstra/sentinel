@@ -4586,3 +4586,8 @@ mod tests {
         }
     }
 }
+
+// Declared last: panic locations are compiled into the shipped binary, so a
+// test-only module above would move them and change that binary.
+#[cfg(test)]
+mod test_exec;
