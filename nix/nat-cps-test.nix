@@ -11,7 +11,7 @@
 # one of them completed, the firewall refusing nothing but repeated server RSTs
 # for flows a first RST already closed (each refusal logged and attributed),
 # and at most
-# 2 % needing a SYN retransmission (the links between test VMs drop packets
+# 10 % needing a SYN retransmission (the links between test VMs drop packets
 # on their own; the receipt measures every hop). That is
 # 4x the live collapse and well under what the routed path did on the same
 # hardware (14k/s). A cleanly closed binding holds its port for 120 s, so the
@@ -358,13 +358,16 @@ pkgs.testers.runNixOSTest {
             assert count < result["server_resets"].get(port, 0), (name, "not a repeated RST", port, count, result["server_resets"].get(port, 0))
         assert result["nat_drops"] == {}, (name, result["nat_drops"])
         # A tripwire for the PERF-02 collapse, which left most new connections
-        # retransmitting their SYN (thousands per phase). The test network's
-        # links between VMs lose packets on their own under this open loop:
-        # over twelve phases on an idle builder up to 652 per hop, and up to
-        # 276 connections needed a retransmission while the firewall lost
-        # none. 2 % of the offered connections leaves room for that and still
-        # fails the collapse by an order of magnitude.
-        assert result["retransmit_shaped_connects"] <= result["offered"] // 50, (name, result["hop_loss"], result)
+        # retransmitting their SYN: 99.5 % of them never completed. The test
+        # network's links between VMs lose packets on their own under this
+        # open loop, and how many depends on the host: up to 276 connections
+        # per phase needed a retransmission on an idle builder (up to 652
+        # packets lost per hop), none on a quiet GitHub runner, and 758 on a
+        # loaded one (2014 lost on one hop), each time with the firewall
+        # forwarding everything it received. 10 % of the offered connections
+        # (2000) is 2.6 times the worst of those and still five times below
+        # "most"; the collapse itself also fails the completion asserts above.
+        assert result["retransmit_shaped_connects"] <= result["offered"] // 10, (name, result["hop_loss"], result)
         assert result["completed_rate"] >= 0.95 * ${toString rate}, (name, result)
     fw.succeed("systemctl is-active sentinel-boot.service velstra.service")
   '';
