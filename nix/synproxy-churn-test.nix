@@ -219,6 +219,14 @@ pkgs.testers.runNixOSTest {
         "bpftool -j map show name SYN_FLOWS | grep -Eq '\"max_entries\":(1024|2048)'", timeout=60
     )
     fw.fail("journalctl -u velstra.service | grep -q 'Error: loading'")
+    # Hold only once the restarted agent is live. Its maps exist earlier, but
+    # until then a connection may be opened through a data plane the proxy is
+    # not yet in effect in, and every such attempt has to be retired.
+    fw.wait_until_succeeds(
+        "journalctl -o cat _SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value velstra.service) "
+        "| grep -q 'Velstra is live'",
+        timeout=120,
+    )
 
     flooded = hold("/tmp/flooded", "10.2.0.2", 2525)
     routed = hold("/tmp/routed", "10.2.0.2", 2525)
