@@ -21,7 +21,13 @@ import threading
 import time
 import tomllib
 
-import release_attempts
+# The release scripts import each other by name. Put this file's own directory
+# on the path, so that works however the file is loaded: as a script, through
+# `python3 -c`, or by importlib from a test.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import release_attempts  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 LAYOUT = ["esp", "store-verity", "store", "store-verity-b", "store-b", "data"]

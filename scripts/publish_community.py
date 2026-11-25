@@ -8,11 +8,18 @@ import subprocess
 import tempfile
 from urllib.error import HTTPError
 from urllib.parse import quote
+import sys
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
-from check_release_environment import approvals_statement
-from community_release import STALL_SECONDS, digest, source, verify_bundle, version
-import release_attempts
+# The release scripts import each other by name. Put this file's own directory
+# on the path, so that works however the file is loaded: as a script, through
+# `python3 -c`, or by importlib from a test.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from check_release_environment import approvals_statement  # noqa: E402
+from community_release import STALL_SECONDS, digest, source, verify_bundle, version  # noqa: E402
+import release_attempts  # noqa: E402
 
 
 class NoRedirect(HTTPRedirectHandler):

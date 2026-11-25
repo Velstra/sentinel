@@ -4,10 +4,18 @@ import argparse
 import json
 import os
 import re
+from pathlib import Path
 import subprocess
+import sys
 from urllib.parse import quote
 
-import release_attempts
+# The release scripts import each other by name. Put this file's own directory
+# on the path, so that works however the file is loaded: as a script, through
+# `python3 -c`, or by importlib from a test.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import release_attempts  # noqa: E402
 
 # Single-operator mode: the shortest wait_timer (minutes) an environment may
 # carry, so a run started with a stolen token cannot release before the owner
