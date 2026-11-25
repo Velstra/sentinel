@@ -76,9 +76,10 @@ jobs:
   regressions:
     needs: plan
     runs-on: ubuntu-24.04
-    # One stalled attempt (killed after 30 min of silence) plus a whole second
-    # attempt; a hang used to hold a runner for the full six hours.
-    timeout-minutes: 150
+    # Room for the slowest healthy job (80 min) to stall at its end, sit out
+    # the 30-min stall limit and run in full once more, with slack for slow
+    # runners at night; a hang used to hold a runner for six hours.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       max-parallel: 16

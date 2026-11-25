@@ -111,7 +111,7 @@ silently drops newly added tests. A check whose build prints nothing for 30
 minutes is taken for a hung runner: the build is killed and started once more
 in the same job. A second stall, or any failure of the check itself, fails the
 release; a failed check is never retried. The check's receipt and the release
-notes name every check that was retried. A regression job's 150-minute
+notes name every check that was retried. A regression job's 240-minute
 timeout fails the release. A checkout that cannot reach github.com is retried
 once after a two-minute pause.
 

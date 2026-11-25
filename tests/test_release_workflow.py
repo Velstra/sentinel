@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/release-community.yml"
 USERNS = "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
 RETRY_IF = "if: steps.checkout.outcome == 'failure'"
+# wizard-encrypted in release run 45345375933, the longest healthy regression
+# job; runners are slower still under night-time load.
+SLOWEST_HEALTHY_REGRESSION_MINUTES = 80
 
 _spec = importlib.util.spec_from_file_location("community_release", ROOT / "scripts/community_release.py")
 release = importlib.util.module_from_spec(_spec)
@@ -73,9 +76,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_a_hung_regression_costs_hours_not_six(self):
         timeout = int(re.search(r"timeout-minutes: (\d+)", self.jobs["regressions"]).group(1))
-        self.assertLessEqual(timeout, 150)
-        # Room for one stalled attempt plus a whole second attempt.
-        self.assertGreater(timeout * 60, 2 * release.STALL_SECONDS)
+        self.assertLess(timeout, 360)
+        # Room for the slowest healthy job to stall at its very end, sit out
+        # the stall limit and then run in full once more.
+        self.assertGreaterEqual(timeout, 2 * SLOWEST_HEALTHY_REGRESSION_MINUTES
+                                + release.STALL_SECONDS // 60)
 
 
 if __name__ == "__main__":
