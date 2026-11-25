@@ -287,6 +287,80 @@ class ReleaseTests(unittest.TestCase):
                 release.validate_catalog(malformed)
 
 
+class StallWatchdogTests(unittest.TestCase):
+    """A regression build that prints nothing for the stall limit is killed and
+    run once more; a build that fails is never run again."""
+
+    def test_output_is_forwarded_and_stdout_returned(self):
+        stdout = release.run_watched(["sh", "-c", "echo log >&2; echo /nix/store/x"], os.environ, 30)
+        self.assertEqual(stdout, "/nix/store/x")
+
+    def test_a_silent_build_is_killed_with_its_whole_process_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / "child"
+            start = time.monotonic()
+            with self.assertRaises(release.Stalled):
+                release.run_watched(["sh", "-c", f"sleep 60 & echo $! > {pid_file}; wait"],
+                                    os.environ, 1, poll=0.1)
+            self.assertLess(time.monotonic() - start, 15)
+            child = int(pid_file.read_text())
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and Path(f"/proc/{child}").exists():
+                time.sleep(0.1)
+            self.assertFalse(Path(f"/proc/{child}").exists(), "the stalled build's child survived")
+
+    def test_a_failing_build_is_a_failure_not_a_stall(self):
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            release.run_watched(["sh", "-c", "echo broken >&2; exit 3"], os.environ, 30)
+        self.assertEqual(failure.exception.returncode, 3)
+
+    def test_steady_output_never_counts_as_a_stall(self):
+        # A byte that is not UTF-8 (compiler and test logs have them) must
+        # neither stop the forwarding nor count as silence.
+        stdout = release.run_watched(
+            ["sh", "-c", "printf 'bad \\377 byte\\n' >&2; "
+                         "for i in 1 2 3 4 5 6; do echo tick >&2; sleep 0.3; done; echo /nix/store/y"],
+            os.environ, 1, poll=0.1)
+        self.assertEqual(stdout, "/nix/store/y")
+
+    def test_a_stall_is_retried_once_and_recorded(self):
+        with patch.object(release, "run_watched", side_effect=[release.Stalled("silent"), "/nix/store/z"]) as run, \
+                patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
+            path, stalls = release.build_check("expr", SENTINEL_CHECK="nat")
+        self.assertEqual((str(path), stalls, run.call_count), ("/nix/store/z", 1, 2))
+        self.assertIn("::warning", out.getvalue())
+        self.assertIn("nat", out.getvalue())
+
+    def test_a_second_stall_fails_the_check(self):
+        with patch.object(release, "run_watched", side_effect=[release.Stalled("a"), release.Stalled("b")]) as run, \
+                patch("sys.stdout", new_callable=__import__("io").StringIO):
+            with self.assertRaises(release.Stalled):
+                release.build_check("expr", SENTINEL_CHECK="nat")
+        self.assertEqual(run.call_count, 2)
+
+    def test_a_failed_check_is_never_retried(self):
+        failure = subprocess.CalledProcessError(1, ["nix", "build"])
+        with patch.object(release, "run_watched", side_effect=[failure, "/nix/store/never"]) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.build_check("expr", SENTINEL_CHECK="nat")
+        self.assertEqual(run.call_count, 1)
+
+    def test_a_clean_build_records_no_retry(self):
+        with patch.object(release, "run_watched", return_value="/nix/store/w"):
+            self.assertEqual(release.build_check("expr", SENTINEL_CHECK="nat")[1], 0)
+
+    def test_receipts_carry_at_most_one_stall_retry(self):
+        names = sorted(release.REQUIRED_SAFETY_CHECKS)
+        base = {"source": "a" * 40, "run": "42-1", "completed_at": int(time.time())}
+        receipts = [base | {"check": n} for n in names]
+        release.validate_checks(receipts, names, "a" * 40, "42-1")
+        release.validate_checks([receipts[0] | {"stall_retries": 1}] + receipts[1:], names, "a" * 40, "42-1")
+        for bad in (2, -1, "1", True, None):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                release.validate_checks([receipts[0] | {"stall_retries": bad}] + receipts[1:],
+                                        names, "a" * 40, "42-1")
+
+
 class RealSignatureTests(unittest.TestCase):
     def test_real_detached_signature_and_wrong_identity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -410,6 +484,18 @@ class PublicationContracts(unittest.TestCase):
         single = self.draft_body({"RELEASE_SINGLE_OPERATOR": "true"})
         self.assertEqual(single, default + "\n\nRelease approvals: single-operator mode "
                                            "(one maintainer, wait timer \u2265 30 min).")
+
+    def test_release_body_names_checks_retried_after_a_stall(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, directory)
+        checks = [{"check": "nat"}, {"check": "image-first-boot", "stall_retries": 1},
+                  {"check": "commit", "stall_retries": 0}]
+        (directory / "source-checks.json").write_text(json.dumps({"checks": checks}))
+        self.assertEqual(publisher.stall_statement(directory),
+                         "Regression checks retried once after a stalled build (no output for 30 min; "
+                         "a failing check is never retried): image-first-boot.")
+        (directory / "source-checks.json").write_text(json.dumps({"checks": checks[:1]}))
+        self.assertEqual(publisher.stall_statement(directory), "")
 
     def test_cross_run_artifact_is_refused_before_download(self):
         metadata = {"expired": False, "workflow_run": {"id": 1, "head_sha": "a" * 40},

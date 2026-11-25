@@ -13,8 +13,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import tomllib
 
@@ -38,6 +41,19 @@ REQUIRED_SAFETY_CHECKS = frozenset({
     "image-first-boot", "image-first-boot-mke2fs", "image-closure", "image-gate-unit",
     "seed-image-unit", "legacy-hash-login",
 })
+
+
+# A regression build that prints nothing for this long is taken for hung
+# runner infrastructure, not for a slow test. Three release runs died that
+# way (2.5 h of silence while building packages from source); healthy jobs
+# never went more than about 10 min without a line.
+STALL_SECONDS = 30 * 60
+# A stalled build is started once more, never more; a failed one never is.
+STALL_RETRIES = 1
+
+
+class Stalled(RuntimeError):
+    """The build printed nothing for the stall limit and was killed."""
 
 
 def run(*args, capture=False, env=None):
@@ -120,15 +136,85 @@ def esp(image):
     return f"{image}@@{partition_table(image)[0]['start'] * 512}"
 
 
-def build(expression, **variables):
-    env = os.environ | {"SENTINEL_RELEASE_SOURCE": str(ROOT)} | variables
-    result = run("nix", "build", "--impure", "--no-link", "--no-write-lock-file",
-                 "--max-jobs", "1", "--cores", "4", "--print-out-paths", "-L",
-                 "--expr", expression, env=env, capture=True)
+def run_watched(args, env, stall_seconds, poll=5.0):
+    """Like run(..., capture=True), but stderr goes to the job log line by line,
+    and the whole process group is killed once neither stream has printed
+    anything for stall_seconds (Stalled). A non-zero exit stays a failure
+    (CalledProcessError), never a stall."""
+    # errors="replace": one byte that is not UTF-8 in a build log must not kill
+    # the reader, which would also stop the clock and fake a stall.
+    process = subprocess.Popen([str(a) for a in args], cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, errors="replace",
+                               start_new_session=True)
+    last_output = [time.monotonic()]
+    captured = []
+
+    def pump(stream, sink):
+        for line in stream:
+            last_output[0] = time.monotonic()
+            sink(line)
+
+    def forward(line):
+        sys.stderr.write(line)
+        sys.stderr.flush()
+
+    readers = [threading.Thread(target=pump, args=(process.stdout, captured.append), daemon=True),
+               threading.Thread(target=pump, args=(process.stderr, forward), daemon=True)]
+    for reader in readers:
+        reader.start()
+    while process.poll() is None:
+        silent = time.monotonic() - last_output[0]
+        if silent > stall_seconds:
+            # The group is killed before its leader is reaped, so the group
+            # ID cannot have been reused. A hung build needs no grace period.
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            for reader in readers:
+                reader.join(timeout=10)
+            raise Stalled(f"no build output for {int(silent)} s; the build was killed")
+        time.sleep(poll)
+    for reader in readers:
+        reader.join()
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, [str(a) for a in args])
+    return "".join(captured).strip()
+
+
+def nix_build_command(expression):
+    return ["nix", "build", "--impure", "--no-link", "--no-write-lock-file",
+            "--max-jobs", "1", "--cores", "4", "--print-out-paths", "-L", "--expr", expression]
+
+
+def output_path(result):
     paths = result.splitlines()
     if len(paths) != 1 or not paths[0].startswith("/nix/store/"):
         raise ValueError("expected one Nix output")
     return Path(paths[0])
+
+
+def build(expression, **variables):
+    env = os.environ | {"SENTINEL_RELEASE_SOURCE": str(ROOT)} | variables
+    return output_path(run(*nix_build_command(expression), env=env, capture=True))
+
+
+def build_check(expression, **variables):
+    """Build one regression check under the stall watchdog: (output, stall retries).
+    Only a stall is retried, at most STALL_RETRIES times; a check whose build
+    fails stays failed, whatever the reason."""
+    env = os.environ | {"SENTINEL_RELEASE_SOURCE": str(ROOT)} | variables
+    name = variables.get("SENTINEL_CHECK", "unknown")
+    for attempt in range(STALL_RETRIES + 1):
+        try:
+            result = run_watched(nix_build_command(expression), env, STALL_SECONDS)
+        except Stalled:
+            if attempt == STALL_RETRIES:
+                print(f"::error title=Stalled build::{name}: no build output for "
+                      f"{STALL_SECONDS // 60} min again after a retry; the check fails", flush=True)
+                raise
+            print(f"::warning title=Stalled build retried::{name}: no build output for "
+                  f"{STALL_SECONDS // 60} min; killed the build and started it once more", flush=True)
+            continue
+        return output_path(result), attempt
 
 
 SELF = 'let self = builtins.getFlake (builtins.getEnv "SENTINEL_RELEASE_SOURCE"); '
@@ -377,13 +463,14 @@ def checks(args):
         if args.check not in names:
             raise ValueError("unknown check")
         nonce = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-        output = build(SELF + '''name = builtins.getEnv "SENTINEL_CHECK";
+        output, stalls = build_check(SELF + '''name = builtins.getEnv "SENTINEL_CHECK";
           test = self.checks.x86_64-linux.${name}; nonce = _: {
             SENTINEL_RELEASE_RUN = builtins.getEnv "SENTINEL_RELEASE_RUN"; };
           in if test ? overrideTestDerivation then test.overrideTestDerivation nonce
           else test.overrideAttrs nonce''', SENTINEL_CHECK=args.check, SENTINEL_RELEASE_RUN=nonce)
         document(args.output, {"source": sha, "check": args.check, "output": str(output),
-                              "run": nonce, "completed_at": int(time.time())})
+                              "run": nonce, "completed_at": int(time.time()),
+                              "stall_retries": stalls})
     else:
         print(json.dumps({"check": names}, separators=(",", ":")))
 
@@ -405,6 +492,8 @@ def validate_checks(receipts, names, sha, nonce):
             or sorted(r.get("check", "") for r in receipts) != sorted(names)
             or any(r.get("source") != sha or r.get("run") != nonce
                    or type(r.get("completed_at")) is not int
+                   or type(r.get("stall_retries", 0)) is not int
+                   or not 0 <= r.get("stall_retries", 0) <= STALL_RETRIES
                    or not 0 <= time.time() - r["completed_at"] <= 86400 for r in receipts)):
         raise ValueError("missing, duplicate, stale or wrong-source check receipts")
 
