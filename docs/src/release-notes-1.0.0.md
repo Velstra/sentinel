@@ -235,6 +235,10 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
   client ports to one service. Masquerade in 1.0 uses the one address of each
   uplink and has no address pool, so the remedy is another masquerading uplink
   ([firewall handbook](handbook/firewall.md)).
+- **Masquerade waits for the uplink's address.** For up to about 2 s after boot
+  or after an uplink's address changes, until the agent has picked up the new
+  address, traffic that needs masquerading on that uplink is dropped, never sent
+  out untranslated.
 - **Rule capacity.** At most 8,192 rule-trie entries per address family; a
   larger rule set is refused at `config check` and `commit` with the capacity
   named, and a saved file over the limit boots the last-known-good configuration.
