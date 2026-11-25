@@ -167,6 +167,21 @@ in pkgs.testers.runNixOSTest {
     lan.wait_for_unit("systemd-networkd.service")
     wan.wait_for_unit("systemd-networkd.service")
     lan.wait_until_succeeds("ping -c1 -W1 198.18.20.1", timeout=60)
+    # Masquerade is in force only once the data plane holds the uplink's
+    # address. The agent brings eth1 up after its hooks are attached, networkd
+    # then configures 198.18.10.100, and the agent learns that address on its
+    # next host-inventory poll. Until then the uplink is unaddressed and every
+    # packet that needs translating is refused at egress: nothing leaks, and
+    # nothing is delivered either, so "translated" cases would fail for a
+    # reason that is not the property under test. Send only once the
+    # MASQUERADE entry holds the uplink address.
+    uplink = ["0xc6", "0x12", "0x0a", "0x64"]  # 198.18.10.100
+
+    def masquerade_addressed(_last: bool) -> bool:
+        entries = json.loads(dut.succeed("bpftool -j map dump name MASQUERADE"))
+        return any(entry.get("value") == uplink for entry in entries)
+
+    retry(masquerade_addressed, timeout_seconds=30)
     wan.succeed("systemd-run --unit=leak-capture tcpdump -U -n -i eth1 -w /tmp/wan.pcap ip")
     wan.wait_until_succeeds("test -s /tmp/wan.pcap", timeout=10)
     before = stats()
