@@ -12,6 +12,7 @@ from urllib.request import Request, HTTPRedirectHandler, build_opener
 
 from check_release_environment import approvals_statement
 from community_release import STALL_SECONDS, digest, source, verify_bundle, version
+import release_attempts
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -49,12 +50,28 @@ def stall_statement(directory):
             f"{STALL_SECONDS // 60} min; a failing check is never retried): " + ", ".join(retried) + ".")
 
 
+def rerun_statement(directory):
+    """Name each regression check re-run after a failure, with its first error
+    and the attempt-1 log. The verified bundle's record must match what GitHub
+    reports for this run."""
+    path = directory / "source-checks.json"
+    recorded = json.loads(path.read_text()).get("reruns", {}) if path.exists() else {}
+    if set(recorded) != set(release_attempts.current()):
+        raise ValueError("the bundle's re-run record differs from this run's jobs")
+    if not recorded:
+        return ""
+    return ("Regression checks re-run once after a failure: " + ", ".join(
+        f"{check} (first failure: {entry['first_failure']}; attempt-1 log: {entry['first_job']})"
+        for check, entry in sorted(recorded.items())) + ".")
+
+
 def publish(directory):
     if (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
             or os.environ.get("GITHUB_REF") != "refs/heads/main"
             or os.environ.get("RELEASE_PUBLISH_REQUESTED") != "true"
-            or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"):
-        raise ValueError("publication requires an explicitly requested first-attempt main dispatch")
+            or os.environ.get("GITHUB_RUN_ATTEMPT") not in ("1", "2")):
+        raise ValueError("publication requires an explicitly requested main dispatch, "
+                         "in its first attempt or its one re-run")
     verify_bundle(directory)
     release = version(os.environ["RELEASE_VERSION"])
     sha = source()
@@ -86,9 +103,9 @@ def publish(directory):
     statement = approvals_statement()
     if statement:
         body += "\n\n" + statement
-    stalls = stall_statement(directory)
-    if stalls:
-        body += "\n\n" + stalls
+    for line in (stall_statement(directory), rerun_statement(directory)):
+        if line:
+            body += "\n\n" + line
     created = api(root + "/releases", {
         "tag_name": release, "target_commitish": sha, "name": f"Sentinel {release}",
         "draft": True, "prerelease": "-rc." in release, "body": body}, method="POST")

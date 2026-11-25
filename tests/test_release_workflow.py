@@ -1,6 +1,7 @@
 """The Community release workflow can build images on GitHub's Ubuntu 24.04 runners."""
 import importlib.util
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -12,6 +13,8 @@ RETRY_IF = "if: steps.checkout.outcome == 'failure'"
 # job; runners are slower still under night-time load.
 SLOWEST_HEALTHY_REGRESSION_MINUTES = 80
 
+# The scripts import each other, as they do when the workflow runs them.
+sys.path.insert(0, str(ROOT / "scripts"))
 _spec = importlib.util.spec_from_file_location("community_release", ROOT / "scripts/community_release.py")
 release = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(release)
@@ -82,6 +85,36 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(timeout, 2 * SLOWEST_HEALTHY_REGRESSION_MINUTES
                                 + release.STALL_SECONDS // 60)
 
+
+    def test_only_a_failed_regression_may_run_in_a_second_attempt(self):
+        first_only = 'test "$GITHUB_RUN_ATTEMPT" = 1'
+        self.assertIn(first_only, self.jobs["plan"])
+        build = self.jobs["build"]
+        self.assertIn(first_only, build)
+        self.assertLess(build.index(first_only), build.index("community_release.py build"))
+        regressions = self.jobs["regressions"]
+        self.assertIn('test "$GITHUB_RUN_ATTEMPT" -le 2', regressions)
+        self.assertLess(regressions.index("-le 2"), regressions.index("community_release.py checks"))
+
+    def test_every_protected_job_checks_the_attempt_before_it_acts(self):
+        for name, environment, action in (("sign", "community-signing", "community_release.py sign"),
+                                          ("seal", "community-attestation", "community_release.py seal"),
+                                          ("publish", "community-publish", "publish_community.py")):
+            with self.subTest(job=name):
+                block = self.jobs[name]
+                check = f"check_release_environment.py {environment} --approved"
+                self.assertIn(check, block)
+                self.assertLess(block.index(check), block.index(action))
+
+    def test_the_package_job_reads_which_attempt_ran_each_check(self):
+        aggregate = next(s for s in steps(self.jobs["package"]) if "community_release.py aggregate" in s)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", aggregate)
+
+    def test_the_re_run_policy_may_read_failure_annotations(self):
+        text = WORKFLOW.read_text()
+        top = text.split("\njobs:\n", 1)[0]
+        self.assertRegex(top, r"(?m)^permissions:\n(?:  .*\n)*  checks: read$")
+        self.assertRegex(self.jobs["publish"], r"    permissions:\n(?:      .*\n)*      checks: read\n")
 
 if __name__ == "__main__":
     unittest.main()
