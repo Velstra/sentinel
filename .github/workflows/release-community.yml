@@ -36,7 +36,20 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Retried once after a pause: github.com unreachable for minutes
+      # (the action's own three attempts) used to end the whole run.
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        continue-on-error: true
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pause before retrying a failed checkout
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 120
+      - name: Retry the checkout once
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -63,13 +76,27 @@ jobs:
   regressions:
     needs: plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    # One stalled attempt (killed after 30 min of silence) plus a whole second
+    # attempt; a hang used to hold a runner for the full six hours.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       max-parallel: 16
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Retried once after a pause: github.com unreachable for minutes
+      # (the action's own three attempts) used to end the whole run.
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Pause before retrying a failed checkout
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 120
+      - name: Retry the checkout once
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Allow the unprivileged user namespaces image builds need
@@ -101,7 +128,19 @@ jobs:
       artifact: ${{ steps.upload.outputs.artifact-id }}
       digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Retried once after a pause: github.com unreachable for minutes
+      # (the action's own three attempts) used to end the whole run.
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Pause before retrying a failed checkout
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 120
+      - name: Retry the checkout once
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Allow the unprivileged user namespaces image builds need
@@ -172,7 +211,19 @@ jobs:
       VELSTRA_KEK_CERT_SHA256: ${{ vars.VELSTRA_KEK_CERT_SHA256 }}
       VELSTRA_DB_CERT_SHA256: ${{ vars.VELSTRA_DB_CERT_SHA256 }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Retried once after a pause: github.com unreachable for minutes
+      # (the action's own three attempts) used to end the whole run.
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Pause before retrying a failed checkout
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 120
+      - name: Retry the checkout once
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Allow the unprivileged user namespaces image builds need
@@ -230,7 +281,19 @@ jobs:
       VELSTRA_KEK_CERT_SHA256: ${{ vars.VELSTRA_KEK_CERT_SHA256 }}
       VELSTRA_DB_CERT_SHA256: ${{ vars.VELSTRA_DB_CERT_SHA256 }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Retried once after a pause: github.com unreachable for minutes
+      # (the action's own three attempts) used to end the whole run.
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Pause before retrying a failed checkout
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 120
+      - name: Retry the checkout once
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Allow the unprivileged user namespaces image builds need
@@ -292,7 +355,19 @@ jobs:
       VELSTRA_GPG_FINGERPRINT: ${{ vars.VELSTRA_GPG_FINGERPRINT }}
       RELEASE_CHECK_CATALOG: ${{ needs.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Retried once after a pause: github.com unreachable for minutes
+      # (the action's own three attempts) used to end the whole run.
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Pause before retrying a failed checkout
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 120
+      - name: Retry the checkout once
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Fetch the exact tested artifact and recheck protection
@@ -344,7 +419,19 @@ jobs:
       RELEASE_CHECK_CATALOG: ${{ needs.plan.outputs.matrix }}
       RELEASE_PUBLISH_REQUESTED: ${{ inputs.publish }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Retried once after a pause: github.com unreachable for minutes
+      # (the action's own three attempts) used to end the whole run.
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Pause before retrying a failed checkout
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 120
+      - name: Retry the checkout once
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Independently validate the exact release before any public write

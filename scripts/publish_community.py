@@ -11,7 +11,7 @@ from urllib.parse import quote
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
 from check_release_environment import approvals_statement
-from community_release import digest, source, verify_bundle, version
+from community_release import STALL_SECONDS, digest, source, verify_bundle, version
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -33,6 +33,20 @@ def api(path, payload=None, method="GET", missing=False):
         if missing and error.code == 404:
             return None
         raise
+
+
+def stall_statement(directory):
+    """Name the regression checks that ran a second time after a stalled build,
+    from the source-check catalog of the verified bundle."""
+    path = directory / "source-checks.json"
+    if not path.exists():
+        return ""
+    retried = sorted(entry["check"] for entry in json.loads(path.read_text())["checks"]
+                     if entry.get("stall_retries") == 1)
+    if not retried:
+        return ""
+    return ("Regression checks retried once after a stalled build (no output for "
+            f"{STALL_SECONDS // 60} min; a failing check is never retried): " + ", ".join(retried) + ".")
 
 
 def publish(directory):
@@ -72,6 +86,9 @@ def publish(directory):
     statement = approvals_statement()
     if statement:
         body += "\n\n" + statement
+    stalls = stall_statement(directory)
+    if stalls:
+        body += "\n\n" + stalls
     created = api(root + "/releases", {
         "tag_name": release, "target_commitish": sha, "name": f"Sentinel {release}",
         "draft": True, "prerelease": "-rc." in release, "body": body}, method="POST")
