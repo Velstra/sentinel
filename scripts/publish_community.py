@@ -68,7 +68,8 @@ def rerun_statement(directory):
     if not recorded:
         return ""
     return ("Regression checks re-run once after a failure: " + ", ".join(
-        f"{check} (first failure: {entry['first_failure']}; attempt-1 log: {entry['first_job']})"
+        f"{check} (first failure: {entry['first_failure']}; attempt-1 log: {entry['first_job']}; "
+        f"attempt 2 ran it {entry['runs']} time{'' if entry['runs'] == 1 else 's'}, all passed)"
         for check, entry in sorted(recorded.items())) + ".")
 
 

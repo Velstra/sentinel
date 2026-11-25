@@ -364,16 +364,27 @@ class StallWatchdogTests(unittest.TestCase):
                                         names, "a" * 40, "42-1")
 
 
-def job(name, conclusion, run_attempt=1, number=None):
+FIXTURES = ROOT / "tests/fixtures/run-45642647509"
+
+
+def real_jobs(name):
+    """A job listing GitHub returned for release run 45642647509."""
+    return json.loads((FIXTURES / name).read_text())["jobs"]
+
+
+def job(name, conclusion, run_attempt=1, number=None, started="2026-11-25T15:13:10Z"):
     """One entry of GitHub's attempt job listing."""
     number = number if number is not None else abs(hash(name)) % 10**9
-    return {"id": number, "name": name, "conclusion": conclusion, "run_attempt": run_attempt,
+    return {"id": number, "name": name, "status": "completed", "conclusion": conclusion,
+            "run_attempt": run_attempt, "started_at": started, "completed_at": started.replace("15:", "16:"),
             "html_url": f"https://github.com/Velstra/sentinel/actions/runs/42/job/{number}"}
 
 
 def listings(failed=("rip",), passed=("nat", "commit"), first_overrides=None, second_overrides=None):
     """Attempt 1, where the `failed` regressions failed and everything downstream
-    was skipped, and the attempt 2 that "Re-run failed jobs" makes of it."""
+    was skipped, and the attempt 2 "Re-run failed jobs" makes of it, shaped as
+    GitHub really lists it: every carried-over job again, with a new id and
+    run_attempt 2 but its attempt-1 times; downstream jobs not yet listed."""
     first = [job("plan", "success"), job("build", "success")]
     first += [job(f"regressions ({c})", "success") for c in passed]
     first += [job(f"regressions ({c})", "failure") for c in failed]
@@ -382,10 +393,13 @@ def listings(failed=("rip",), passed=("nat", "commit"), first_overrides=None, se
         next(j for j in first if j["name"] == name).update(change)
     second = []
     for entry in first:
-        rerun = entry["name"] in {f"regressions ({c})" for c in failed} or entry["name"] in (
-            "sign", "package", "seal", "publish")
-        second.append(entry | ({"run_attempt": 2, "conclusion": "success", "id": entry["id"] + 1,
-                                "html_url": entry["html_url"] + "-2"} if rerun else {}))
+        if entry["name"] in ("sign", "package", "seal", "publish"):
+            continue
+        copy = entry | {"id": entry["id"] + 1, "run_attempt": 2}
+        if entry["name"] in {f"regressions ({c})" for c in failed}:
+            copy |= {"conclusion": "success", "started_at": "2026-11-25T20:23:13Z",
+                     "completed_at": "2026-11-25T20:48:02Z", "html_url": entry["html_url"] + "-2"}
+        second.append(copy)
     for name, change in (second_overrides or {}).items():
         next(j for j in second if j["name"] == name).update(change)
     return first, second
@@ -410,31 +424,57 @@ class ReRunPolicyTests(unittest.TestCase):
         first, second = listings(failed=("rip", "reboot"))
         found = attempts.reruns(first, second)
         self.assertEqual(sorted(found), ["reboot", "rip"])
-        self.assertEqual(found["rip"]["conclusion"], "failure")
-        self.assertEqual(found["rip"]["run_attempt"], 1)
+        self.assertEqual(found["rip"]["job"]["conclusion"], "failure")
+        self.assertEqual(len(found["rip"]["runs"]), 1)
 
     def test_nothing_else_may_change(self):
         cases = {
-            "the plan was run again": listings(second_overrides={"plan": {"run_attempt": 2}}),
-            "the build was run again": listings(second_overrides={"build": {"run_attempt": 2}}),
+            "the plan was run again": listings(second_overrides={"plan": {"started_at": "2026-11-25T20:23:13Z"}}),
+            "the build was run again": listings(second_overrides={"build": {"completed_at": "2026-11-25T21:00:00Z"}}),
             "the build failed in attempt 1": listings(first_overrides={"build": {"conclusion": "failure"}},
                                                       second_overrides={"build": {"conclusion": "failure"}}),
-            "a passing regression was run again": listings(second_overrides={"regressions (nat)": {"run_attempt": 2}}),
+            "a passing regression was run again": listings(
+                second_overrides={"regressions (nat)": {"started_at": "2026-11-25T20:23:13Z"}}),
+            "the failed regression was only carried over": listings(
+                second_overrides={"regressions (rip)": {"conclusion": "failure", "started_at": "2026-11-25T15:13:10Z",
+                                                        "completed_at": "2026-11-25T16:13:10Z"}}),
             "a cancelled regression was run again": listings(first_overrides={"regressions (rip)": {"conclusion": "cancelled"}}),
             "a timed-out regression was run again": listings(first_overrides={"regressions (rip)": {"conclusion": "timed_out"}}),
             "sign ran in attempt 1": listings(first_overrides={"sign": {"conclusion": "success"}}),
             "publish ran in attempt 1": listings(first_overrides={"publish": {"conclusion": "failure"}}),
             "attempt 2 re-ran nothing": listings(failed=()),
-            "a job of attempt 3": listings(second_overrides={"regressions (rip)": {"run_attempt": 3}}),
         }
         first, second = listings()
         cases["a job appeared"] = (first, second + [job("regressions (new)", "success", 2)])
         cases["a job disappeared"] = (first, [j for j in second if j["name"] != "regressions (nat)"])
         cases["an unknown job"] = (first + [job("debug", "success")], second + [job("debug", "success")])
-        cases["a duplicate name"] = (first + [first[2]], second + [second[2]])
+        cases["a duplicate name in attempt 1"] = (first + [first[2]], second)
+        cases["a passing regression listed twice"] = (first, second + [second[2] | {"id": 1}])
         for reason, (one, two) in cases.items():
             with self.subTest(reason=reason), self.assertRaises(ValueError):
                 attempts.reruns(one, two)
+
+    def test_the_real_re_run_of_run_45642647509(self):
+        # Every carried-over job came back with a new id and run_attempt 2;
+        # routed-reply, the one failure, was listed 34 times.
+        first, second = real_jobs("attempt-1.json"), real_jobs("attempt-2-in-progress.json")
+        found = attempts.reruns(first, second)
+        self.assertEqual(list(found), ["routed-reply"])
+        self.assertEqual(len(found["routed-reply"]["runs"]), 34)
+        self.assertEqual(found["routed-reply"]["job"]["conclusion"], "failure")
+        # 33 of the 34 entries were still queued: not green yet.
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(second)
+        rerun = "regressions (routed-reply)"
+        done = [j | {"status": "completed", "conclusion": "success"} if j["name"] == rerun else j for j in second]
+        attempts.regressions_green(done)
+        at = next(k for k, j in enumerate(done) if j["name"] == rerun)
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(done[:at] + [done[at] | {"conclusion": "failure"}] + done[at + 1:])
+        plan = next(k for k, j in enumerate(second) if j["name"] == "plan")
+        moved = second[:plan] + [second[plan] | {"started_at": "2026-11-25T20:23:13Z"}] + second[plan + 1:]
+        with self.assertRaises(ValueError):
+            attempts.reruns(first, moved)
 
     def test_a_regression_that_fails_twice_blocks_the_release(self):
         first, second = listings(second_overrides={"regressions (rip)": {"conclusion": "failure"}})
@@ -479,12 +519,12 @@ class ReRunPolicyTests(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2", "GITHUB_RUN_ID": "42",
                                      "GITHUB_REPOSITORY": "Velstra/sentinel"}):
             self.assertEqual(attempts.current(fetch=fetch), {"rip": {
-                "first_failure": "rip failed: OSPF never converged", "first_job": rip["html_url"]}})
+                "first_failure": "rip failed: OSPF never converged", "first_job": rip["html_url"], "runs": 1}})
 
     def test_receipts_must_come_from_the_attempt_that_ran_them(self):
         from types import SimpleNamespace
         names = sorted(release.REQUIRED_SAFETY_CHECKS | {"rip"})
-        reruns = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1"}}
+        reruns = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1", "runs": 1}}
         with tempfile.TemporaryDirectory() as temp, patch.object(release, "source", return_value="a" * 40), \
                 patch.object(release, "run", return_value=json.dumps(names)), \
                 patch.object(attempts, "current", return_value=reruns), \
@@ -506,7 +546,7 @@ class ReRunPolicyTests(unittest.TestCase):
 
     def test_the_bundle_records_exactly_the_reruns_of_its_attempt(self):
         names = ["nat", "rip"]
-        record = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1"}}
+        record = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1", "runs": 1}}
         self.assertEqual(release.expected_receipt_runs({"run": "42-2", "reruns": record}, names, "42", 2),
                          {"nat": "42-1", "rip": "42-2"})
         self.assertEqual(release.expected_receipt_runs({"run": "42-1"}, names, "42", 1),
@@ -515,6 +555,7 @@ class ReRunPolicyTests(unittest.TestCase):
                     {"run": "42-2", "reruns": {}},                       # attempt 2 that re-ran nothing
                     {"run": "42-2", "reruns": {"other": record["rip"]}},  # not a catalogued check
                     {"run": "42-2", "reruns": {"rip": {"first_failure": 1}}},
+                    {"run": "42-2", "reruns": {"rip": record["rip"] | {"runs": 0}}},
                     {"run": "42-1", "reruns": []}):
             number = int(bad["run"][-1])
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -669,7 +710,7 @@ class PublicationContracts(unittest.TestCase):
 
     def test_release_body_lists_reruns_with_their_first_failure(self):
         reruns = {"rip": {"first_failure": "rip failed: OSPF never converged",
-                          "first_job": "https://github.com/Velstra/sentinel/actions/runs/42/job/7"}}
+                          "first_job": "https://github.com/Velstra/sentinel/actions/runs/42/job/7", "runs": 34}}
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(__import__("shutil").rmtree, directory)
         (directory / "source-checks.json").write_text(json.dumps({"checks": [], "reruns": reruns}))
@@ -677,7 +718,8 @@ class PublicationContracts(unittest.TestCase):
             self.assertEqual(publisher.rerun_statement(directory),
                              "Regression checks re-run once after a failure: rip (first failure: "
                              "rip failed: OSPF never converged; attempt-1 log: "
-                             "https://github.com/Velstra/sentinel/actions/runs/42/job/7).")
+                             "https://github.com/Velstra/sentinel/actions/runs/42/job/7; "
+                             "attempt 2 ran it 34 times, all passed).")
         with patch.object(attempts, "current", return_value={}), \
                 self.assertRaisesRegex(ValueError, "re-run"):
             publisher.rerun_statement(directory)
