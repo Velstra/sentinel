@@ -148,8 +148,11 @@ attempt 2. In that attempt:
 - sign, package, seal and publish run for the first time, so every
   environment approval is requested again;
 - a regression job that fails again blocks the release; there is no attempt 3.
-- GitHub may list a re-run job more than once in attempt 2; every entry must
-  finish green, and the release notes say how many times attempt 2 ran it.
+- GitHub may list a re-run job more than once in attempt 2. Every entry that
+  got a runner must finish green, and at least one must. An entry that never
+  got a runner is a phantom: it is ignored once the run has moved on to sign,
+  which shows GitHub no longer waits for it. The release notes say how many
+  times attempt 2 ran the check and how many phantom entries it listed.
 
 Before signing, and again before sealing and publishing, the workflow reads
 from GitHub's job listings which job ran in which attempt and refuses anything

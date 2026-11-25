@@ -50,9 +50,25 @@ def carried_over(before, after):
     return all(before.get(k) == after.get(k) for k in CARRIED_OVER)
 
 
+def phantom(job):
+    """An entry GitHub listed but never gave a runner (run 45642647509 listed
+    33 of them for one re-run job). Its started_at is set anyway, to its
+    creation time, so only the missing runner and completion tell it apart."""
+    return (job.get("status") == "queued" and job.get("completed_at") is None
+            and not job.get("runner_id") and not job.get("runner_name"))
+
+
+def moved_on(jobs):
+    """GitHub has gone past the regressions: a downstream job (sign) exists and
+    has left the queue, so it no longer waits for any queued regression entry."""
+    return any(j.get("name") in DOWNSTREAM and j.get("status") in ("waiting", "in_progress", "completed")
+               for j in jobs)
+
+
 def reruns(first, second):
     """The regression jobs attempt 2 ran again: {check: {"job": its attempt-1
-    job, "runs": its attempt-2 entries}}.
+    job, "runs": its attempt-2 entries that started, "phantoms": how many
+    never did}}.
 
     `first` and `second` are GitHub's job listings of attempts 1 and 2. A job
     carried over from attempt 1 appears in attempt 2 with identical name,
@@ -87,9 +103,12 @@ def reruns(first, second):
             if before.get("conclusion") != "failure":
                 raise ValueError(f"{name} was {before.get('conclusion')} in attempt 1; "
                                  "only a failed regression may run again")
-            if not after or any(carried_over(before, job) for job in after):
+            ran = [job for job in after if not phantom(job)]
+            if not ran or any(carried_over(before, job) for job in ran):
                 raise ValueError(f"{name} failed in attempt 1 and was not run again")
-            found[regression.group(1)] = {"job": before, "runs": after}
+            if len(ran) < len(after) and not moved_on(second):
+                raise ValueError(f"{name}: attempt 2 still waits for {len(after) - len(ran)} queued entries")
+            found[regression.group(1)] = {"job": before, "runs": ran, "phantoms": len(after) - len(ran)}
         else:
             raise ValueError(f"unexpected job {name!r} in a release run")
     if not found:
@@ -98,11 +117,15 @@ def reruns(first, second):
 
 
 def regressions_green(jobs):
-    """Every regression entry finished green; one that failed twice blocks, and
-    so does any duplicate of a re-run that is not a completed success."""
-    failing = sorted({REGRESSION.fullmatch(j["name"]).group(1) for j in jobs
-                      if REGRESSION.fullmatch(j.get("name", ""))
-                      and (j.get("status") != "completed" or j.get("conclusion") != "success")})
+    """Every regression entry that ran finished green, and every regression ran:
+    one that failed twice blocks, and so does any started entry that is not a
+    completed success. A phantom entry counts only while GitHub still waits."""
+    ignore = moved_on(jobs)
+    counted = [j for j in jobs if REGRESSION.fullmatch(j.get("name", "")) and not (ignore and phantom(j))]
+    failing = {REGRESSION.fullmatch(j["name"]).group(1) for j in counted
+               if j.get("status") != "completed" or j.get("conclusion") != "success"}
+    every = {REGRESSION.fullmatch(j["name"]).group(1) for j in jobs if REGRESSION.fullmatch(j.get("name", ""))}
+    failing = sorted(failing | (every - {REGRESSION.fullmatch(j["name"]).group(1) for j in counted}))
     if failing:
         raise ValueError("regression checks not green in their final attempt: " + ", ".join(failing))
 
@@ -142,7 +165,7 @@ def attempt_jobs(repository, run_id, number, fetch=gh):
 
 
 def current(fetch=gh):
-    """This run's re-runs, {check: {"first_failure", "first_job", "runs"}}: empty in
+    """This run's re-runs, {check: {"first_failure", "first_job", "runs", "phantoms"}}: empty in
     attempt 1. Raises ValueError for an attempt or a job set the policy refuses."""
     number = attempt()
     if number == 1:
@@ -161,5 +184,6 @@ def current(fetch=gh):
             f"repos/{repository}/check-runs/{job['id']}"
         annotations = fetch(f"{check_run}/annotations?per_page=50")
         record[check] = {"first_failure": first_failure(job, annotations if isinstance(annotations, list) else []),
-                         "first_job": job.get("html_url"), "runs": len(rerun["runs"])}
+                         "first_job": job.get("html_url"), "runs": len(rerun["runs"]),
+                         "phantoms": rerun["phantoms"]}
     return record

@@ -502,7 +502,9 @@ def expected_receipt_runs(checks, names, run_id, number):
             or (number == 1) != (not reruns) or not set(reruns) <= set(names)
             or any(not isinstance(entry, dict) or not isinstance(entry.get("first_failure"), str)
                    or not isinstance(entry.get("first_job"), str)
-                   or type(entry.get("runs")) is not int or entry["runs"] < 1 for entry in reruns.values())):
+                   or type(entry.get("runs")) is not int or entry["runs"] < 1
+                   or type(entry.get("phantoms", 0)) is not int or entry.get("phantoms", 0) < 0
+                   for entry in reruns.values())):
         raise ValueError("source checks do not belong to this workflow run or record its re-runs wrongly")
     return {name: f"{run_id}-{2 if name in reruns else 1}" for name in names}
 

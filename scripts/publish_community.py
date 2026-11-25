@@ -57,6 +57,15 @@ def stall_statement(directory):
             f"{STALL_SECONDS // 60} min; a failing check is never retried): " + ", ".join(retried) + ".")
 
 
+def rerun_count(entry):
+    """How often attempt 2 ran a check, and how many entries it only listed."""
+    runs, phantoms = entry["runs"], entry.get("phantoms", 0)
+    text = "attempt 2 ran it once (passed)" if runs == 1 else f"attempt 2 ran it {runs} times (all passed)"
+    if phantoms:
+        text += f"; {phantoms} phantom entr{'y was' if phantoms == 1 else 'ies were'} listed but never started"
+    return text
+
+
 def rerun_statement(directory):
     """Name each regression check re-run after a failure, with its first error
     and the attempt-1 log. The verified bundle's record must match what GitHub
@@ -69,7 +78,7 @@ def rerun_statement(directory):
         return ""
     return ("Regression checks re-run once after a failure: " + ", ".join(
         f"{check} (first failure: {entry['first_failure']}; attempt-1 log: {entry['first_job']}; "
-        f"attempt 2 ran it {entry['runs']} time{'' if entry['runs'] == 1 else 's'}, all passed)"
+        + rerun_count(entry) + ")"
         for check, entry in sorted(recorded.items())) + ".")
 
 

@@ -454,27 +454,44 @@ class ReRunPolicyTests(unittest.TestCase):
             with self.subTest(reason=reason), self.assertRaises(ValueError):
                 attempts.reruns(one, two)
 
-    def test_the_real_re_run_of_run_45642647509(self):
+    def test_the_real_re_run_of_run_45642647509_while_it_ran(self):
         # Every carried-over job came back with a new id and run_attempt 2;
-        # routed-reply, the one failure, was listed 34 times.
+        # routed-reply, the one failure, was listed 34 times: 1 running, 33
+        # queued, and sign not created yet. GitHub still waited, so do we.
         first, second = real_jobs("attempt-1.json"), real_jobs("attempt-2-in-progress.json")
-        found = attempts.reruns(first, second)
-        self.assertEqual(list(found), ["routed-reply"])
-        self.assertEqual(len(found["routed-reply"]["runs"]), 34)
-        self.assertEqual(found["routed-reply"]["job"]["conclusion"], "failure")
-        # 33 of the 34 entries were still queued: not green yet.
+        with self.assertRaisesRegex(ValueError, "still waits for 33"):
+            attempts.reruns(first, second)
         with self.assertRaisesRegex(ValueError, "routed-reply"):
             attempts.regressions_green(second)
-        rerun = "regressions (routed-reply)"
-        done = [j | {"status": "completed", "conclusion": "success"} if j["name"] == rerun else j for j in second]
-        attempts.regressions_green(done)
-        at = next(k for k, j in enumerate(done) if j["name"] == rerun)
-        with self.assertRaisesRegex(ValueError, "routed-reply"):
-            attempts.regressions_green(done[:at] + [done[at] | {"conclusion": "failure"}] + done[at + 1:])
         plan = next(k for k, j in enumerate(second) if j["name"] == "plan")
         moved = second[:plan] + [second[plan] | {"started_at": "2026-11-25T20:23:13Z"}] + second[plan + 1:]
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "plan"):
             attempts.reruns(first, moved)
+
+    def test_the_real_re_run_of_run_45642647509_once_sign_waits(self):
+        # The one real re-run passed; 33 entries never got a runner (started_at
+        # is their creation time); sign is waiting for its approval.
+        first, second = real_jobs("attempt-1.json"), real_jobs("attempt-2-sign-waiting.json")
+        found = attempts.reruns(first, second)
+        self.assertEqual({k: (len(v["runs"]), v["phantoms"]) for k, v in found.items()}, {"routed-reply": (1, 33)})
+        attempts.regressions_green(second)
+        rerun = "regressions (routed-reply)"
+        without_sign = [j for j in second if j["name"] != "sign"]
+        with self.assertRaisesRegex(ValueError, "still waits for 33"):
+            attempts.reruns(first, without_sign)
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(without_sign)
+        real = next(k for k, j in enumerate(second) if j["name"] == rerun and j["status"] == "completed")
+        failed = second[:real] + [second[real] | {"conclusion": "failure"}] + second[real + 1:]
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(failed)
+        queued = next(k for k, j in enumerate(second) if j["name"] == rerun and j["status"] == "queued")
+        started = second[:queued] + [second[queued] | {"runner_name": "GitHub Actions 7", "runner_id": 7}] + second[queued + 1:]
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(started)
+        only_phantoms = [j for j in second if not (j["name"] == rerun and j["status"] == "completed")]
+        with self.assertRaisesRegex(ValueError, "not run again"):
+            attempts.reruns(first, only_phantoms)
 
     def test_a_regression_that_fails_twice_blocks_the_release(self):
         first, second = listings(second_overrides={"regressions (rip)": {"conclusion": "failure"}})
@@ -519,7 +536,8 @@ class ReRunPolicyTests(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2", "GITHUB_RUN_ID": "42",
                                      "GITHUB_REPOSITORY": "Velstra/sentinel"}):
             self.assertEqual(attempts.current(fetch=fetch), {"rip": {
-                "first_failure": "rip failed: OSPF never converged", "first_job": rip["html_url"], "runs": 1}})
+                "first_failure": "rip failed: OSPF never converged", "first_job": rip["html_url"], "runs": 1,
+                "phantoms": 0}})
 
     def test_receipts_must_come_from_the_attempt_that_ran_them(self):
         from types import SimpleNamespace
@@ -556,6 +574,7 @@ class ReRunPolicyTests(unittest.TestCase):
                     {"run": "42-2", "reruns": {"other": record["rip"]}},  # not a catalogued check
                     {"run": "42-2", "reruns": {"rip": {"first_failure": 1}}},
                     {"run": "42-2", "reruns": {"rip": record["rip"] | {"runs": 0}}},
+                    {"run": "42-2", "reruns": {"rip": record["rip"] | {"phantoms": -1}}},
                     {"run": "42-1", "reruns": []}):
             number = int(bad["run"][-1])
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -719,7 +738,11 @@ class PublicationContracts(unittest.TestCase):
                              "Regression checks re-run once after a failure: rip (first failure: "
                              "rip failed: OSPF never converged; attempt-1 log: "
                              "https://github.com/Velstra/sentinel/actions/runs/42/job/7; "
-                             "attempt 2 ran it 34 times, all passed).")
+                             "attempt 2 ran it 34 times (all passed)).")
+        self.assertEqual(publisher.rerun_count({"runs": 1, "phantoms": 33}),
+                         "attempt 2 ran it once (passed); 33 phantom entries were listed but never started")
+        self.assertEqual(publisher.rerun_count({"runs": 1, "phantoms": 1}),
+                         "attempt 2 ran it once (passed); 1 phantom entry was listed but never started")
         with patch.object(attempts, "current", return_value={}), \
                 self.assertRaisesRegex(ValueError, "re-run"):
             publisher.rerun_statement(directory)
