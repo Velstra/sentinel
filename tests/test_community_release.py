@@ -501,13 +501,44 @@ class ReRunPolicyTests(unittest.TestCase):
         attempts.regressions_green(listings()[1])
 
     def test_the_job_listing_is_read_completely(self):
-        jobs = [job(f"regressions (c{i})", "success", number=i) for i in range(207)]
-        pages = {n: {"total_count": 207, "jobs": jobs[(n - 1) * 100:n * 100]} for n in (1, 2, 3)}
-        fetch = lambda path: pages[int(path.rsplit("page=", 1)[1])]
-        self.assertEqual(len(attempts.attempt_jobs("Velstra/sentinel", "42", 1, fetch)), 207)
-        short = lambda path: {"total_count": 207, "jobs": jobs[:100]} if path.endswith("page=1") else {"total_count": 207, "jobs": []}
+        jobs = real_jobs("attempt-2-sign-waiting.json")
+        requests = []
+
+        def fetch(path):
+            requests.append(path)
+            self.assertIn("per_page=30&", path)
+            page = int(path.rsplit("page=", 1)[1])
+            return {"total_count": len(jobs), "jobs": jobs[(page - 1) * 30:page * 30]}
+
+        self.assertEqual(attempts.attempt_jobs("Velstra/sentinel", "45642647509", 2, fetch), jobs)
+        self.assertEqual(len(requests), 9)
+        short = lambda path: {"total_count": 243, "jobs": jobs[:30]} if path.endswith("page=1") else {"total_count": 243, "jobs": []}
         with self.assertRaises(ValueError):
-            attempts.attempt_jobs("Velstra/sentinel", "42", 1, short)
+            attempts.attempt_jobs("Velstra/sentinel", "45642647509", 2, short)
+
+    def test_api_reads_retry_server_errors_and_then_fail_closed(self):
+        from types import SimpleNamespace
+        ok = SimpleNamespace(returncode=0, stdout='{"total_count": 0, "jobs": []}', stderr="")
+        bad = SimpleNamespace(returncode=1, stdout="", stderr="gh: Server Error (HTTP 502)\n")
+        replies, calls, waits = iter([bad, bad, ok]), [], []
+        out = attempts.gh_get(["repos/Velstra/sentinel/actions/runs/1/attempts/2/jobs?per_page=30&page=1"],
+                              run=lambda command, **kw: calls.append(command) or next(replies), sleep=waits.append)
+        self.assertEqual((out, len(calls), waits), (ok.stdout, 3, [5, 10]))
+        waits.clear()
+        with self.assertRaisesRegex(ValueError, r"failed 5 times; last: gh: Server Error \(HTTP 502\)"):
+            attempts.gh_get(["jobs"], run=lambda command, **kw: bad, sleep=waits.append)
+        self.assertEqual(waits, [5, 10, 20, 40])
+        waits.clear()
+        missing = SimpleNamespace(returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)")
+        with self.assertRaisesRegex(ValueError, "HTTP 404"):
+            attempts.gh_get(["jobs"], run=lambda command, **kw: missing, sleep=waits.append)
+        self.assertEqual(waits, [], "only a server error is retried")
+
+        def hang(command, **kw):
+            raise subprocess.TimeoutExpired(command, 60)
+
+        with self.assertRaisesRegex(ValueError, "timed out"):
+            attempts.gh_get(["jobs"], run=hang, sleep=waits.append)
 
     def test_the_first_failure_names_the_real_error(self):
         failed = job("regressions (rip)", "failure")

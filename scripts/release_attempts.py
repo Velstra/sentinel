@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import time
 
 MAX_ATTEMPT = 2
 FIRST_ATTEMPT_ONLY = ("plan", "build")
@@ -18,8 +19,12 @@ DOWNSTREAM = ("sign", "package", "seal", "publish")
 REGRESSION = re.compile(r"regressions \(([a-zA-Z0-9_-]+)\)")
 # The runner's own closing line for any failed step; it says nothing about why.
 GENERIC_FAILURE = re.compile(r"Process completed with exit code \d+\.?")
-PAGE_SIZE = 100
-MAX_PAGES = 6
+# GitHub answers 502 for a 100-entry page of a large run (run 45642647509,
+# 243 jobs); 30 per page works. 20 pages cover 600 entries.
+PAGE_SIZE = 30
+MAX_PAGES = 20
+# Waits between the attempts of one API read; a 5xx is retried, nothing else.
+API_RETRY_DELAYS = (5, 10, 20, 40)
 
 
 def attempt():
@@ -141,8 +146,30 @@ def first_failure(job, annotations):
     return text.splitlines()[0][:200]
 
 
+def gh_get(args, run=subprocess.run, sleep=time.sleep):
+    """The output of `gh api ARGS` (a read). A server error (HTTP 5xx) or a
+    timeout is retried after API_RETRY_DELAYS; anything else, or the last
+    failure, fails closed with what GitHub said."""
+    command = ["gh", "api", *args]
+    for attempt, delay in enumerate((*API_RETRY_DELAYS, None), start=1):
+        try:
+            result = run(command, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            reason = "timed out"
+        else:
+            if result.returncode == 0:
+                return result.stdout
+            reason = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+            reason = reason[0]
+            if not re.search(r"HTTP 5\d\d", reason):
+                raise ValueError(f"GitHub API read {args[-1]} failed: {reason}")
+        if delay is None:
+            raise ValueError(f"GitHub API read {args[-1]} failed {attempt} times; last: {reason}")
+        sleep(delay)
+
+
 def gh(path):
-    return json.loads(subprocess.check_output(["gh", "api", path], text=True, timeout=60))
+    return json.loads(gh_get([path]))
 
 
 def attempt_jobs(repository, run_id, number, fetch=gh):
@@ -182,7 +209,7 @@ def current(fetch=gh):
         url = job.get("check_run_url") or ""
         check_run = url.split("api.github.com/", 1)[1] if "api.github.com/" in url else \
             f"repos/{repository}/check-runs/{job['id']}"
-        annotations = fetch(f"{check_run}/annotations?per_page=50")
+        annotations = fetch(f"{check_run}/annotations?per_page={PAGE_SIZE}")
         record[check] = {"first_failure": first_failure(job, annotations if isinstance(annotations, list) else []),
                          "first_job": job.get("html_url"), "runs": len(rerun["runs"]),
                          "phantoms": rerun["phantoms"]}
