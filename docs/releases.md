@@ -17,7 +17,9 @@ gh run watch RUN_ID --exit-status
 The version's base must match `Cargo.toml`. Tag pushes build and test only.
 A main-branch dispatch additionally requests production signing approval.
 `publish=false` never creates a GitHub Release. A failed check blocks the
-subsequent jobs; start a new run instead of reusing an earlier approval.
+subsequent jobs. Failed regression checks may be run once more in the same run
+([one re-run](#one-re-run-of-failed-regression-checks)); for anything else, or
+a third attempt, start a new run instead of reusing an earlier approval.
 
 To publish, dispatch the same action with `-F publish=true`. This performs a
 new complete qualification and requires independent environment approvals
@@ -110,8 +112,8 @@ run nonce rather than accepting a cached test result. No check-name allowlist
 silently drops newly added tests. A check whose build prints nothing for 30
 minutes is taken for a hung runner: the build is killed and started once more
 in the same job. A second stall, or any failure of the check itself, fails the
-release; a failed check is never retried. The check's receipt and the release
-notes name every check that was retried. A regression job's 240-minute
+job; the job itself never retries a failed check. The check's receipt and the
+release notes name every check that was retried. A regression job's 240-minute
 timeout fails the release. A checkout that cannot reach github.com is retried
 once after a two-minute pause.
 
@@ -132,6 +134,29 @@ The full planned check catalog and every receipt's 24-hour freshness are
 revalidated before checksum signing and again before publication.
 Upload happens into a draft; every uploaded byte is downloaded and checked
 before the release becomes visible. Failed uploads leave a draft for review.
+
+## One re-run of failed regression checks
+
+A run whose regression jobs failed may be continued once with GitHub's
+**Re-run failed jobs** (`gh run rerun RUN_ID --failed`), which makes run
+attempt 2. In that attempt:
+
+- only regression jobs that *failed* in attempt 1 run again; one that was
+  cancelled or timed out, or any other change, makes the release refuse;
+- the plan, the build and every regression that passed come from attempt 1:
+  the build is never repeated, and the release signs the attempt-1 build;
+- sign, package, seal and publish run for the first time, so every
+  environment approval is requested again;
+- a regression job that fails again blocks the release; there is no attempt 3.
+
+Before signing, and again before sealing and publishing, the workflow reads
+from GitHub's job listing which job ran in which attempt and refuses anything
+else. The packaged `source-checks.json` records each re-run check with its
+first failure and the link to its attempt-1 log, and the release notes list
+them: "Regression checks re-run once after a failure: CHECK (first failure:
+...; attempt-1 log: ...)". Check receipts and the build are kept for one day,
+so a re-run must reach packaging within a day of attempt 1; later, start a new
+run.
 
 ## Explicit limitations
 

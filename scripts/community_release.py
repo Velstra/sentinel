@@ -21,6 +21,14 @@ import threading
 import time
 import tomllib
 
+# The release scripts import each other by name. Put this file's own directory
+# on the path, so that works however the file is loaded: as a script, through
+# `python3 -c`, or by importlib from a test.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import release_attempts  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 LAYOUT = ["esp", "store-verity", "store", "store-verity-b", "store-b", "data"]
 EFI = ["/EFI/BOOT/BOOTX64.EFI", "/EFI/systemd/systemd-bootx64.efi",
@@ -442,12 +450,12 @@ def validate_bundle(directory):
             or boot.get("certificate_sha256") != {n: digest(directory / f"{n}.crt") for n in ("PK", "KEK", "db")}):
         raise ValueError("boot evidence mismatch")
     checks = json.loads((directory / "source-checks.json").read_text())
-    nonce = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-    if checks.get("source") != evidence["source"] or checks.get("run") != nonce:
+    if checks.get("source") != evidence["source"]:
         raise ValueError("source checks do not belong to this workflow run")
     # The immutable plan job supplies the catalog independently of the bundle.
     names = json.loads(os.environ["RELEASE_CHECK_CATALOG"])["check"]
-    validate_checks(checks.get("checks"), names, evidence["source"], nonce)
+    expected = expected_receipt_runs(checks, names, os.environ["GITHUB_RUN_ID"], release_attempts.attempt())
+    validate_checks(checks.get("checks"), names, evidence["source"], expected)
     provenance = json.loads((directory / "source-sbom.provenance.json").read_text())
     if (provenance.get("source_commit") != evidence["source"] or provenance.get("scope") != "source-lockfiles"
             or provenance.get("sbom_sha256") != digest(directory / "source-sbom.cdx.json")):
@@ -485,12 +493,28 @@ def validate_catalog(names):
         raise ValueError("release catalog omits mandatory safety checks: " + ", ".join(sorted(missing)))
 
 
+def expected_receipt_runs(checks, names, run_id, number):
+    """{check: the run nonce its receipt must carry}, from the bundle's re-run
+    record: attempt 1 for every check, except attempt 2 for a check re-run after
+    a failure. Only attempt 2 may record re-runs, and it must record one."""
+    reruns = checks.get("reruns", {})
+    if (checks.get("run") != f"{run_id}-{number}" or not isinstance(reruns, dict)
+            or (number == 1) != (not reruns) or not set(reruns) <= set(names)
+            or any(not isinstance(entry, dict) or not isinstance(entry.get("first_failure"), str)
+                   or not isinstance(entry.get("first_job"), str) for entry in reruns.values())):
+        raise ValueError("source checks do not belong to this workflow run or record its re-runs wrongly")
+    return {name: f"{run_id}-{2 if name in reruns else 1}" for name in names}
+
+
 def validate_checks(receipts, names, sha, nonce):
+    """`nonce` is the run every receipt carries, or {check: run} when a re-run
+    attempt produced some of them."""
     validate_catalog(names)
+    expected = nonce if isinstance(nonce, dict) else {name: nonce for name in names}
     if (not isinstance(receipts, list) or len(receipts) != len(names)
             or any(not isinstance(r, dict) for r in receipts)
             or sorted(r.get("check", "") for r in receipts) != sorted(names)
-            or any(r.get("source") != sha or r.get("run") != nonce
+            or any(r.get("source") != sha or r.get("run") != expected.get(r.get("check"))
                    or type(r.get("completed_at")) is not int
                    or type(r.get("stall_retries", 0)) is not int
                    or not 0 <= r.get("stall_retries", 0) <= STALL_RETRIES
@@ -503,10 +527,16 @@ def aggregate(args):
     names = json.loads(run("nix", "eval", "--json", ".#checks.x86_64-linux", "--apply",
                           "builtins.attrNames", capture=True))
     receipts = [json.loads(p.read_text()) for p in args.input.glob("*.json")]
-    expected_run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-    validate_checks(receipts, names, sha, expected_run)
-    document(args.output, {"source": sha, "run": expected_run, "checks": receipts,
-                          "scope": "source-regressions-not-exact-final-disk-tests"})
+    run_id, number = os.environ["GITHUB_RUN_ID"], release_attempts.attempt()
+    # Which jobs came from which attempt, as GitHub reports it, not as the
+    # downloaded receipts say.
+    reruns = release_attempts.current()
+    summary = {"source": sha, "run": f"{run_id}-{number}", "checks": receipts,
+               "scope": "source-regressions-not-exact-final-disk-tests"}
+    if reruns:
+        summary["reruns"] = reruns
+    validate_checks(receipts, names, sha, expected_receipt_runs(summary, names, run_id, number))
+    document(args.output, summary)
 
 
 def main():

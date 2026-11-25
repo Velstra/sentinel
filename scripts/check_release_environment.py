@@ -4,8 +4,18 @@ import argparse
 import json
 import os
 import re
+from pathlib import Path
 import subprocess
+import sys
 from urllib.parse import quote
+
+# The release scripts import each other by name. Put this file's own directory
+# on the path, so that works however the file is loaded: as a script, through
+# `python3 -c`, or by importlib from a test.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import release_attempts  # noqa: E402
 
 # Single-operator mode: the shortest wait_timer (minutes) an environment may
 # carry, so a run started with a stolen token cannot release before the owner
@@ -82,6 +92,15 @@ def approval(environment, history, actors, single_operator=False):
         raise ValueError("an actual independent human approval for this run is required")
 
 
+def approved(environment, history, actors, single_operator=False):
+    """An approval for this job, in an attempt the re-run policy allows: the
+    first, or the one re-run of failed regression jobs, whose downstream jobs
+    never ran before and so carry no older approval. Returns the re-runs."""
+    reruns = release_attempts.current()
+    approval(environment, history, actors, single_operator)
+    return reruns
+
+
 def response_document(raw):
     parts = re.split(r"\r?\n\r?\n", raw, maxsplit=1)
     if (len(parts) != 2 or not parts[0].startswith("HTTP/")
@@ -106,10 +125,11 @@ if __name__ == "__main__":
     single = single_operator_enabled()
     validate(environment, api(root + "/deployment-branch-policies?per_page=100"), single)
     if args.approved:
-        if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
-            raise ValueError("start a new run instead of reusing an approval")
-        approval(environment, api(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
-                                  f"{os.environ['GITHUB_RUN_ID']}/approvals"),
-                 {os.environ.get("GITHUB_ACTOR"), os.environ.get("GITHUB_TRIGGERING_ACTOR")}, single)
+        reruns = approved(environment, api(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                                           f"{os.environ['GITHUB_RUN_ID']}/approvals"),
+                          {os.environ.get("GITHUB_ACTOR"), os.environ.get("GITHUB_TRIGGERING_ACTOR")}, single)
+        if reruns:
+            print("::notice title=Re-run attempt::attempt 2 re-ran failed regression checks: "
+                  + ", ".join(sorted(reruns)))
     if single:
         print(f"::notice title={args.environment}::{approvals_statement()}")

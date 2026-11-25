@@ -22,11 +22,14 @@ def load(name):
     return module
 
 
-release = load("community_release")
-protection = load("check_release_environment")
+attempts = load("release_attempts")
+with patch.dict(sys.modules, {"release_attempts": attempts}):
+    release = load("community_release")
+    protection = load("check_release_environment")
 identity = load("release_identity")
 transfer = load("release_transfer")
-with patch.dict(sys.modules, {"community_release": release, "check_release_environment": protection}):
+with patch.dict(sys.modules, {"community_release": release, "check_release_environment": protection,
+                              "release_attempts": attempts}):
     publisher = load("publish_community")
 
 
@@ -361,6 +364,173 @@ class StallWatchdogTests(unittest.TestCase):
                                         names, "a" * 40, "42-1")
 
 
+def job(name, conclusion, run_attempt=1, number=None):
+    """One entry of GitHub's attempt job listing."""
+    number = number if number is not None else abs(hash(name)) % 10**9
+    return {"id": number, "name": name, "conclusion": conclusion, "run_attempt": run_attempt,
+            "html_url": f"https://github.com/Velstra/sentinel/actions/runs/42/job/{number}"}
+
+
+def listings(failed=("rip",), passed=("nat", "commit"), first_overrides=None, second_overrides=None):
+    """Attempt 1, where the `failed` regressions failed and everything downstream
+    was skipped, and the attempt 2 that "Re-run failed jobs" makes of it."""
+    first = [job("plan", "success"), job("build", "success")]
+    first += [job(f"regressions ({c})", "success") for c in passed]
+    first += [job(f"regressions ({c})", "failure") for c in failed]
+    first += [job(n, "skipped") for n in ("sign", "package", "seal", "publish")]
+    for name, change in (first_overrides or {}).items():
+        next(j for j in first if j["name"] == name).update(change)
+    second = []
+    for entry in first:
+        rerun = entry["name"] in {f"regressions ({c})" for c in failed} or entry["name"] in (
+            "sign", "package", "seal", "publish")
+        second.append(entry | ({"run_attempt": 2, "conclusion": "success", "id": entry["id"] + 1,
+                                "html_url": entry["html_url"] + "-2"} if rerun else {}))
+    for name, change in (second_overrides or {}).items():
+        next(j for j in second if j["name"] == name).update(change)
+    return first, second
+
+
+class ReRunPolicyTests(unittest.TestCase):
+    """The owner allows "Re-run failed jobs" once, for regression jobs that
+    failed. The plan, the build and every regression that passed come from
+    attempt 1; the downstream jobs never ran in attempt 1, so none of their
+    approvals can be reused."""
+
+    def test_only_attempts_one_and_two_are_accepted(self):
+        for value in ("1", "2"):
+            with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": value}):
+                self.assertEqual(attempts.attempt(), int(value))
+        for value in ("3", "0", "", "2a"):
+            with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": value}), self.subTest(value=value), \
+                    self.assertRaises(ValueError):
+                attempts.attempt()
+
+    def test_a_failed_regression_may_run_once_more(self):
+        first, second = listings(failed=("rip", "reboot"))
+        found = attempts.reruns(first, second)
+        self.assertEqual(sorted(found), ["reboot", "rip"])
+        self.assertEqual(found["rip"]["conclusion"], "failure")
+        self.assertEqual(found["rip"]["run_attempt"], 1)
+
+    def test_nothing_else_may_change(self):
+        cases = {
+            "the plan was run again": listings(second_overrides={"plan": {"run_attempt": 2}}),
+            "the build was run again": listings(second_overrides={"build": {"run_attempt": 2}}),
+            "the build failed in attempt 1": listings(first_overrides={"build": {"conclusion": "failure"}},
+                                                      second_overrides={"build": {"conclusion": "failure"}}),
+            "a passing regression was run again": listings(second_overrides={"regressions (nat)": {"run_attempt": 2}}),
+            "a cancelled regression was run again": listings(first_overrides={"regressions (rip)": {"conclusion": "cancelled"}}),
+            "a timed-out regression was run again": listings(first_overrides={"regressions (rip)": {"conclusion": "timed_out"}}),
+            "sign ran in attempt 1": listings(first_overrides={"sign": {"conclusion": "success"}}),
+            "publish ran in attempt 1": listings(first_overrides={"publish": {"conclusion": "failure"}}),
+            "attempt 2 re-ran nothing": listings(failed=()),
+            "a job of attempt 3": listings(second_overrides={"regressions (rip)": {"run_attempt": 3}}),
+        }
+        first, second = listings()
+        cases["a job appeared"] = (first, second + [job("regressions (new)", "success", 2)])
+        cases["a job disappeared"] = (first, [j for j in second if j["name"] != "regressions (nat)"])
+        cases["an unknown job"] = (first + [job("debug", "success")], second + [job("debug", "success")])
+        cases["a duplicate name"] = (first + [first[2]], second + [second[2]])
+        for reason, (one, two) in cases.items():
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                attempts.reruns(one, two)
+
+    def test_a_regression_that_fails_twice_blocks_the_release(self):
+        first, second = listings(second_overrides={"regressions (rip)": {"conclusion": "failure"}})
+        attempts.reruns(first, second)
+        with self.assertRaisesRegex(ValueError, "rip"):
+            attempts.regressions_green(second)
+        attempts.regressions_green(listings()[1])
+
+    def test_the_job_listing_is_read_completely(self):
+        jobs = [job(f"regressions (c{i})", "success", number=i) for i in range(207)]
+        pages = {n: {"total_count": 207, "jobs": jobs[(n - 1) * 100:n * 100]} for n in (1, 2, 3)}
+        fetch = lambda path: pages[int(path.rsplit("page=", 1)[1])]
+        self.assertEqual(len(attempts.attempt_jobs("Velstra/sentinel", "42", 1, fetch)), 207)
+        short = lambda path: {"total_count": 207, "jobs": jobs[:100]} if path.endswith("page=1") else {"total_count": 207, "jobs": []}
+        with self.assertRaises(ValueError):
+            attempts.attempt_jobs("Velstra/sentinel", "42", 1, short)
+
+    def test_the_first_failure_names_the_real_error(self):
+        failed = job("regressions (rip)", "failure")
+        generic = {"annotation_level": "failure", "message": "Process completed with exit code 1."}
+        specific = {"annotation_level": "failure", "message": "rip: no build output for 30 min again\nmore"}
+        warning = {"annotation_level": "warning", "message": "Node.js 20 is deprecated"}
+        self.assertEqual(attempts.first_failure(failed, [warning, generic, specific]),
+                         "rip: no build output for 30 min again")
+        self.assertEqual(attempts.first_failure(failed, [warning, generic]), "Process completed with exit code 1.")
+        self.assertEqual(attempts.first_failure(failed, []), "job failure")
+
+    def test_the_current_run_is_judged_from_the_api(self):
+        with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "1", "GITHUB_RUN_ID": "42",
+                                     "GITHUB_REPOSITORY": "Velstra/sentinel"}):
+            self.assertEqual(attempts.current(fetch=lambda path: self.fail(path)), {})
+        first, second = listings()
+        rip = next(j for j in first if j["name"] == "regressions (rip)")
+
+        def fetch(path):
+            if "/attempts/" in path:
+                listing = first if "/attempts/1/" in path else second
+                return {"total_count": len(listing), "jobs": listing}
+            self.assertIn(f"check-runs/{rip['id']}/annotations", path)
+            return [{"annotation_level": "failure", "message": "rip failed: OSPF never converged"}]
+
+        with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2", "GITHUB_RUN_ID": "42",
+                                     "GITHUB_REPOSITORY": "Velstra/sentinel"}):
+            self.assertEqual(attempts.current(fetch=fetch), {"rip": {
+                "first_failure": "rip failed: OSPF never converged", "first_job": rip["html_url"]}})
+
+    def test_receipts_must_come_from_the_attempt_that_ran_them(self):
+        from types import SimpleNamespace
+        names = sorted(release.REQUIRED_SAFETY_CHECKS | {"rip"})
+        reruns = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1"}}
+        with tempfile.TemporaryDirectory() as temp, patch.object(release, "source", return_value="a" * 40), \
+                patch.object(release, "run", return_value=json.dumps(names)), \
+                patch.object(attempts, "current", return_value=reruns), \
+                patch.dict(os.environ, {"GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "2"}):
+            directory = Path(temp)
+            args = SimpleNamespace(input=directory, output=directory / "complete.txt")
+            base = {"source": "a" * 40, "completed_at": int(time.time())}
+            for name in release.REQUIRED_SAFETY_CHECKS:
+                (directory / f"{name}.json").write_text(json.dumps(base | {"check": name, "run": "42-1"}))
+            (directory / "rip.json").write_text(json.dumps(base | {"check": "rip", "run": "42-1"}))
+            with self.assertRaises(ValueError): release.aggregate(args)
+            (directory / "rip.json").write_text(json.dumps(base | {"check": "rip", "run": "42-2"}))
+            release.aggregate(args)
+            summary = json.loads(args.output.read_text())
+            self.assertEqual((summary["run"], summary["reruns"]), ("42-2", reruns))
+            nat = next(iter(sorted(release.REQUIRED_SAFETY_CHECKS)))
+            (directory / f"{nat}.json").write_text(json.dumps(base | {"check": nat, "run": "42-2"}))
+            with self.assertRaises(ValueError): release.aggregate(args)
+
+    def test_the_bundle_records_exactly_the_reruns_of_its_attempt(self):
+        names = ["nat", "rip"]
+        record = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1"}}
+        self.assertEqual(release.expected_receipt_runs({"run": "42-2", "reruns": record}, names, "42", 2),
+                         {"nat": "42-1", "rip": "42-2"})
+        self.assertEqual(release.expected_receipt_runs({"run": "42-1"}, names, "42", 1),
+                         {"nat": "42-1", "rip": "42-1"})
+        for bad in ({"run": "42-1", "reruns": record},                   # attempt 1 with a re-run
+                    {"run": "42-2", "reruns": {}},                       # attempt 2 that re-ran nothing
+                    {"run": "42-2", "reruns": {"other": record["rip"]}},  # not a catalogued check
+                    {"run": "42-2", "reruns": {"rip": {"first_failure": 1}}},
+                    {"run": "42-1", "reruns": []}):
+            number = int(bad["run"][-1])
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                release.expected_receipt_runs(bad, names, "42", number)
+
+    def test_approval_is_checked_only_for_an_allowed_attempt(self):
+        environment, history = {"id": 7}, [{"state": "approved", "environments": [{"id": 7}],
+                                             "user": {"type": "User", "login": "reviewer"}}]
+        with patch.object(attempts, "current", return_value={}) as current:
+            protection.approved(environment, history, {"owner"})
+        current.assert_called_once()
+        with patch.object(attempts, "current", side_effect=ValueError("a release run may have at most one re-run")), \
+                self.assertRaises(ValueError):
+            protection.approved(environment, history, {"owner"})
+
+
 class RealSignatureTests(unittest.TestCase):
     def test_real_detached_signature_and_wrong_identity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -418,7 +588,7 @@ class PublicationContracts(unittest.TestCase):
 
     def test_direct_publisher_rejects_unrequested_or_retry_runs_before_api(self):
         for key, value in (("GITHUB_EVENT_NAME", "push"), ("GITHUB_REF", "refs/heads/feature"),
-                           ("RELEASE_PUBLISH_REQUESTED", "false"), ("GITHUB_RUN_ATTEMPT", "2")):
+                           ("RELEASE_PUBLISH_REQUESTED", "false"), ("GITHUB_RUN_ATTEMPT", "3")):
             with patch.dict(os.environ, {key: value}), patch.object(publisher, "api") as api, \
                     self.subTest(key=key), self.assertRaises(ValueError):
                 publisher.publish(Path("unused"))
@@ -496,6 +666,24 @@ class PublicationContracts(unittest.TestCase):
                          "a failing check is never retried): image-first-boot.")
         (directory / "source-checks.json").write_text(json.dumps({"checks": checks[:1]}))
         self.assertEqual(publisher.stall_statement(directory), "")
+
+    def test_release_body_lists_reruns_with_their_first_failure(self):
+        reruns = {"rip": {"first_failure": "rip failed: OSPF never converged",
+                          "first_job": "https://github.com/Velstra/sentinel/actions/runs/42/job/7"}}
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, directory)
+        (directory / "source-checks.json").write_text(json.dumps({"checks": [], "reruns": reruns}))
+        with patch.object(attempts, "current", return_value=reruns):
+            self.assertEqual(publisher.rerun_statement(directory),
+                             "Regression checks re-run once after a failure: rip (first failure: "
+                             "rip failed: OSPF never converged; attempt-1 log: "
+                             "https://github.com/Velstra/sentinel/actions/runs/42/job/7).")
+        with patch.object(attempts, "current", return_value={}), \
+                self.assertRaisesRegex(ValueError, "re-run"):
+            publisher.rerun_statement(directory)
+        (directory / "source-checks.json").write_text(json.dumps({"checks": []}))
+        with patch.object(attempts, "current", return_value={}):
+            self.assertEqual(publisher.rerun_statement(directory), "")
 
     def test_cross_run_artifact_is_refused_before_download(self):
         metadata = {"expired": False, "workflow_run": {"id": 1, "head_sha": "a" * 40},

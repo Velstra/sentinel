@@ -17,6 +17,8 @@ on:
 permissions:
   contents: read
   actions: read
+  # The re-run policy reads the failure annotations of attempt-1 jobs.
+  checks: read
 
 concurrency:
   group: community-release
@@ -61,7 +63,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$GITHUB_RUN_ATTEMPT" = 1 # Start a new run; never reuse old approvals.
+          # The plan always comes from attempt 1. "Re-run failed jobs" never
+          # repeats it; "Re-run all jobs" fails here.
+          test "$GITHUB_RUN_ATTEMPT" = 1
           test "$RELEASE_ARTIFACT_BYTE_BUDGET" -gt 0
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           python3 scripts/check_repository_hygiene.py --history
@@ -113,6 +117,8 @@ jobs:
           CHECK: ${{ matrix.check }}
         run: |
           test -r /dev/kvm && test -w /dev/kvm
+          # A failed regression job may run once more (attempt 2), never again.
+          test "$GITHUB_RUN_ATTEMPT" -le 2
           python3 scripts/community_release.py checks --check "$CHECK" --output "$RUNNER_TEMP/$CHECK.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -154,6 +160,8 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
+          # The build is never repeated: a re-run release signs the attempt-1 build.
+          test "$GITHUB_RUN_ATTEMPT" = 1
           bash scripts/release-tools.sh python3 scripts/community_release.py build --version "$RELEASE_VERSION" --output "$RUNNER_TEMP/factory"
           python3 scripts/community_release.py budget --input "$RUNNER_TEMP/factory"
       # The image, not the source tree: corrected Nix CPEs, the kernel
@@ -328,6 +336,8 @@ jobs:
       - name: Require a complete current-run catalog and produce the source SBOM
         env:
           SYFT_BIN: ${{ steps.syft.outputs.cmd }}
+          # Which receipts came from which attempt is read from GitHub's jobs.
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/community_release.py aggregate --input "$RUNNER_TEMP/checks" --output "$RUNNER_TEMP/release/source-checks.json"
           bash scripts/release-tools.sh python3 scripts/generate_sbom.py --syft "$SYFT_BIN" --output-dir "$RUNNER_TEMP/sbom"
@@ -413,6 +423,7 @@ jobs:
     permissions:
       contents: write
       actions: read
+      checks: read
     env:
       RELEASE_VERSION: ${{ needs.plan.outputs.version }}
       VELSTRA_GPG_FINGERPRINT: ${{ vars.VELSTRA_GPG_FINGERPRINT }}
