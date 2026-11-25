@@ -169,6 +169,7 @@ in pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import importlib.util, json, os
     from pathlib import Path
     spec = importlib.util.spec_from_file_location("probe", "${./conformance/probe.py}")
@@ -189,6 +190,7 @@ in pkgs.testers.runNixOSTest {
         assert router.succeed("cat /proc/sys/net/ipv4/conf/all/accept_local").strip() == "0"
     for interface in ["eth1", "eth2"]:
         dut.succeed("ip -details link show " + interface + " | grep -q prog/xdp")
+    uplink_ready.wait_uplink_addressed(dut, "eth1", "198.18.10.100")
     oracle, subject = [], []
     for destination, lan, wan in [(oracle, lan_ref, wan_ref), (subject, lan_dut, wan_dut)]:
         destination.extend(json.loads(lan.succeed("conformance-probe client lan")))

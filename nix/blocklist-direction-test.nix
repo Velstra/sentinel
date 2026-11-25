@@ -141,6 +141,7 @@ pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import contextlib
 
     failures = []
@@ -169,6 +170,7 @@ pkgs.testers.runNixOSTest {
                                      " && ! ip -6 address show dev eth1 | grep -q tentative", timeout=30)
     lan.wait_until_succeeds("! ip -6 address show dev eth1 | grep -q tentative", timeout=30)
 
+    uplink_ready.wait_uplink_addressed(firewall, "eth1", "203.0.113.1")
     def why():
         return ("\ncompiled:\n" + firewall.execute("cat /run/sentinel/velstra.toml")[1]
                 + "\nstatistics:\n" + firewall.execute("sentinel show firewall statistics")[1]

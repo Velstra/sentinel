@@ -77,6 +77,7 @@ pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import importlib.util
     import json
     import os
@@ -115,6 +116,7 @@ pkgs.testers.runNixOSTest {
         fw.wait_until_succeeds("ip -details link show " + interface + " | grep -q prog/xdp", timeout=60)
     fw.succeed("sentinel config check /var/lib/sentinel/appliance.toml")
     client.wait_until_succeeds("ping -c1 -W1 198.18.20.1", timeout=60)
+    uplink_ready.wait_uplink_addressed(fw, "eth1", "198.18.10.100")
 
     # One tuple, two connections: the first ends in a reset, the second
     # reuses the binding and closes cleanly (the server closes first and

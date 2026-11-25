@@ -78,6 +78,7 @@ in pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import hashlib, importlib.util, json, os, shlex, time
     from pathlib import Path
     from typing import Any
@@ -215,6 +216,7 @@ in pkgs.testers.runNixOSTest {
         assert all(baseline["maps"][name]["raw_count"] == 0 for name in ("CONNTRACK", "FW_FLOWS", "SYN_FLOWS")), "refusing a contaminated state-map baseline"
         fw.wait_until_succeeds("ip -details link show eth1 | grep -q prog/xdp", timeout=30)
         fw.wait_until_succeeds("ip -details link show eth2 | grep -q prog/xdp", timeout=30)
+        uplink_ready.wait_uplink_addressed(fw, "eth1", "198.18.10.100")
         template = None
         lan_index = int(fw.succeed("cat /sys/class/net/eth2/ifindex"))
         wan_index = int(fw.succeed("cat /sys/class/net/eth1/ifindex"))

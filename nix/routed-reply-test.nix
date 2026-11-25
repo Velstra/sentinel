@@ -147,6 +147,7 @@ pkgs.testers.runNixOSTest {
         import json
         import os
         from pathlib import Path
+        ${import ./uplink-ready.nix { inherit pkgs; }}
         start_all()
         fw.wait_for_unit("sentinel-boot-late.service")
         fw.wait_for_unit("velstra.service")
@@ -157,6 +158,7 @@ pkgs.testers.runNixOSTest {
         # No VPN/shunt is configured. This isolates ordinary routed replies from
         # IPsec provenance rules, rather than blaming a confidentiality guard.
         fw.fail("test -e /run/sentinel/ipsec-guards.json")
+        uplink_ready.wait_uplink_addressed(fw, "eth1", "198.18.10.100")
         outbound=json.loads(inside.succeed("curl --fail --silent --show-error --max-time 5 http://198.18.10.254:9102/"))
         assert outbound["peer"]=="198.18.10.100",outbound
         outside.succeed("systemd-run --unit=qa-routed-reply-wire --property=RuntimeMaxSec=45 ${pkgs.tcpdump}/bin/tcpdump --immediate-mode -U -ni eth1 -w /run/routed-reply.pcap 'tcp or udp'")

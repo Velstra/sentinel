@@ -75,6 +75,7 @@ in pkgs.testers.runNixOSTest {
     };
   };
   testScript=''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import json
     import os
     from pathlib import Path
@@ -90,6 +91,7 @@ in pkgs.testers.runNixOSTest {
     client.wait_until_succeeds("ip -4 address show eth1 | grep -q 198.18.20.51/24",timeout=30)
     fw.succeed("ip -details link show eth1 | grep -q prog/xdp")
     fw.succeed("ip -details link show eth2 | grep -q prog/xdp")
+    uplink_ready.wait_uplink_addressed(fw, "eth1", "198.18.10.100")
     # Aya6f6859f defaults to real TCX links on kernel>=6.6. A classic
     # tc-filter listing is empty even with correctly attached TCX programs.
     wan_index=int(fw.succeed("cat /sys/class/net/eth1/ifindex"))

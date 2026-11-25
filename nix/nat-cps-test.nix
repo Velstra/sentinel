@@ -123,6 +123,7 @@ pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import json
     import os
     import re
@@ -250,6 +251,7 @@ pkgs.testers.runNixOSTest {
     fw.wait_until_succeeds("ip -4 address show eth2 | grep -q 198.18.20.1/24", timeout=30)
     for interface in ["eth1", "eth2"]:
         fw.wait_until_succeeds("ip -details link show " + interface + " | grep -q prog/xdp", timeout=60)
+    uplink_ready.wait_uplink_addressed(fw, "eth1", "198.18.10.100")
     wan_index = int(fw.succeed("cat /sys/class/net/eth1/ifindex"))
     links = json.loads(fw.succeed("bpftool -j link show"))
     assert any(l.get("type") == "tcx" and l.get("ifindex") == wan_index

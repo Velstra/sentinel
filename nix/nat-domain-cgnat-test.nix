@@ -76,6 +76,7 @@ in pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import hashlib, importlib.util, json, os, shlex
     from pathlib import Path
     from typing import Any
@@ -141,6 +142,7 @@ in pkgs.testers.runNixOSTest {
         assert baseline["maps"]["CONNTRACK"]["raw_count"] == 0, receipt["baseline_counts"]
         for name in ("eth1", "eth2"):
             fw.wait_until_succeeds("ip -details link show " + name + " | grep -q prog/xdp", timeout=30)
+        uplink_ready.wait_uplink_addressed(fw, "eth1", "198.18.10.100")
         fw.succeed("sentinel config check /var/lib/sentinel/appliance.toml")
         config_hash = fw.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
         receipt["cohort"] = dict(sentinel="${self.packages.x86_64-linux.sentinel}",

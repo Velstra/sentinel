@@ -182,6 +182,7 @@ in pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import importlib.util, json, os
     from pathlib import Path
     spec = importlib.util.spec_from_file_location("probe", "${./conformance/probe.py}")
@@ -209,6 +210,7 @@ in pkgs.testers.runNixOSTest {
     # reason; the two blocked-ping cases below are the ones it cannot pass.
     for interface in ["eth1", "eth2"]:
         dut.succeed("ip -details link show " + interface + " | grep -q prog/xdp")
+    uplink_ready.wait_uplink_addressed(dut, "eth1", "198.18.10.100")
     oracle, subject = [], []
     for destination, lan, wan in [(oracle, lan_ref, wan_ref), (subject, lan_dut, wan_dut)]:
         destination.extend(json.loads(lan.succeed("conformance-probe client policy-lan")))

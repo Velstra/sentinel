@@ -308,6 +308,7 @@ in pkgs.testers.runNixOSTest {
   };
   testScript = if logStall then logStallScript else ''
     import base64, time, json, shlex
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import importlib.util
     # The one failover bound every HA check uses; formula and measurements
     # are in nix/ha-failover-bound.py.
@@ -507,6 +508,11 @@ in pkgs.testers.runNixOSTest {
         node.succeed("systemd-run --unit=ha-packets ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/ha-packets.pcap -i eth1 tcp port 8443")
     ${pkgs.lib.optionalString (!wireguard) ''
     ha_bound.ha_capture_start(client,"eth1",8443)
+    ''}
+    ${pkgs.lib.optionalString masquerade ''
+    # With no fixed `to`, the pair masquerades from the VIP, which the owner
+    # holds on eth1.
+    uplink_ready.wait_uplink_addressed(master, "eth1", "10.1.0.100")
     ''}
     client.succeed("systemd-run --unit=ha-stream ${pkgs.python3}/bin/python3 ${stream}")
     client.wait_until_succeeds("test -f /tmp/stream-ready",timeout=20)
