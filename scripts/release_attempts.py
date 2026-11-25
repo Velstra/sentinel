@@ -146,26 +146,46 @@ def first_failure(job, annotations):
     return text.splitlines()[0][:200]
 
 
-def gh_get(args, run=subprocess.run, sleep=time.sleep):
-    """The output of `gh api ARGS` (a read). A server error (HTTP 5xx) or a
+def retrying(args, once, sleep=time.sleep):
+    """Run one `gh api` read until it succeeds. A server error (HTTP 5xx) or a
     timeout is retried after API_RETRY_DELAYS; anything else, or the last
     failure, fails closed with what GitHub said."""
-    command = ["gh", "api", *args]
     for attempt, delay in enumerate((*API_RETRY_DELAYS, None), start=1):
         try:
-            result = run(command, capture_output=True, text=True, timeout=60)
+            result = once()
         except subprocess.TimeoutExpired:
             reason = "timed out"
         else:
             if result.returncode == 0:
-                return result.stdout
-            reason = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
-            reason = reason[0]
+                return result
+            stderr = result.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            lines = stderr.strip().splitlines()
+            reason = lines[-1] if lines else f"exit {result.returncode}"
             if not re.search(r"HTTP 5\d\d", reason):
                 raise ValueError(f"GitHub API read {args[-1]} failed: {reason}")
         if delay is None:
             raise ValueError(f"GitHub API read {args[-1]} failed {attempt} times; last: {reason}")
         sleep(delay)
+
+
+def gh_get(args, run=subprocess.run, sleep=time.sleep):
+    """The output of `gh api ARGS`, a read, retried like `retrying`."""
+    command = ["gh", "api", *args]
+    return retrying(args, lambda: run(command, capture_output=True, text=True, timeout=60), sleep).stdout
+
+
+def gh_download(args, target, run=subprocess.run, sleep=time.sleep, timeout=1800):
+    """`gh api ARGS` written to `target` (an artifact zip), retried like
+    `retrying`; every attempt starts the file afresh."""
+    command = ["gh", "api", *args]
+
+    def once():
+        with open(target, "wb") as stream:
+            return run(command, stdout=stream, stderr=subprocess.PIPE, timeout=timeout)
+
+    retrying(args, once, sleep)
 
 
 def gh(path):

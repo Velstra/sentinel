@@ -7,9 +7,17 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-import subprocess
+import sys
 import tempfile
 import zipfile
+
+# The release scripts import each other by name. Put this file's own directory
+# on the path, so that works however the file is loaded: as a script, through
+# `python3 -c`, or by importlib from a test.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import release_attempts  # noqa: E402
 
 
 def unpack(archive, output, budget):
@@ -37,7 +45,7 @@ def download(identifier, expected, output):
     if not re.fullmatch(r"[1-9][0-9]*", identifier) or not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise ValueError("immutable artifact ID and exact SHA256 required")
     root = f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts/{identifier}"
-    info = json.loads(subprocess.check_output(["gh", "api", root], text=True, timeout=30))
+    info = json.loads(release_attempts.gh_get([root]))
     workflow = info.get("workflow_run", {})
     budget = int(os.environ.get("RELEASE_ARTIFACT_BYTE_BUDGET", "0"))
     if (info.get("expired") is not False or workflow.get("id") != int(os.environ["GITHUB_RUN_ID"])
@@ -47,8 +55,7 @@ def download(identifier, expected, output):
         raise ValueError("artifact is expired, oversized or belongs to another run/source/digest")
     with tempfile.TemporaryDirectory(prefix="sentinel-transfer-") as temp:
         archive = Path(temp) / "artifact.zip"
-        with archive.open("wb") as stream:
-            subprocess.run(["gh", "api", root + "/zip"], stdout=stream, check=True, timeout=1800)
+        release_attempts.gh_download([root + "/zip"], archive)
         with archive.open("rb") as stream:
             if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
                 raise ValueError("artifact download digest mismatch")

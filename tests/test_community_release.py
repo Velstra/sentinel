@@ -516,6 +516,20 @@ class ReRunPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             attempts.attempt_jobs("Velstra/sentinel", "45642647509", 2, short)
 
+    def test_artifact_downloads_retry_server_errors_and_restart_the_file(self):
+        from types import SimpleNamespace
+        replies, waits = iter([b"gh: Server Error (HTTP 502)", b"gh: Server Error (HTTP 503)", None]), []
+
+        def run(command, stdout, **kw):
+            failure = next(replies)
+            stdout.write(b"partial " if failure else b"complete zip")
+            return SimpleNamespace(returncode=1 if failure else 0, stderr=failure or b"")
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "artifact.zip"
+            attempts.gh_download(["repos/Velstra/sentinel/actions/artifacts/1/zip"], target, run=run, sleep=waits.append)
+            self.assertEqual((target.read_bytes(), waits), (b"complete zip", [5, 10]))
+
     def test_api_reads_retry_server_errors_and_then_fail_closed(self):
         from types import SimpleNamespace
         ok = SimpleNamespace(returncode=0, stdout='{"total_count": 0, "jobs": []}', stderr="")
@@ -781,12 +795,49 @@ class PublicationContracts(unittest.TestCase):
         with patch.object(attempts, "current", return_value={}):
             self.assertEqual(publisher.rerun_statement(directory), "")
 
+    def test_publication_reads_retry_server_errors_but_writes_never_repeat(self):
+        # The class the publisher catches: the module loader above can leave
+        # this test process with a second copy of urllib.error.
+        HTTPError = publisher.HTTPError
+
+        class Reply:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def read(self): return b'{"status": "identical"}'
+
+        def opener(errors):
+            calls = []
+
+            class Opener:
+                def open(self, request, timeout):
+                    calls.append(request.get_method())
+                    error = next(errors)
+                    if error:
+                        raise HTTPError(request.full_url, error, "server error", {}, None)
+                    return Reply()
+            return calls, Opener()
+
+        with patch.dict(os.environ, {"GH_TOKEN": "test-only"}):
+            calls, fake = opener(iter([502, 502, None]))
+            waits = []
+            with patch.object(publisher, "build_opener", return_value=fake):
+                self.assertEqual(publisher.api("repos/x/compare/a...main", sleep=waits.append), {"status": "identical"})
+            self.assertEqual((calls, waits), (["GET"] * 3, [5, 10]))
+            calls, fake = opener(iter([502] * 5))
+            with patch.object(publisher, "build_opener", return_value=fake), \
+                    self.assertRaisesRegex(ValueError, "failed 5 times"):
+                publisher.api("repos/x/compare/a...main", sleep=lambda s: None)
+            calls, fake = opener(iter([502, None]))
+            with patch.object(publisher, "build_opener", return_value=fake), self.assertRaises(HTTPError):
+                publisher.api("repos/x/releases", {"draft": True}, method="POST", sleep=lambda s: None)
+            self.assertEqual(calls, ["POST"], "a write is never repeated")
+
     def test_cross_run_artifact_is_refused_before_download(self):
         metadata = {"expired": False, "workflow_run": {"id": 1, "head_sha": "a" * 40},
                     "digest": "sha256:" + "b" * 64, "size_in_bytes": 100}
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(transfer.subprocess, "check_output", return_value=json.dumps(metadata)), \
-                patch.object(transfer.subprocess, "run") as download, \
+                patch.object(transfer.release_attempts, "gh_get", return_value=json.dumps(metadata)), \
+                patch.object(transfer.release_attempts, "gh_download") as download, \
                 patch.dict(os.environ, {"GITHUB_REPOSITORY": "Velstra/sentinel", "GITHUB_RUN_ID": "2",
                                         "GITHUB_SHA": "a" * 40, "RELEASE_ARTIFACT_BYTE_BUDGET": "1000"}):
             with self.assertRaisesRegex(ValueError, "another run"):
