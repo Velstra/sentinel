@@ -4,8 +4,8 @@
  "floors": [
   {
    "package": "linux",
-   "minimum": "6.12.118",
-   "fixes": "linux-6.12.y stable fixes after 6.12.117 (nix/kernel.nix)"
+   "minimum": "6.12.119",
+   "fixes": "linux-6.12.y stable fixes through 6.12.119, among them CVE-2026-99650, CVE-2026-99669, CVE-2026-99674 (nix/kernel.nix)"
   },
   {
    "package": "haproxy",

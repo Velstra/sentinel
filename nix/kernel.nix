@@ -2,10 +2,9 @@
 # patches, toolchain) at a newer 6.12.y stable release than the pin carries.
 #
 # Only the source moves. Advancing the whole nixpkgs pin for a kernel release
-# would also move the userspace package set (meson, LLVM, ... between the pin
-# and the nixos-26.05 head), and the kernel recipe itself is unchanged there:
-# that branch differs only in kernels-org.json, whose 6.12 entry is copied
-# below. Every check that boots "the 6.12 kernel" (ebpf-verifier-6-12, the
+# would also move the userspace package set, while the kernel recipe itself
+# only reads its version and hash from kernels-org.json, whose 6.12 entry is
+# copied below. Every check that boots "the 6.12 kernel" (ebpf-verifier-6-12, the
 # fragment and publication tests) runs this one, through the overlay in
 # flake.nix and the appliance module's boot.kernelPackages.
 #
@@ -14,10 +13,10 @@
 # silently keeping or dropping the override.
 pkgs:
 let
-  version = "6.12.118";
+  version = "6.12.119";
   base = pkgs.linux_6_12;
 in
-assert pkgs.lib.elem base.version [ "6.12.117" version ];
+assert pkgs.lib.elem base.version [ "6.12.117" "6.12.118" version ];
 if base.version == version then
   pkgs.linuxPackages_6_12
 else
@@ -25,10 +24,11 @@ else
     argsOverride = {
       inherit version;
       modDirVersion = version;
-      # nixos-26.05 ab5c18f, pkgs/os-specific/linux/kernel/kernels-org.json.
+      # nixpkgs master kernels-org.json (6.12.119); the same SHA-256 as
+      # kernel.org's signed v6.x/sha256sums.asc (143b2879...0c0333).
       src = pkgs.fetchurl {
         url = "mirror://kernel/linux/kernel/v6.x/linux-${version}.tar.xz";
-        hash = "sha256:19d5w74ixfhpv3bnwl0kszd1pn0wmv3y6asvfk02m18f69h88c08";
+        hash = "sha256:0cq31jkzqx5ssihb5xp1sw3a7sz2b578k5av15qf5fdccmwjhfql";
       };
     };
   })
