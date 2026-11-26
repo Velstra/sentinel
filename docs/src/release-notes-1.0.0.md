@@ -280,14 +280,13 @@ the upgrade starts with fresh state** instead of adopting the pinned tables
   predecessor's reading the helper acts on. Then tunnels may stall until NTP corrects the clock, and
   `sentinel show health` reports `ha-clock-behind-peer`. Run NTP on both
   members ([HA handbook](handbook/ha.md)).
-- **Kernel CVEs without a 6.12.y fix.** 1.0.0 ships Linux 6.12.118. Of the
-  187 High/Critical kernel matches the image scan reports, the kernel CNA's
+- **Kernel CVEs without a 6.12.y fix.** 1.0.0 ships Linux 6.12.119. Of the
+  194 High/Critical kernel matches the image scan reports, the kernel CNA's
   per-branch records show 109 already fixed on 6.12.y and 3 not present in 6.12;
-  **57 affect 6.12 and have no 6.12.y fix yet**, and **18 have no kernel.org
-  CNA record**. These 75 are listed one by one in the release gate's
+  **63 affect 6.12 and have no 6.12.y fix yet**, and **19 have no kernel.org
+  CNA record**. These 82 are listed one by one in the release gate's
   kernel baseline (`scripts/cve-waivers.json`), not accepted as a count.
-  45 of the 57 are fixed in the 6.18 LTS line, which is evaluated with the
-  NixOS 26.11 base roll.
+  48 of the 63 are fixed in the 6.18 LTS line (6.18.65), which 1.0.1 ships.
 
 ## Verification
 
