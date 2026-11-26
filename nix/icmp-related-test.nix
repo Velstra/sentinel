@@ -131,6 +131,7 @@ pkgs.testers.runNixOSTest {
     };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import json, os, shlex, socket, struct, time
     from pathlib import Path
     from typing import Any
@@ -357,6 +358,7 @@ pkgs.testers.runNixOSTest {
     dut.wait_until_succeeds("ip -4 address show eth2 | grep -q 198.18.20.1/24", timeout=30)
     for interface in ["eth1", "eth2"]:
         dut.succeed("ip -details link show " + interface + " | grep -q prog/xdp")
+    uplink_ready.wait_uplink_addressed(dut, "eth1", "198.18.10.100")
     for machine in [dut, reference]:
         assert machine.succeed("cat /proc/sys/net/ipv4/conf/all/accept_local").strip() == "0"
         machine.succeed("systemd-run --unit=icmp-related-capture tcpdump -U -n -i any -w /tmp/icmp-related.pcap")

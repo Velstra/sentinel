@@ -154,6 +154,7 @@ in pkgs.testers.runNixOSTest {
   };
   testScript = ''
     import json, re
+    ${import ./uplink-ready.nix { inherit pkgs; }}
 
     def stats():
         text = dut.succeed("sentinel show firewall statistics")
@@ -175,13 +176,7 @@ in pkgs.testers.runNixOSTest {
     # nothing is delivered either, so "translated" cases would fail for a
     # reason that is not the property under test. Send only once the
     # MASQUERADE entry holds the uplink address.
-    uplink = ["0xc6", "0x12", "0x0a", "0x64"]  # 198.18.10.100
-
-    def masquerade_addressed(_last: bool) -> bool:
-        entries = json.loads(dut.succeed("bpftool -j map dump name MASQUERADE"))
-        return any(entry.get("value") == uplink for entry in entries)
-
-    retry(masquerade_addressed, timeout_seconds=30)
+    uplink_ready.wait_uplink_addressed(dut, "eth1", "198.18.10.100")
     wan.succeed("systemd-run --unit=leak-capture tcpdump -U -n -i eth1 -w /tmp/wan.pcap ip")
     wan.wait_until_succeeds("test -s /tmp/wan.pcap", timeout=10)
     before = stats()

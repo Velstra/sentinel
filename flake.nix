@@ -2088,6 +2088,14 @@
           python3 -B -m unittest discover -s test -v
           touch $out
         '';
+        # The masquerade readiness wait the NAT VM checks share (nix/uplink-ready.py).
+        uplink-ready-unit = pkgs.runCommand "sentinel-uplink-ready-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p test
+          cp ${./nix/uplink-ready.py} test/uplink-ready.py
+          cp ${./nix/test_uplink_ready.py} test/test_uplink_ready.py
+          python3 -B -m unittest discover -s test -v
+          touch $out
+        '';
         # The mixed-version HA fixture's rewrite of velstra.toml for an older
         # agent (nix/ha-two-node-flow-test.nix): never widens a dst-local rule.
         legacy-filter-unit = pkgs.runCommand "sentinel-legacy-filter-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
@@ -9385,6 +9393,7 @@
             fw.wait_for_unit("velstra.service")
             server.wait_for_unit("web.service")
 
+            ${import ./nix/uplink-ready.nix { inherit pkgs; }}
             # The fw's WAN ip must be live BEFORE we configure masquerade: the
             # agent reads it to fill the MASQUERADE map at (re)start.
             fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
@@ -9451,6 +9460,7 @@
             assert other != block, f"two addresses share a block:\n{block}\n{other}"
 
             # Traffic still flows, and the source port now falls inside the block.
+            uplink_ready.wait_uplink_addressed(fw, "eth1", "10.1.0.1")
             client.succeed("curl -s --max-time 5 http://10.1.0.2:80/ >/dev/null")
             flows = fw.succeed("sentinel show flows")
             assert "10.1.0.2" in flows, f"the flow is missing: {flows}"

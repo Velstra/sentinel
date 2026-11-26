@@ -58,6 +58,7 @@ in pkgs.testers.runNixOSTest {
     bk2 = member 3 3;
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     members = {fw: 1, bk1: 2, bk2: 3}
     start_all()
     for n in members:
@@ -94,6 +95,8 @@ in pkgs.testers.runNixOSTest {
         )
 
     # The flow: a masqueraded connection the client keeps open through fw.
+    for n, number in members.items():
+        uplink_ready.wait_uplink_addressed(n, "eth1", "10.1.0." + str(number))
     client.wait_until_succeeds("curl -s --max-time 5 http://10.1.0.10:80/ | grep -q hello-from-server", timeout=60)
     client.succeed(
         "systemd-run --unit=hold ${pkgs.python3}/bin/python3 -c "

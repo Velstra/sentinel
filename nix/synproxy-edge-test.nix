@@ -116,6 +116,7 @@ pkgs.testers.runNixOSTest {
       };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import re
 
     failures = []
@@ -240,6 +241,7 @@ pkgs.testers.runNixOSTest {
     ])
     fw.wait_for_unit("velstra.service")
     fw.wait_until_succeeds("grep -q '^\\[\\[synproxy\\]\\]' /run/sentinel/velstra.toml", timeout=30)
+    uplink_ready.wait_uplink_addressed(fw, "eth1", "10.1.0.1")
 
     scenario("the datapath is loaded and enforcing", datapath_enforces)
     scenario("syn-protect is in show, running and saved config after commit + save",
@@ -261,6 +263,7 @@ pkgs.testers.runNixOSTest {
         fw.start()
         boot()
         fw.wait_until_succeeds("grep -q '^\\[\\[synproxy\\]\\]' /run/sentinel/velstra.toml", timeout=60)
+        uplink_ready.wait_uplink_addressed(fw, "eth1", "10.1.0.1")
         agent_proxies(3)
         persisted("after reboot", committed=False)
         datapath_enforces()

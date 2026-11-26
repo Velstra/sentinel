@@ -166,6 +166,7 @@ pkgs.testers.runNixOSTest {
       };
   };
   testScript = ''
+    ${import ./uplink-ready.nix { inherit pkgs; }}
     import time
     FAST_PATH = "'NAT\\(ct\\)|FWD -> ifindex|ENCAP vni=|DNAT [0-9]'"
 
@@ -193,6 +194,7 @@ pkgs.testers.runNixOSTest {
     fw.wait_for_unit("velstra.service")
     fw.succeed("grep -q 'masquerade = true' /run/sentinel/velstra.toml")
     fw.succeed("grep -q 'log = true' /run/sentinel/velstra.toml")
+    uplink_ready.wait_uplink_addressed(fw, "eth1", "10.1.0.1")
 
     # Established, reverse-NAT traffic: 3 x 4 MiB through the masquerade, about
     # 9000 reply packets un-NAT'd on the WAN ingress fast path.
