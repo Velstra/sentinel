@@ -148,10 +148,17 @@ attempt 2. In that attempt:
 - sign, package, seal and publish run for the first time, so every
   environment approval is requested again;
 - a regression job that fails again blocks the release; there is no attempt 3.
+- GitHub may list a re-run job more than once in attempt 2. Every entry that
+  got a runner must finish green, and at least one must. An entry that never
+  got a runner is a phantom: it is ignored once the run has moved on to sign,
+  which shows GitHub no longer waits for it. The release notes say how many
+  times attempt 2 ran the check and how many phantom entries it listed.
 
 Before signing, and again before sealing and publishing, the workflow reads
-from GitHub's job listing which job ran in which attempt and refuses anything
-else. The packaged `source-checks.json` records each re-run check with its
+from GitHub's job listings which job ran in which attempt and refuses anything
+else. GitHub lists every carried-over job again in attempt 2, with a new ID,
+so a job counts as carried over when its name, start, end and conclusion match
+attempt 1. The packaged `source-checks.json` records each re-run check with its
 first failure and the link to its attempt-1 log, and the release notes list
 them: "Regression checks re-run once after a failure: CHECK (first failure:
 ...; attempt-1 log: ...)". Check receipts and the build are kept for one day,

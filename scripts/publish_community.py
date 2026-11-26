@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-from urllib.error import HTTPError
+import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 import sys
 from urllib.request import Request, HTTPRedirectHandler, build_opener
@@ -27,20 +28,34 @@ class NoRedirect(HTTPRedirectHandler):
         raise ValueError("GitHub API redirects are forbidden")
 
 
-def api(path, payload=None, method="GET", missing=False):
+def api(path, payload=None, method="GET", missing=False, sleep=time.sleep):
+    """One GitHub API call. A read (GET) is retried after a server error
+    (HTTP 5xx) or a network failure, like release_attempts' reads; a write
+    is never repeated."""
     request = Request("https://api.github.com/" + path,
                       data=json.dumps(payload).encode() if payload is not None else None,
                       headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                "Accept": "application/vnd.github+json",
                                "Content-Type": "application/json",
                                "X-GitHub-Api-Version": "2022-11-28"}, method=method)
-    try:
-        with build_opener(NoRedirect).open(request, timeout=60) as response:
-            return json.load(response)
-    except HTTPError as error:
-        if missing and error.code == 404:
-            return None
-        raise
+    delays = release_attempts.API_RETRY_DELAYS if method == "GET" else ()
+    for attempt, delay in enumerate((*delays, None), start=1):
+        try:
+            with build_opener(NoRedirect).open(request, timeout=60) as response:
+                return json.load(response)
+        except HTTPError as error:
+            if missing and error.code == 404:
+                return None
+            if error.code < 500 or not delays:
+                raise
+            last = error
+        except (URLError, TimeoutError) as error:
+            if not delays:
+                raise
+            last = error
+        if delay is None:
+            raise ValueError(f"GitHub API read {path} failed {attempt} times; last: {last}") from last
+        sleep(delay)
 
 
 def stall_statement(directory):
@@ -57,6 +72,15 @@ def stall_statement(directory):
             f"{STALL_SECONDS // 60} min; a failing check is never retried): " + ", ".join(retried) + ".")
 
 
+def rerun_count(entry):
+    """How often attempt 2 ran a check, and how many entries it only listed."""
+    runs, phantoms = entry["runs"], entry.get("phantoms", 0)
+    text = "attempt 2 ran it once (passed)" if runs == 1 else f"attempt 2 ran it {runs} times (all passed)"
+    if phantoms:
+        text += f"; {phantoms} phantom entr{'y was' if phantoms == 1 else 'ies were'} listed but never started"
+    return text
+
+
 def rerun_statement(directory):
     """Name each regression check re-run after a failure, with its first error
     and the attempt-1 log. The verified bundle's record must match what GitHub
@@ -68,7 +92,8 @@ def rerun_statement(directory):
     if not recorded:
         return ""
     return ("Regression checks re-run once after a failure: " + ", ".join(
-        f"{check} (first failure: {entry['first_failure']}; attempt-1 log: {entry['first_job']})"
+        f"{check} (first failure: {entry['first_failure']}; attempt-1 log: {entry['first_job']}; "
+        + rerun_count(entry) + ")"
         for check, entry in sorted(recorded.items())) + ".")
 
 

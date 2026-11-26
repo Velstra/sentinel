@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import time
 
 MAX_ATTEMPT = 2
 FIRST_ATTEMPT_ONLY = ("plan", "build")
@@ -18,8 +19,12 @@ DOWNSTREAM = ("sign", "package", "seal", "publish")
 REGRESSION = re.compile(r"regressions \(([a-zA-Z0-9_-]+)\)")
 # The runner's own closing line for any failed step; it says nothing about why.
 GENERIC_FAILURE = re.compile(r"Process completed with exit code \d+\.?")
-PAGE_SIZE = 100
-MAX_PAGES = 6
+# GitHub answers 502 for a 100-entry page of a large run (run 45642647509,
+# 243 jobs); 30 per page works. 20 pages cover 600 entries.
+PAGE_SIZE = 30
+MAX_PAGES = 20
+# Waits between the attempts of one API read; a 5xx is retried, nothing else.
+API_RETRY_DELAYS = (5, 10, 20, 40)
 
 
 def attempt():
@@ -40,37 +45,75 @@ def by_name(jobs):
     return named
 
 
-def reruns(first, second):
-    """The regression jobs attempt 2 ran again, as {check: attempt-1 job}.
+# What makes an attempt-2 entry the attempt-1 job carried over. GitHub gives
+# carried-over jobs a new id and run_attempt 2 (run 45642647509), so only
+# these fields identify them.
+CARRIED_OVER = ("name", "started_at", "completed_at", "conclusion")
 
-    `first` and `second` are GitHub's job listings of attempts 1 and 2; a job
-    carried over from attempt 1 keeps run_attempt 1 in the second listing."""
-    one, two = by_name(first), by_name(second)
-    if set(one) != set(two):
-        raise ValueError("the job set changed between attempts")
+
+def carried_over(before, after):
+    return all(before.get(k) == after.get(k) for k in CARRIED_OVER)
+
+
+def phantom(job):
+    """An entry GitHub listed but never gave a runner (run 45642647509 listed
+    33 of them for one re-run job). Its started_at is set anyway, to its
+    creation time, so only the missing runner and completion tell it apart."""
+    return (job.get("status") == "queued" and job.get("completed_at") is None
+            and not job.get("runner_id") and not job.get("runner_name"))
+
+
+def moved_on(jobs):
+    """GitHub has gone past the regressions: a downstream job (sign) exists and
+    has left the queue, so it no longer waits for any queued regression entry."""
+    return any(j.get("name") in DOWNSTREAM and j.get("status") in ("waiting", "in_progress", "completed")
+               for j in jobs)
+
+
+def reruns(first, second):
+    """The regression jobs attempt 2 ran again: {check: {"job": its attempt-1
+    job, "runs": its attempt-2 entries that started, "phantoms": how many
+    never did}}.
+
+    `first` and `second` are GitHub's job listings of attempts 1 and 2. A job
+    carried over from attempt 1 appears in attempt 2 with identical name,
+    times and conclusion. A failed regression run again may appear in attempt
+    2 more than once."""
+    one = by_name(first)
     if any(j.get("run_attempt") != 1 for j in first):
         raise ValueError("attempt 1 lists a job from another attempt")
+    if not isinstance(second, list) or any(not isinstance(j, dict) or not isinstance(j.get("name"), str)
+                                           for j in second):
+        raise ValueError("malformed job listing")
+    entries = {}
+    for job in second:
+        entries.setdefault(job["name"], []).append(job)
+    unknown = set(entries) - set(one)
+    if unknown:
+        raise ValueError("attempt 2 lists jobs attempt 1 did not have: " + ", ".join(sorted(unknown)))
     found = {}
-    for name, job in two.items():
-        before, again = one[name], job.get("run_attempt")
-        if again not in (1, 2):
-            raise ValueError(f"{name}: run attempt {again!r} is not allowed")
+    for name, before in one.items():
+        after = entries.get(name, [])
         regression = REGRESSION.fullmatch(name)
-        if name in FIRST_ATTEMPT_ONLY:
-            if again != 1 or before.get("conclusion") != "success":
-                raise ValueError(f"{name} must have succeeded in attempt 1 and not run again")
-        elif name in DOWNSTREAM:
+        if name in DOWNSTREAM:
             # It never ran in attempt 1, so no approval of attempt 1 can count.
+            # In attempt 2 it may be missing yet, or running now.
             if before.get("conclusion") != "skipped":
                 raise ValueError(f"{name} already ran in attempt 1; start a new run")
+        elif name in FIRST_ATTEMPT_ONLY or (regression and before.get("conclusion") == "success"):
+            if (before.get("conclusion") != "success" or len(after) != 1
+                    or not carried_over(before, after[0])):
+                raise ValueError(f"{name} must pass in attempt 1 and be carried over unchanged")
         elif regression:
-            if again == 1 and before.get("conclusion") != "success":
-                raise ValueError(f"{name} did not pass in attempt 1 and was not run again")
-            if again == 2:
-                if before.get("conclusion") != "failure":
-                    raise ValueError(f"{name} was {before.get('conclusion')} in attempt 1; "
-                                     "only a failed regression may run again")
-                found[regression.group(1)] = before
+            if before.get("conclusion") != "failure":
+                raise ValueError(f"{name} was {before.get('conclusion')} in attempt 1; "
+                                 "only a failed regression may run again")
+            ran = [job for job in after if not phantom(job)]
+            if not ran or any(carried_over(before, job) for job in ran):
+                raise ValueError(f"{name} failed in attempt 1 and was not run again")
+            if len(ran) < len(after) and not moved_on(second):
+                raise ValueError(f"{name}: attempt 2 still waits for {len(after) - len(ran)} queued entries")
+            found[regression.group(1)] = {"job": before, "runs": ran, "phantoms": len(after) - len(ran)}
         else:
             raise ValueError(f"unexpected job {name!r} in a release run")
     if not found:
@@ -79,9 +122,15 @@ def reruns(first, second):
 
 
 def regressions_green(jobs):
-    """Every regression job passed in its final attempt; one that failed twice blocks."""
-    failing = sorted(REGRESSION.fullmatch(j["name"]).group(1) for j in jobs
-                     if REGRESSION.fullmatch(j.get("name", "")) and j.get("conclusion") != "success")
+    """Every regression entry that ran finished green, and every regression ran:
+    one that failed twice blocks, and so does any started entry that is not a
+    completed success. A phantom entry counts only while GitHub still waits."""
+    ignore = moved_on(jobs)
+    counted = [j for j in jobs if REGRESSION.fullmatch(j.get("name", "")) and not (ignore and phantom(j))]
+    failing = {REGRESSION.fullmatch(j["name"]).group(1) for j in counted
+               if j.get("status") != "completed" or j.get("conclusion") != "success"}
+    every = {REGRESSION.fullmatch(j["name"]).group(1) for j in jobs if REGRESSION.fullmatch(j.get("name", ""))}
+    failing = sorted(failing | (every - {REGRESSION.fullmatch(j["name"]).group(1) for j in counted}))
     if failing:
         raise ValueError("regression checks not green in their final attempt: " + ", ".join(failing))
 
@@ -97,8 +146,50 @@ def first_failure(job, annotations):
     return text.splitlines()[0][:200]
 
 
+def retrying(args, once, sleep=time.sleep):
+    """Run one `gh api` read until it succeeds. A server error (HTTP 5xx) or a
+    timeout is retried after API_RETRY_DELAYS; anything else, or the last
+    failure, fails closed with what GitHub said."""
+    for attempt, delay in enumerate((*API_RETRY_DELAYS, None), start=1):
+        try:
+            result = once()
+        except subprocess.TimeoutExpired:
+            reason = "timed out"
+        else:
+            if result.returncode == 0:
+                return result
+            stderr = result.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            lines = stderr.strip().splitlines()
+            reason = lines[-1] if lines else f"exit {result.returncode}"
+            if not re.search(r"HTTP 5\d\d", reason):
+                raise ValueError(f"GitHub API read {args[-1]} failed: {reason}")
+        if delay is None:
+            raise ValueError(f"GitHub API read {args[-1]} failed {attempt} times; last: {reason}")
+        sleep(delay)
+
+
+def gh_get(args, run=subprocess.run, sleep=time.sleep):
+    """The output of `gh api ARGS`, a read, retried like `retrying`."""
+    command = ["gh", "api", *args]
+    return retrying(args, lambda: run(command, capture_output=True, text=True, timeout=60), sleep).stdout
+
+
+def gh_download(args, target, run=subprocess.run, sleep=time.sleep, timeout=1800):
+    """`gh api ARGS` written to `target` (an artifact zip), retried like
+    `retrying`; every attempt starts the file afresh."""
+    command = ["gh", "api", *args]
+
+    def once():
+        with open(target, "wb") as stream:
+            return run(command, stdout=stream, stderr=subprocess.PIPE, timeout=timeout)
+
+    retrying(args, once, sleep)
+
+
 def gh(path):
-    return json.loads(subprocess.check_output(["gh", "api", path], text=True, timeout=60))
+    return json.loads(gh_get([path]))
 
 
 def attempt_jobs(repository, run_id, number, fetch=gh):
@@ -121,7 +212,7 @@ def attempt_jobs(repository, run_id, number, fetch=gh):
 
 
 def current(fetch=gh):
-    """This run's re-runs, {check: {"first_failure", "first_job"}}: empty in
+    """This run's re-runs, {check: {"first_failure", "first_job", "runs", "phantoms"}}: empty in
     attempt 1. Raises ValueError for an attempt or a job set the policy refuses."""
     number = attempt()
     if number == 1:
@@ -132,12 +223,14 @@ def current(fetch=gh):
     found = reruns(first, second)
     regressions_green(second)
     record = {}
-    for check, job in sorted(found.items()):
+    for check, rerun in sorted(found.items()):
+        job = rerun["job"]
         # An Actions job is its own check run; prefer the URL GitHub gives.
         url = job.get("check_run_url") or ""
         check_run = url.split("api.github.com/", 1)[1] if "api.github.com/" in url else \
             f"repos/{repository}/check-runs/{job['id']}"
-        annotations = fetch(f"{check_run}/annotations?per_page=50")
+        annotations = fetch(f"{check_run}/annotations?per_page={PAGE_SIZE}")
         record[check] = {"first_failure": first_failure(job, annotations if isinstance(annotations, list) else []),
-                         "first_job": job.get("html_url")}
+                         "first_job": job.get("html_url"), "runs": len(rerun["runs"]),
+                         "phantoms": rerun["phantoms"]}
     return record

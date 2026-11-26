@@ -364,16 +364,27 @@ class StallWatchdogTests(unittest.TestCase):
                                         names, "a" * 40, "42-1")
 
 
-def job(name, conclusion, run_attempt=1, number=None):
+FIXTURES = ROOT / "tests/fixtures/run-45642647509"
+
+
+def real_jobs(name):
+    """A job listing GitHub returned for release run 45642647509."""
+    return json.loads((FIXTURES / name).read_text())["jobs"]
+
+
+def job(name, conclusion, run_attempt=1, number=None, started="2026-11-25T15:13:10Z"):
     """One entry of GitHub's attempt job listing."""
     number = number if number is not None else abs(hash(name)) % 10**9
-    return {"id": number, "name": name, "conclusion": conclusion, "run_attempt": run_attempt,
+    return {"id": number, "name": name, "status": "completed", "conclusion": conclusion,
+            "run_attempt": run_attempt, "started_at": started, "completed_at": started.replace("15:", "16:"),
             "html_url": f"https://github.com/Velstra/sentinel/actions/runs/42/job/{number}"}
 
 
 def listings(failed=("rip",), passed=("nat", "commit"), first_overrides=None, second_overrides=None):
     """Attempt 1, where the `failed` regressions failed and everything downstream
-    was skipped, and the attempt 2 that "Re-run failed jobs" makes of it."""
+    was skipped, and the attempt 2 "Re-run failed jobs" makes of it, shaped as
+    GitHub really lists it: every carried-over job again, with a new id and
+    run_attempt 2 but its attempt-1 times; downstream jobs not yet listed."""
     first = [job("plan", "success"), job("build", "success")]
     first += [job(f"regressions ({c})", "success") for c in passed]
     first += [job(f"regressions ({c})", "failure") for c in failed]
@@ -382,10 +393,13 @@ def listings(failed=("rip",), passed=("nat", "commit"), first_overrides=None, se
         next(j for j in first if j["name"] == name).update(change)
     second = []
     for entry in first:
-        rerun = entry["name"] in {f"regressions ({c})" for c in failed} or entry["name"] in (
-            "sign", "package", "seal", "publish")
-        second.append(entry | ({"run_attempt": 2, "conclusion": "success", "id": entry["id"] + 1,
-                                "html_url": entry["html_url"] + "-2"} if rerun else {}))
+        if entry["name"] in ("sign", "package", "seal", "publish"):
+            continue
+        copy = entry | {"id": entry["id"] + 1, "run_attempt": 2}
+        if entry["name"] in {f"regressions ({c})" for c in failed}:
+            copy |= {"conclusion": "success", "started_at": "2026-11-25T20:23:13Z",
+                     "completed_at": "2026-11-25T20:48:02Z", "html_url": entry["html_url"] + "-2"}
+        second.append(copy)
     for name, change in (second_overrides or {}).items():
         next(j for j in second if j["name"] == name).update(change)
     return first, second
@@ -410,31 +424,74 @@ class ReRunPolicyTests(unittest.TestCase):
         first, second = listings(failed=("rip", "reboot"))
         found = attempts.reruns(first, second)
         self.assertEqual(sorted(found), ["reboot", "rip"])
-        self.assertEqual(found["rip"]["conclusion"], "failure")
-        self.assertEqual(found["rip"]["run_attempt"], 1)
+        self.assertEqual(found["rip"]["job"]["conclusion"], "failure")
+        self.assertEqual(len(found["rip"]["runs"]), 1)
 
     def test_nothing_else_may_change(self):
         cases = {
-            "the plan was run again": listings(second_overrides={"plan": {"run_attempt": 2}}),
-            "the build was run again": listings(second_overrides={"build": {"run_attempt": 2}}),
+            "the plan was run again": listings(second_overrides={"plan": {"started_at": "2026-11-25T20:23:13Z"}}),
+            "the build was run again": listings(second_overrides={"build": {"completed_at": "2026-11-25T21:00:00Z"}}),
             "the build failed in attempt 1": listings(first_overrides={"build": {"conclusion": "failure"}},
                                                       second_overrides={"build": {"conclusion": "failure"}}),
-            "a passing regression was run again": listings(second_overrides={"regressions (nat)": {"run_attempt": 2}}),
+            "a passing regression was run again": listings(
+                second_overrides={"regressions (nat)": {"started_at": "2026-11-25T20:23:13Z"}}),
+            "the failed regression was only carried over": listings(
+                second_overrides={"regressions (rip)": {"conclusion": "failure", "started_at": "2026-11-25T15:13:10Z",
+                                                        "completed_at": "2026-11-25T16:13:10Z"}}),
             "a cancelled regression was run again": listings(first_overrides={"regressions (rip)": {"conclusion": "cancelled"}}),
             "a timed-out regression was run again": listings(first_overrides={"regressions (rip)": {"conclusion": "timed_out"}}),
             "sign ran in attempt 1": listings(first_overrides={"sign": {"conclusion": "success"}}),
             "publish ran in attempt 1": listings(first_overrides={"publish": {"conclusion": "failure"}}),
             "attempt 2 re-ran nothing": listings(failed=()),
-            "a job of attempt 3": listings(second_overrides={"regressions (rip)": {"run_attempt": 3}}),
         }
         first, second = listings()
         cases["a job appeared"] = (first, second + [job("regressions (new)", "success", 2)])
         cases["a job disappeared"] = (first, [j for j in second if j["name"] != "regressions (nat)"])
         cases["an unknown job"] = (first + [job("debug", "success")], second + [job("debug", "success")])
-        cases["a duplicate name"] = (first + [first[2]], second + [second[2]])
+        cases["a duplicate name in attempt 1"] = (first + [first[2]], second)
+        cases["a passing regression listed twice"] = (first, second + [second[2] | {"id": 1}])
         for reason, (one, two) in cases.items():
             with self.subTest(reason=reason), self.assertRaises(ValueError):
                 attempts.reruns(one, two)
+
+    def test_the_real_re_run_of_run_45642647509_while_it_ran(self):
+        # Every carried-over job came back with a new id and run_attempt 2;
+        # routed-reply, the one failure, was listed 34 times: 1 running, 33
+        # queued, and sign not created yet. GitHub still waited, so do we.
+        first, second = real_jobs("attempt-1.json"), real_jobs("attempt-2-in-progress.json")
+        with self.assertRaisesRegex(ValueError, "still waits for 33"):
+            attempts.reruns(first, second)
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(second)
+        plan = next(k for k, j in enumerate(second) if j["name"] == "plan")
+        moved = second[:plan] + [second[plan] | {"started_at": "2026-11-25T20:23:13Z"}] + second[plan + 1:]
+        with self.assertRaisesRegex(ValueError, "plan"):
+            attempts.reruns(first, moved)
+
+    def test_the_real_re_run_of_run_45642647509_once_sign_waits(self):
+        # The one real re-run passed; 33 entries never got a runner (started_at
+        # is their creation time); sign is waiting for its approval.
+        first, second = real_jobs("attempt-1.json"), real_jobs("attempt-2-sign-waiting.json")
+        found = attempts.reruns(first, second)
+        self.assertEqual({k: (len(v["runs"]), v["phantoms"]) for k, v in found.items()}, {"routed-reply": (1, 33)})
+        attempts.regressions_green(second)
+        rerun = "regressions (routed-reply)"
+        without_sign = [j for j in second if j["name"] != "sign"]
+        with self.assertRaisesRegex(ValueError, "still waits for 33"):
+            attempts.reruns(first, without_sign)
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(without_sign)
+        real = next(k for k, j in enumerate(second) if j["name"] == rerun and j["status"] == "completed")
+        failed = second[:real] + [second[real] | {"conclusion": "failure"}] + second[real + 1:]
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(failed)
+        queued = next(k for k, j in enumerate(second) if j["name"] == rerun and j["status"] == "queued")
+        started = second[:queued] + [second[queued] | {"runner_name": "GitHub Actions 7", "runner_id": 7}] + second[queued + 1:]
+        with self.assertRaisesRegex(ValueError, "routed-reply"):
+            attempts.regressions_green(started)
+        only_phantoms = [j for j in second if not (j["name"] == rerun and j["status"] == "completed")]
+        with self.assertRaisesRegex(ValueError, "not run again"):
+            attempts.reruns(first, only_phantoms)
 
     def test_a_regression_that_fails_twice_blocks_the_release(self):
         first, second = listings(second_overrides={"regressions (rip)": {"conclusion": "failure"}})
@@ -444,13 +501,58 @@ class ReRunPolicyTests(unittest.TestCase):
         attempts.regressions_green(listings()[1])
 
     def test_the_job_listing_is_read_completely(self):
-        jobs = [job(f"regressions (c{i})", "success", number=i) for i in range(207)]
-        pages = {n: {"total_count": 207, "jobs": jobs[(n - 1) * 100:n * 100]} for n in (1, 2, 3)}
-        fetch = lambda path: pages[int(path.rsplit("page=", 1)[1])]
-        self.assertEqual(len(attempts.attempt_jobs("Velstra/sentinel", "42", 1, fetch)), 207)
-        short = lambda path: {"total_count": 207, "jobs": jobs[:100]} if path.endswith("page=1") else {"total_count": 207, "jobs": []}
+        jobs = real_jobs("attempt-2-sign-waiting.json")
+        requests = []
+
+        def fetch(path):
+            requests.append(path)
+            self.assertIn("per_page=30&", path)
+            page = int(path.rsplit("page=", 1)[1])
+            return {"total_count": len(jobs), "jobs": jobs[(page - 1) * 30:page * 30]}
+
+        self.assertEqual(attempts.attempt_jobs("Velstra/sentinel", "45642647509", 2, fetch), jobs)
+        self.assertEqual(len(requests), 9)
+        short = lambda path: {"total_count": 243, "jobs": jobs[:30]} if path.endswith("page=1") else {"total_count": 243, "jobs": []}
         with self.assertRaises(ValueError):
-            attempts.attempt_jobs("Velstra/sentinel", "42", 1, short)
+            attempts.attempt_jobs("Velstra/sentinel", "45642647509", 2, short)
+
+    def test_artifact_downloads_retry_server_errors_and_restart_the_file(self):
+        from types import SimpleNamespace
+        replies, waits = iter([b"gh: Server Error (HTTP 502)", b"gh: Server Error (HTTP 503)", None]), []
+
+        def run(command, stdout, **kw):
+            failure = next(replies)
+            stdout.write(b"partial " if failure else b"complete zip")
+            return SimpleNamespace(returncode=1 if failure else 0, stderr=failure or b"")
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "artifact.zip"
+            attempts.gh_download(["repos/Velstra/sentinel/actions/artifacts/1/zip"], target, run=run, sleep=waits.append)
+            self.assertEqual((target.read_bytes(), waits), (b"complete zip", [5, 10]))
+
+    def test_api_reads_retry_server_errors_and_then_fail_closed(self):
+        from types import SimpleNamespace
+        ok = SimpleNamespace(returncode=0, stdout='{"total_count": 0, "jobs": []}', stderr="")
+        bad = SimpleNamespace(returncode=1, stdout="", stderr="gh: Server Error (HTTP 502)\n")
+        replies, calls, waits = iter([bad, bad, ok]), [], []
+        out = attempts.gh_get(["repos/Velstra/sentinel/actions/runs/1/attempts/2/jobs?per_page=30&page=1"],
+                              run=lambda command, **kw: calls.append(command) or next(replies), sleep=waits.append)
+        self.assertEqual((out, len(calls), waits), (ok.stdout, 3, [5, 10]))
+        waits.clear()
+        with self.assertRaisesRegex(ValueError, r"failed 5 times; last: gh: Server Error \(HTTP 502\)"):
+            attempts.gh_get(["jobs"], run=lambda command, **kw: bad, sleep=waits.append)
+        self.assertEqual(waits, [5, 10, 20, 40])
+        waits.clear()
+        missing = SimpleNamespace(returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)")
+        with self.assertRaisesRegex(ValueError, "HTTP 404"):
+            attempts.gh_get(["jobs"], run=lambda command, **kw: missing, sleep=waits.append)
+        self.assertEqual(waits, [], "only a server error is retried")
+
+        def hang(command, **kw):
+            raise subprocess.TimeoutExpired(command, 60)
+
+        with self.assertRaisesRegex(ValueError, "timed out"):
+            attempts.gh_get(["jobs"], run=hang, sleep=waits.append)
 
     def test_the_first_failure_names_the_real_error(self):
         failed = job("regressions (rip)", "failure")
@@ -479,12 +581,13 @@ class ReRunPolicyTests(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2", "GITHUB_RUN_ID": "42",
                                      "GITHUB_REPOSITORY": "Velstra/sentinel"}):
             self.assertEqual(attempts.current(fetch=fetch), {"rip": {
-                "first_failure": "rip failed: OSPF never converged", "first_job": rip["html_url"]}})
+                "first_failure": "rip failed: OSPF never converged", "first_job": rip["html_url"], "runs": 1,
+                "phantoms": 0}})
 
     def test_receipts_must_come_from_the_attempt_that_ran_them(self):
         from types import SimpleNamespace
         names = sorted(release.REQUIRED_SAFETY_CHECKS | {"rip"})
-        reruns = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1"}}
+        reruns = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1", "runs": 1}}
         with tempfile.TemporaryDirectory() as temp, patch.object(release, "source", return_value="a" * 40), \
                 patch.object(release, "run", return_value=json.dumps(names)), \
                 patch.object(attempts, "current", return_value=reruns), \
@@ -506,7 +609,7 @@ class ReRunPolicyTests(unittest.TestCase):
 
     def test_the_bundle_records_exactly_the_reruns_of_its_attempt(self):
         names = ["nat", "rip"]
-        record = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1"}}
+        record = {"rip": {"first_failure": "rip failed", "first_job": "https://example.invalid/job/1", "runs": 1}}
         self.assertEqual(release.expected_receipt_runs({"run": "42-2", "reruns": record}, names, "42", 2),
                          {"nat": "42-1", "rip": "42-2"})
         self.assertEqual(release.expected_receipt_runs({"run": "42-1"}, names, "42", 1),
@@ -515,6 +618,8 @@ class ReRunPolicyTests(unittest.TestCase):
                     {"run": "42-2", "reruns": {}},                       # attempt 2 that re-ran nothing
                     {"run": "42-2", "reruns": {"other": record["rip"]}},  # not a catalogued check
                     {"run": "42-2", "reruns": {"rip": {"first_failure": 1}}},
+                    {"run": "42-2", "reruns": {"rip": record["rip"] | {"runs": 0}}},
+                    {"run": "42-2", "reruns": {"rip": record["rip"] | {"phantoms": -1}}},
                     {"run": "42-1", "reruns": []}):
             number = int(bad["run"][-1])
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -669,7 +774,7 @@ class PublicationContracts(unittest.TestCase):
 
     def test_release_body_lists_reruns_with_their_first_failure(self):
         reruns = {"rip": {"first_failure": "rip failed: OSPF never converged",
-                          "first_job": "https://github.com/Velstra/sentinel/actions/runs/42/job/7"}}
+                          "first_job": "https://github.com/Velstra/sentinel/actions/runs/42/job/7", "runs": 34}}
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(__import__("shutil").rmtree, directory)
         (directory / "source-checks.json").write_text(json.dumps({"checks": [], "reruns": reruns}))
@@ -677,7 +782,12 @@ class PublicationContracts(unittest.TestCase):
             self.assertEqual(publisher.rerun_statement(directory),
                              "Regression checks re-run once after a failure: rip (first failure: "
                              "rip failed: OSPF never converged; attempt-1 log: "
-                             "https://github.com/Velstra/sentinel/actions/runs/42/job/7).")
+                             "https://github.com/Velstra/sentinel/actions/runs/42/job/7; "
+                             "attempt 2 ran it 34 times (all passed)).")
+        self.assertEqual(publisher.rerun_count({"runs": 1, "phantoms": 33}),
+                         "attempt 2 ran it once (passed); 33 phantom entries were listed but never started")
+        self.assertEqual(publisher.rerun_count({"runs": 1, "phantoms": 1}),
+                         "attempt 2 ran it once (passed); 1 phantom entry was listed but never started")
         with patch.object(attempts, "current", return_value={}), \
                 self.assertRaisesRegex(ValueError, "re-run"):
             publisher.rerun_statement(directory)
@@ -685,12 +795,49 @@ class PublicationContracts(unittest.TestCase):
         with patch.object(attempts, "current", return_value={}):
             self.assertEqual(publisher.rerun_statement(directory), "")
 
+    def test_publication_reads_retry_server_errors_but_writes_never_repeat(self):
+        # The class the publisher catches: the module loader above can leave
+        # this test process with a second copy of urllib.error.
+        HTTPError = publisher.HTTPError
+
+        class Reply:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def read(self): return b'{"status": "identical"}'
+
+        def opener(errors):
+            calls = []
+
+            class Opener:
+                def open(self, request, timeout):
+                    calls.append(request.get_method())
+                    error = next(errors)
+                    if error:
+                        raise HTTPError(request.full_url, error, "server error", {}, None)
+                    return Reply()
+            return calls, Opener()
+
+        with patch.dict(os.environ, {"GH_TOKEN": "test-only"}):
+            calls, fake = opener(iter([502, 502, None]))
+            waits = []
+            with patch.object(publisher, "build_opener", return_value=fake):
+                self.assertEqual(publisher.api("repos/x/compare/a...main", sleep=waits.append), {"status": "identical"})
+            self.assertEqual((calls, waits), (["GET"] * 3, [5, 10]))
+            calls, fake = opener(iter([502] * 5))
+            with patch.object(publisher, "build_opener", return_value=fake), \
+                    self.assertRaisesRegex(ValueError, "failed 5 times"):
+                publisher.api("repos/x/compare/a...main", sleep=lambda s: None)
+            calls, fake = opener(iter([502, None]))
+            with patch.object(publisher, "build_opener", return_value=fake), self.assertRaises(HTTPError):
+                publisher.api("repos/x/releases", {"draft": True}, method="POST", sleep=lambda s: None)
+            self.assertEqual(calls, ["POST"], "a write is never repeated")
+
     def test_cross_run_artifact_is_refused_before_download(self):
         metadata = {"expired": False, "workflow_run": {"id": 1, "head_sha": "a" * 40},
                     "digest": "sha256:" + "b" * 64, "size_in_bytes": 100}
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(transfer.subprocess, "check_output", return_value=json.dumps(metadata)), \
-                patch.object(transfer.subprocess, "run") as download, \
+                patch.object(transfer.release_attempts, "gh_get", return_value=json.dumps(metadata)), \
+                patch.object(transfer.release_attempts, "gh_download") as download, \
                 patch.dict(os.environ, {"GITHUB_REPOSITORY": "Velstra/sentinel", "GITHUB_RUN_ID": "2",
                                         "GITHUB_SHA": "a" * 40, "RELEASE_ARTIFACT_BYTE_BUDGET": "1000"}):
             with self.assertRaisesRegex(ValueError, "another run"):

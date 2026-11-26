@@ -5,7 +5,6 @@ import json
 import os
 import re
 from pathlib import Path
-import subprocess
 import sys
 from urllib.parse import quote
 
@@ -110,7 +109,7 @@ def response_document(raw):
 
 
 def api(path):
-    return response_document(subprocess.check_output(["gh", "api", "--include", path], text=True, timeout=30))
+    return response_document(release_attempts.gh_get(["--include", path]))
 
 
 if __name__ == "__main__":
@@ -123,7 +122,7 @@ if __name__ == "__main__":
     if environment.get("name") != args.environment or type(environment.get("id")) is not int:
         raise ValueError("environment identity mismatch")
     single = single_operator_enabled()
-    validate(environment, api(root + "/deployment-branch-policies?per_page=100"), single)
+    validate(environment, api(root + f"/deployment-branch-policies?per_page={release_attempts.PAGE_SIZE}"), single)
     if args.approved:
         reruns = approved(environment, api(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
                                            f"{os.environ['GITHUB_RUN_ID']}/approvals"),
