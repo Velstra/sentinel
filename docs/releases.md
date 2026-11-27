@@ -17,9 +17,17 @@ gh run watch RUN_ID --exit-status
 The version's base must match `Cargo.toml`. Tag pushes build and test only.
 A main-branch dispatch additionally requests production signing approval.
 `publish=false` never creates a GitHub Release. A failed check blocks the
-subsequent jobs. Failed regression checks may be run once more in the same run
-([one re-run](#one-re-run-of-failed-regression-checks)); for anything else, or
-a third attempt, start a new run instead of reusing an earlier approval.
+subsequent jobs. A failed job may be run again in the same run, up to run
+attempt 3 ([re-runs](#re-runs-after-a-failure)); for anything else, start a
+new run instead of reusing an earlier approval.
+
+The regression checks, and only they, may run on self-hosted ephemeral
+runners instead of GitHub's ([regression runners](#regression-runners)):
+
+```sh
+gh workflow run release-community.yml --ref main -f version=v1.0.0 -F publish=true \
+  -f regression_runner=velstra-rel-LABEL
+```
 
 To publish, dispatch the same action with `-F publish=true`. This performs a
 new complete qualification and requires independent environment approvals
@@ -78,8 +86,8 @@ For each of `community-signing`, `community-attestation` and
 - the same branch policies as above: `main`, optionally tag `v*`.
 
 Each signing, attestation and publication job still requires a real
-`approved` review of the current run in its own environment by a GitHub
-`User` account. The maintainer may approve their own run, but the job having
+`approved` review in its own environment by a GitHub `User` account, one for
+each time the job runs ([approvals](#re-runs-after-a-failure)). The maintainer may approve their own run, but the job having
 started is never taken as an approval. The release body ends with
 "Release approvals: single-operator mode (one maintainer, wait timer ≥ 30
 min).", and each environment check writes the same line as a run annotation.
@@ -113,9 +121,16 @@ silently drops newly added tests. A check whose build prints nothing for 30
 minutes is taken for a hung runner: the build is killed and started once more
 in the same job. A second stall, or any failure of the check itself, fails the
 job; the job itself never retries a failed check. The check's receipt and the
-release notes name every check that was retried. A regression job's 240-minute
-timeout fails the release. A checkout that cannot reach github.com is retried
-once after a two-minute pause.
+release notes name every check that was retried. A regression job that hits
+its 240-minute timeout is stopped (it may be [run again](#re-runs-after-a-failure)).
+A checkout that cannot reach github.com is retried once after a two-minute
+pause.
+
+The image build, the installer ISO build and the exact-disk boot gate are
+watched the same way: 30 minutes without output kills the build, which starts
+once more in the same job (Nix keeps what it had finished). A second stall, or
+any failure, fails the job. `image-evidence.json` records each retry under
+`stall_retries`, and the release notes name the retried builds.
 
 Build, firmware signing, packaging/VM execution, checksum signing and
 publication use fresh separate runners. VM execution receives no private keys;
@@ -135,35 +150,113 @@ revalidated before checksum signing and again before publication.
 Upload happens into a draft; every uploaded byte is downloaded and checked
 before the release becomes visible. Failed uploads leave a draft for review.
 
-## One re-run of failed regression checks
+## Re-runs after a failure
 
-A run whose regression jobs failed may be continued once with GitHub's
-**Re-run failed jobs** (`gh run rerun RUN_ID --failed`), which makes run
-attempt 2. In that attempt:
+A run whose jobs failed may be continued with GitHub's **Re-run failed jobs**
+(`gh run rerun RUN_ID --failed`), which makes run attempt 2, and once more,
+attempt 3. `scripts/release_attempts.py` reads from GitHub's job listings
+which job ran in which attempt and refuses anything else:
 
-- only regression jobs that *failed* in attempt 1 run again; one that was
-  cancelled or timed out, or any other change, makes the release refuse;
-- the plan, the build and every regression that passed come from attempt 1:
-  the build is never repeated, and the release signs the attempt-1 build;
-- sign, package, seal and publish run for the first time, so every
-  environment approval is requested again;
-- a regression job that fails again blocks the release; there is no attempt 3.
-- GitHub may list a re-run job more than once in attempt 2. Every entry that
-  got a runner must finish green, and at least one must. An entry that never
-  got a runner is a phantom: it is ignored once the run has moved on to sign,
-  which shows GitHub no longer waits for it. The release notes say how many
-  times attempt 2 ran the check and how many phantom entries it listed.
+- a job that *failed* (or timed out) may run again in the next attempt: a
+  regression check, the build, or sign, package, seal and publish. A
+  regression check thus runs at most twice more after its first failure.
+  GitHub reports a job that hit its `timeout-minutes` as *cancelled*; the
+  policy reads the job's annotations and counts it as timed out only when
+  GitHub's own "The job has exceeded the maximum execution time of …" is
+  there, and fails closed when it cannot read them. Any other cancelled job,
+  or a plan that failed, makes the release refuse: start a new run;
+- every job that passed is carried over unchanged into each later attempt and
+  is never run again: the plan, a build that passed (the release signs that
+  one), every passing regression, and sign, package or seal once they passed.
+  GitHub lists a carried-over job again with a new ID, so it counts as carried
+  over when its name, start, end and conclusion match its earlier entry;
+- a release job that was only skipped, because an earlier one failed, runs for
+  the first time;
+- a job that fails in attempt 3 blocks the release; there is no attempt 4.
+- GitHub may list a re-run job more than once. Every entry that got a runner
+  must finish green, and at least one must. An entry that never got a runner
+  is a phantom: it is ignored once the run has moved on to sign, which shows
+  GitHub no longer waits for it, and always in an earlier attempt.
 
-Before signing, and again before sealing and publishing, the workflow reads
-from GitHub's job listings which job ran in which attempt and refuses anything
-else. GitHub lists every carried-over job again in attempt 2, with a new ID,
-so a job counts as carried over when its name, start, end and conclusion match
-attempt 1. The packaged `source-checks.json` records each re-run check with its
-first failure and the link to its attempt-1 log, and the release notes list
-them: "Regression checks re-run once after a failure: CHECK (first failure:
-...; attempt-1 log: ...)". Check receipts and the build are kept for one day,
-so a re-run must reach packaging within a day of attempt 1; later, start a new
-run.
+**Approvals.** Every run of sign, seal or publish needs an approval of its
+own, given in the attempt that runs it; GitHub asks for it again whenever such
+a job runs again. GitHub's review history for a run covers all its attempts and
+says neither when nor in which attempt a review was given; a wait timer that
+elapsed is listed as an approval by `github-actions[bot]`. So
+`check_release_environment.py --approved` counts: the human approvals in the
+job's environment must equal the number of times its job got a runner in this
+run, the run now included. An approval from an earlier attempt can never stand
+in for the run now. A rejected review closes the gate: its job fails without a
+runner, makes no run, and may run again in the next attempt with a new
+approval.
+
+In the two-person mode each run's approval must come from someone who neither
+dispatched the run nor started the attempt of that run; GitHub's run-attempt
+records say who did. As the history does not say which approval belongs to
+which run, the check requires that the approvers can be matched to the runs
+that way. In [single-operator mode](#single-operator-mode) the maintainer
+dispatches, approves and starts every re-run; only the count applies.
+
+**Bytes.** Each job takes its input by artifact ID and digest from the job
+before it, whichever attempt that one ran in: sign takes the build's, package
+the signed disk, seal the tested release and publish the sealed one. Each
+attempt uploads these under its own name (`...-attempt-N`), so a job that runs
+again never meets its earlier upload and no artifact is ever replaced. The
+check receipts keep their names: the receipt upload is a regression job's last
+step, so a failed job never made one. The re-run package boot-tests the disk
+under a new run nonce.
+
+The packaged `source-checks.json` records each regression check run again,
+with its first failure, the attempt it first failed in, the link to that log
+and the attempts that ran it again; its receipt must come from the last of
+them. Seal and publish compare that record with GitHub's listings, and take
+the attempt that packaged the bundle from them. The release notes list every
+job run again: "Regression checks re-run after a failure: CHECK (first
+failure, attempt 1: ...; log: ...; ran again once in attempt 2 and passed)",
+and "Release jobs re-run after a failure: JOB (first failure, attempt 2: ...;
+log: ...; ran again in attempt 3)". Check receipts and the build are kept for
+one day, so a re-run must reach packaging within a day of the checks; later,
+start a new run.
+
+## Regression runners
+
+The dispatch input `regression_runner` chooses the runners of the regression
+checks: `github` (the default, and always for tag pushes) keeps them on
+GitHub-hosted `ubuntu-24.04`, at most 19 at a time. A label matching
+`velstra-rel-[a-z0-9]{8,32}` runs them on `[self-hosted, linux, x64, LABEL]`,
+self-hosted ephemeral runners registered for that run, at most 40 at a time.
+The plan job validates the value and fails closed on anything else.
+
+Plan, build, sign, package, seal and publish always run on GitHub-hosted
+`ubuntu-24.04` (a workflow test enforces it), and every one of their release
+commands refuses to run unless `RUNNER_ENVIRONMENT` is `github-hosted`. No
+signing key, no signed byte and no release artifact reaches a self-hosted
+runner. The regression job holds no secret: its token can only read the
+repository (`permissions: contents: read`), and it writes nothing but its
+check receipt.
+
+What a self-hosted runner can do is lie about a regression result. The
+receipts of self-hosted regressions are only as trustworthy as those runners:
+each is ephemeral (one job, then discarded), exists only for the run, and is
+reachable only through the run's own label, so no earlier job or other
+workflow can have left anything on it. `source-checks.json` records the runner
+class and label, seal and publish check that record against the plan's own
+outputs, and the release notes say it: "Regression checks ran on self-hosted
+ephemeral runners (runner label velstra-rel-...)".
+
+A self-hosted runner must provide: Ubuntu 24.04 x86-64 with systemd and udev;
+labels `self-hosted`, `linux`, `x64` and the run's label; `/dev/kvm` usable by
+the job and the Nix build users; `git`, `curl`, `xz-utils` and `python3` 3.11
+or newer; a clock kept by NTP; outbound HTTPS to github.com and its Actions
+services, releases.nixos.org and cache.nixos.org; at least 4 vCPUs, 16 GB of
+memory and 100 GB of disk. Either no Nix, and passwordless `sudo` for the
+installer, or Nix 2.35.4 preinstalled as a multi-user daemon whose `nix.conf`
+enables `nix-command flakes` and keeps the default system features
+(`nixos-test benchmark big-parallel kvm`): the install step then does nothing.
+The AppArmor user-namespace restriction must be lifted, or `sudo` allowed for
+`sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`; the step needs no
+`sudo` when it is already lifted. The job user need not be a trusted Nix
+user; the daemon may then not honour the job's `--max-jobs` and `--cores`.
 
 ## Explicit limitations
 

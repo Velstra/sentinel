@@ -58,6 +58,42 @@ REQUIRED_SAFETY_CHECKS = frozenset({
 STALL_SECONDS = 30 * 60
 # A stalled build is started once more, never more; a failed one never is.
 STALL_RETRIES = 1
+# The long release builds, watched like the checks, as image-evidence.json
+# records them.
+BUILD_STAGES = ("image-build", "installer-iso", "boot-gate")
+
+# Where the regression checks run. `github` keeps them on GitHub's runners;
+# a label of this form selects self-hosted ephemeral runners for them, and
+# only for them.
+GITHUB_RUNNER = "github"
+HOSTED_LABEL = "ubuntu-24.04"
+SELF_HOSTED_LABEL = re.compile(r"velstra-rel-[a-z0-9]{8,32}")
+# GitHub Free runs 20 hosted jobs at once, and build runs alongside the
+# regressions. Self-hosted regressions leave all hosted slots to the release;
+# a self-hosted pool can only grow for jobs GitHub has queued, so the bound is
+# the pool size, not lower.
+HOSTED_PARALLEL = 19
+SELF_HOSTED_PARALLEL = 40
+
+
+def regression_runner(value):
+    """What runs the regression checks: the runs-on value, the parallelism and
+    the record the release keeps of it. Anything unexpected fails closed."""
+    if value == GITHUB_RUNNER:
+        return {"runner": value, "runs_on": HOSTED_LABEL, "max_parallel": HOSTED_PARALLEL,
+                "record": {"class": "github-hosted", "label": HOSTED_LABEL}}
+    if not isinstance(value, str) or not SELF_HOSTED_LABEL.fullmatch(value):
+        raise ValueError(f"regression runner must be {GITHUB_RUNNER!r} or match {SELF_HOSTED_LABEL.pattern}")
+    return {"runner": value, "runs_on": ["self-hosted", "linux", "x64", value],
+            "max_parallel": SELF_HOSTED_PARALLEL, "record": {"class": "self-hosted-ephemeral", "label": value}}
+
+
+def runner_outputs(value):
+    """The plan job's outputs for the runner choice, one validated line each."""
+    runner = regression_runner(value)
+    return (f"regression_runner={runner['runner']}\n"
+            f"regression_runs_on={json.dumps(runner['runs_on'], separators=(',', ':'))}\n"
+            f"regression_max_parallel={runner['max_parallel']}\n")
 
 
 class Stalled(RuntimeError):
@@ -200,29 +236,52 @@ def output_path(result):
     return Path(paths[0])
 
 
-def build(expression, **variables):
+def watched(expression, label, variables):
+    """Build under the stall watchdog: (output, stall retries). Only a stall is
+    retried, at most STALL_RETRIES times; a build that fails stays failed,
+    whatever the reason."""
     env = os.environ | {"SENTINEL_RELEASE_SOURCE": str(ROOT)} | variables
-    return output_path(run(*nix_build_command(expression), env=env, capture=True))
-
-
-def build_check(expression, **variables):
-    """Build one regression check under the stall watchdog: (output, stall retries).
-    Only a stall is retried, at most STALL_RETRIES times; a check whose build
-    fails stays failed, whatever the reason."""
-    env = os.environ | {"SENTINEL_RELEASE_SOURCE": str(ROOT)} | variables
-    name = variables.get("SENTINEL_CHECK", "unknown")
     for attempt in range(STALL_RETRIES + 1):
         try:
             result = run_watched(nix_build_command(expression), env, STALL_SECONDS)
         except Stalled:
             if attempt == STALL_RETRIES:
-                print(f"::error title=Stalled build::{name}: no build output for "
-                      f"{STALL_SECONDS // 60} min again after a retry; the check fails", flush=True)
+                print(f"::error title=Stalled build::{label}: no build output for "
+                      f"{STALL_SECONDS // 60} min again after a retry; the build fails", flush=True)
                 raise
-            print(f"::warning title=Stalled build retried::{name}: no build output for "
+            print(f"::warning title=Stalled build retried::{label}: no build output for "
                   f"{STALL_SECONDS // 60} min; killed the build and started it once more", flush=True)
             continue
         return output_path(result), attempt
+
+
+def build(expression, label, **variables):
+    """One long release build (image, installer ISO, boot gate) under the
+    stall watchdog: (output, stall retries)."""
+    return watched(expression, label, variables)
+
+
+def build_check(expression, **variables):
+    """Build one regression check under the stall watchdog: (output, stall retries)."""
+    return watched(expression, variables.get("SENTINEL_CHECK", "unknown"), variables)
+
+
+def stall_retries(receipt):
+    """A receipt's stall retries: 0 when it records none."""
+    value = receipt.get("stall_retries", 0)
+    if type(value) is not int or not 0 <= value <= STALL_RETRIES:
+        raise ValueError("invalid stall retry record")
+    return value
+
+
+def build_stalls(evidence):
+    """The stall retries of every long release build, exactly as recorded."""
+    stalls = evidence.get("stall_retries")
+    if not isinstance(stalls, dict) or sorted(stalls) != sorted(BUILD_STAGES):
+        raise ValueError("incomplete release build stall record")
+    for stage in BUILD_STAGES:
+        stall_retries({"stall_retries": stalls[stage]})
+    return stalls
 
 
 SELF = 'let self = builtins.getFlake (builtins.getEnv "SENTINEL_RELEASE_SOURCE"); '
@@ -232,10 +291,10 @@ def build_image(args):
     sha = source()
     release = version(args.version)
     args.output.mkdir(parents=True, exist_ok=False)
-    output = build(SELF + '''cfg = self.nixosConfigurations.sentinel-image.extendModules {
+    output, stalls = build(SELF + '''cfg = self.nixosConfigurations.sentinel-image.extendModules {
       modules = [ ({ lib, ... }: { velstra.appliance.imageVersion = lib.mkForce
         (builtins.getEnv "SENTINEL_RELEASE_VERSION"); }) ];
-      }; in cfg.config.system.build.finalImageSigned''', SENTINEL_RELEASE_VERSION=release[1:])
+      }; in cfg.config.system.build.finalImageSigned''', "image build", SENTINEL_RELEASE_VERSION=release[1:])
     images = list(output.rglob("*.raw"))
     if len(images) != 1:
         raise ValueError("expected one factory image")
@@ -243,7 +302,7 @@ def build_image(args):
     run("zstd", "-T4", "-6", images[0], "-o", args.output / "factory.raw.zst")
     document(args.output / "build.json", {"schema": 1, "source": sha, "version": release,
              "raw_sha256": digest(images[0]), "compressed_sha256": digest(args.output / "factory.raw.zst"),
-             "trust": "factory-test-keys-not-for-publication"})
+             "trust": "factory-test-keys-not-for-publication", "stall_retries": stalls})
 
 
 def decompress(path, target):
@@ -307,7 +366,8 @@ def sign_image(args):
         verify_image(image, identity, release)
         run("zstd", "-T4", "-6", image, "-o", args.output / "signed.raw.zst")
         document(args.output / "signed.json", {"schema": 1, "source": sha, "version": release,
-                 "raw_sha256": digest(image), "compressed_sha256": digest(args.output / "signed.raw.zst")})
+                 "raw_sha256": digest(image), "compressed_sha256": digest(args.output / "signed.raw.zst"),
+                 "build_stall_retries": stall_retries(receipt)})
     public = args.output / "identity"
     public.mkdir()
     for name in ("PK", "KEK", "db"):
@@ -349,18 +409,18 @@ def package(args):
         qcow = args.output / f"{prefix}.qcow2"
         convert_qcow(image, qcow)
         store = run("nix", "store", "add-path", image, capture=True)
-        output = build(SELF + '''cfg = self.nixosConfigurations.sentinel-iso.extendModules {
+        output, iso_stalls = build(SELF + '''cfg = self.nixosConfigurations.sentinel-iso.extendModules {
           modules = [ ({ lib, ... }: { velstra.iso.imageSource = lib.mkForce (toString
             (builtins.storePath (builtins.getEnv "SENTINEL_SIGNED_IMAGE")));
             velstra.iso.label = lib.mkForce (builtins.getEnv "SENTINEL_RELEASE_VERSION"); }) ];
-          }; in cfg.config.system.build.isoImage''', SENTINEL_SIGNED_IMAGE=store,
+          }; in cfg.config.system.build.isoImage''', "installer ISO", SENTINEL_SIGNED_IMAGE=store,
           SENTINEL_RELEASE_VERSION=release[1:])
         iso = list(output.rglob("*.iso"))
         if len(iso) != 1:
             raise ValueError("expected one installer ISO")
         shutil.copyfile(iso[0], args.output / f"{prefix}.iso")
         verify_iso(iso[0], Path(store).name, receipt["raw_sha256"], Path(temp))
-        gate = build(SELF + '''pkgs = self.nixosConfigurations.appliance.pkgs;
+        gate, gate_stalls = build(SELF + '''pkgs = self.nixosConfigurations.appliance.pkgs;
           test = import (self.outPath + "/nix/release-image-boot.nix") {
             inherit self pkgs; signedImage = builtins.storePath (builtins.getEnv "SENTINEL_SIGNED_IMAGE");
             expectedSha256 = builtins.getEnv "SENTINEL_RAW_SHA256";
@@ -368,7 +428,7 @@ def package(args):
             kekCert = builtins.toPath (builtins.getEnv "SENTINEL_KEK_CERT");
             dbCert = builtins.toPath (builtins.getEnv "SENTINEL_DB_CERT");
           }; in test.overrideTestDerivation (_: { SENTINEL_RELEASE_RUN =
-            builtins.getEnv "SENTINEL_RELEASE_RUN"; })''',
+            builtins.getEnv "SENTINEL_RELEASE_RUN"; })''', "boot gate",
           SENTINEL_RELEASE_RUN=os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"],
           SENTINEL_SIGNED_IMAGE=store, SENTINEL_RAW_SHA256=receipt["raw_sha256"],
           SENTINEL_PK_CERT=str(identity / "PK.crt"), SENTINEL_KEK_CERT=str(identity / "KEK.crt"),
@@ -388,6 +448,8 @@ def package(args):
         "boot_test_output": str(gate), "tested_at": int(time.time()),
         "disk_secure_boot": True, "installer_secure_boot": False,
         "qcow2_byte_equivalent": True, "iso_embedded_raw_verified": True,
+        "stall_retries": {"image-build": stall_retries({"stall_retries": receipt.get("build_stall_retries", 0)}),
+                          "installer-iso": iso_stalls, "boot-gate": gate_stalls},
         "scope": "exact-disk-secure-boot-and-blessing; source-regressions-are-separate"})
     (args.output / "INSTALL.txt").write_text(
         "Verify SHA256SUMS.gpg with the independently obtained release key, then SHA256SUMS.\n"
@@ -442,6 +504,7 @@ def validate_bundle(directory):
             or evidence.get("qcow2_byte_equivalent") is not True or evidence.get("iso_embedded_raw_verified") is not True
             or digest(directory / f"{prefix}.raw.zst") != evidence.get("compressed_sha256")):
         raise ValueError("incomplete image/format verification")
+    build_stalls(evidence)
     boot = json.loads((directory / "release-image-boot.json").read_text())
     if (boot.get("complete") is not True or len(boot.get("boots", [])) != 2
             or [r.get("number") for r in boot["boots"]] != [1, 2]
@@ -452,9 +515,17 @@ def validate_bundle(directory):
     checks = json.loads((directory / "source-checks.json").read_text())
     if checks.get("source") != evidence["source"]:
         raise ValueError("source checks do not belong to this workflow run")
+    # The plan job's outputs say where the regressions ran, independently of the bundle.
+    if checks.get("regression_runner") != regression_runner(os.environ["RELEASE_REGRESSION_RUNNER"])["record"]:
+        raise ValueError("the bundle names other regression runners than the plan")
     # The immutable plan job supplies the catalog independently of the bundle.
     names = json.loads(os.environ["RELEASE_CHECK_CATALOG"])["check"]
-    expected = expected_receipt_runs(checks, names, os.environ["GITHUB_RUN_ID"], release_attempts.attempt())
+    # Package may have run in an earlier attempt than this job; GitHub says which.
+    record = release_attempts.current()
+    expected = expected_receipt_runs(checks, names, os.environ["GITHUB_RUN_ID"],
+                                     release_attempts.ran_in(record, "package"))
+    if rerun_attempts(checks.get("reruns", {})) != rerun_attempts(record["checks"]):
+        raise ValueError("the bundle's re-run record differs from this run's jobs")
     validate_checks(checks.get("checks"), names, evidence["source"], expected)
     provenance = json.loads((directory / "source-sbom.provenance.json").read_text())
     if (provenance.get("source_commit") != evidence["source"] or provenance.get("scope") != "source-lockfiles"
@@ -493,20 +564,37 @@ def validate_catalog(names):
         raise ValueError("release catalog omits mandatory safety checks: " + ", ".join(sorted(missing)))
 
 
-def expected_receipt_runs(checks, names, run_id, number):
+def valid_rerun(entry, package):
+    """A regression re-run record a bundle packaged in attempt `package` may hold."""
+    attempts = entry.get("attempts") if isinstance(entry, dict) else None
+    return (isinstance(entry.get("first_failure"), str) and isinstance(entry.get("first_job"), str)
+            and type(entry.get("failed_in")) is int and entry["failed_in"] == 1
+            and isinstance(attempts, list) and attempts
+            and all(type(n) is int for n in attempts) and attempts == sorted(set(attempts))
+            and 2 <= attempts[0] and attempts[-1] <= package
+            and type(entry.get("runs")) is int and entry["runs"] >= len(attempts)
+            and type(entry.get("phantoms", 0)) is int and entry.get("phantoms", 0) >= 0)
+
+
+def rerun_attempts(reruns):
+    """{check: the attempts that ran it again}, the part of a re-run record
+    the bundle and GitHub must agree on."""
+    if not isinstance(reruns, dict):
+        raise ValueError("malformed re-run record")
+    return {check: entry.get("attempts") if isinstance(entry, dict) else None for check, entry in reruns.items()}
+
+
+def expected_receipt_runs(checks, names, run_id, package):
     """{check: the run nonce its receipt must carry}, from the bundle's re-run
-    record: attempt 1 for every check, except attempt 2 for a check re-run after
-    a failure. Only attempt 2 may record re-runs, and it must record one."""
+    record: attempt 1 for every check, except the attempt that last ran a
+    check re-run after a failure. `package` is the attempt that packaged the
+    bundle; no record may name a later one."""
     reruns = checks.get("reruns", {})
-    if (checks.get("run") != f"{run_id}-{number}" or not isinstance(reruns, dict)
-            or (number == 1) != (not reruns) or not set(reruns) <= set(names)
-            or any(not isinstance(entry, dict) or not isinstance(entry.get("first_failure"), str)
-                   or not isinstance(entry.get("first_job"), str)
-                   or type(entry.get("runs")) is not int or entry["runs"] < 1
-                   or type(entry.get("phantoms", 0)) is not int or entry.get("phantoms", 0) < 0
-                   for entry in reruns.values())):
+    if (checks.get("run") != f"{run_id}-{package}" or not isinstance(reruns, dict)
+            or not set(reruns) <= set(names)
+            or any(not isinstance(entry, dict) or not valid_rerun(entry, package) for entry in reruns.values())):
         raise ValueError("source checks do not belong to this workflow run or record its re-runs wrongly")
-    return {name: f"{run_id}-{2 if name in reruns else 1}" for name in names}
+    return {name: f"{run_id}-{reruns[name]['attempts'][-1] if name in reruns else 1}" for name in names}
 
 
 def validate_checks(receipts, names, sha, nonce):
@@ -533,8 +621,9 @@ def aggregate(args):
     run_id, number = os.environ["GITHUB_RUN_ID"], release_attempts.attempt()
     # Which jobs came from which attempt, as GitHub reports it, not as the
     # downloaded receipts say.
-    reruns = release_attempts.current()
+    reruns = release_attempts.current()["checks"]
     summary = {"source": sha, "run": f"{run_id}-{number}", "checks": receipts,
+               "regression_runner": regression_runner(os.environ["RELEASE_REGRESSION_RUNNER"])["record"],
                "scope": "source-regressions-not-exact-final-disk-tests"}
     if reruns:
         summary["reruns"] = reruns
@@ -542,16 +631,26 @@ def aggregate(args):
     document(args.output, summary)
 
 
+# Every command that builds, signs, packages, seals or publishes.
+HOSTED_ONLY = ("build", "sign", "package", "aggregate", "validate", "seal", "verify")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build", "sign", "package", "checks", "aggregate", "validate", "seal", "verify", "budget"])
+    parser.add_argument("command", choices=["build", "sign", "package", "checks", "aggregate", "validate", "seal",
+                                            "verify", "budget", "runner"])
     parser.add_argument("--version")
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--identity", type=Path)
     parser.add_argument("--check")
+    parser.add_argument("--runner")
     args = parser.parse_args()
-    if args.command == "build": build_image(args)
+    # Only the regression checks may run on self-hosted runners.
+    if args.command in HOSTED_ONLY:
+        release_attempts.require_github_hosted()
+    if args.command == "runner": sys.stdout.write(runner_outputs(args.runner))
+    elif args.command == "build": build_image(args)
     elif args.command == "sign": sign_image(args)
     elif args.command == "package": package(args)
     elif args.command == "checks": checks(args)

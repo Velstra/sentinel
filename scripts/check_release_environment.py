@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Require an actually protected release environment, not just a YAML name."""
 import argparse
+import itertools
 import json
 import os
 import re
@@ -20,6 +21,10 @@ import release_attempts  # noqa: E402
 # carry, so a run started with a stolen token cannot release before the owner
 # can reject it.
 SINGLE_OPERATOR_MIN_WAIT_MINUTES = 30
+# A run of this workflow has at most a handful of runs per protected job.
+MAX_MATCHED_RUNS = 6
+# The one job each environment admits.
+ENVIRONMENT_JOBS = {"community-signing": "sign", "community-attestation": "seal", "community-publish": "publish"}
 
 
 def single_operator_enabled():
@@ -72,32 +77,58 @@ def validate(environment, branches, single_operator=False):
         raise ValueError("only main and optional v* tags may enter the release environment")
 
 
-def approval(environment, history, actors, single_operator=False):
+def matched(logins, runs):
+    """Some order of the approvers gives every run an approver it allows."""
+    return any(all(login not in forbidden for login, forbidden in zip(order, runs))
+               for order in itertools.permutations(logins))
+
+
+def approval(environment, history, actors, single_operator=False, runs=1):
+    """A human approval in this environment for each run its job has had in
+    this run, the run now included. `runs` is how many, or, per run, the
+    logins that may not approve it (who dispatched the run and who started
+    that run's attempt); a count stands for runs all forbidding `actors`.
+
+    GitHub's review history covers every attempt of the run and says neither
+    when nor in which attempt a review was given (run 45868284650). So the
+    approvals are counted: one per run, never one shared by two runs. A wait
+    timer that elapsed is listed as an approval by github-actions[bot] and
+    counts for nothing; a rejected review closed the gate, so its job never
+    got a runner, made no run and may run again with a new approval."""
     if not isinstance(history, list):
         raise ValueError("approval history unavailable")
-    relevant = [r for r in history if any(e.get("id") == environment.get("id")
-                for e in r.get("environments", []))]
-    if single_operator:
-        # The one maintainer may approve their own run, but the approval must
-        # exist: a job that merely started (bypass, no rule) is not one.
-        if (not relevant or any(r.get("state") != "approved" for r in relevant)
-                or not any(r.get("user", {}).get("type") == "User" and r["user"].get("login")
-                           for r in relevant)):
-            raise ValueError("an actual human approval for this run is required")
-        return
-    if (not relevant or any(r.get("state") != "approved" for r in relevant)
-            or not any(r.get("user", {}).get("type") == "User"
-                       and r["user"].get("login") and r["user"]["login"] not in actors for r in relevant)):
-        raise ValueError("an actual independent human approval for this run is required")
+    if type(runs) is int:
+        runs = [set(actors)] * runs
+    relevant = [r for r in history if isinstance(r, dict) and any(
+        isinstance(e, dict) and e.get("id") == environment.get("id") for e in r.get("environments") or [])]
+    if any(r.get("state") not in ("approved", "rejected") for r in relevant):
+        raise ValueError("an actual human approval for this run is required")
+    humans = [r["user"]["login"] for r in relevant if r.get("state") == "approved"
+              and isinstance(r.get("user"), dict) and r["user"].get("type") == "User"
+              and isinstance(r["user"].get("login"), str) and r["user"]["login"]]
+    if not runs or len(humans) != len(runs) or len(runs) > MAX_MATCHED_RUNS:
+        raise ValueError(f"{len(humans)} human approval(s) for {len(runs)} run(s) of this job in this run; "
+                         "every run needs an approval of its own")
+    # The one maintainer may approve their own run, but the approval must
+    # exist: a job that merely started (bypass, no rule) is not one.
+    if not single_operator and not matched(humans, runs):
+        raise ValueError("an actual independent human approval for each run is required")
 
 
-def approved(environment, history, actors, single_operator=False):
-    """An approval for this job, in an attempt the re-run policy allows: the
-    first, or the one re-run of failed regression jobs, whose downstream jobs
-    never ran before and so carry no older approval. Returns the re-runs."""
-    reruns = release_attempts.current()
-    approval(environment, history, actors, single_operator)
-    return reruns
+def approved(environment, history, actors, single_operator=False, job=None):
+    """The approvals for this job on a GitHub-hosted runner, in an attempt the
+    re-run policy allows: one per run of the job, each by someone who neither
+    dispatched the run nor started that run's attempt (GitHub says who did).
+    `actors` are this attempt's, as the job sees them. Returns the re-run record."""
+    record = release_attempts.current()
+    release_attempts.require_github_hosted()
+    if record["attempt"] == 1:
+        runs = [set(actors)]
+    else:
+        runs = [set(record["actors"][n - 1]) | (set(actors) if n == record["attempt"] else set())
+                for n in record["gates"].get(job, [])]
+    approval(environment, history, actors, single_operator, runs)
+    return record
 
 
 def response_document(raw):
@@ -124,11 +155,13 @@ if __name__ == "__main__":
     single = single_operator_enabled()
     validate(environment, api(root + f"/deployment-branch-policies?per_page={release_attempts.PAGE_SIZE}"), single)
     if args.approved:
-        reruns = approved(environment, api(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+        record = approved(environment, api(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
                                            f"{os.environ['GITHUB_RUN_ID']}/approvals"),
-                          {os.environ.get("GITHUB_ACTOR"), os.environ.get("GITHUB_TRIGGERING_ACTOR")}, single)
-        if reruns:
-            print("::notice title=Re-run attempt::attempt 2 re-ran failed regression checks: "
-                  + ", ".join(sorted(reruns)))
+                          {os.environ.get("GITHUB_ACTOR"), os.environ.get("GITHUB_TRIGGERING_ACTOR")}, single,
+                          ENVIRONMENT_JOBS[args.environment])
+        rerun = sorted(record["checks"]) + sorted(record["jobs"])
+        if rerun:
+            print(f"::notice title=Re-run attempt::attempt {record['attempt']} follows failed jobs re-run: "
+                  + ", ".join(rerun))
     if single:
         print(f"::notice title={args.environment}::{approvals_statement()}")

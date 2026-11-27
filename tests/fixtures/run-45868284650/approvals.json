@@ -1,0 +1,30 @@
+[
+ {
+  "state": "approved",
+  "comment": "30 minute wait timer",
+  "user": {
+   "login": "github-actions[bot]",
+   "type": "Bot"
+  },
+  "environments": [
+   {
+    "id": 27774271127,
+    "name": "community-signing"
+   }
+  ]
+ },
+ {
+  "state": "approved",
+  "comment": "",
+  "user": {
+   "login": "maintainer",
+   "type": "User"
+  },
+  "environments": [
+   {
+    "id": 27774271127,
+    "name": "community-signing"
+   }
+  ]
+ }
+]
