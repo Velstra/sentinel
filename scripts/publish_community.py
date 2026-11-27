@@ -19,7 +19,8 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_release_environment import approvals_statement  # noqa: E402
-from community_release import STALL_SECONDS, digest, source, verify_bundle, version  # noqa: E402
+from community_release import (BUILD_STAGES, HOSTED_LABEL, STALL_SECONDS, build_stalls, digest,  # noqa: E402
+                               regression_runner, rerun_attempts, source, verify_bundle, version)
 import release_attempts  # noqa: E402
 
 
@@ -72,38 +73,92 @@ def stall_statement(directory):
             f"{STALL_SECONDS // 60} min; a failing check is never retried): " + ", ".join(retried) + ".")
 
 
+# How the release body names each long release build.
+BUILD_NAMES = {"image-build": "image build", "installer-iso": "installer ISO", "boot-gate": "boot gate"}
+
+
+def build_stall_statement(directory):
+    """Name the release builds that ran a second time after a stall, from the
+    verified bundle's image evidence."""
+    path = directory / "image-evidence.json"
+    if not path.exists():
+        return ""
+    stalls = build_stalls(json.loads(path.read_text()))
+    retried = [BUILD_NAMES[stage] for stage in BUILD_STAGES if stalls[stage] == 1]
+    if not retried:
+        return ""
+    return ("Release builds retried once after a stalled build (no output for "
+            f"{STALL_SECONDS // 60} min; a failing build is never retried): " + ", ".join(retried) + ".")
+
+
+def runner_statement(directory):
+    """Say which runners ran the regression checks, from the verified bundle,
+    whose record the plan's own outputs confirmed."""
+    path = directory / "source-checks.json"
+    if not path.exists():
+        raise ValueError("the bundle has no source check record")
+    record = json.loads(path.read_text()).get("regression_runner")
+    if record == regression_runner("github")["record"]:
+        return f"Regression checks and every release job ran on GitHub-hosted runners ({HOSTED_LABEL})."
+    if (not isinstance(record, dict) or record.get("class") != "self-hosted-ephemeral"
+            or regression_runner(record.get("label"))["record"] != record):
+        raise ValueError("the bundle does not say which runners ran the regression checks")
+    return f"Regression checks ran on self-hosted ephemeral runners (runner label {record['label']})."
+
+
+def attempts_text(attempts):
+    return f"attempt {attempts[0]}" if len(attempts) == 1 else \
+        "attempts " + ", ".join(str(n) for n in attempts[:-1]) + f" and {attempts[-1]}"
+
+
 def rerun_count(entry):
-    """How often attempt 2 ran a check, and how many entries it only listed."""
-    runs, phantoms = entry["runs"], entry.get("phantoms", 0)
-    text = "attempt 2 ran it once (passed)" if runs == 1 else f"attempt 2 ran it {runs} times (all passed)"
+    """How often later attempts ran a check again, and how many entries they
+    only listed. The policy has verified that its last attempt passed."""
+    attempts, runs, phantoms = entry["attempts"], entry["runs"], entry.get("phantoms", 0)
+    text = f"ran again {'once' if runs == 1 else f'{runs} times'} in {attempts_text(attempts)} and passed"
+    if len(attempts) > 1:
+        text += f" in attempt {attempts[-1]}"
     if phantoms:
         text += f"; {phantoms} phantom entr{'y was' if phantoms == 1 else 'ies were'} listed but never started"
     return text
 
 
+def first_failure_text(entry):
+    return (f"first failure, attempt {entry['failed_in']}: {entry['first_failure']}; "
+            f"log: {entry['first_job']}")
+
+
 def rerun_statement(directory):
-    """Name each regression check re-run after a failure, with its first error
-    and the attempt-1 log. The verified bundle's record must match what GitHub
-    reports for this run."""
+    """Name each job run again after a failure, with its first error and log:
+    the regression checks as the verified bundle recorded them, which must
+    match what GitHub reports for this run, and the release jobs as GitHub
+    reports them now (publication may itself be a re-run)."""
     path = directory / "source-checks.json"
     recorded = json.loads(path.read_text()).get("reruns", {}) if path.exists() else {}
-    if set(recorded) != set(release_attempts.current()):
+    record = release_attempts.current()
+    if rerun_attempts(recorded) != rerun_attempts(record["checks"]):
         raise ValueError("the bundle's re-run record differs from this run's jobs")
-    if not recorded:
-        return ""
-    return ("Regression checks re-run once after a failure: " + ", ".join(
-        f"{check} (first failure: {entry['first_failure']}; attempt-1 log: {entry['first_job']}; "
-        + rerun_count(entry) + ")"
-        for check, entry in sorted(recorded.items())) + ".")
+    lines = []
+    if recorded:
+        lines.append("Regression checks re-run after a failure: " + ", ".join(
+            f"{check} ({first_failure_text(entry)}; {rerun_count(entry)})"
+            for check, entry in sorted(recorded.items())) + ".")
+    if record["jobs"]:
+        lines.append("Release jobs re-run after a failure: " + ", ".join(
+            f"{name} ({first_failure_text(entry)}; ran again "
+            + (f"{entry['runs']} times " if entry["runs"] > 1 else "") + f"in {attempts_text(entry['attempts'])})"
+            for name, entry in sorted(record["jobs"].items())) + ".")
+    return "\n\n".join(lines)
 
 
 def publish(directory):
     if (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
             or os.environ.get("GITHUB_REF") != "refs/heads/main"
             or os.environ.get("RELEASE_PUBLISH_REQUESTED") != "true"
-            or os.environ.get("GITHUB_RUN_ATTEMPT") not in ("1", "2")):
+            or os.environ.get("GITHUB_RUN_ATTEMPT") not in
+            {str(n) for n in range(1, release_attempts.MAX_ATTEMPT + 1)}):
         raise ValueError("publication requires an explicitly requested main dispatch, "
-                         "in its first attempt or its one re-run")
+                         f"in its first attempt or one of its re-runs (attempts 1 to {release_attempts.MAX_ATTEMPT})")
     verify_bundle(directory)
     release = version(os.environ["RELEASE_VERSION"])
     sha = source()
@@ -132,10 +187,11 @@ def publish(directory):
             "source-sbom.cdx.json inventories source dependencies, not the complete OS. "
             "Source regression tests and exact-disk boot tests are separately identified; "
             "no physical-hardware certification is claimed.")
+    body += "\n\n" + runner_statement(directory)
     statement = approvals_statement()
     if statement:
         body += "\n\n" + statement
-    for line in (stall_statement(directory), rerun_statement(directory)):
+    for line in (stall_statement(directory), build_stall_statement(directory), rerun_statement(directory)):
         if line:
             body += "\n\n" + line
     created = api(root + "/releases", {

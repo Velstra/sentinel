@@ -13,6 +13,10 @@ on:
         description: 'Publish after all checks and independent environment approvals'
         type: boolean
         default: false
+      regression_runner:
+        description: 'Runners for the regression checks only: github, or the velstra-rel-* label of self-hosted ephemeral runners'
+        type: string
+        default: github
 
 permissions:
   contents: read
@@ -37,6 +41,9 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      regression_runner: ${{ steps.plan.outputs.regression_runner }}
+      regression_runs_on: ${{ steps.plan.outputs.regression_runs_on }}
+      regression_max_parallel: ${{ steps.plan.outputs.regression_max_parallel }}
     steps:
       # Retried once after a pause: github.com unreachable for minutes
       # (the action's own three attempts) used to end the whole run.
@@ -60,6 +67,8 @@ jobs:
         id: plan
         env:
           REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
+          # Tag pushes have no inputs: their regressions stay on GitHub.
+          REGRESSION_RUNNER: ${{ inputs.regression_runner || 'github' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -72,22 +81,32 @@ jobs:
           python3 scripts/check_input_freshness.py --max-age-days 21
           python3 -B -m unittest discover -s tests -p 'test_community_release.py' -v
           python3 -c 'import os,sys; sys.path.insert(0,"scripts"); from community_release import version; print("version="+version(os.environ["REQUESTED_VERSION"]))' >> "$GITHUB_OUTPUT"
-          echo "matrix=$(python3 scripts/community_release.py checks)" >> "$GITHUB_OUTPUT"
+          # The runner choice fails closed for anything but github or a velstra-rel-* label.
+          {
+            echo "matrix=$(python3 scripts/community_release.py checks)"
+            python3 scripts/community_release.py runner --runner "$REGRESSION_RUNNER"
+          } >> "$GITHUB_OUTPUT"
           python3 scripts/check_release_environment.py community-signing
           python3 scripts/check_release_environment.py community-attestation
           python3 scripts/check_release_environment.py community-publish
 
   regressions:
     needs: plan
-    runs-on: ubuntu-24.04
+    # The only job that may run on self-hosted ephemeral runners (input
+    # regression_runner): it holds no secret and writes nothing but its
+    # receipt. Every job that builds, signs or publishes stays on GitHub's.
+    runs-on: ${{ fromJSON(needs.plan.outputs.regression_runs_on) }}
+    permissions:
+      contents: read
     # Room for the slowest healthy job (80 min) to stall at its end, sit out
     # the 30-min stall limit and run in full once more, with slack for slow
     # runners at night; a hang used to hold a runner for six hours.
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      # GitHub Free runs 20 jobs at once; build runs alongside the regressions.
-      max-parallel: 19
+      # 19 on GitHub (Free runs 20 jobs at once; build runs alongside), 40 on
+      # self-hosted runners, whose pool sees only jobs that are queued.
+      max-parallel: ${{ fromJSON(needs.plan.outputs.regression_max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       # Retried once after a pause: github.com unreachable for minutes
@@ -109,7 +128,12 @@ jobs:
         # Ubuntu 24.04 runners restrict them through AppArmor; the image
         # derivations unshare a user namespace and fail with
         # "write failed /proc/self/uid_map: Operation not permitted".
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        # A self-hosted runner image may have lifted it already, or run a
+        # kernel without AppArmor: then there is nothing to do.
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
         with:
           enable_kvm: true
@@ -117,9 +141,9 @@ jobs:
         env:
           CHECK: ${{ matrix.check }}
         run: |
-          test -r /dev/kvm && test -w /dev/kvm
-          # A failed regression job may run once more (attempt 2), never again.
-          test "$GITHUB_RUN_ATTEMPT" -le 2
+          test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm is not usable on $RUNNER_NAME"; exit 1; }
+          # A failed regression job may run twice more (attempts 2 and 3), never again.
+          test "$GITHUB_RUN_ATTEMPT" -le 3
           python3 scripts/community_release.py checks --check "$CHECK" --output "$RUNNER_TEMP/$CHECK.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -161,8 +185,9 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          # The build is never repeated: a re-run release signs the attempt-1 build.
-          test "$GITHUB_RUN_ATTEMPT" = 1
+          # Only a failed build runs again (scripts/release_attempts.py): a build
+          # that passed is carried over, and the release signs that one.
+          test "$GITHUB_RUN_ATTEMPT" -le 3
           bash scripts/release-tools.sh python3 scripts/community_release.py build --version "$RELEASE_VERSION" --output "$RUNNER_TEMP/factory"
           python3 scripts/community_release.py budget --input "$RUNNER_TEMP/factory"
       # The image, not the source tree: corrected Nix CPEs, the kernel
@@ -189,7 +214,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: image-cve-verdict
+          # Its own name per attempt: a job run again never meets its earlier upload.
+          name: image-cve-verdict-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/cve-scan/verdict.json
             ${{ runner.temp }}/cve-scan/rewrite-report.json
@@ -199,7 +225,8 @@ jobs:
       - id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: factory-not-for-distribution
+          # Its own name per attempt: a job run again never meets its earlier upload.
+          name: factory-not-for-distribution-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/factory
           if-no-files-found: error
           retention-days: 1
@@ -220,6 +247,7 @@ jobs:
       VELSTRA_PK_CERT_SHA256: ${{ vars.VELSTRA_PK_CERT_SHA256 }}
       VELSTRA_KEK_CERT_SHA256: ${{ vars.VELSTRA_KEK_CERT_SHA256 }}
       VELSTRA_DB_CERT_SHA256: ${{ vars.VELSTRA_DB_CERT_SHA256 }}
+      RELEASE_REGRESSION_RUNNER: ${{ needs.plan.outputs.regression_runner }}
     steps:
       # Retried once after a pause: github.com unreachable for minutes
       # (the action's own three attempts) used to end the whole run.
@@ -268,7 +296,8 @@ jobs:
       - id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: signed-disk
+          # Its own name per attempt: a job run again never meets its earlier upload.
+          name: signed-disk-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/signed
           if-no-files-found: error
           retention-days: 1
@@ -290,6 +319,7 @@ jobs:
       VELSTRA_PK_CERT_SHA256: ${{ vars.VELSTRA_PK_CERT_SHA256 }}
       VELSTRA_KEK_CERT_SHA256: ${{ vars.VELSTRA_KEK_CERT_SHA256 }}
       VELSTRA_DB_CERT_SHA256: ${{ vars.VELSTRA_DB_CERT_SHA256 }}
+      RELEASE_REGRESSION_RUNNER: ${{ needs.plan.outputs.regression_runner }}
     steps:
       # Retried once after a pause: github.com unreachable for minutes
       # (the action's own three attempts) used to end the whole run.
@@ -348,7 +378,8 @@ jobs:
       - id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: tested-release
+          # Its own name per attempt: a job run again never meets its earlier upload.
+          name: tested-release-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/release
           if-no-files-found: error
           retention-days: 1
@@ -366,6 +397,7 @@ jobs:
       RELEASE_VERSION: ${{ needs.plan.outputs.version }}
       VELSTRA_GPG_FINGERPRINT: ${{ vars.VELSTRA_GPG_FINGERPRINT }}
       RELEASE_CHECK_CATALOG: ${{ needs.plan.outputs.matrix }}
+      RELEASE_REGRESSION_RUNNER: ${{ needs.plan.outputs.regression_runner }}
     steps:
       # Retried once after a pause: github.com unreachable for minutes
       # (the action's own three attempts) used to end the whole run.
@@ -397,6 +429,9 @@ jobs:
         run: |
           python3 scripts/release_identity.py gpg
       - name: Sign the complete artifact inventory
+        env:
+          # The bundle check reads which attempt packaged the bundle.
+          GH_TOKEN: ${{ github.token }}
         run: |
           gpg --batch --import "$RELEASE_IDENTITY/release.asc"
           python3 scripts/community_release.py seal --input "$RUNNER_TEMP/release"
@@ -404,7 +439,8 @@ jobs:
       - id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: authenticated-release
+          # Its own name per attempt: a job run again never meets its earlier upload.
+          name: authenticated-release-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/release
           if-no-files-found: error
           retention-days: 1
@@ -431,6 +467,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_CHECK_CATALOG: ${{ needs.plan.outputs.matrix }}
       RELEASE_PUBLISH_REQUESTED: ${{ inputs.publish }}
+      RELEASE_REGRESSION_RUNNER: ${{ needs.plan.outputs.regression_runner }}
     steps:
       # Retried once after a pause: github.com unreachable for minutes
       # (the action's own three attempts) used to end the whole run.
