@@ -94,6 +94,14 @@ let
       version = "3.54.1";
       # The 3.53.3 recipe's patches are upstream commits that 3.54.1 contains.
       patches = [ ];
+      # Not SQLite's own test suite: this release is upstream-tested, and the
+      # backport is in no binary cache, so every uncached runner built it with
+      # about a million tests (some 10 min per regression job). Release run
+      # 45963560974 had that suite hang for 5.5 h (no output after
+      # "testrunner.tcl mdevtest") until the 6 h job limit, and fail once on
+      # test/notify2.test, a timing test. The image tests exercise SQLite
+      # through the product.
+      doCheck = false;
       src = pkgs.fetchurl {
         url = "https://sqlite.org/2026/sqlite-src-3540100.zip";
         sha256 = "387e7f6cad4797b17848c07d453dc6606917bb356a6cfe5a3abafd38c240c71b";
