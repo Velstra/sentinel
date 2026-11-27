@@ -410,6 +410,11 @@ FIXTURES = ROOT / "tests/fixtures/run-45642647509"
 # both (they passed), sign passed and package failed in its boot gate. The
 # approval history is GitHub's, with the maintainer's login replaced.
 PACKAGE_FAILED = ROOT / "tests/fixtures/run-45868284650"
+# Release run 45963560974: three regressions failed in attempt 1; attempt 2
+# re-ran them, sign passed, and package hit the 6 h job limit while SQLite's
+# own test suite hung. GitHub calls that "cancelled"; only the job's
+# annotations say it was the time limit.
+PACKAGE_TIMED_OUT = ROOT / "tests/fixtures/run-45963560974"
 DOWNSTREAM = ("sign", "package", "seal", "publish")
 
 
@@ -507,6 +512,76 @@ class ReRunPolicyTests(unittest.TestCase):
     def test_a_timed_out_regression_counts_as_failed(self):
         first, second = listings(first_overrides={"regressions (rip)": {"conclusion": "timed_out"}})
         self.assertEqual(attempts.review([first, second])["reruns"]["regressions (rip)"]["attempts"], [2])
+
+    def test_a_job_github_cancelled_at_its_time_limit_may_run_again(self):
+        first, second = (real_jobs(f"attempt-{n}.json", PACKAGE_TIMED_OUT) for n in (1, 2))
+        history = attempts.review([first, second])
+        self.assertEqual(sorted(history["reruns"]), ["regressions (image-first-boot)", "regressions (nat-cps)",
+                                                     "regressions (ota-publication-failure)"])
+        self.assertEqual(history["latest"]["package"]["conclusion"], "cancelled")
+        attempts.require_green(history)
+        third = again(second, 3, [("package", "success")])
+        # Without the annotation's word for it, a cancelled job was stopped on purpose.
+        with self.assertRaisesRegex(ValueError, "package was cancelled"):
+            attempts.review([first, second, third])
+        package = named(second, "package")
+        asked = []
+        history = attempts.review([first, second, third], timed_out=lambda job: asked.append(job) or True)
+        self.assertEqual(asked, [package], "only the cancelled job is asked about")
+        self.assertEqual((history["reruns"]["package"]["failed_in"], history["reruns"]["package"]["attempts"]),
+                         (2, [3]))
+        with self.assertRaisesRegex(ValueError, "package was cancelled"):
+            attempts.review([first, second, third], timed_out=lambda job: False)
+
+    def test_only_githubs_own_time_limit_annotation_means_timed_out(self):
+        real = json.loads((PACKAGE_TIMED_OUT / "package-annotations.json").read_text())
+        self.assertTrue(attempts.hit_time_limit(real))
+        canceled = [a for a in real if "maximum execution time" not in a["message"]]
+        for annotations in (canceled, [], [{"annotation_level": "warning",
+                                            "message": "The job has exceeded the maximum execution time of 6h0m0s"}],
+                            [{"annotation_level": "failure",
+                              "message": "rip: The job has exceeded the maximum execution time of 6h0m0s"}],
+                            None, {"message": "x"}, [None]):
+            with self.subTest(annotations=annotations):
+                self.assertFalse(attempts.hit_time_limit(annotations))
+        for minutes in ("4h0m0s", "1h30m0s", "0h45m10s"):
+            self.assertTrue(attempts.hit_time_limit([{"annotation_level": "failure", "message":
+                                                      f"The job has exceeded the maximum execution time of {minutes}"}]))
+
+    def test_the_current_run_reads_the_time_limit_from_the_annotations(self):
+        first, second = (real_jobs(f"attempt-{n}.json", PACKAGE_TIMED_OUT) for n in (1, 2))
+        third = again(second, 3, [("package", "success")])
+        package = named(second, "package")
+        real = json.loads((PACKAGE_TIMED_OUT / "package-annotations.json").read_text())
+        environment = {"GITHUB_RUN_ID": "45963560974", "GITHUB_REPOSITORY": "Velstra/sentinel",
+                       "GITHUB_RUN_ATTEMPT": "3"}
+
+        def fetch_with(annotations):
+            def fetch(path):
+                if "/annotations" in path:
+                    if f"check-runs/{package['id']}/" in path:
+                        return annotations() if callable(annotations) else annotations
+                    return [{"annotation_level": "failure", "message": "check failed"}]
+                if "/attempts/" in path and "/jobs" not in path:
+                    number = int(path.rsplit("/", 1)[1])
+                    return {"run_attempt": number, "actor": {"login": "owner"}, "triggering_actor": {"login": "owner"}}
+                listing = (first, second, third)[int(path.split("/attempts/", 1)[1].split("/", 1)[0]) - 1]
+                return {"total_count": len(listing), "jobs": listing}
+            return fetch
+
+        with patch.dict(os.environ, environment):
+            record = attempts.current(fetch=fetch_with(real))
+            self.assertEqual(record["jobs"]["package"]["first_failure"],
+                             "The job has exceeded the maximum execution time of 6h0m0s")
+            self.assertEqual(record["jobs"]["package"]["attempts"], [3])
+            manual = [a for a in real if "maximum execution time" not in a["message"]]
+            with self.assertRaisesRegex(ValueError, "cancelled"):
+                attempts.current(fetch=fetch_with(manual))
+
+            def unreadable():
+                raise ValueError("GitHub API read failed 5 times")
+            with self.assertRaisesRegex(ValueError, "GitHub API read"):
+                attempts.current(fetch=fetch_with(unreadable))
 
     def test_a_failed_build_may_be_built_again(self):
         first = first_attempt(failed=(), overrides={"build": {"conclusion": "failure"}})

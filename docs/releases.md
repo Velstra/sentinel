@@ -122,7 +122,7 @@ minutes is taken for a hung runner: the build is killed and started once more
 in the same job. A second stall, or any failure of the check itself, fails the
 job; the job itself never retries a failed check. The check's receipt and the
 release notes name every check that was retried. A regression job that hits
-its 240-minute timeout fails (it may be [run again](#re-runs-after-a-failure)).
+its 240-minute timeout is stopped (it may be [run again](#re-runs-after-a-failure)).
 A checkout that cannot reach github.com is retried once after a two-minute
 pause.
 
@@ -159,9 +159,12 @@ which job ran in which attempt and refuses anything else:
 
 - a job that *failed* (or timed out) may run again in the next attempt: a
   regression check, the build, or sign, package, seal and publish. A
-  regression check thus runs at most twice more after its first failure. A
-  cancelled job, or a plan that failed, makes the release refuse: start a new
-  run;
+  regression check thus runs at most twice more after its first failure.
+  GitHub reports a job that hit its `timeout-minutes` as *cancelled*; the
+  policy reads the job's annotations and counts it as timed out only when
+  GitHub's own "The job has exceeded the maximum execution time of …" is
+  there, and fails closed when it cannot read them. Any other cancelled job,
+  or a plan that failed, makes the release refuse: start a new run;
 - every job that passed is carried over unchanged into each later attempt and
   is never run again: the plan, a build that passed (the release signs that
   one), every passing regression, and sign, package or seal once they passed.

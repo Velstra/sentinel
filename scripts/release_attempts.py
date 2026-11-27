@@ -22,8 +22,12 @@ DOWNSTREAM = ("sign", "package", "seal", "publish")
 UPSTREAM = ("plan", "build")
 REGRESSION = re.compile(r"regressions \(([a-zA-Z0-9_-]+)\)")
 # What may run again. A timeout is a failure of the job; a cancelled job was
-# stopped on purpose (or by GitHub) and is a reason to start a new run.
+# stopped on purpose and is a reason to start a new run, except when GitHub
+# cancelled it at the job's time limit (hit_time_limit).
 RERUNNABLE = ("failure", "timed_out")
+# GitHub reports a job that hit timeout-minutes as "cancelled" (package of run
+# 45963560974, 6 h); only this failure annotation tells it from a cancel.
+TIME_LIMIT = re.compile(r"The job has exceeded the maximum execution time of \d+h\d+m\d+s")
 # The runner's own closing line for any failed step; it says nothing about why.
 GENERIC_FAILURE = re.compile(r"Process completed with exit code \d+\.?")
 # GitHub answers 502 for a 100-entry page of a large run (run 45642647509,
@@ -108,6 +112,13 @@ def outcome(entries):
     return sorted(str(c) for c in conclusions - {"success", *RERUNNABLE})[0]
 
 
+def hit_time_limit(annotations):
+    """GitHub's own annotation says the job ran out of time."""
+    return isinstance(annotations, list) and any(
+        isinstance(a, dict) and a.get("annotation_level") == "failure" and isinstance(a.get("message"), str)
+        and TIME_LIMIT.fullmatch(a["message"].strip()) for a in annotations)
+
+
 def listing_of(jobs, number):
     if not isinstance(jobs, list) or any(not isinstance(j, dict) or not isinstance(j.get("name"), str)
                                          for j in jobs):
@@ -124,7 +135,16 @@ def known(name):
     return name in FIRST_ATTEMPT_ONLY or name in UPSTREAM or name in DOWNSTREAM or REGRESSION.fullmatch(name)
 
 
-def judge(name, before, listed, number, waiting):
+def rerunnable(before, timed_out):
+    """The job's latest state allows a re-run: it failed, or GitHub cancelled
+    every cancelled entry of it at the time limit."""
+    if before["conclusion"] in RERUNNABLE:
+        return True
+    return before["conclusion"] == "cancelled" and all(
+        timed_out(job) for job in before["entries"] if job.get("conclusion") == "cancelled")
+
+
+def judge(name, before, listed, number, waiting, timed_out):
     """What attempt `number` did with one job, given its latest state before:
     None when it kept that state (carried over, or not reached yet), else
     (its fresh entries, the phantoms listed with them, whether it is a re-run
@@ -139,7 +159,7 @@ def judge(name, before, listed, number, waiting):
         if len(real) != 1 or not kept:
             raise ValueError(f"{name} passed in attempt {before['attempt']} and must be carried over unchanged")
         return None
-    if before["conclusion"] in RERUNNABLE:
+    if rerunnable(before, timed_out):
         if kept or (not fresh and name not in DOWNSTREAM):
             raise ValueError(f"{name} failed in attempt {before['attempt']} and was not run again")
         # A release job whose turn has not come in this attempt keeps its state.
@@ -150,11 +170,13 @@ def judge(name, before, listed, number, waiting):
                      "only a failed job may run again; start a new run")
 
 
-def review(listings):
+def review(listings, timed_out=lambda job: False):
     """Judge every attempt of a run against the one before it.
 
     `listings` are GitHub's job listings of attempts 1..N, N being the attempt
-    that runs now. Returns {"reruns": {job: {"job": its first failed entry,
+    that runs now; `timed_out(job)` says whether a cancelled entry hit its
+    time limit (read from GitHub, asked only when a later attempt judges it).
+    Returns {"reruns": {job: {"job": its first failed entry,
     "failed_in", "attempts": the later attempts that ran it, "runs",
     "phantoms"}}, "runs": {job: how many of its entries got a runner, over all
     attempts}, "gates": {job: the attempt of each of those runs}, "latest":
@@ -180,7 +202,7 @@ def review(listings):
         waiting = number == len(listings) and not moved_on(jobs, latest)
         reran = False
         for name in one:
-            step = judge(name, latest[name], entries.get(name, []), number, waiting)
+            step = judge(name, latest[name], entries.get(name, []), number, waiting, timed_out)
             if step is None:
                 continue
             fresh, phantoms, rerun = step
@@ -326,7 +348,11 @@ def current(fetch=gh):
     key = (repository, run_id, number)
     if fetch is gh and key in _CURRENT:
         return json.loads(json.dumps(_CURRENT[key]))
-    history = review([attempt_jobs(repository, run_id, n, fetch) for n in range(1, number + 1)])
+    # A failed read of the annotations fails the whole judgement.
+    def timed_out(job):
+        return hit_time_limit(fetch(f"{check_run(job, repository)}/annotations?per_page={PAGE_SIZE}"))
+
+    history = review([attempt_jobs(repository, run_id, n, fetch) for n in range(1, number + 1)], timed_out)
     require_green(history)
     record = {"attempt": number, "checks": {}, "jobs": {}, "runs": history["runs"], "gates": history["gates"],
               "actors": [starters(fetch(f"repos/{repository}/actions/runs/{run_id}/attempts/{n}"), n)
