@@ -109,6 +109,60 @@ class ReleaseImageBootContracts(unittest.TestCase):
         ENV["record_marker"]("sentinel-fw login:", observed, 2)
         self.assertEqual(observed, {"login-prompt": 1})
 
+    # Boot 1 of release run 45868284650 (attempt 2) as its job log shows it,
+    # from Secure Boot to the getty, with the lines in between that carry no
+    # marker left out. agetty ends with "sentinel-fw login: " and no newline:
+    # the driver reads the serial line by line, so that prompt only reached
+    # the queue when the VM was killed 220 s later.
+    RUN_45868284650_BOOT_1 = (
+        b"EFI stub: UEFI Secure Boot is enabled.\r\n"
+        b"[  OK  ] Reached target Multi-User System.\r\n"
+        b"         Starting Verify the appliance before blessing the current UKI...\r\n"
+        b"[   11.237886] velstra-boot-verify-start[676]: boot health: saved config, services, links and XDP are ready\r\n"
+        b"[  OK  ] Finished Verify the appliance before blessing the current UKI.\r\n"
+        b"         Starting Mark the Current Boot Loader Entry as Good...\r\n"
+        b"[  OK  ] Finished Mark the Current Boot Loader Entry as Good.\r\n"
+        b"7878+q6E616D65\r\n"
+        b"\r\n"
+        b"<<< Welcome to Velstra Sentinel 26.05.20261116.f684076 (x86_64) - ttyS0 >>>\r\n"
+        b"\r\n"
+        b"\r\n"
+        b"sentinel-fw login: ")
+
+    @staticmethod
+    def delivered_while_running(serial):
+        """What the test driver queues while the VM runs: whole lines only,
+        decoded the way its serial reader decodes them."""
+        return [raw.decode(errors="ignore").replace("\r", "").rstrip() for raw in serial.split(b"\n")[:-1]]
+
+    def test_getty_on_the_serial_console_without_a_newline_after_its_prompt(self):
+        lines = self.delivered_while_running(self.RUN_45868284650_BOOT_1)
+        self.assertNotIn("sentinel-fw login:", lines)
+        for require_bless in (True, False):
+            with self.subTest(require_bless=require_bless):
+                observed = {}
+                for number, line in enumerate(lines, 1):
+                    ENV["record_marker"](line, observed, number)
+                self.assertEqual(len(ENV["require_markers"](observed, require_bless)), 5 if require_bless else 3)
+                self.assertLess(observed["multi-user"], observed["login-prompt"])
+
+    def test_issue_line_counts_only_when_agetty_expanded_it_for_ttyS0(self):
+        for line in ("<<< Welcome to Velstra Sentinel 26.05.20261116.f684076 (x86_64) - \\l >>>",
+                     "<<< Welcome to Velstra Sentinel 26.05.20261116.f684076 (x86_64) - tty1 >>>",
+                     "<<< Welcome to Velstra Sentinel 26.05.20261116.f684076 (x86_64) - ttyS01 >>>",
+                     "<<< Welcome to NixOS 26.05.20261116.f684076 (x86_64) - ttyS0 >>>",
+                     "Welcome to Velstra Sentinel!"):
+            observed = {}
+            with self.subTest(line=line):
+                ENV["record_marker"](line, observed, 1)
+                self.assertNotIn("login-prompt", observed)
+
+    def test_login_prompt_must_follow_secure_boot(self):
+        observed = self.milestones()
+        observed["login-prompt"] = 0
+        with self.assertRaises(AssertionError):
+            ENV["require_markers"](observed, True)
+
     def test_other_hostname_and_failure_logs_are_not_health_success(self):
         observed = {}
         for line in ("another-node login:", "EFI stub: UEFI Secure Boot is disabled"):
