@@ -86,7 +86,8 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: 16
+      # GitHub Free runs 20 jobs at once; build runs alongside the regressions.
+      max-parallel: 19
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       # Retried once after a pause: github.com unreachable for minutes

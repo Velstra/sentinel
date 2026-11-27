@@ -80,14 +80,18 @@ pkgs.testers.runNixOSTest {
         if "boot health:" in line:
             assert "boot health: saved config, services, links and XDP are ready" in line, ("failed product assessment", line)
         markers = {
-            "secure-boot": "EFI stub: UEFI Secure Boot is enabled",
-            "product-health": "boot health: saved config, services, links and XDP are ready",
-            "boot-blessed": "Finished Mark the Current Boot Loader Entry as Good",
-            "login-prompt": "sentinel-fw login:",
-            "multi-user": "Reached target Multi-User System",
+            "secure-boot": re.escape("EFI stub: UEFI Secure Boot is enabled"),
+            "product-health": re.escape("boot health: saved config, services, links and XDP are ready"),
+            "boot-blessed": re.escape("Finished Mark the Current Boot Loader Entry as Good"),
+            # agetty prints its issue line, then "sentinel-fw login: " with no
+            # newline, which the driver's line-based serial reader only hands
+            # over once the VM has ended. Only agetty expands the issue's \l
+            # to the terminal it runs on, so this line proves the serial getty.
+            "login-prompt": r"sentinel-fw login:|<<< Welcome to Velstra Sentinel \S+ \(\S+\) - ttyS0 >>>",
+            "multi-user": re.escape("Reached target Multi-User System"),
         }
         for name, marker in markers.items():
-            if marker in line:
+            if re.search(marker, line):
                 if name == "secure-boot":
                     assert name not in observed, ("unexpected reboot during assessment", name)
                 observed.setdefault(name, number)
@@ -98,6 +102,7 @@ pkgs.testers.runNixOSTest {
             required.update({"product-health", "boot-blessed"})
         assert required <= observed.keys(), ("missing boot milestones", sorted(required - observed.keys()))
         assert observed["secure-boot"] < observed["multi-user"], observed
+        assert observed["secure-boot"] < observed["login-prompt"], observed
         if "product-health" in observed:
             assert observed["secure-boot"] < observed["product-health"], observed
         if "boot-blessed" in observed:
